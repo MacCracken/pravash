@@ -48,7 +48,7 @@ Complete the Euler grid pipeline. Required by joshua for fluid simulation.
 - [x] Correct dx scaling in advection, diffusion, divergence, projection
 - [x] MacCormack advection (forward-backward correction with neighbor clamping)
 - [x] Periodic boundary conditions (wrapping edges, periodic sampling)
-- [ ] FFT Poisson solver (requires DST in hisab for wall boundaries)
+- [x] DST Poisson solver (exact solve via hisab `dst`/`idst` for wall boundaries)
 
 ### 0.4 — Coupling & Interaction (complete)
 
@@ -60,9 +60,9 @@ Bridge particle and grid worlds. Required by impetus for fluid-body interaction.
 - [x] `FlipSolver` — FLIP/PIC hybrid (P2G, pressure projection, G2P with configurable blend)
 - [x] Central-difference surface normals with degenerate fallback
 - [x] Correct dt scaling in FLIP pressure projection
-- [ ] Particle-level set surface tracking
-- [ ] Added mass computation for submerged bodies
-- [ ] Drag integration with velocity fields (not just freestream)
+- [x] Particle-level set surface tracking (nearest-particle distance field)
+- [x] Added mass computation (`effective_mass`, `integrate_bodies_with_added_mass`)
+- [x] Drag from velocity fields (`drag_from_particles` — samples fluid velocity near body surface)
 
 ### 0.5 — Shallow Water & Waves
 

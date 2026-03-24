@@ -207,6 +207,166 @@ pub fn integrate_bodies(bodies: &mut [RigidBody], gravity: [f64; 3], dt: f64) {
     }
 }
 
+// ── Added Mass ──────────────────────────────────────────────────────────────
+
+/// Added mass coefficients for common shapes.
+pub struct AddedMassCoefficient;
+
+impl AddedMassCoefficient {
+    /// Sphere: C_a = 0.5
+    pub const SPHERE: f64 = 0.5;
+    /// Cube: C_a ≈ 0.67
+    pub const CUBE: f64 = 0.67;
+    /// Long cylinder (transverse): C_a = 1.0
+    pub const CYLINDER: f64 = 1.0;
+    /// Flat plate (normal): C_a ≈ 1.0
+    pub const FLAT_PLATE: f64 = 1.0;
+}
+
+/// Compute the effective mass including added mass.
+///
+/// m_eff = m_body + C_a · ρ_fluid · V_body
+#[inline]
+#[must_use]
+pub fn effective_mass(body_mass: f64, fluid_density: f64, body_volume: f64, ca: f64) -> f64 {
+    body_mass + ca * fluid_density * body_volume
+}
+
+/// Integrate rigid body motion with added mass effect.
+///
+/// The added mass increases the effective inertia of the body, reducing
+/// acceleration for a given force. `ca` is the added mass coefficient
+/// (shape-dependent, 0.5 for sphere).
+pub fn integrate_bodies_with_added_mass(
+    bodies: &mut [RigidBody],
+    gravity: [f64; 3],
+    dt: f64,
+    fluid_density: f64,
+    ca: f64,
+) {
+    for body in bodies {
+        let vol = body.shape.volume();
+        let m_eff = effective_mass(body.mass, fluid_density, vol, ca);
+        let inv_m = 1.0 / m_eff.max(1e-20);
+        body.velocity[0] += (body.force[0] * inv_m + gravity[0]) * dt;
+        body.velocity[1] += (body.force[1] * inv_m + gravity[1]) * dt;
+        body.velocity[2] += (body.force[2] * inv_m + gravity[2]) * dt;
+        body.position[0] += body.velocity[0] * dt;
+        body.position[1] += body.velocity[1] * dt;
+        body.position[2] += body.velocity[2] * dt;
+    }
+}
+
+// ── Drag from Velocity Fields ───────────────────────────────────────────────
+
+/// Compute drag on a rigid body from nearby SPH particle velocities.
+///
+/// Samples the average fluid velocity near the body surface from particles
+/// within `sample_radius`, then applies the standard drag formula using
+/// the relative velocity.
+///
+/// Returns the drag force vector (opposing relative motion).
+#[must_use]
+pub fn drag_from_particles(
+    body: &RigidBody,
+    particles: &[FluidParticle],
+    fluid_density: f64,
+    drag_coefficient: f64,
+    sample_radius: f64,
+) -> [f64; 3] {
+    let _span = trace_span!("coupling::drag_from_particles").entered();
+    // Average fluid velocity near the body surface
+    let mut avg_vx = 0.0;
+    let mut avg_vy = 0.0;
+    let mut avg_vz = 0.0;
+    let mut count = 0.0;
+
+    for p in particles {
+        let sd = body.signed_distance(p.position);
+        if sd.abs() < sample_radius {
+            avg_vx += p.velocity[0];
+            avg_vy += p.velocity[1];
+            avg_vz += p.velocity[2];
+            count += 1.0;
+        }
+    }
+
+    if count < 1.0 {
+        return [0.0; 3];
+    }
+
+    avg_vx /= count;
+    avg_vy /= count;
+    avg_vz /= count;
+
+    // Relative velocity (fluid relative to body)
+    let rel_vx = avg_vx - body.velocity[0];
+    let rel_vy = avg_vy - body.velocity[1];
+    let rel_vz = avg_vz - body.velocity[2];
+    let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz).sqrt();
+
+    if rel_speed < 1e-20 {
+        return [0.0; 3];
+    }
+
+    // Cross-section area approximation from shape volume
+    let area = match body.shape {
+        BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
+        BodyShape::Box { half_extents } => 4.0 * half_extents[1] * half_extents[2],
+    };
+
+    // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
+    let drag_mag = 0.5 * fluid_density * rel_speed * drag_coefficient * area;
+    [
+        drag_mag * rel_vx / rel_speed,
+        drag_mag * rel_vy / rel_speed,
+        drag_mag * rel_vz / rel_speed,
+    ]
+}
+
+// ── Particle-Level Set Surface Tracking ─────────────────────────────────────
+
+/// Reconstruct a signed distance field on a grid from SPH particles.
+///
+/// Uses nearest-particle distance to build an approximate level set.
+/// Positive = outside fluid, negative = inside fluid.
+/// The `particle_radius` defines the effective radius of each particle's
+/// contribution to the fluid region.
+pub fn particle_level_set(
+    level_set: &mut [f64],
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    particles: &[FluidParticle],
+    particle_radius: f64,
+) {
+    let _span = trace_span!("coupling::particle_level_set", nx, ny, n = particles.len()).entered();
+
+    // Initialize to large positive (outside)
+    let far = (nx as f64 + ny as f64) * dx;
+    level_set.fill(far);
+
+    // For each grid cell, find distance to nearest particle
+    for y in 0..ny {
+        for x in 0..nx {
+            let gx = x as f64 * dx;
+            let gy = y as f64 * dx;
+            let idx = y * nx + x;
+            let mut min_dist = far;
+
+            for p in particles {
+                let ddx = gx - p.position[0];
+                let ddy = gy - p.position[1];
+                let dist = (ddx * ddx + ddy * ddy).sqrt() - particle_radius;
+                if dist < min_dist {
+                    min_dist = dist;
+                }
+            }
+            level_set[idx] = min_dist;
+        }
+    }
+}
+
 // ── FLIP/PIC Hybrid ─────────────────────────────────────────────────────────
 
 /// FLIP/PIC hybrid solver — particles advected on a background grid.
@@ -653,5 +813,116 @@ mod tests {
         // Both should produce finite results
         assert!(particles_flip[0].velocity[0].is_finite());
         assert!(particles_pic[0].velocity[0].is_finite());
+    }
+
+    // ── Added mass tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_effective_mass_sphere() {
+        // Sphere in water: m_eff = 1.0 + 0.5 * 1000 * V
+        let vol = BodyShape::Sphere { radius: 0.1 }.volume();
+        let m_eff = effective_mass(1.0, 1000.0, vol, AddedMassCoefficient::SPHERE);
+        assert!(m_eff > 1.0);
+        // Added mass should be 0.5 * 1000 * (4/3 * pi * 0.001) ≈ 2.09
+        assert!((m_eff - 1.0 - 0.5 * 1000.0 * vol).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_integrate_with_added_mass_slower() {
+        let mut body_normal =
+            RigidBody::new([0.0, 1.0, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
+        let mut body_added = body_normal.clone();
+        // Apply same force, zero gravity to isolate added mass effect
+        body_normal.force = [10.0, 0.0, 0.0];
+        body_added.force = [10.0, 0.0, 0.0];
+
+        integrate_bodies(std::slice::from_mut(&mut body_normal), [0.0; 3], 0.01);
+        integrate_bodies_with_added_mass(
+            std::slice::from_mut(&mut body_added),
+            [0.0; 3],
+            0.01,
+            1000.0,
+            AddedMassCoefficient::SPHERE,
+        );
+
+        // Added mass body should accelerate less from the same force
+        assert!(
+            body_added.velocity[0].abs() < body_normal.velocity[0].abs(),
+            "added mass should reduce force response: normal={}, added={}",
+            body_normal.velocity[0],
+            body_added.velocity[0]
+        );
+    }
+
+    // ── Drag from particles tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_drag_no_particles() {
+        let body = RigidBody::new([0.0; 3], 1.0, BodyShape::Sphere { radius: 0.1 });
+        let drag = drag_from_particles(&body, &[], 1000.0, 0.47, 0.2);
+        assert!(drag[0].abs() < 1e-20);
+    }
+
+    #[test]
+    fn test_drag_opposing_motion() {
+        let mut body = RigidBody::new([0.5, 0.5, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
+        body.velocity = [1.0, 0.0, 0.0]; // body moving right
+
+        // Stationary fluid particles nearby
+        let particles: Vec<FluidParticle> = (0..5)
+            .map(|i| FluidParticle::new([0.45 + i as f64 * 0.025, 0.5, 0.0], 0.01))
+            .collect();
+
+        let drag = drag_from_particles(&body, &particles, 1000.0, 0.47, 0.2);
+        // Drag should oppose body motion (point left, negative x)
+        assert!(
+            drag[0] < 0.0,
+            "drag should oppose rightward motion: {}",
+            drag[0]
+        );
+    }
+
+    // ── Particle-level set tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_level_set_empty() {
+        let mut ls = vec![0.0; 16];
+        particle_level_set(&mut ls, 4, 4, 0.1, &[], 0.05);
+        // All should be far (positive = outside)
+        assert!(ls.iter().all(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn test_level_set_single_particle() {
+        let particles = vec![FluidParticle::new([0.2, 0.2, 0.0], 0.01)];
+        let mut ls = vec![0.0; 25];
+        particle_level_set(&mut ls, 5, 5, 0.1, &particles, 0.05);
+        // Cell at (2,2) = 0.2,0.2 should be inside (negative)
+        assert!(
+            ls[2 * 5 + 2] < 0.0,
+            "particle center should be inside: {}",
+            ls[2 * 5 + 2]
+        );
+        // Far corner should be outside (positive)
+        assert!(ls[0] > 0.0);
+    }
+
+    #[test]
+    fn test_level_set_continuous() {
+        let particles = vec![FluidParticle::new([0.5, 0.5, 0.0], 0.01)];
+        let mut ls = vec![0.0; 100];
+        particle_level_set(&mut ls, 10, 10, 0.1, &particles, 0.1);
+        // Level set should be smooth (no sharp jumps between adjacent cells)
+        for y in 0..9 {
+            for x in 0..9 {
+                let d1 = ls[y * 10 + x];
+                let d2 = ls[y * 10 + x + 1];
+                assert!(
+                    (d1 - d2).abs() < 0.2,
+                    "level set should be smooth: ({x},{y})={d1}, ({},{y})={d2}",
+                    x + 1
+                );
+            }
+        }
     }
 }

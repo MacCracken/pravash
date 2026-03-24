@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PravashError, Result};
 
+use hisab::num::{dst, idst};
 use tracing::trace_span;
 
 /// Boundary condition type for the grid solver.
@@ -390,6 +391,90 @@ impl FluidGrid {
         }
     }
 
+    /// DST-based Poisson solver for Dirichlet (wall) boundary conditions.
+    ///
+    /// Solves ∇²p = div on interior cells using 2D Discrete Sine Transform.
+    /// Exact solve (no iterations needed). Works for any grid size.
+    fn pressure_solve_dst(pressure: &mut [f64], div: &[f64], nx: usize, ny: usize) {
+        let _span = trace_span!("grid::pressure_solve_dst", nx, ny).entered();
+        let inx = nx - 2; // interior dimensions
+        let iny = ny - 2;
+        if inx == 0 || iny == 0 {
+            return;
+        }
+
+        // Extract interior divergence into a flat buffer
+        let mut rhs = vec![0.0f64; inx * iny];
+        for iy in 0..iny {
+            for ix in 0..inx {
+                rhs[iy * inx + ix] = div[(iy + 1) * nx + (ix + 1)];
+            }
+        }
+
+        // 2D DST: rows then columns
+        // Row DSTs
+        for iy in 0..iny {
+            let row: Vec<f64> = rhs[iy * inx..(iy + 1) * inx].to_vec();
+            if let Ok(transformed) = dst(&row) {
+                rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
+            }
+        }
+        // Column DSTs
+        let mut col = vec![0.0f64; iny];
+        for ix in 0..inx {
+            for iy in 0..iny {
+                col[iy] = rhs[iy * inx + ix];
+            }
+            if let Ok(transformed) = dst(&col) {
+                for iy in 0..iny {
+                    rhs[iy * inx + ix] = transformed[iy];
+                }
+            }
+        }
+
+        // Divide by eigenvalues of the discrete Laplacian (DST-I)
+        // λ(kx,ky) = 2cos(π(kx+1)/(inx+1)) + 2cos(π(ky+1)/(iny+1)) - 4
+        let pi = std::f64::consts::PI;
+        for ky in 0..iny {
+            for kx in 0..inx {
+                let lx = 2.0 * (pi * (kx + 1) as f64 / (inx + 1) as f64).cos() - 2.0;
+                let ly = 2.0 * (pi * (ky + 1) as f64 / (iny + 1) as f64).cos() - 2.0;
+                let eigenvalue = lx + ly;
+                if eigenvalue.abs() > 1e-20 {
+                    rhs[ky * inx + kx] /= eigenvalue;
+                }
+            }
+        }
+
+        // 2D IDST: rows then columns
+        for iy in 0..iny {
+            let row: Vec<f64> = rhs[iy * inx..(iy + 1) * inx].to_vec();
+            if let Ok(transformed) = idst(&row) {
+                rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
+            }
+        }
+        for ix in 0..inx {
+            for iy in 0..iny {
+                col[iy] = rhs[iy * inx + ix];
+            }
+            if let Ok(transformed) = idst(&col) {
+                for iy in 0..iny {
+                    rhs[iy * inx + ix] = transformed[iy];
+                }
+            }
+        }
+
+        // Write back to pressure (interior only, boundaries stay zero)
+        for i in pressure.iter_mut() {
+            *i = 0.0;
+        }
+        for iy in 0..iny {
+            for ix in 0..inx {
+                pressure[(iy + 1) * nx + (ix + 1)] = rhs[iy * inx + ix];
+            }
+        }
+    }
+
     /// Subtract pressure gradient from velocity to enforce divergence-free.
     fn project_velocity(
         vx: &mut [f64],
@@ -699,13 +784,18 @@ impl FluidGrid {
         {
             scratch_a.fill(0.0);
             Self::divergence(&mut scratch_a, &self.vx, &self.vy, nx, ny, inv_2dx);
-            Self::pressure_solve(
-                &mut self.pressure,
-                &scratch_a,
-                nx,
-                ny,
-                config.pressure_iterations,
-            );
+            // DST solver for wall boundaries (exact), GS for periodic
+            if config.boundary == BoundaryCondition::Periodic {
+                Self::pressure_solve(
+                    &mut self.pressure,
+                    &scratch_a,
+                    nx,
+                    ny,
+                    config.pressure_iterations,
+                );
+            } else {
+                Self::pressure_solve_dst(&mut self.pressure, &scratch_a, nx, ny);
+            }
             Self::project_velocity(&mut self.vx, &mut self.vy, &self.pressure, nx, ny, inv_2dx);
         }
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
