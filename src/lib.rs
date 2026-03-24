@@ -34,6 +34,9 @@ pub mod buoyancy;
 #[cfg(feature = "vortex")]
 pub mod vortex;
 
+#[cfg(feature = "coupling")]
+pub mod coupling;
+
 #[cfg(feature = "logging")]
 pub mod logging;
 

@@ -1,6 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use pravash::common::{FluidConfig, FluidMaterial};
+use pravash::common::{FluidConfig, FluidMaterial, FluidParticle};
+use pravash::coupling::{self, BodyShape, FlipSolver, RigidBody};
 use pravash::grid::{FluidGrid, GridConfig};
 use pravash::shallow::ShallowWater;
 use pravash::sph::{self, SphSolver};
@@ -195,6 +196,54 @@ fn bench_create_particle_block(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Coupling Benchmarks ─────────────────────────────────────────────────────
+
+fn bench_coupling_sph_bodies(c: &mut Criterion) {
+    let mut group = c.benchmark_group("coupling_sph_bodies");
+    let particles_base = sph::create_particle_block([0.1, 0.1], [0.5, 0.5], 0.02, 0.001);
+    let bodies = vec![
+        RigidBody::new([0.3, 0.3, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 }),
+        RigidBody::new(
+            [0.5, 0.3, 0.0],
+            1.0,
+            BodyShape::Box {
+                half_extents: [0.05, 0.05, 0.05],
+            },
+        ),
+    ];
+    group.bench_function(format!("{}_particles", particles_base.len()), |b| {
+        b.iter_batched(
+            || (particles_base.clone(), bodies.clone()),
+            |(mut p, mut bo)| coupling::couple_sph_bodies(&mut p, &mut bo, 0.05, 1000.0, 10.0),
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+fn bench_flip_step(c: &mut Criterion) {
+    let mut group = c.benchmark_group("flip_step");
+    for &n in &[25, 100, 225] {
+        let spacing = 1.0 / (n as f64).sqrt();
+        let particles: Vec<FluidParticle> = (0..n)
+            .map(|i| {
+                let x = 0.3 + (i % (n as f64).sqrt() as usize) as f64 * spacing;
+                let y = 0.3 + (i / (n as f64).sqrt() as usize) as f64 * spacing;
+                FluidParticle::new_2d(x, y, 0.001)
+            })
+            .collect();
+        let mut solver = FlipSolver::new(16, 16, 0.1, 0.95).unwrap();
+        group.bench_function(format!("{n}_particles"), |b| {
+            b.iter_batched(
+                || particles.clone(),
+                |mut p| solver.step(&mut p, [0.0, -9.81, 0.0], 0.01).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sph_kernels,
@@ -208,5 +257,7 @@ criterion_group!(
     bench_shallow_step,
     bench_shallow_volume,
     bench_create_particle_block,
+    bench_coupling_sph_bodies,
+    bench_flip_step,
 );
 criterion_main!(benches);

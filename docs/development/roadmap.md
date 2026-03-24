@@ -34,17 +34,21 @@ Unlock SPH for real workloads. Required by kiran for water effects.
 - [ ] PCISPH or DFSPH pressure solver (density-invariant incompressibility)
 - [ ] Adaptive timestep (CFL-driven dt adjustment)
 
-### 0.3 — Grid Navier-Stokes
+### 0.3 — Grid Navier-Stokes (complete)
 
 Complete the Euler grid pipeline. Required by joshua for fluid simulation.
 
-- [ ] Semi-Lagrangian advection (scalar + velocity self-advection)
-- [ ] Pressure projection via FFT Poisson solver (use hisab's FFT)
-- [ ] Divergence-free velocity enforcement
+- [x] Semi-Lagrangian advection (bilinear, velocity + density)
+- [x] Pressure projection via GS Poisson solver with warm start
+- [x] Divergence-free velocity enforcement
+- [x] Boundary conditions: no-slip, free-slip
+- [x] Vorticity confinement (2D, applied to grid velocity)
+- [x] Buoyancy-driven density advection (smoke, fire)
+- [x] `GridConfig` with `smoke()` preset, `Serialize`/`Deserialize`
+- [x] Correct dx scaling in advection, diffusion, divergence, projection
 - [ ] MacCormack advection (higher-order, less diffusive)
-- [ ] Boundary conditions: no-slip, free-slip, periodic, inflow/outflow
-- [ ] Vorticity confinement (apply vortex module to grid solver)
-- [ ] Temperature/density advection for buoyancy-driven flow (smoke, fire)
+- [ ] Periodic / inflow-outflow boundary conditions
+- [ ] FFT Poisson solver (requires DST in hisab for wall boundaries)
 
 ### 0.4 — Coupling & Interaction
 

@@ -20,9 +20,10 @@ grid = []
 shallow = []
 buoyancy = []
 vortex = []
+coupling = []
 ai = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
 logging = ["dep:tracing-subscriber"]
-full = ["sph", "grid", "shallow", "buoyancy", "vortex", "ai", "logging"]
+full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "ai", "logging"]
 
 [dependencies]
 hisab = "0.22.4"
@@ -43,11 +44,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "benchmarks"
 harness = false
-required-features = ["sph", "grid", "shallow"]
+required-features = ["sph", "grid", "shallow", "coupling"]
 
 [[test]]
 name = "integration"
-required-features = ["sph", "grid", "shallow", "buoyancy", "vortex"]
+required-features = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling"]
 
 [[example]]
 name = "basic_fluid"

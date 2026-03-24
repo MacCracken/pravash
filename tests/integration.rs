@@ -1,5 +1,6 @@
 use pravash::buoyancy::{self, DragCoefficient, FlowRegime};
 use pravash::common::{FluidConfig, FluidMaterial, FluidParticle};
+use pravash::coupling::{self, BodyShape, FlipSolver, RigidBody};
 use pravash::grid::FluidGrid;
 use pravash::shallow::ShallowWater;
 use pravash::sph::{self, SphSolver};
@@ -504,4 +505,93 @@ fn solver_symmetric_pressure_conserves_momentum() {
         total_py.abs() < 1e-8,
         "y-momentum not conserved: {total_py}"
     );
+}
+
+// ── Coupling Integration ────────────────────────────────────────────────────
+
+#[test]
+fn coupling_sphere_falls_through_fluid() {
+    let mut particles = sph::create_particle_block([0.2, 0.1], [0.6, 0.4], 0.03, 0.001);
+    let config = FluidConfig::water_2d();
+    let mut solver = SphSolver::new();
+
+    let mut body = RigidBody::new([0.5, 0.7, 0.0], 0.1, BodyShape::Sphere { radius: 0.05 });
+
+    let y_start = body.position[1];
+    for _ in 0..50 {
+        solver.step(&mut particles, &config, 0.001).unwrap();
+        coupling::couple_sph_bodies(&mut particles, &mut [body.clone()], 0.05, 500.0, 5.0);
+        coupling::integrate_bodies(std::slice::from_mut(&mut body), config.gravity, config.dt);
+    }
+
+    // Body should have fallen under gravity
+    assert!(
+        body.position[1] < y_start,
+        "body should fall: y_start={y_start}, y_now={}",
+        body.position[1]
+    );
+    assert!(body.position[1].is_finite());
+}
+
+#[test]
+fn coupling_body_receives_force() {
+    let mut particles = vec![FluidParticle::new([0.55, 0.0, 0.0], 1.0)];
+    particles[0].density = 1000.0;
+    particles[0].velocity = [1.0, 0.0, 0.0];
+    let mut bodies = vec![RigidBody::new(
+        [0.5, 0.0, 0.0],
+        10.0,
+        BodyShape::Sphere { radius: 0.1 },
+    )];
+
+    coupling::couple_sph_bodies(&mut particles, &mut bodies, 0.15, 1000.0, 10.0);
+
+    // Body should receive a force from the particle
+    let force_mag =
+        (bodies[0].force[0].powi(2) + bodies[0].force[1].powi(2) + bodies[0].force[2].powi(2))
+            .sqrt();
+    assert!(force_mag > 0.0, "body should receive force from particle");
+}
+
+#[test]
+fn flip_particles_fall_under_gravity() {
+    let mut solver = FlipSolver::new(16, 16, 0.1, 0.95).unwrap();
+    let mut particles = vec![
+        FluidParticle::new_2d(0.5, 0.8, 0.01),
+        FluidParticle::new_2d(0.6, 0.8, 0.01),
+        FluidParticle::new_2d(0.7, 0.8, 0.01),
+    ];
+
+    for _ in 0..10 {
+        solver
+            .step(&mut particles, [0.0, -9.81, 0.0], 0.01)
+            .unwrap();
+    }
+
+    // All particles should have fallen
+    for p in &particles {
+        assert!(p.position[1] < 0.8, "particle should fall");
+        assert!(p.position[1].is_finite());
+    }
+}
+
+#[test]
+fn flip_multi_step_stable() {
+    let mut solver = FlipSolver::new(16, 16, 0.1, 0.9).unwrap();
+    let mut particles: Vec<FluidParticle> = (0..20)
+        .map(|i| {
+            let x = 0.3 + (i % 5) as f64 * 0.05;
+            let y = 0.3 + (i / 5) as f64 * 0.05;
+            FluidParticle::new_2d(x, y, 0.01)
+        })
+        .collect();
+
+    for _ in 0..100 {
+        solver.step(&mut particles, [0.0, -1.0, 0.0], 0.01).unwrap();
+    }
+
+    for p in &particles {
+        assert!(p.position[0].is_finite());
+        assert!(p.position[1].is_finite());
+    }
 }
