@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{PravashError, Result};
+
 /// Buoyancy force on a submerged body (Archimedes' principle).
 ///
 /// F = ρ_fluid × g × V_displaced
@@ -11,12 +13,21 @@ pub fn buoyancy_force(fluid_density: f64, gravity: f64, displaced_volume: f64) -
     fluid_density * gravity * displaced_volume
 }
 
-/// Drag force on a body moving through fluid.
+/// Drag force magnitude on a body moving through fluid.
 ///
 /// F = 0.5 × ρ × v² × Cd × A
+///
+/// Returns the magnitude of the drag force (always non-negative).
+/// The caller is responsible for applying the force in the correct direction
+/// (opposing the velocity).
 #[inline]
 #[must_use]
-pub fn drag_force(fluid_density: f64, velocity: f64, drag_coefficient: f64, cross_section_area: f64) -> f64 {
+pub fn drag_force(
+    fluid_density: f64,
+    velocity: f64,
+    drag_coefficient: f64,
+    cross_section_area: f64,
+) -> f64 {
     0.5 * fluid_density * velocity * velocity * drag_coefficient * cross_section_area
 }
 
@@ -35,23 +46,53 @@ impl DragCoefficient {
 /// Terminal velocity — when drag equals gravitational force.
 ///
 /// v_t = sqrt(2·m·g / (ρ·Cd·A))
+///
+/// Returns an error if any denominator term is zero or negative, or if
+/// the argument to sqrt would be negative.
 #[inline]
-#[must_use]
-pub fn terminal_velocity(mass: f64, gravity: f64, fluid_density: f64, drag_coefficient: f64, area: f64) -> f64 {
-    (2.0 * mass * gravity / (fluid_density * drag_coefficient * area)).sqrt()
+pub fn terminal_velocity(
+    mass: f64,
+    gravity: f64,
+    fluid_density: f64,
+    drag_coefficient: f64,
+    area: f64,
+) -> Result<f64> {
+    let denom = fluid_density * drag_coefficient * area;
+    if denom <= 0.0 {
+        return Err(PravashError::InvalidParameter {
+            reason: "terminal_velocity denominator (ρ·Cd·A) must be positive".into(),
+        });
+    }
+    let arg = 2.0 * mass * gravity / denom;
+    if arg < 0.0 {
+        return Err(PravashError::InvalidParameter {
+            reason: "terminal_velocity: m·g must be non-negative".into(),
+        });
+    }
+    Ok(arg.sqrt())
 }
 
 /// Reynolds number — determines flow regime (laminar vs turbulent).
 ///
 /// Re = ρ·v·L / μ
+///
+/// Returns an error if viscosity is zero (inviscid limit).
 #[inline]
-#[must_use]
-pub fn reynolds_number(fluid_density: f64, velocity: f64, length: f64, viscosity: f64) -> f64 {
-    fluid_density * velocity * length / viscosity
+pub fn reynolds_number(
+    fluid_density: f64,
+    velocity: f64,
+    length: f64,
+    viscosity: f64,
+) -> Result<f64> {
+    if viscosity <= 0.0 {
+        return Err(PravashError::InvalidViscosity { viscosity });
+    }
+    Ok(fluid_density * velocity * length / viscosity)
 }
 
 /// Flow regime classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FlowRegime {
     Laminar,
     Transitional,
@@ -100,16 +141,31 @@ mod tests {
 
     #[test]
     fn test_terminal_velocity() {
-        let vt = terminal_velocity(1.0, 9.81, 1.225, DragCoefficient::SPHERE, 0.01);
+        let vt = terminal_velocity(1.0, 9.81, 1.225, DragCoefficient::SPHERE, 0.01).unwrap();
         assert!(vt > 0.0);
         assert!(vt.is_finite());
     }
 
     #[test]
+    fn test_terminal_velocity_zero_denom() {
+        assert!(terminal_velocity(1.0, 9.81, 0.0, DragCoefficient::SPHERE, 0.01).is_err());
+    }
+
+    #[test]
+    fn test_terminal_velocity_negative_gravity() {
+        assert!(terminal_velocity(1.0, -9.81, 1.225, DragCoefficient::SPHERE, 0.01).is_err());
+    }
+
+    #[test]
     fn test_reynolds_number() {
         // Water flowing at 1 m/s through 0.1m pipe
-        let re = reynolds_number(1000.0, 1.0, 0.1, 0.001);
+        let re = reynolds_number(1000.0, 1.0, 0.1, 0.001).unwrap();
         assert!((re - 100000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_reynolds_number_zero_viscosity() {
+        assert!(reynolds_number(1000.0, 1.0, 0.1, 0.0).is_err());
     }
 
     #[test]
@@ -129,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_drag_coefficients() {
-        assert!(DragCoefficient::STREAMLINED < DragCoefficient::SPHERE);
-        assert!(DragCoefficient::SPHERE < DragCoefficient::FLAT_PLATE);
+        const { assert!(DragCoefficient::STREAMLINED < DragCoefficient::SPHERE) };
+        const { assert!(DragCoefficient::SPHERE < DragCoefficient::FLAT_PLATE) };
     }
 }

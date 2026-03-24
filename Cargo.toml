@@ -47,7 +47,7 @@ required-features = ["sph", "grid", "shallow"]
 
 [[test]]
 name = "integration"
-required-features = ["sph", "grid", "shallow"]
+required-features = ["sph", "grid", "shallow", "buoyancy", "vortex"]
 
 [[example]]
 name = "basic_fluid"

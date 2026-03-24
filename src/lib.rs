@@ -40,5 +40,5 @@ pub mod logging;
 #[cfg(feature = "ai")]
 pub mod ai;
 
+pub use common::{FluidConfig, FluidMaterial, FluidParticle};
 pub use error::PravashError;
-pub use common::{FluidMaterial, FluidParticle, FluidConfig};

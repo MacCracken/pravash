@@ -1,11 +1,13 @@
 //! Grid-based Euler/Navier-Stokes fluid solver.
 //!
 //! Represents fluid on a fixed grid with velocity and pressure fields.
-//! Uses operator splitting: advection → diffusion → projection.
+//! Currently implements diffusion via Gauss-Seidel relaxation.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PravashError, Result};
+
+use tracing::trace_span;
 
 /// 2D grid-based fluid state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +33,14 @@ impl FluidGrid {
         if nx == 0 || ny == 0 {
             return Err(PravashError::InvalidGridResolution { nx, ny });
         }
-        let size = nx * ny;
+        if dx <= 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("cell size must be positive: {dx}").into(),
+            });
+        }
+        let size = nx.checked_mul(ny).ok_or(PravashError::InvalidParameter {
+            reason: format!("grid size overflow: {nx} x {ny}").into(),
+        })?;
         Ok(Self {
             nx,
             ny,
@@ -53,11 +62,13 @@ impl FluidGrid {
     /// Index from (x, y) coordinates.
     #[inline]
     pub fn idx(&self, x: usize, y: usize) -> usize {
+        debug_assert!(x < self.nx && y < self.ny, "grid index out of bounds");
         y * self.nx + x
     }
 
     /// Get velocity at a cell.
     #[inline]
+    #[must_use]
     pub fn velocity_at(&self, x: usize, y: usize) -> (f64, f64) {
         let i = self.idx(x, y);
         (self.vx[i], self.vy[i])
@@ -65,12 +76,14 @@ impl FluidGrid {
 
     /// Speed at a cell.
     #[inline]
+    #[must_use]
     pub fn speed_at(&self, x: usize, y: usize) -> f64 {
         let (vx, vy) = self.velocity_at(x, y);
         (vx * vx + vy * vy).sqrt()
     }
 
     /// Maximum speed in the grid (for CFL).
+    #[must_use]
     pub fn max_speed(&self) -> f64 {
         self.vx
             .iter()
@@ -80,6 +93,7 @@ impl FluidGrid {
     }
 
     /// Total kinetic energy.
+    #[must_use]
     pub fn total_kinetic_energy(&self) -> f64 {
         let dx2 = self.dx * self.dx;
         self.vx
@@ -91,14 +105,26 @@ impl FluidGrid {
     }
 
     /// Diffuse a field using Gauss-Seidel iteration.
-    pub fn diffuse(field: &mut [f64], nx: usize, ny: usize, diff_rate: f64, dt: f64, iterations: usize) {
+    ///
+    /// The field length must equal `nx * ny`. Interior cells are updated;
+    /// boundary cells (edges) are left unchanged (zero Neumann condition).
+    pub fn diffuse(
+        field: &mut [f64],
+        nx: usize,
+        ny: usize,
+        diff_rate: f64,
+        dt: f64,
+        iterations: usize,
+    ) {
+        let _span = trace_span!("grid::diffuse", nx, ny, iterations).entered();
+        debug_assert_eq!(field.len(), nx * ny, "field size must match nx*ny");
         let a = dt * diff_rate * (nx as f64) * (ny as f64);
         for _ in 0..iterations {
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let idx = y * nx + x;
-                    let neighbors = field[idx - 1] + field[idx + 1]
-                        + field[idx - nx] + field[idx + nx];
+                    let neighbors =
+                        field[idx - 1] + field[idx + 1] + field[idx - nx] + field[idx + nx];
                     field[idx] = (field[idx] + a * neighbors) / (1.0 + 4.0 * a);
                 }
             }
@@ -121,6 +147,12 @@ mod tests {
     fn test_grid_invalid() {
         assert!(FluidGrid::new(0, 10, 0.1).is_err());
         assert!(FluidGrid::new(10, 0, 0.1).is_err());
+    }
+
+    #[test]
+    fn test_grid_invalid_dx() {
+        assert!(FluidGrid::new(10, 10, 0.0).is_err());
+        assert!(FluidGrid::new(10, 10, -1.0).is_err());
     }
 
     #[test]

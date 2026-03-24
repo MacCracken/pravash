@@ -54,19 +54,35 @@ impl FluidMaterial {
     };
 
     /// Custom material with validation.
-    pub fn custom(density: f64, viscosity: f64, surface_tension: f64, speed_of_sound: f64) -> Result<Self> {
+    #[must_use = "returns a new material, does not modify in place"]
+    pub fn custom(
+        density: f64,
+        viscosity: f64,
+        surface_tension: f64,
+        speed_of_sound: f64,
+    ) -> Result<Self> {
         if density <= 0.0 {
             return Err(PravashError::InvalidDensity { density });
         }
         if viscosity < 0.0 {
             return Err(PravashError::InvalidViscosity { viscosity });
         }
-        Ok(Self { density, viscosity, surface_tension, speed_of_sound })
+        if speed_of_sound <= 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("speed of sound must be positive: {speed_of_sound}").into(),
+            });
+        }
+        Ok(Self {
+            density,
+            viscosity,
+            surface_tension,
+            speed_of_sound,
+        })
     }
 }
 
 /// A fluid particle (SPH).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FluidParticle {
     /// Position [x, y] (2D) or [x, y, z] (3D — z=0 for 2D).
     pub position: [f64; 3],
@@ -84,6 +100,7 @@ pub struct FluidParticle {
 
 impl FluidParticle {
     /// Create a particle at rest.
+    #[must_use]
     pub fn new(position: [f64; 3], mass: f64) -> Self {
         Self {
             position,
@@ -97,12 +114,14 @@ impl FluidParticle {
 
     /// Create a 2D particle (z = 0).
     #[inline]
+    #[must_use]
     pub fn new_2d(x: f64, y: f64, mass: f64) -> Self {
         Self::new([x, y, 0.0], mass)
     }
 
     /// Speed (magnitude of velocity).
     #[inline]
+    #[must_use]
     pub fn speed(&self) -> f64 {
         let v = &self.velocity;
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
@@ -110,6 +129,7 @@ impl FluidParticle {
 
     /// Kinetic energy: 0.5 * m * v².
     #[inline]
+    #[must_use]
     pub fn kinetic_energy(&self) -> f64 {
         let v2 = self.velocity[0] * self.velocity[0]
             + self.velocity[1] * self.velocity[1]
@@ -117,18 +137,26 @@ impl FluidParticle {
         0.5 * self.mass * v2
     }
 
-    /// Distance to another particle.
+    /// Squared distance to another particle (avoids sqrt).
     #[inline]
-    pub fn distance_to(&self, other: &FluidParticle) -> f64 {
+    #[must_use]
+    pub fn distance_squared_to(&self, other: &FluidParticle) -> f64 {
         let dx = self.position[0] - other.position[0];
         let dy = self.position[1] - other.position[1];
         let dz = self.position[2] - other.position[2];
-        (dx * dx + dy * dy + dz * dz).sqrt()
+        dx * dx + dy * dy + dz * dz
+    }
+
+    /// Distance to another particle.
+    #[inline]
+    #[must_use]
+    pub fn distance_to(&self, other: &FluidParticle) -> f64 {
+        self.distance_squared_to(other).sqrt()
     }
 }
 
 /// Simulation configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FluidConfig {
     /// Timestep in seconds.
     pub dt: f64,
@@ -148,6 +176,7 @@ pub struct FluidConfig {
 
 impl FluidConfig {
     /// Default 2D water simulation config.
+    #[must_use]
     pub fn water_2d() -> Self {
         Self {
             dt: 0.001,
@@ -166,10 +195,28 @@ impl FluidConfig {
             return Err(PravashError::InvalidTimestep { dt: self.dt });
         }
         if self.smoothing_radius <= 0.0 {
-            return Err(PravashError::InvalidSmoothingRadius { h: self.smoothing_radius });
+            return Err(PravashError::InvalidSmoothingRadius {
+                h: self.smoothing_radius,
+            });
         }
         if self.rest_density <= 0.0 {
-            return Err(PravashError::InvalidDensity { density: self.rest_density });
+            return Err(PravashError::InvalidDensity {
+                density: self.rest_density,
+            });
+        }
+        if self.gas_constant <= 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("gas constant must be positive: {}", self.gas_constant).into(),
+            });
+        }
+        if self.boundary_damping < 0.0 || self.boundary_damping > 1.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!(
+                    "boundary damping must be in [0, 1]: {}",
+                    self.boundary_damping
+                )
+                .into(),
+            });
         }
         Ok(())
     }
@@ -197,7 +244,7 @@ mod tests {
     #[test]
     fn test_water_material() {
         assert!((FluidMaterial::WATER.density - 1000.0).abs() < f64::EPSILON);
-        assert!(FluidMaterial::WATER.viscosity > 0.0);
+        const { assert!(FluidMaterial::WATER.viscosity > 0.0) };
     }
 
     #[test]
@@ -218,10 +265,23 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_material_invalid_speed_of_sound() {
+        assert!(FluidMaterial::custom(1000.0, 0.01, 0.05, 0.0).is_err());
+        assert!(FluidMaterial::custom(1000.0, 0.01, 0.05, -1.0).is_err());
+    }
+
+    #[test]
     fn test_particle_new() {
         let p = FluidParticle::new([1.0, 2.0, 3.0], 0.01);
         assert!((p.position[0] - 1.0).abs() < f64::EPSILON);
         assert!((p.speed()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_particle_copy() {
+        let p = FluidParticle::new_2d(1.0, 2.0, 0.01);
+        let p2 = p; // Copy, not move
+        assert!((p.position[0] - p2.position[0]).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -253,9 +313,23 @@ mod tests {
     }
 
     #[test]
+    fn test_particle_distance_squared() {
+        let a = FluidParticle::new_2d(0.0, 0.0, 1.0);
+        let b = FluidParticle::new_2d(3.0, 4.0, 1.0);
+        assert!((a.distance_squared_to(&b) - 25.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn test_config_water_2d() {
         let c = FluidConfig::water_2d();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_copy() {
+        let c = FluidConfig::water_2d();
+        let c2 = c; // Copy, not move
+        assert!((c.dt - c2.dt).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -269,6 +343,22 @@ mod tests {
     fn test_config_invalid_smoothing() {
         let mut c = FluidConfig::water_2d();
         c.smoothing_radius = 0.0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_gas_constant() {
+        let mut c = FluidConfig::water_2d();
+        c.gas_constant = 0.0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_boundary_damping() {
+        let mut c = FluidConfig::water_2d();
+        c.boundary_damping = 1.5;
+        assert!(c.validate().is_err());
+        c.boundary_damping = -0.1;
         assert!(c.validate().is_err());
     }
 

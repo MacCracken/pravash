@@ -1,5 +1,7 @@
 //! Error types for pravash.
 
+use std::borrow::Cow;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PravashError {
@@ -21,14 +23,16 @@ pub enum PravashError {
     #[error("smoothing radius must be positive: {h}")]
     InvalidSmoothingRadius { h: f64 },
 
-    #[error("CFL condition violated: velocity {velocity} exceeds stable limit for dx={dx}, dt={dt}")]
+    #[error(
+        "CFL condition violated: velocity {velocity} exceeds stable limit for dx={dx}, dt={dt}"
+    )]
     CflViolation { velocity: f64, dx: f64, dt: f64 },
 
     #[error("simulation diverged: {reason}")]
-    Diverged { reason: String },
+    Diverged { reason: Cow<'static, str> },
 
     #[error("invalid parameter: {reason}")]
-    InvalidParameter { reason: String },
+    InvalidParameter { reason: Cow<'static, str> },
 }
 
 pub type Result<T> = std::result::Result<T, PravashError>;
@@ -51,14 +55,28 @@ mod tests {
 
     #[test]
     fn test_cfl_violation() {
-        let e = PravashError::CflViolation { velocity: 100.0, dx: 0.01, dt: 0.001 };
+        let e = PravashError::CflViolation {
+            velocity: 100.0,
+            dx: 0.01,
+            dt: 0.001,
+        };
         assert!(e.to_string().contains("100"));
     }
 
     #[test]
     fn test_diverged() {
-        let e = PravashError::Diverged { reason: "NaN in pressure".into() };
+        let e = PravashError::Diverged {
+            reason: "NaN in pressure".into(),
+        };
         assert!(e.to_string().contains("NaN"));
+    }
+
+    #[test]
+    fn test_diverged_static() {
+        let e = PravashError::Diverged {
+            reason: Cow::Borrowed("static reason"),
+        };
+        assert!(e.to_string().contains("static"));
     }
 
     #[test]

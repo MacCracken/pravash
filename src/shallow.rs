@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PravashError, Result};
 
+use tracing::trace_span;
+
 /// Shallow water state on a 2D grid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShallowWater {
@@ -25,6 +27,12 @@ pub struct ShallowWater {
     pub gravity: f64,
     /// Damping factor (energy loss per step).
     pub damping: f64,
+    /// Scratch buffer for velocity snapshots (avoids per-step allocation).
+    #[serde(skip)]
+    scratch_vx: Vec<f64>,
+    /// Scratch buffer for velocity snapshots (avoids per-step allocation).
+    #[serde(skip)]
+    scratch_vy: Vec<f64>,
 }
 
 impl ShallowWater {
@@ -44,6 +52,8 @@ impl ShallowWater {
             ground: vec![0.0; size],
             gravity: 9.81,
             damping: 0.999,
+            scratch_vx: vec![0.0; size],
+            scratch_vy: vec![0.0; size],
         })
     }
 
@@ -54,6 +64,7 @@ impl ShallowWater {
 
     /// Total water depth at a cell (height - ground).
     #[inline]
+    #[must_use]
     pub fn depth_at(&self, x: usize, y: usize) -> f64 {
         let i = self.idx(x, y);
         (self.height[i] - self.ground[i]).max(0.0)
@@ -61,22 +72,27 @@ impl ShallowWater {
 
     /// Surface elevation at a cell.
     #[inline]
+    #[must_use]
     pub fn surface_at(&self, x: usize, y: usize) -> f64 {
         self.height[self.idx(x, y)]
     }
 
     /// Add a circular disturbance (drop/splash).
     pub fn add_disturbance(&mut self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
+        let _span = trace_span!("shallow::disturbance").entered();
         for y in 0..self.ny {
             for x in 0..self.nx {
                 let px = x as f64 * self.dx;
                 let py = y as f64 * self.dx;
                 let dx = px - cx;
                 let dy = py - cy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist < radius {
+                let dist2 = dx * dx + dy * dy;
+                let r2 = radius * radius;
+                if dist2 < r2 {
+                    let dist = dist2.sqrt();
                     let factor = 1.0 - dist / radius;
-                    self.height[self.idx(x, y)] += amplitude * factor * factor;
+                    let idx = self.idx(x, y);
+                    self.height[idx] += amplitude * factor * factor;
                 }
             }
         }
@@ -84,6 +100,7 @@ impl ShallowWater {
 
     /// Step the simulation using a simple finite-difference scheme.
     pub fn step(&mut self, dt: f64) -> Result<()> {
+        let _span = trace_span!("shallow::step", nx = self.nx, ny = self.ny).entered();
         if dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
         }
@@ -92,6 +109,8 @@ impl ShallowWater {
         let ny = self.ny;
         let g = self.gravity;
         let dx = self.dx;
+        // Timestep-proportional damping: damp^(dt/dt_ref) where dt_ref = 0.001
+        let damp = self.damping.powf(dt / 0.001);
 
         // Update velocities from height gradient
         for y in 1..ny - 1 {
@@ -101,20 +120,24 @@ impl ShallowWater {
                 let dhdy = (self.height[i + nx] - self.height[i - nx]) / (2.0 * dx);
                 self.vx[i] -= g * dhdx * dt;
                 self.vy[i] -= g * dhdy * dt;
-                self.vx[i] *= self.damping;
-                self.vy[i] *= self.damping;
+                self.vx[i] *= damp;
+                self.vy[i] *= damp;
             }
         }
 
+        // Snapshot velocities into scratch buffers (no allocation after first step)
+        self.scratch_vx.resize(nx * ny, 0.0);
+        self.scratch_vy.resize(nx * ny, 0.0);
+        self.scratch_vx.copy_from_slice(&self.vx);
+        self.scratch_vy.copy_from_slice(&self.vy);
+
         // Update height from velocity divergence
-        let vx_snapshot = self.vx.clone();
-        let vy_snapshot = self.vy.clone();
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
                 let depth = (self.height[i] - self.ground[i]).max(0.01);
-                let dvx = (vx_snapshot[i + 1] - vx_snapshot[i - 1]) / (2.0 * dx);
-                let dvy = (vy_snapshot[i + nx] - vy_snapshot[i - nx]) / (2.0 * dx);
+                let dvx = (self.scratch_vx[i + 1] - self.scratch_vx[i - 1]) / (2.0 * dx);
+                let dvy = (self.scratch_vy[i + nx] - self.scratch_vy[i - nx]) / (2.0 * dx);
                 self.height[i] -= depth * (dvx + dvy) * dt;
             }
         }
@@ -123,6 +146,7 @@ impl ShallowWater {
     }
 
     /// Total water volume (sum of depths × cell area).
+    #[must_use]
     pub fn total_volume(&self) -> f64 {
         let cell_area = self.dx * self.dx;
         self.height
@@ -133,6 +157,7 @@ impl ShallowWater {
     }
 
     /// Maximum wave height above rest level.
+    #[must_use]
     pub fn max_wave_height(&self, rest_height: f64) -> f64 {
         self.height
             .iter()
@@ -162,14 +187,16 @@ mod tests {
     #[test]
     fn test_depth_at() {
         let mut sw = ShallowWater::new(10, 10, 0.1, 2.0).unwrap();
-        sw.ground[sw.idx(5, 5)] = 0.5;
+        let idx = sw.idx(5, 5);
+        sw.ground[idx] = 0.5;
         assert!((sw.depth_at(5, 5) - 1.5).abs() < EPS);
     }
 
     #[test]
     fn test_depth_at_dry() {
         let mut sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
-        sw.ground[sw.idx(5, 5)] = 2.0; // ground above water
+        let idx = sw.idx(5, 5);
+        sw.ground[idx] = 2.0; // ground above water
         assert!(sw.depth_at(5, 5).abs() < EPS); // clamped to 0
     }
 
@@ -236,5 +263,17 @@ mod tests {
         let sw2: ShallowWater = serde_json::from_str(&json).unwrap();
         assert_eq!(sw2.nx, 5);
         assert!((sw2.height[0] - 1.5).abs() < EPS);
+    }
+
+    #[test]
+    fn test_no_alloc_after_first_step() {
+        let mut sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
+        sw.step(0.001).unwrap();
+        let cap_vx = sw.scratch_vx.capacity();
+        let cap_vy = sw.scratch_vy.capacity();
+        sw.step(0.001).unwrap();
+        // Capacity should not change (no reallocation)
+        assert_eq!(sw.scratch_vx.capacity(), cap_vx);
+        assert_eq!(sw.scratch_vy.capacity(), cap_vy);
     }
 }
