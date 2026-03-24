@@ -101,6 +101,57 @@ fn grid_large_grid_creation() {
     assert!(grid.max_speed().abs() < f64::EPSILON);
 }
 
+// ── Grid Navier-Stokes Integration ──────────────────────────────────────────
+
+#[test]
+fn grid_navier_stokes_smoke_rises() {
+    use pravash::grid::GridConfig;
+
+    let mut g = FluidGrid::new(30, 30, 0.1).unwrap();
+    let config = GridConfig::smoke();
+
+    // Inject density and upward velocity at bottom center
+    for x in 12..18 {
+        let i = 2 * 30 + x;
+        g.density[i] = 1.0;
+        g.vy[i] = 2.0;
+    }
+
+    for _ in 0..50 {
+        for x in 12..18 {
+            g.density[2 * 30 + x] = 1.0;
+        }
+        g.step(&config).unwrap();
+    }
+
+    // Velocity should exist and be finite
+    assert!(g.max_speed() > 0.01);
+    assert!(g.max_speed().is_finite());
+
+    // All values should be finite (no divergence)
+    for v in &g.vx {
+        assert!(v.is_finite());
+    }
+    for v in &g.vy {
+        assert!(v.is_finite());
+    }
+}
+
+#[test]
+fn grid_navier_stokes_stable_empty() {
+    use pravash::grid::GridConfig;
+
+    let mut g = FluidGrid::new(20, 20, 0.1).unwrap();
+    let config = GridConfig::smoke();
+
+    for _ in 0..100 {
+        g.step(&config).unwrap();
+    }
+
+    // Empty grid should stay at zero
+    assert!(g.max_speed() < f64::EPSILON);
+}
+
 // ── Shallow Water Integration ───────────────────────────────────────────────
 
 #[test]

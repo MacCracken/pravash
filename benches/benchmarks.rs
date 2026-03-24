@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use pravash::common::{FluidConfig, FluidMaterial};
-use pravash::grid::FluidGrid;
+use pravash::grid::{FluidGrid, GridConfig};
 use pravash::shallow::ShallowWater;
 use pravash::sph::{self, SphSolver};
 
@@ -101,6 +101,29 @@ fn bench_grid_max_speed(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_grid_step(c: &mut Criterion) {
+    let mut group = c.benchmark_group("grid_step");
+    let config = GridConfig::smoke();
+    for &n in &[15, 30, 63] {
+        let mut grid = FluidGrid::new(n, n, 0.1).unwrap();
+        // Add some density and velocity for non-trivial work
+        let mid = n / 2;
+        for x in mid - 2..mid + 2 {
+            let i = 2 * n + x;
+            grid.density[i] = 1.0;
+            grid.vy[i] = 1.0;
+        }
+        group.bench_function(format!("{n}x{n}"), |b| {
+            b.iter_batched(
+                || grid.clone(),
+                |mut g| g.step(&config).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 // ── Shallow Water Benchmarks ────────────────────────────────────────────────
 
 fn bench_shallow_step(c: &mut Criterion) {
@@ -181,6 +204,7 @@ criterion_group!(
     bench_solver_step,
     bench_grid_diffuse,
     bench_grid_max_speed,
+    bench_grid_step,
     bench_shallow_step,
     bench_shallow_volume,
     bench_create_particle_block,

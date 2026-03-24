@@ -21,16 +21,18 @@ Core types, basic solvers, project scaffolding.
 - [x] `error`: PravashError with `#[non_exhaustive]`, Cow strings
 - [x] P(-1) scaffold hardening: benchmarks, audit, 2-3x SPH speedup
 
-### 0.2 — SPH Acceleration & Incompressibility
+### 0.2 — SPH Acceleration & Surface Tension (complete)
 
 Unlock SPH for real workloads. Required by kiran for water effects.
 
-- [ ] **Spatial hash grid** using hisab's `SpatialHash` — O(n²) → O(n·k) neighbor queries
-- [ ] Neighbor list caching (rebuild only when particles move beyond threshold)
+- [x] **SphSolver** with hisab `SpatialHash` — O(n·k) neighbor queries via `query_cell`
+- [x] Neighbor list caching (flat buffer + offset table, single pass, zero per-particle alloc)
+- [x] Persistent scratch buffers (densities, snapshot, positions_f32, neighbor cache)
+- [x] Surface tension (CSF model with poly6 gradient/laplacian)
+- [x] Symmetric pressure formula for momentum conservation
+- [x] f64→f32 precision handling, h validation
 - [ ] PCISPH or DFSPH pressure solver (density-invariant incompressibility)
-- [ ] Persistent scratch buffers for SPH step (eliminate per-step Vec allocations)
 - [ ] Adaptive timestep (CFL-driven dt adjustment)
-- [ ] Surface tension (CSF model or pairwise cohesion)
 
 ### 0.3 — Grid Navier-Stokes
 
