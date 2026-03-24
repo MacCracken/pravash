@@ -125,6 +125,53 @@ fn bench_grid_step(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_grid_step_maccormack(c: &mut Criterion) {
+    let mut group = c.benchmark_group("grid_step_maccormack");
+    let mut config = GridConfig::smoke();
+    config.use_maccormack = true;
+    config.dt = 0.01;
+    for &n in &[15, 30, 63] {
+        let mut grid = FluidGrid::new(n, n, 0.1).unwrap();
+        let mid = n / 2;
+        for x in mid - 2..mid + 2 {
+            let i = 2 * n + x;
+            grid.density[i] = 1.0;
+            grid.vy[i] = 1.0;
+        }
+        group.bench_function(format!("{n}x{n}"), |b| {
+            b.iter_batched(
+                || grid.clone(),
+                |mut g| g.step(&config).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_grid_step_periodic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("grid_step_periodic");
+    let mut config = GridConfig::smoke();
+    config.boundary = pravash::grid::BoundaryCondition::Periodic;
+    for &n in &[15, 30, 63] {
+        let mut grid = FluidGrid::new(n, n, 0.1).unwrap();
+        let mid = n / 2;
+        for x in mid - 2..mid + 2 {
+            let i = 2 * n + x;
+            grid.density[i] = 1.0;
+            grid.vy[i] = 1.0;
+        }
+        group.bench_function(format!("{n}x{n}"), |b| {
+            b.iter_batched(
+                || grid.clone(),
+                |mut g| g.step(&config).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 // ── Shallow Water Benchmarks ────────────────────────────────────────────────
 
 fn bench_shallow_step(c: &mut Criterion) {
@@ -176,6 +223,71 @@ fn bench_solver_step(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_solver_step_surface_tension(c: &mut Criterion) {
+    let mut group = c.benchmark_group("solver_step_st");
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+
+    for &n in &[100, 225, 625] {
+        let spacing = 1.0 / (n as f64).sqrt();
+        let particles = sph::create_particle_block([0.1, 0.3], [0.5, 0.5], spacing, 0.001);
+        let mut solver = SphSolver::with_surface_tension(0.072);
+        group.bench_function(format!("{}_particles", particles.len()), |b| {
+            b.iter_batched(
+                || particles.clone(),
+                |mut p| solver.step(&mut p, &config, viscosity).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_pcisph_step(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pcisph_step");
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+
+    for &n in &[25, 100, 225] {
+        let spacing = 1.0 / (n as f64).sqrt();
+        let particles = sph::create_particle_block([0.1, 0.3], [0.5, 0.5], spacing, 0.001);
+        let mut solver = SphSolver::new();
+        group.bench_function(format!("{}_particles", particles.len()), |b| {
+            b.iter_batched(
+                || particles.clone(),
+                |mut p| {
+                    solver
+                        .step_pcisph(&mut p, &config, viscosity, 5, 0.01)
+                        .unwrap()
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_sph_viscosity_force(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sph_viscosity_force");
+    let mut particles = sph::create_particle_block([0.0, 0.0], [0.5, 0.5], 0.02, 0.001);
+    for (i, p) in particles.iter_mut().enumerate() {
+        p.density = 1000.0;
+        p.velocity = [(i as f64 * 0.1).sin(), (i as f64 * 0.1).cos(), 0.0];
+    }
+    let h = 0.05;
+    group.bench_function(format!("{}_particles", particles.len()), |b| {
+        b.iter(|| {
+            sph::viscosity_force(
+                black_box(0),
+                black_box(&particles),
+                black_box(h),
+                black_box(0.001),
+            )
+        })
+    });
+    group.finish();
+}
+
 // ── Particle Creation ───────────────────────────────────────────────────────
 
 fn bench_create_particle_block(c: &mut Criterion) {
@@ -221,6 +333,70 @@ fn bench_coupling_sph_bodies(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_particle_level_set(c: &mut Criterion) {
+    let mut group = c.benchmark_group("particle_level_set");
+    for &(grid_n, n_particles) in &[(32, 100), (64, 500), (32, 1000)] {
+        let particles = sph::create_particle_block(
+            [0.1, 0.1],
+            [0.5, 0.5],
+            0.5 / (n_particles as f64).sqrt(),
+            0.001,
+        );
+        let mut level_set = vec![0.0; grid_n * grid_n];
+        group.bench_function(
+            format!("{grid_n}x{grid_n}_{}_particles", particles.len()),
+            |b| {
+                b.iter(|| {
+                    coupling::particle_level_set(
+                        black_box(&mut level_set),
+                        black_box(grid_n),
+                        black_box(grid_n),
+                        black_box(0.1),
+                        black_box(&particles),
+                        black_box(0.05),
+                    )
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_drag_from_particles(c: &mut Criterion) {
+    let mut group = c.benchmark_group("drag_from_particles");
+    let particles = sph::create_particle_block([0.1, 0.1], [0.5, 0.5], 0.02, 0.001);
+    let mut body = RigidBody::new([0.3, 0.3, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
+    body.velocity = [1.0, 0.0, 0.0];
+    group.bench_function(format!("{}_particles", particles.len()), |b| {
+        b.iter(|| {
+            coupling::drag_from_particles(
+                black_box(&body),
+                black_box(&particles),
+                black_box(1000.0),
+                black_box(0.47),
+                black_box(0.15),
+            )
+        })
+    });
+    group.finish();
+}
+
+fn bench_shallow_disturbance(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shallow_disturbance");
+    for &n in &[32, 64, 128] {
+        let sw = ShallowWater::new(n, n, 0.1, 1.0).unwrap();
+        let cx = n as f64 * 0.1 / 2.0;
+        group.bench_function(format!("{n}x{n}"), |b| {
+            b.iter_batched(
+                || sw.clone(),
+                |mut s| s.add_disturbance(cx, cx, 0.3, 0.5),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 fn bench_flip_step(c: &mut Criterion) {
     let mut group = c.benchmark_group("flip_step");
     for &n in &[25, 100, 225] {
@@ -250,14 +426,22 @@ criterion_group!(
     bench_sph_density,
     bench_sph_step,
     bench_sph_pressure_force,
+    bench_sph_viscosity_force,
     bench_solver_step,
+    bench_solver_step_surface_tension,
+    bench_pcisph_step,
     bench_grid_diffuse,
     bench_grid_max_speed,
     bench_grid_step,
+    bench_grid_step_maccormack,
+    bench_grid_step_periodic,
     bench_shallow_step,
     bench_shallow_volume,
+    bench_shallow_disturbance,
     bench_create_particle_block,
     bench_coupling_sph_bodies,
+    bench_particle_level_set,
+    bench_drag_from_particles,
     bench_flip_step,
 );
 criterion_main!(benches);
