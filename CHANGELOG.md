@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- shallow: Non-linear shallow water equations with convective acceleration (u·∇u)
+- shallow: Flux-form continuity equation (∂(hu)/∂x + ∂(hv)/∂y) for proper mass transport
+- shallow: Neumann boundary enforcement (zero-gradient height, reflected normal velocity)
+- shallow: Manning's bed friction (`manning_n` per-cell roughness) with implicit treatment for stability
+- grid: Persistent scratch buffers (zero allocation after first step)
+- grid: DST pressure solver now propagates transform errors instead of silent ignore
+- common: `FluidConfig::validate()` rejects NaN/Inf for dt, smoothing_radius, density, gas_constant
+- common: `FluidConfig::validate()` rejects inverted bounds (min > max)
+- sph: PCISPH divergence detection (NaN/Inf check on acceleration and predicted positions)
+- sph: Aligned standalone `pressure_force()` and brute-force `step()` with symmetric formula
+- coupling: FLIP solver particle boundary clamping to grid domain
+- coupling: Directional drag cross-section for box shapes (projected onto velocity normal)
+- deny.toml for cargo-deny license and advisory checking
+
+### Changed
+- Cargo.toml: license corrected from deprecated `GPL-3.0` to `GPL-3.0-only`
+- shallow: NaN dt now rejected (consistent with grid.rs)
+- sph: `SpatialHash::new()` error properly propagated (hisab API change)
+
 ## [0.24.3] - 2026-03-24
 
 ### Added

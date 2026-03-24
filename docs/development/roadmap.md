@@ -4,8 +4,8 @@
 
 ### 0.25.3 — Shallow Water & Waves
 
-- [ ] Non-linear shallow water equations (proper convective terms)
-- [ ] Bed friction (Manning's equation)
+- [x] Non-linear shallow water equations (proper convective terms)
+- [x] Bed friction (Manning's equation)
 - [ ] Wetting/drying (wet-dry transitions)
 - [ ] Wave breaking detection
 - [ ] Dispersive correction (Boussinesq-type)
