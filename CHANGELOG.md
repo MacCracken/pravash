@@ -11,6 +11,12 @@
 - shallow: Wave breaking detection (`breaking_threshold`, `is_breaking()`) with turbulent bore dissipation
 - shallow: Boussinesq dispersive correction (`dispersion_coeff`) for short-wavelength accuracy
 - shallow: Well-balanced hydrostatic reconstruction for terrain-following pressure gradient (lake-at-rest preserved over sloped bathymetry)
+- sph: Rayon parallelism for SphSolver density and force loops (`parallel` feature gate)
+- grid: Rayon parallelism for advection and pressure projection (`parallel` feature gate)
+- common: `ParticleSoa` — SIMD-friendly Structure-of-Arrays layout with AOS↔SOA conversion
+- compute: GPU-agnostic `ComputeBackend` trait, `PackedParticles` f32 buffer packing, kernel parameter structs for SPH/grid/shallow
+- common: `ParticleArena` — pre-allocated pool with alloc/free/compact, `ArenaHandle` for block references
+- logging: `init_profiling()` — chrome://tracing JSON output for flame graph analysis via tracing-chrome
 - grid: Persistent scratch buffers (zero allocation after first step)
 - grid: DST pressure solver now propagates transform errors instead of silent ignore
 - common: `FluidConfig::validate()` rejects NaN/Inf for dt, smoothing_radius, density, gas_constant

@@ -13,12 +13,12 @@
 
 ### 0.26.3 — Performance & Parallelism
 
-- [ ] Rayon parallelism for SPH density/force loops
-- [ ] Rayon parallelism for grid operations
-- [ ] SIMD-friendly SOA layout option for FluidParticle
-- [ ] GPU compute via wgpu (optional feature)
-- [ ] Memory pool / arena allocator for particle buffers
-- [ ] Profiling integration (tracing spans → flame graphs)
+- [x] Rayon parallelism for SPH density/force loops
+- [x] Rayon parallelism for grid operations
+- [x] SIMD-friendly SOA layout option for FluidParticle
+- [x] GPU-agnostic compute interface (`ComputeBackend` trait, packed buffers)
+- [x] Memory pool / arena allocator for particle buffers
+- [x] Profiling integration (tracing spans → flame graphs)
 
 ### 0.27.0 — Multi-phase & Advanced Physics
 

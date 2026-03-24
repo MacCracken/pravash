@@ -21,9 +21,11 @@ shallow = []
 buoyancy = []
 vortex = []
 coupling = []
+compute = []
+parallel = ["dep:rayon"]
 ai = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
-logging = ["dep:tracing-subscriber"]
-full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "ai", "logging"]
+logging = ["dep:tracing-subscriber", "dep:tracing-chrome"]
+full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute", "parallel", "ai", "logging"]
 
 [dependencies]
 hisab = { version = "0.24", path = "../hisab" }
@@ -36,6 +38,8 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+tracing-chrome = { version = "0.7", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

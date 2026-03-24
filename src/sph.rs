@@ -26,6 +26,9 @@ use hisab::SpatialHash;
 use hisab::Vec3;
 use tracing::trace_span;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 // ── Precomputed Kernel Coefficients ─────────────────────────────────────────
 
 /// Precomputed kernel coefficients for a given smoothing radius h.
@@ -407,17 +410,34 @@ impl SphSolver {
         {
             let _span = trace_span!("sph::density", n).entered();
             self.densities.resize(n, 0.0);
-            for i in 0..n {
+            let offsets = &self.neighbor_offsets;
+            let indices = &self.neighbor_indices;
+            let compute_density_i = |i: usize| -> f64 {
                 let pi = &particles[i];
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
                 let mut d = 0.0;
-                for &j in self.neighbors(i) {
+                for &j in &indices[start..end] {
                     let r2 = pi.distance_squared_to(&particles[j]);
                     if r2 <= kc.h2 {
                         d += particles[j].mass * kc.poly6(r2);
                     }
                 }
-                self.densities[i] = d;
+                d
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                let densities: Vec<f64> = (0..n).into_par_iter().map(compute_density_i).collect();
+                self.densities.copy_from_slice(&densities);
             }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for i in 0..n {
+                    self.densities[i] = compute_density_i(i);
+                }
+            }
+
             for (i, p) in particles.iter_mut().enumerate() {
                 p.density = self.densities[i];
                 p.pressure = equation_of_state(p.density, config.rest_density, config.gas_constant);
@@ -432,25 +452,30 @@ impl SphSolver {
         {
             let _span = trace_span!("sph::forces", n).entered();
             let st = self.surface_tension;
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n {
-                let pi = &self.snapshot[i];
-                let mut ax = config.gravity[0];
-                let mut ay = config.gravity[1];
-                let mut az = config.gravity[2];
+            let snapshot = &self.snapshot;
+            let offsets = &self.neighbor_offsets;
+            let indices = &self.neighbor_indices;
+            let gravity = config.gravity;
+
+            let compute_accel_i = |i: usize| -> [f64; 3] {
+                let pi = &snapshot[i];
+                let mut ax = gravity[0];
+                let mut ay = gravity[1];
+                let mut az = gravity[2];
                 let rho = pi.density.max(1e-10);
 
-                // Surface tension accumulators (CSF with poly6 kernel)
                 let mut cn_x = 0.0;
                 let mut cn_y = 0.0;
                 let mut cn_z = 0.0;
                 let mut laplacian_color = 0.0;
 
-                for &j in self.neighbors(i) {
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                for &j in &indices[start..end] {
                     if j == i {
                         continue;
                     }
-                    let pj = &self.snapshot[j];
+                    let pj = &snapshot[j];
                     let r2 = pi.distance_squared_to(pj);
                     if r2 > kc.h2 || r2 < 1e-20 {
                         continue;
@@ -462,7 +487,6 @@ impl SphSolver {
                     let dy = pi.position[1] - pj.position[1];
                     let dz = pi.position[2] - pj.position[2];
 
-                    // Symmetric pressure force: -m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W
                     let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
                     let grad = kc.spiky_grad(r);
                     let p_scale = -pj.mass * sym_pressure * grad / r;
@@ -470,14 +494,12 @@ impl SphSolver {
                     ay += p_scale * dy;
                     az += p_scale * dz;
 
-                    // Viscosity force
                     let lap = kc.visc_laplacian(r);
                     let v_scale = viscosity * pj.mass * lap / rho_j / rho;
                     ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
                     ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
                     az += v_scale * (pj.velocity[2] - pi.velocity[2]);
 
-                    // Surface tension: color field gradient and Laplacian (poly6 kernel)
                     if st > 0.0 {
                         let mass_over_rho = pj.mass / rho_j;
                         let pg = kc.poly6_grad_scalar(r2);
@@ -488,7 +510,6 @@ impl SphSolver {
                     }
                 }
 
-                // Surface tension force: F_st = -σ · κ · n̂
                 if st > 0.0 {
                     let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
                     if cn_mag > 1e-6 / kc.h {
@@ -500,13 +521,21 @@ impl SphSolver {
                     }
                 }
 
-                if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
+                [ax, ay, az]
+            };
+
+            #[cfg(feature = "parallel")]
+            let accels: Vec<[f64; 3]> = (0..n).into_par_iter().map(compute_accel_i).collect();
+            #[cfg(not(feature = "parallel"))]
+            let accels: Vec<[f64; 3]> = (0..n).map(compute_accel_i).collect();
+
+            for (i, accel) in accels.iter().enumerate() {
+                if !accel[0].is_finite() || !accel[1].is_finite() || !accel[2].is_finite() {
                     return Err(PravashError::Diverged {
                         reason: format!("NaN/Inf in acceleration at particle {i}").into(),
                     });
                 }
-
-                particles[i].acceleration = [ax, ay, az];
+                particles[i].acceleration = *accel;
             }
         }
 
@@ -1271,6 +1300,49 @@ mod tests {
         assert!(kc.poly6(1.1).abs() < EPS);
         assert!(kc.poly6_grad_scalar(1.1).abs() < EPS);
         assert!(kc.poly6_laplacian(1.1).abs() < EPS);
+    }
+
+    // ── Parallel consistency tests ────────────────────────────────────────
+
+    #[test]
+    fn test_solver_step_deterministic() {
+        // Two identical runs should produce identical results
+        // (validates that parallel path doesn't introduce nondeterminism in ordering)
+        let config = FluidConfig::water_2d();
+        let particles_init = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+
+        let run = || -> Vec<FluidParticle> {
+            let mut p = particles_init.clone();
+            let mut solver = SphSolver::new();
+            for _ in 0..5 {
+                solver.step(&mut p, &config, 0.001).unwrap();
+            }
+            p
+        };
+
+        let r1 = run();
+        let r2 = run();
+        for (a, b) in r1.iter().zip(r2.iter()) {
+            assert!(
+                (a.position[0] - b.position[0]).abs() < 1e-10,
+                "runs should be deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn test_solver_large_particle_count() {
+        // Stress test with many particles — should not crash or produce NaN
+        let mut particles = create_particle_block([0.1, 0.1], [0.5, 0.5], 0.01, 0.0001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        assert!(
+            particles.iter().all(|p| p.position[0].is_finite()),
+            "large particle simulation should stay finite"
+        );
     }
 
     // ── PCISPH tests ────────────────────────────────────────────────────────

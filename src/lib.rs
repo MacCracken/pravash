@@ -37,11 +37,16 @@ pub mod vortex;
 #[cfg(feature = "coupling")]
 pub mod coupling;
 
+#[cfg(feature = "compute")]
+pub mod compute;
+
 #[cfg(feature = "logging")]
 pub mod logging;
 
 #[cfg(feature = "ai")]
 pub mod ai;
 
-pub use common::{FluidConfig, FluidMaterial, FluidParticle};
+pub use common::{
+    ArenaHandle, FluidConfig, FluidMaterial, FluidParticle, ParticleArena, ParticleSoa,
+};
 pub use error::PravashError;

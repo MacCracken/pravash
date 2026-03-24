@@ -11,6 +11,9 @@ use crate::error::{PravashError, Result};
 use hisab::num::{dst, idst};
 use tracing::trace_span;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Boundary condition type for the grid solver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -220,12 +223,31 @@ impl FluidGrid {
     ) {
         let _span = trace_span!("grid::advect", nx, ny).entered();
         let dt_inv_dx = dt * inv_dx;
-        for y in 1..ny - 1 {
-            for x in 1..nx - 1 {
-                let i = y * nx + x;
-                let fx = x as f64 - dt_inv_dx * vx[i];
-                let fy = y as f64 - dt_inv_dx * vy[i];
-                dst[i] = Self::sample(src, nx, ny, fx, fy);
+
+        #[cfg(feature = "parallel")]
+        {
+            let rows: Vec<(usize, &mut [f64])> = dst.chunks_mut(nx).enumerate().collect();
+            rows.into_par_iter().for_each(|(y, row)| {
+                if y >= 1 && y < ny - 1 {
+                    #[allow(clippy::needless_range_loop)]
+                    for x in 1..nx - 1 {
+                        let i = y * nx + x;
+                        let fx = x as f64 - dt_inv_dx * vx[i];
+                        let fy = y as f64 - dt_inv_dx * vy[i];
+                        row[x] = Self::sample(src, nx, ny, fx, fy);
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    let fx = x as f64 - dt_inv_dx * vx[i];
+                    let fy = y as f64 - dt_inv_dx * vy[i];
+                    dst[i] = Self::sample(src, nx, ny, fx, fy);
+                }
             }
         }
     }
@@ -244,12 +266,29 @@ impl FluidGrid {
     ) {
         let _span = trace_span!("grid::advect_periodic", nx, ny).entered();
         let dt_inv_dx = dt * inv_dx;
-        for y in 0..ny {
-            for x in 0..nx {
-                let i = y * nx + x;
-                let fx = x as f64 - dt_inv_dx * vx[i];
-                let fy = y as f64 - dt_inv_dx * vy[i];
-                dst[i] = Self::sample_periodic(src, nx, ny, fx, fy);
+
+        #[cfg(feature = "parallel")]
+        {
+            let rows: Vec<(usize, &mut [f64])> = dst.chunks_mut(nx).enumerate().collect();
+            rows.into_par_iter().for_each(|(y, row)| {
+                #[allow(clippy::needless_range_loop)]
+                for x in 0..nx {
+                    let i = y * nx + x;
+                    let fx = x as f64 - dt_inv_dx * vx[i];
+                    let fy = y as f64 - dt_inv_dx * vy[i];
+                    row[x] = Self::sample_periodic(src, nx, ny, fx, fy);
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let i = y * nx + x;
+                    let fx = x as f64 - dt_inv_dx * vx[i];
+                    let fy = y as f64 - dt_inv_dx * vy[i];
+                    dst[i] = Self::sample_periodic(src, nx, ny, fx, fy);
+                }
             }
         }
     }
@@ -517,11 +556,40 @@ impl FluidGrid {
         inv_2dx: f64,
     ) {
         let _span = trace_span!("grid::project").entered();
-        for y in 1..ny - 1 {
-            for x in 1..nx - 1 {
-                let i = y * nx + x;
-                vx[i] -= (pressure[i + 1] - pressure[i - 1]) * inv_2dx;
-                vy[i] -= (pressure[i + nx] - pressure[i - nx]) * inv_2dx;
+
+        #[cfg(feature = "parallel")]
+        {
+            // Compute corrections, then apply (avoids split-borrow issues)
+            let corrections: Vec<(f64, f64)> = (1..ny - 1)
+                .into_par_iter()
+                .flat_map(|y| {
+                    (1..nx - 1).into_par_iter().map(move |x| {
+                        let i = y * nx + x;
+                        (
+                            (pressure[i + 1] - pressure[i - 1]) * inv_2dx,
+                            (pressure[i + nx] - pressure[i - nx]) * inv_2dx,
+                        )
+                    })
+                })
+                .collect();
+            let mut idx = 0;
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    vx[i] -= corrections[idx].0;
+                    vy[i] -= corrections[idx].1;
+                    idx += 1;
+                }
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    vx[i] -= (pressure[i + 1] - pressure[i - 1]) * inv_2dx;
+                    vy[i] -= (pressure[i + nx] - pressure[i - nx]) * inv_2dx;
+                }
             }
         }
     }
@@ -1285,6 +1353,29 @@ mod tests {
         // Scratch buffers are skipped but should be rebuilt on next step
         g2.step(&config).unwrap();
         assert!(g2.max_speed().is_finite());
+    }
+
+    #[test]
+    fn test_grid_step_deterministic() {
+        let config = GridConfig::smoke();
+        let run = || -> FluidGrid {
+            let mut g = FluidGrid::new(20, 20, 0.1).unwrap();
+            let center = g.idx(10, 10);
+            g.density[center] = 1.0;
+            g.vy[center] = 0.5;
+            for _ in 0..10 {
+                g.step(&config).unwrap();
+            }
+            g
+        };
+        let g1 = run();
+        let g2 = run();
+        for i in 0..g1.vx.len() {
+            assert!(
+                (g1.vx[i] - g2.vx[i]).abs() < 1e-10,
+                "grid step should be deterministic"
+            );
+        }
     }
 
     #[test]
