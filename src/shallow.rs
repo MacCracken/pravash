@@ -34,6 +34,28 @@ pub struct ShallowWater {
     /// Typical values: 0.01 (smooth), 0.025 (earth channel), 0.035 (gravel),
     /// 0.05 (heavy brush), 0.1 (dense vegetation).
     pub manning_n: Vec<f64>,
+    /// Minimum water depth for a cell to be considered "wet".
+    /// Cells with depth below this threshold have their velocity zeroed
+    /// and produce no outgoing flux. Default: 1e-4 meters.
+    pub dry_threshold: f64,
+    /// Critical surface slope for wave breaking detection: |∇η| / depth.
+    /// When exceeded, extra dissipation is applied. Default: 0.5.
+    /// Set to 0.0 to disable breaking detection.
+    pub breaking_threshold: f64,
+    /// Extra viscous dissipation applied at breaking wave fronts.
+    /// Velocity is damped by `1 / (1 + breaking_dissipation · dt)` at breaking cells.
+    /// Default: 5.0.
+    pub breaking_dissipation: f64,
+    /// Boussinesq dispersive correction coefficient.
+    /// Scales the dispersive pressure term: `coeff · h² · g · ∇²(∇η)`.
+    /// The theoretical value is 1/3 ≈ 0.333 (Peregrine 1967).
+    /// Set to 0.0 to disable (default).
+    ///
+    /// **Stability note:** The explicit 4th-order term is stiff. Use small
+    /// values (0.01–0.1) and small timesteps. Stability requires roughly
+    /// `dt < dx² / (coeff · h² · g)`. For `dx=0.1, h=1, coeff=0.05`:
+    /// `dt < 0.01 / (0.05 · 9.81) ≈ 0.02`.
+    pub dispersion_coeff: f64,
     /// Scratch buffers (persistent across steps to avoid allocation).
     #[serde(skip)]
     scratch_vx: Vec<f64>,
@@ -41,6 +63,9 @@ pub struct ShallowWater {
     scratch_vy: Vec<f64>,
     #[serde(skip)]
     scratch_h: Vec<f64>,
+    /// Scratch for Laplacian of height (dispersion).
+    #[serde(skip)]
+    scratch_lap: Vec<f64>,
 }
 
 impl ShallowWater {
@@ -61,9 +86,14 @@ impl ShallowWater {
             gravity: 9.81,
             damping: 0.999,
             manning_n: vec![0.0; size],
+            dry_threshold: 1e-4,
+            breaking_threshold: 0.5,
+            breaking_dissipation: 5.0,
+            dispersion_coeff: 0.0,
             scratch_vx: vec![0.0; size],
             scratch_vy: vec![0.0; size],
             scratch_h: vec![0.0; size],
+            scratch_lap: vec![0.0; size],
         })
     }
 
@@ -85,6 +115,34 @@ impl ShallowWater {
     #[must_use]
     pub fn surface_at(&self, x: usize, y: usize) -> f64 {
         self.height[self.idx(x, y)]
+    }
+
+    /// Whether a cell is wet (depth above dry threshold).
+    #[inline]
+    #[must_use]
+    pub fn is_wet(&self, x: usize, y: usize) -> bool {
+        self.depth_at(x, y) >= self.dry_threshold
+    }
+
+    /// Whether a cell is at a breaking wave front.
+    ///
+    /// Compares the surface gradient magnitude to the breaking threshold
+    /// relative to local depth. Returns false for boundary/dry cells.
+    #[must_use]
+    pub fn is_breaking(&self, x: usize, y: usize) -> bool {
+        if x == 0 || x >= self.nx - 1 || y == 0 || y >= self.ny - 1 {
+            return false;
+        }
+        let i = self.idx(x, y);
+        let depth = (self.height[i] - self.ground[i]).max(0.0);
+        if depth < self.dry_threshold || self.breaking_threshold <= 0.0 {
+            return false;
+        }
+        let inv_2dx = 0.5 / self.dx;
+        let dhdx = (self.height[i + 1] - self.height[i - 1]) * inv_2dx;
+        let dhdy = (self.height[i + self.nx] - self.height[i - self.nx]) * inv_2dx;
+        let slope = (dhdx * dhdx + dhdy * dhdy).sqrt();
+        slope / depth > self.breaking_threshold
     }
 
     /// Add a circular disturbance (drop/splash).
@@ -130,11 +188,22 @@ impl ShallowWater {
         // Timestep-proportional damping: damp^(dt/dt_ref) where dt_ref = 0.001
         let damp = self.damping.powf(dt / 0.001);
 
+        let dry_thr = self.dry_threshold;
+
         // Ensure scratch buffers are correct size (may be empty after deserialization)
         let size = nx * ny;
         self.scratch_vx.resize(size, 0.0);
         self.scratch_vy.resize(size, 0.0);
         self.scratch_h.resize(size, 0.0);
+        self.scratch_lap.resize(size, 0.0);
+
+        // Zero velocity in dry cells before snapshotting
+        for i in 0..size {
+            if (self.height[i] - self.ground[i]) < dry_thr {
+                self.vx[i] = 0.0;
+                self.vy[i] = 0.0;
+            }
+        }
 
         // Snapshot current state for centered-difference stencils
         self.scratch_vx.copy_from_slice(&self.vx);
@@ -145,9 +214,24 @@ impl ShallowWater {
         let svy = &self.scratch_vy;
         let sh = &self.scratch_h;
 
+        // Pre-compute Laplacian of surface height for Boussinesq dispersion.
+        // ∇²η = (η[i+1] + η[i-1] + η[i+nx] + η[i-nx] - 4·η[i]) / dx²
+        let disp = self.dispersion_coeff;
+        if disp > 0.0 {
+            let inv_dx2 = 1.0 / (dx * dx);
+            self.scratch_lap.fill(0.0);
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    self.scratch_lap[i] =
+                        (sh[i + 1] + sh[i - 1] + sh[i + nx] + sh[i - nx] - 4.0 * sh[i]) * inv_dx2;
+                }
+            }
+        }
+
         // Momentum update: pressure gradient + convective acceleration
         // ∂u/∂t = -g·∂η/∂x - u·∂u/∂x - v·∂u/∂y
-        // ∂v/∂t = -g·∂η/∂y - u·∂v/∂x - v·∂v/∂y
+        // Boussinesq correction: -disp · h² · g · ∂(∇²η)/∂x
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
@@ -167,6 +251,20 @@ impl ShallowWater {
                 self.vx[i] -= (g * dhdx + u * dudx + v * dudy) * dt;
                 self.vy[i] -= (g * dhdy + u * dvdx + v * dvdy) * dt;
 
+                // Boussinesq dispersive correction: -coeff · h² · g · ∇(∇²η)
+                // Gradient of the Laplacian gives the dispersive pressure term.
+                if disp > 0.0 {
+                    let depth = (sh[i] - self.ground[i]).max(0.0);
+                    if depth > dry_thr {
+                        let lap = &self.scratch_lap;
+                        let dlap_dx = (lap[i + 1] - lap[i - 1]) * inv_2dx;
+                        let dlap_dy = (lap[i + nx] - lap[i - nx]) * inv_2dx;
+                        let scale = disp * depth * depth * g;
+                        self.vx[i] -= scale * dlap_dx * dt;
+                        self.vy[i] -= scale * dlap_dy * dt;
+                    }
+                }
+
                 // Manning's bed friction: S_f = -g·n²·|u|·u / h^(4/3)
                 // Uses implicit treatment: u_new = u_old / (1 + α·dt) for stability
                 let n_manning = self.manning_n[i];
@@ -183,20 +281,35 @@ impl ShallowWater {
                     }
                 }
 
+                // Wave breaking dissipation: extra damping at steep fronts
+                // Reuses dhdx/dhdy from pressure gradient (same stencil on snapshot)
+                let brk_thr = self.breaking_threshold;
+                if brk_thr > 0.0 && self.breaking_dissipation > 0.0 {
+                    let depth = (sh[i] - self.ground[i]).max(0.0);
+                    if depth > dry_thr {
+                        let slope = (dhdx * dhdx + dhdy * dhdy).sqrt();
+                        if slope / depth > brk_thr {
+                            let decay = 1.0 / (1.0 + self.breaking_dissipation * dt);
+                            self.vx[i] *= decay;
+                            self.vy[i] *= decay;
+                        }
+                    }
+                }
+
                 self.vx[i] *= damp;
                 self.vy[i] *= damp;
             }
         }
 
         // Continuity update (flux form): ∂h/∂t + ∂(h·u)/∂x + ∂(h·v)/∂y = 0
-        // Uses depth (h - ground) for flux computation
+        // Flux limited at dry fronts: no outgoing flux from dry cells.
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
                 let depth = (sh[i] - self.ground[i]).max(0.0);
 
-                // Compute fluxes at cell faces using averaged depth and velocity
-                // Flux_x = h·u, Flux_y = h·v (using updated velocities for stability)
+                // Compute fluxes at cell faces using averaged depth and velocity.
+                // Dry cells (velocity already zeroed) contribute zero flux naturally.
                 let hu_right = {
                     let d = (sh[i + 1] - self.ground[i + 1]).max(0.0);
                     0.5 * (depth * self.vx[i] + d * self.vx[i + 1])
@@ -216,6 +329,12 @@ impl ShallowWater {
 
                 let flux_div = (hu_right - hu_left + hv_top - hv_bottom) * inv_2dx;
                 self.height[i] -= flux_div * dt;
+
+                // Clamp: depth must never go negative
+                let min_h = self.ground[i];
+                if self.height[i] < min_h {
+                    self.height[i] = min_h;
+                }
             }
         }
 
@@ -604,6 +723,274 @@ mod tests {
             "friction near dry cells should remain finite"
         );
         assert!(sw.height.iter().all(|h| h.is_finite()));
+    }
+
+    // ── Wetting/drying tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_dry_cells_zero_velocity() {
+        let mut sw = ShallowWater::new(20, 6, 0.1, 1.0).unwrap();
+        sw.damping = 1.0;
+        // Make right half dry
+        let nx = sw.nx;
+        for y in 0..6 {
+            for x in 10..20 {
+                sw.ground[y * nx + x] = 2.0;
+            }
+        }
+        // Give everything velocity
+        sw.vx.fill(1.0);
+        sw.vy.fill(0.5);
+
+        sw.step(0.001).unwrap();
+
+        // Dry cells should have zero velocity
+        for y in 1..5 {
+            for x in 11..19 {
+                assert!(
+                    !sw.is_wet(x, y),
+                    "cell ({x},{y}) should be dry: depth={}",
+                    sw.depth_at(x, y)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_depth_never_negative() {
+        // Water flowing off a shelf should not produce negative depth
+        let mut sw = ShallowWater::new(30, 6, 0.1, 0.5).unwrap();
+        sw.damping = 1.0;
+        let nx = sw.nx;
+        // Create a shelf: ground rises in the middle
+        for y in 0..6 {
+            for x in 12..18 {
+                sw.ground[y * nx + x] = 0.45; // just below water surface
+            }
+        }
+        // Strong rightward flow
+        sw.vx.fill(3.0);
+
+        for _ in 0..500 {
+            sw.step(0.0005).unwrap();
+        }
+
+        // No cell should have negative depth
+        for i in 0..sw.height.len() {
+            let depth = sw.height[i] - sw.ground[i];
+            assert!(
+                depth >= -1e-10,
+                "depth should never be negative: cell {i}, depth={depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_water_advances_onto_dry_bed() {
+        // Dam break onto initially dry bed — water should advance
+        let mut sw = ShallowWater::new(40, 6, 0.1, 0.0).unwrap();
+        sw.damping = 1.0;
+        let nx = sw.nx;
+        // Left side: water, right side: dry (height = ground = 0)
+        for y in 0..6 {
+            for x in 0..15 {
+                sw.height[y * nx + x] = 1.0;
+            }
+        }
+
+        // Initially, right side is dry
+        assert!(!sw.is_wet(30, 3));
+
+        for _ in 0..1000 {
+            sw.step(0.0005).unwrap();
+        }
+
+        // Water should have advanced past the midpoint
+        let midpoint_depth = sw.depth_at(20, 3);
+        assert!(
+            midpoint_depth > sw.dry_threshold,
+            "water should advance onto dry bed: depth at (20,3) = {midpoint_depth}"
+        );
+        // Everything should remain finite
+        assert!(sw.height.iter().all(|h| h.is_finite()));
+        assert!(sw.vx.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_is_wet_helper() {
+        let mut sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
+        assert!(sw.is_wet(5, 5));
+        let i = sw.idx(5, 5);
+        sw.ground[i] = 1.5; // raise ground above water
+        assert!(!sw.is_wet(5, 5));
+    }
+
+    // ── Wave breaking tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_steep_wave_detected_as_breaking() {
+        let mut sw = ShallowWater::new(20, 6, 0.1, 1.0).unwrap();
+        // Create a very steep step in the middle
+        let nx = sw.nx;
+        for y in 0..6 {
+            for x in 0..10 {
+                sw.height[y * nx + x] = 3.0;
+            }
+        }
+        // The cell at the step edge should be breaking
+        assert!(
+            sw.is_breaking(10, 3),
+            "steep front should be detected as breaking"
+        );
+    }
+
+    #[test]
+    fn test_gentle_wave_not_breaking() {
+        let mut sw = ShallowWater::new(40, 6, 0.1, 1.0).unwrap();
+        // Very gentle sinusoidal perturbation
+        for x in 0..40 {
+            let phase = std::f64::consts::PI * 2.0 * x as f64 / 40.0;
+            for y in 0..6 {
+                let i = sw.idx(x, y);
+                sw.height[i] += 0.001 * phase.sin();
+            }
+        }
+        // No cell should be breaking
+        for x in 1..39 {
+            assert!(
+                !sw.is_breaking(x, 3),
+                "gentle wave should not break at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_breaking_dissipates_energy() {
+        // Dam break with breaking enabled should have less energy than without
+        let run = |breaking: bool| -> f64 {
+            let mut sw = ShallowWater::new(40, 6, 0.1, 0.5).unwrap();
+            sw.damping = 1.0;
+            if !breaking {
+                sw.breaking_threshold = 0.0; // disable
+            }
+            let nx = sw.nx;
+            for y in 0..6 {
+                for x in 0..15 {
+                    sw.height[y * nx + x] = 2.0;
+                }
+            }
+            for _ in 0..300 {
+                sw.step(0.0005).unwrap();
+            }
+            // Total kinetic energy
+            sw.vx
+                .iter()
+                .zip(sw.vy.iter())
+                .map(|(&u, &v)| u * u + v * v)
+                .sum()
+        };
+
+        let ke_with_breaking = run(true);
+        let ke_without = run(false);
+        assert!(
+            ke_with_breaking < ke_without,
+            "breaking should dissipate energy: with={ke_with_breaking}, without={ke_without}"
+        );
+    }
+
+    #[test]
+    fn test_breaking_disabled_when_threshold_zero() {
+        let mut sw = ShallowWater::new(20, 6, 0.1, 1.0).unwrap();
+        sw.breaking_threshold = 0.0;
+        // Even with a steep front, is_breaking should return false
+        let nx = sw.nx;
+        for y in 0..6 {
+            for x in 0..10 {
+                sw.height[y * nx + x] = 5.0;
+            }
+        }
+        assert!(!sw.is_breaking(10, 3));
+    }
+
+    // ── Dispersive correction tests ────────────────────────────────────────
+
+    #[test]
+    fn test_dispersion_disabled_by_default() {
+        // With dispersion_coeff = 0 (default), results should match non-dispersive
+        let mut sw_a = ShallowWater::new(30, 6, 0.1, 1.0).unwrap();
+        let mut sw_b = ShallowWater::new(30, 6, 0.1, 1.0).unwrap();
+        sw_a.damping = 1.0;
+        sw_b.damping = 1.0;
+        sw_a.breaking_threshold = 0.0;
+        sw_b.breaking_threshold = 0.0;
+        // Same perturbation
+        sw_a.add_disturbance(1.5, 0.3, 0.2, 0.3);
+        sw_b.add_disturbance(1.5, 0.3, 0.2, 0.3);
+
+        for _ in 0..50 {
+            sw_a.step(0.001).unwrap();
+            sw_b.step(0.001).unwrap();
+        }
+
+        for i in 0..sw_a.height.len() {
+            assert!(
+                (sw_a.height[i] - sw_b.height[i]).abs() < 1e-12,
+                "zero dispersion should be identical"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispersion_changes_wave_shape() {
+        // With dispersion enabled, a sharp pulse should spread differently.
+        // Uses coarser grid + small coefficient for stability with explicit scheme.
+        let run = |disp: f64| -> Vec<f64> {
+            let mut sw = ShallowWater::new(40, 6, 0.1, 1.0).unwrap();
+            sw.damping = 1.0;
+            sw.breaking_threshold = 0.0;
+            sw.dispersion_coeff = disp;
+            sw.add_disturbance(2.0, 0.3, 0.2, 0.1);
+            for _ in 0..200 {
+                sw.step(0.0001).unwrap();
+            }
+            let y = 3;
+            (0..40).map(|x| sw.height[sw.idx(x, y)]).collect()
+        };
+
+        let profile_no_disp = run(0.0);
+        let profile_with_disp = run(0.05);
+
+        // Profiles should differ (dispersion changes wave shape)
+        let diff: f64 = profile_no_disp
+            .iter()
+            .zip(profile_with_disp.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-6,
+            "dispersion should change the wave profile: diff={diff}"
+        );
+        assert!(profile_with_disp.iter().all(|h| h.is_finite()));
+    }
+
+    #[test]
+    fn test_dispersion_stable_long_run() {
+        // Dispersive simulation should not blow up over many steps.
+        // Small coefficient + tiny dt for explicit stability of 4th-order term.
+        let mut sw = ShallowWater::new(30, 6, 0.1, 1.0).unwrap();
+        sw.damping = 1.0;
+        sw.dispersion_coeff = 0.01;
+        sw.add_disturbance(1.5, 0.3, 0.2, 0.05);
+
+        for _ in 0..500 {
+            sw.step(0.00005).unwrap();
+        }
+
+        assert!(
+            sw.height.iter().all(|h| h.is_finite()),
+            "dispersive sim should stay finite"
+        );
+        assert!(sw.vx.iter().all(|v| v.is_finite()));
     }
 
     #[test]

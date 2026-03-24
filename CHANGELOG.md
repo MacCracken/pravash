@@ -7,6 +7,9 @@
 - shallow: Flux-form continuity equation (∂(hu)/∂x + ∂(hv)/∂y) for proper mass transport
 - shallow: Neumann boundary enforcement (zero-gradient height, reflected normal velocity)
 - shallow: Manning's bed friction (`manning_n` per-cell roughness) with implicit treatment for stability
+- shallow: Wetting/drying transitions (`dry_threshold`, `is_wet()`) with velocity zeroing, depth clamping
+- shallow: Wave breaking detection (`breaking_threshold`, `is_breaking()`) with turbulent bore dissipation
+- shallow: Boussinesq dispersive correction (`dispersion_coeff`) for short-wavelength accuracy
 - grid: Persistent scratch buffers (zero allocation after first step)
 - grid: DST pressure solver now propagates transform errors instead of silent ignore
 - common: `FluidConfig::validate()` rejects NaN/Inf for dt, smoothing_radius, density, gas_constant

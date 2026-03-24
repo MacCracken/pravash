@@ -6,9 +6,9 @@
 
 - [x] Non-linear shallow water equations (proper convective terms)
 - [x] Bed friction (Manning's equation)
-- [ ] Wetting/drying (wet-dry transitions)
-- [ ] Wave breaking detection
-- [ ] Dispersive correction (Boussinesq-type)
+- [x] Wetting/drying (wet-dry transitions)
+- [x] Wave breaking detection
+- [x] Dispersive correction (Boussinesq-type)
 - [ ] Terrain-following coordinate system
 
 ### 0.26.3 — Performance & Parallelism
