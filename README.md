@@ -13,6 +13,7 @@ Particle-based and grid-based fluid simulation. SPH for real-time effects, Euler
 | `shallow` | yes | Shallow water equations — 2D surface waves |
 | `buoyancy` | no | Buoyancy, drag, Reynolds number, flow regime |
 | `vortex` | no | Vorticity, Lamb-Oseen/Rankine vortices, enstrophy, Kolmogorov scale |
+| `coupling` | no | Fluid-body interaction, FLIP/PIC hybrid, level set, added mass |
 | `ai` | no | Daimon/hoosh integration |
 | `logging` | no | Structured logging via `PRAVASH_LOG` |
 
@@ -20,25 +21,29 @@ Particle-based and grid-based fluid simulation. SPH for real-time effects, Euler
 
 | Module | Description |
 |--------|-------------|
-| `sph` | SPH kernels (Poly6, Spiky, Viscosity), density/pressure computation, force calculation, particle stepping |
-| `grid` | FluidGrid with velocity/pressure/density fields, Gauss-Seidel diffusion |
+| `sph` | SPH solver with spatial hash acceleration, PCISPH, surface tension, adaptive timestep |
+| `grid` | Navier-Stokes: advection (semi-Lagrangian + MacCormack), diffusion, pressure projection (DST + GS), vorticity confinement, buoyancy |
 | `shallow` | ShallowWater heightfield with disturbances, wave propagation, volume conservation |
 | `buoyancy` | Archimedes buoyancy, drag force, terminal velocity, Reynolds number |
 | `vortex` | Vorticity, Lamb-Oseen/Rankine vortex models, enstrophy, Kolmogorov microscale |
+| `coupling` | RigidBody interaction, FLIP/PIC hybrid, particle-level set, added mass, field drag |
 | `common` | FluidParticle, FluidMaterial (water/oil/honey/air/lava), FluidConfig |
 
 ## Quick Start
 
 ```rust
-use pravash::sph::{create_particle_block, step};
+use pravash::sph::{SphSolver, create_particle_block, total_kinetic_energy};
 use pravash::common::{FluidConfig, FluidMaterial};
 
 let mut particles = create_particle_block([0.2, 0.5], [0.3, 0.3], 0.02, 0.001);
 let config = FluidConfig::water_2d();
+let mut solver = SphSolver::new();
 
 for _ in 0..100 {
-    step(&mut particles, &config, FluidMaterial::WATER.viscosity).unwrap();
+    solver.step(&mut particles, &config, FluidMaterial::WATER.viscosity).unwrap();
 }
+
+println!("KE: {}", total_kinetic_energy(&particles));
 ```
 
 ## Roadmap

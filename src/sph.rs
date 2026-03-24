@@ -847,6 +847,8 @@ impl Default for SphSolver {
 /// Perform one SPH simulation step (brute-force O(n²)).
 ///
 /// For better performance with >100 particles, use [`SphSolver::step`] instead.
+/// Note: this function uses the non-symmetric pressure formula for backwards
+/// compatibility. [`SphSolver::step`] uses the momentum-conserving symmetric form.
 pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f64) -> Result<()> {
     let _span = trace_span!("sph::step", n = particles.len()).entered();
     config.validate()?;

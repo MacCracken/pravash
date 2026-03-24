@@ -125,6 +125,10 @@ impl ShallowWater {
             }
         }
 
+        // Ensure scratch buffers are correct size (may be empty after deserialization)
+        let size = nx * ny;
+        self.scratch_vx.resize(size, 0.0);
+        self.scratch_vy.resize(size, 0.0);
         self.scratch_vx.copy_from_slice(&self.vx);
         self.scratch_vy.copy_from_slice(&self.vy);
 
