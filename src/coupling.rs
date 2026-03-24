@@ -309,10 +309,19 @@ pub fn drag_from_particles(
         return [0.0; 3];
     }
 
-    // Cross-section area approximation from shape volume
+    // Cross-section area projected onto the velocity-normal plane
     let area = match body.shape {
         BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
-        BodyShape::Box { half_extents } => 4.0 * half_extents[1] * half_extents[2],
+        BodyShape::Box { half_extents } => {
+            // Project box area onto the plane perpendicular to relative velocity
+            let ax = (rel_vx / rel_speed).abs();
+            let ay = (rel_vy / rel_speed).abs();
+            let az = (rel_vz / rel_speed).abs();
+            // Each face contributes proportionally to its alignment with velocity
+            4.0 * (ax * half_extents[1] * half_extents[2]
+                + ay * half_extents[0] * half_extents[2]
+                + az * half_extents[0] * half_extents[1])
+        }
     };
 
     // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
@@ -608,11 +617,29 @@ impl FlipSolver {
         // 4. G2P with FLIP/PIC blend
         self.grid_to_particles(particles);
 
-        // 5. Advect particles
+        // 5. Advect particles and clamp to grid domain
+        let max_x = (nx - 1) as f64 * self.dx;
+        let max_y = (ny - 1) as f64 * self.dx;
         for p in particles.iter_mut() {
             p.position[0] += p.velocity[0] * dt;
             p.position[1] += p.velocity[1] * dt;
             p.position[2] += p.velocity[2] * dt;
+
+            // Clamp to grid domain with velocity reflection
+            if p.position[0] < 0.0 {
+                p.position[0] = 0.0;
+                p.velocity[0] = 0.0;
+            } else if p.position[0] > max_x {
+                p.position[0] = max_x;
+                p.velocity[0] = 0.0;
+            }
+            if p.position[1] < 0.0 {
+                p.position[1] = 0.0;
+                p.velocity[1] = 0.0;
+            } else if p.position[1] > max_y {
+                p.position[1] = max_y;
+                p.velocity[1] = 0.0;
+            }
         }
 
         Ok(())
@@ -813,6 +840,34 @@ mod tests {
         // Both should produce finite results
         assert!(particles_flip[0].velocity[0].is_finite());
         assert!(particles_pic[0].velocity[0].is_finite());
+    }
+
+    #[test]
+    fn test_flip_boundary_clamping() {
+        let mut solver = FlipSolver::new(8, 8, 0.1, 0.95).unwrap();
+        // Particle with high velocity heading out of domain
+        let mut particles = vec![FluidParticle::new_2d(0.05, 0.05, 0.01)];
+        particles[0].velocity = [-10.0, -10.0, 0.0];
+
+        solver.step(&mut particles, [0.0; 3], 0.1).unwrap();
+
+        // Particle should be clamped to domain [0, (nx-1)*dx]
+        assert!(
+            particles[0].position[0] >= 0.0,
+            "x should be >= 0: {}",
+            particles[0].position[0]
+        );
+        assert!(
+            particles[0].position[1] >= 0.0,
+            "y should be >= 0: {}",
+            particles[0].position[1]
+        );
+        // Velocity should be zeroed at boundary
+        assert!(
+            particles[0].velocity[0].abs() < 1e-10,
+            "vx should be 0 at boundary: {}",
+            particles[0].velocity[0]
+        );
     }
 
     // ── Added mass tests ────────────────────────────────────────────────────

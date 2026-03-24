@@ -179,11 +179,15 @@ pub fn equation_of_state(density: f64, rest_density: f64, gas_constant: f64) -> 
 // ── Forces (standalone, brute-force) ────────────────────────────────────────
 
 /// Compute pressure force on particle i from all neighbors (brute-force).
+///
+/// Uses the symmetric momentum-conserving formula:
+/// F_i = -m_i Σ_j m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W(r_ij, h)
 #[must_use]
 pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) -> [f64; 3] {
     let kc = KernelCoeffs::new(h);
     let pi = &particles[particle_idx];
     let mut force = [0.0; 3];
+    let rho_i = pi.density.max(1e-10);
 
     for (j, pj) in particles.iter().enumerate() {
         if j == particle_idx {
@@ -194,10 +198,11 @@ pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) 
             continue;
         }
         let r = r2.sqrt();
+        let rho_j = pj.density.max(1e-10);
 
-        let pressure_term = (pi.pressure + pj.pressure) / (2.0 * pj.density.max(1e-10));
+        let sym_pressure = pi.pressure / (rho_i * rho_i) + pj.pressure / (rho_j * rho_j);
         let grad = kc.spiky_grad(r);
-        let scale = -pj.mass * pressure_term * grad / r;
+        let scale = -pi.mass * pj.mass * sym_pressure * grad / r;
 
         force[0] += scale * (pi.position[0] - pj.position[0]);
         force[1] += scale * (pi.position[1] - pj.position[1]);
@@ -270,8 +275,14 @@ impl SphSolver {
     /// Create a new solver. Call [`step`](SphSolver::step) to advance the simulation.
     #[must_use]
     pub fn new() -> Self {
+        // SAFETY: 1.0 is always a valid cell size (positive, finite).
+        // SpatialHash::new only fails for non-positive or non-finite values.
+        let grid = match SpatialHash::new(1.0) {
+            Ok(g) => g,
+            Err(_) => unreachable!(),
+        };
         Self {
-            grid: SpatialHash::new(1.0),
+            grid,
             cell_size: 1.0,
             densities: Vec::new(),
             snapshot: Vec::new(),
@@ -296,14 +307,15 @@ impl SphSolver {
 
     /// Build spatial hash and cache neighbor lists for all particles.
     /// Uses `query_cell` per neighbor cell (zero-alloc) instead of `query_radius`.
-    fn build_neighbors(&mut self, particles: &[FluidParticle], h_f32: f32) {
+    fn build_neighbors(&mut self, particles: &[FluidParticle], h: f64, h_f32: f32) -> Result<()> {
         let n = particles.len();
         let inv_cs = 1.0 / h_f32;
         let half_cs = h_f32 * 0.5;
 
         // Rebuild grid: clear retains HashMap capacity
         if (self.cell_size - h_f32).abs() > f32::EPSILON {
-            self.grid = SpatialHash::new(h_f32);
+            self.grid =
+                SpatialHash::new(h_f32).map_err(|_| PravashError::InvalidSmoothingRadius { h })?;
             self.cell_size = h_f32;
         } else {
             self.grid.clear();
@@ -351,6 +363,7 @@ impl SphSolver {
             self.neighbor_offsets
                 .push(self.neighbor_indices.len() as u32);
         }
+        Ok(())
     }
 
     /// Get the cached neighbor slice for particle i.
@@ -387,7 +400,7 @@ impl SphSolver {
         // Build spatial hash and cache neighbor lists (zero-alloc query_cell)
         {
             let _span = trace_span!("sph::build_neighbors", n).entered();
-            self.build_neighbors(particles, h_f32);
+            self.build_neighbors(particles, h, h_f32)?;
         }
 
         // Compute densities via cached neighbors
@@ -562,7 +575,7 @@ impl SphSolver {
         // Build neighbors
         {
             let _span = trace_span!("sph::build_neighbors", n).entered();
-            self.build_neighbors(particles, h_f32);
+            self.build_neighbors(particles, h, h_f32)?;
         }
 
         // Compute densities
@@ -847,8 +860,7 @@ impl Default for SphSolver {
 /// Perform one SPH simulation step (brute-force O(n²)).
 ///
 /// For better performance with >100 particles, use [`SphSolver::step`] instead.
-/// Note: this function uses the non-symmetric pressure formula for backwards
-/// compatibility. [`SphSolver::step`] uses the momentum-conserving symmetric form.
+/// Both use the symmetric momentum-conserving pressure formula.
 pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f64) -> Result<()> {
     let _span = trace_span!("sph::step", n = particles.len()).entered();
     config.validate()?;
@@ -894,17 +906,18 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 let r = r2.sqrt();
                 let rho_j = pj.density.max(1e-10);
 
-                let pressure_term = (pi.pressure + pj.pressure) / (2.0 * rho_j);
+                // Symmetric momentum-conserving pressure: -m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W
+                let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
                 let grad = kc.spiky_grad(r);
-                let p_scale = -pj.mass * pressure_term * grad / r;
+                let p_scale = -pj.mass * sym_pressure * grad / r;
 
                 let dx = pi.position[0] - pj.position[0];
                 let dy = pi.position[1] - pj.position[1];
                 let dz = pi.position[2] - pj.position[2];
 
-                ax += (p_scale * dx) / rho;
-                ay += (p_scale * dy) / rho;
-                az += (p_scale * dz) / rho;
+                ax += p_scale * dx;
+                ay += p_scale * dy;
+                az += p_scale * dz;
 
                 let lap = kc.visc_laplacian(r);
                 let v_scale = viscosity * pj.mass * lap / rho_j / rho;

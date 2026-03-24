@@ -143,7 +143,39 @@ impl ShallowWater {
             }
         }
 
+        // Enforce boundary conditions (Neumann: zero-gradient at edges)
+        self.enforce_boundary();
+
         Ok(())
+    }
+
+    /// Enforce Neumann (zero-gradient) boundary conditions.
+    /// Copies nearest interior row/column to boundary cells.
+    fn enforce_boundary(&mut self) {
+        let nx = self.nx;
+        let ny = self.ny;
+        // Top and bottom rows
+        for x in 0..nx {
+            self.height[x] = self.height[nx + x];
+            self.vx[x] = self.vx[nx + x];
+            self.vy[x] = 0.0; // reflect: zero normal velocity at boundary
+            let top = (ny - 1) * nx + x;
+            let below = (ny - 2) * nx + x;
+            self.height[top] = self.height[below];
+            self.vx[top] = self.vx[below];
+            self.vy[top] = 0.0;
+        }
+        // Left and right columns
+        for y in 0..ny {
+            let l = y * nx;
+            self.height[l] = self.height[l + 1];
+            self.vx[l] = 0.0; // reflect: zero normal velocity at boundary
+            self.vy[l] = self.vy[l + 1];
+            let r = y * nx + nx - 1;
+            self.height[r] = self.height[r - 1];
+            self.vx[r] = 0.0;
+            self.vy[r] = self.vy[r - 1];
+        }
     }
 
     /// Total water volume (sum of depths × cell area).
@@ -276,5 +308,48 @@ mod tests {
         // Capacity should not change (no reallocation)
         assert_eq!(sw.scratch_vx.capacity(), cap_vx);
         assert_eq!(sw.scratch_vy.capacity(), cap_vy);
+    }
+
+    #[test]
+    fn test_boundary_reflects_waves() {
+        let mut sw = ShallowWater::new(20, 20, 0.1, 1.0).unwrap();
+        // Add disturbance near left boundary
+        sw.add_disturbance(0.2, 1.0, 0.15, 0.5);
+        for _ in 0..200 {
+            sw.step(0.001).unwrap();
+        }
+        // Boundary cells should have sensible values (not stuck at initial)
+        let left_height = sw.height[sw.idx(0, 10)];
+        let interior_height = sw.height[sw.idx(1, 10)];
+        // Neumann BC: boundary should match interior neighbor
+        assert!(
+            (left_height - interior_height).abs() < 1e-6,
+            "boundary should track interior: left={left_height}, interior={interior_height}"
+        );
+    }
+
+    #[test]
+    fn test_boundary_zero_normal_velocity() {
+        let mut sw = ShallowWater::new(20, 20, 0.1, 1.0).unwrap();
+        sw.add_disturbance(1.0, 1.0, 0.3, 0.5);
+        for _ in 0..50 {
+            sw.step(0.001).unwrap();
+        }
+        // Left boundary: vx should be 0 (normal to wall)
+        for y in 0..sw.ny {
+            assert!(
+                sw.vx[sw.idx(0, y)].abs() < 1e-10,
+                "left boundary vx should be 0 at y={y}: {}",
+                sw.vx[sw.idx(0, y)]
+            );
+        }
+        // Bottom boundary: vy should be 0 (normal to wall)
+        for x in 0..sw.nx {
+            assert!(
+                sw.vy[sw.idx(x, 0)].abs() < 1e-10,
+                "bottom boundary vy should be 0 at x={x}: {}",
+                sw.vy[sw.idx(x, 0)]
+            );
+        }
     }
 }

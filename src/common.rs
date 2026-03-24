@@ -222,6 +222,16 @@ impl FluidConfig {
                 .into(),
             });
         }
+        // Check bounds ordering: min must be <= max for each axis
+        let [min_x, min_y, min_z, max_x, max_y, max_z] = self.bounds;
+        if min_x > max_x || min_y > max_y || min_z > max_z {
+            return Err(PravashError::InvalidParameter {
+                reason: format!(
+                    "bounds min must be <= max: [{min_x}, {min_y}, {min_z}] to [{max_x}, {max_y}, {max_z}]"
+                )
+                .into(),
+            });
+        }
         Ok(())
     }
 
@@ -364,6 +374,20 @@ mod tests {
         assert!(c.validate().is_err());
         c.boundary_damping = -0.1;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_bounds() {
+        let mut c = FluidConfig::water_2d();
+        c.bounds = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // min_x > max_x
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_equal_bounds_valid() {
+        let mut c = FluidConfig::water_2d();
+        c.bounds = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // min_x == max_x, valid (2D)
+        assert!(c.validate().is_ok());
     }
 
     #[test]

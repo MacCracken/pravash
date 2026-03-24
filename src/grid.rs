@@ -87,6 +87,16 @@ pub struct FluidGrid {
     pub pressure: Vec<f64>,
     /// Density/scalar field (smoke, temperature, dye).
     pub density: Vec<f64>,
+    /// Scratch buffers (persistent across steps to avoid allocation).
+    #[serde(skip)]
+    scratch_a: Vec<f64>,
+    #[serde(skip)]
+    scratch_b: Vec<f64>,
+    #[serde(skip)]
+    scratch_c: Vec<f64>,
+    /// Diffusion RHS buffer.
+    #[serde(skip)]
+    diffuse_rhs: Vec<f64>,
 }
 
 impl FluidGrid {
@@ -114,6 +124,10 @@ impl FluidGrid {
             vy: vec![0.0; size],
             pressure: vec![0.0; size],
             density: vec![0.0; size],
+            scratch_a: vec![0.0; size],
+            scratch_b: vec![0.0; size],
+            scratch_c: vec![0.0; size],
+            diffuse_rhs: vec![0.0; size],
         })
     }
 
@@ -345,19 +359,36 @@ impl FluidGrid {
         dx: f64,
         iterations: usize,
     ) {
+        let mut rhs = vec![0.0f64; nx * ny];
+        Self::diffuse_with_buf(field, nx, ny, diff_rate, dt, dx, iterations, &mut rhs);
+    }
+
+    /// Diffuse using a caller-provided RHS buffer (avoids allocation).
+    #[allow(clippy::too_many_arguments)]
+    fn diffuse_with_buf(
+        field: &mut [f64],
+        nx: usize,
+        ny: usize,
+        diff_rate: f64,
+        dt: f64,
+        dx: f64,
+        iterations: usize,
+        rhs: &mut Vec<f64>,
+    ) {
         let _span = trace_span!("grid::diffuse", nx, ny, iterations).entered();
         debug_assert_eq!(field.len(), nx * ny, "field size must match nx*ny");
         let a = dt * diff_rate / (dx * dx);
         let inv_denom = 1.0 / (1.0 + 4.0 * a);
-        // Preserve original field as the RHS of the implicit equation
-        let x0: Vec<f64> = field.to_vec();
+        let n = nx * ny;
+        rhs.resize(n, 0.0);
+        rhs.copy_from_slice(field);
         for _ in 0..iterations {
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let idx = y * nx + x;
                     let neighbors =
                         field[idx - 1] + field[idx + 1] + field[idx - nx] + field[idx + nx];
-                    field[idx] = (x0[idx] + a * neighbors) * inv_denom;
+                    field[idx] = (rhs[idx] + a * neighbors) * inv_denom;
                 }
             }
         }
@@ -654,88 +685,53 @@ impl FluidGrid {
         let inv_dx = 1.0 / dx;
         let inv_2dx = 0.5 * inv_dx;
 
-        let mut scratch_a = vec![0.0f64; n];
-        let mut scratch_b = vec![0.0f64; n];
+        // Ensure scratch buffers are correct size (may be empty after deserialization)
+        self.scratch_a.resize(n, 0.0);
+        self.scratch_b.resize(n, 0.0);
+        self.scratch_c.resize(n, 0.0);
+        self.diffuse_rhs.resize(n, 0.0);
+        self.scratch_a.fill(0.0);
+        self.scratch_b.fill(0.0);
+
+        // Take scratch buffers out of self to avoid borrow conflicts with field slices
+        let mut sa = std::mem::take(&mut self.scratch_a);
+        let mut sb = std::mem::take(&mut self.scratch_b);
+        let mut sc = std::mem::take(&mut self.scratch_c);
+        let mut drhs = std::mem::take(&mut self.diffuse_rhs);
+        sa.resize(n, 0.0);
+        sb.resize(n, 0.0);
+        sc.resize(n, 0.0);
+        drhs.resize(n, 0.0);
+        sa.fill(0.0);
+        sb.fill(0.0);
 
         // 1. Advect velocity
         if config.use_maccormack && config.boundary != BoundaryCondition::Periodic {
-            let mut temp = vec![0.0f64; n];
+            sc.fill(0.0);
             Self::advect_maccormack(
-                &mut scratch_a,
-                &self.vx,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-                &mut temp,
+                &mut sa, &self.vx, &self.vx, &self.vy, nx, ny, dt, inv_dx, &mut sc,
             );
             Self::advect_maccormack(
-                &mut scratch_b,
-                &self.vy,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-                &mut temp,
+                &mut sb, &self.vy, &self.vx, &self.vy, nx, ny, dt, inv_dx, &mut sc,
             );
-            self.vx.copy_from_slice(&scratch_a);
-            self.vy.copy_from_slice(&scratch_b);
+            self.vx.copy_from_slice(&sa);
+            self.vy.copy_from_slice(&sb);
         } else if config.boundary == BoundaryCondition::Periodic {
-            Self::advect_periodic(
-                &mut scratch_a,
-                &self.vx,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-            );
-            Self::advect_periodic(
-                &mut scratch_b,
-                &self.vy,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-            );
-            self.vx.copy_from_slice(&scratch_a);
-            self.vy.copy_from_slice(&scratch_b);
+            Self::advect_periodic(&mut sa, &self.vx, &self.vx, &self.vy, nx, ny, dt, inv_dx);
+            Self::advect_periodic(&mut sb, &self.vy, &self.vx, &self.vy, nx, ny, dt, inv_dx);
+            self.vx.copy_from_slice(&sa);
+            self.vy.copy_from_slice(&sb);
         } else {
-            Self::advect(
-                &mut scratch_a,
-                &self.vx,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-            );
-            Self::advect(
-                &mut scratch_b,
-                &self.vy,
-                &self.vx,
-                &self.vy,
-                nx,
-                ny,
-                dt,
-                inv_dx,
-            );
-            self.vx.copy_from_slice(&scratch_a);
-            self.vy.copy_from_slice(&scratch_b);
+            Self::advect(&mut sa, &self.vx, &self.vx, &self.vy, nx, ny, dt, inv_dx);
+            Self::advect(&mut sb, &self.vy, &self.vx, &self.vy, nx, ny, dt, inv_dx);
+            self.vx.copy_from_slice(&sa);
+            self.vy.copy_from_slice(&sb);
         }
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
 
         // 2. Diffuse velocity
         if config.viscosity > 0.0 {
-            Self::diffuse(
+            Self::diffuse_with_buf(
                 &mut self.vx,
                 nx,
                 ny,
@@ -743,8 +739,9 @@ impl FluidGrid {
                 dt,
                 dx,
                 config.diffusion_iterations,
+                &mut drhs,
             );
-            Self::diffuse(
+            Self::diffuse_with_buf(
                 &mut self.vy,
                 nx,
                 ny,
@@ -752,6 +749,7 @@ impl FluidGrid {
                 dt,
                 dx,
                 config.diffusion_iterations,
+                &mut drhs,
             );
             Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
         }
@@ -765,8 +763,7 @@ impl FluidGrid {
         }
 
         if config.vorticity_confinement > 0.0 {
-            // Reuse scratch_a as vorticity buffer
-            scratch_a.fill(0.0);
+            sa.fill(0.0);
             Self::apply_vorticity_confinement(
                 &mut self.vx,
                 &mut self.vy,
@@ -775,26 +772,19 @@ impl FluidGrid {
                 dx,
                 dt,
                 config.vorticity_confinement,
-                &mut scratch_a,
+                &mut sa,
             );
         }
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
 
         // 4. Pressure projection
         {
-            scratch_a.fill(0.0);
-            Self::divergence(&mut scratch_a, &self.vx, &self.vy, nx, ny, inv_2dx);
-            // DST solver for wall boundaries (exact), GS for periodic
+            sa.fill(0.0);
+            Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, inv_2dx);
             if config.boundary == BoundaryCondition::Periodic {
-                Self::pressure_solve(
-                    &mut self.pressure,
-                    &scratch_a,
-                    nx,
-                    ny,
-                    config.pressure_iterations,
-                );
+                Self::pressure_solve(&mut self.pressure, &sa, nx, ny, config.pressure_iterations);
             } else {
-                Self::pressure_solve_dst(&mut self.pressure, &scratch_a, nx, ny);
+                Self::pressure_solve_dst(&mut self.pressure, &sa, nx, ny);
             }
             Self::project_velocity(&mut self.vx, &mut self.vy, &self.pressure, nx, ny, inv_2dx);
         }
@@ -802,9 +792,9 @@ impl FluidGrid {
 
         // 5. Advect density
         if config.use_maccormack && config.boundary != BoundaryCondition::Periodic {
-            let mut temp = vec![0.0f64; n];
+            sc.fill(0.0);
             Self::advect_maccormack(
-                &mut scratch_a,
+                &mut sa,
                 &self.density,
                 &self.vx,
                 &self.vy,
@@ -812,12 +802,12 @@ impl FluidGrid {
                 ny,
                 dt,
                 inv_dx,
-                &mut temp,
+                &mut sc,
             );
-            self.density.copy_from_slice(&scratch_a);
+            self.density.copy_from_slice(&sa);
         } else if config.boundary == BoundaryCondition::Periodic {
             Self::advect_periodic(
-                &mut scratch_a,
+                &mut sa,
                 &self.density,
                 &self.vx,
                 &self.vy,
@@ -826,10 +816,10 @@ impl FluidGrid {
                 dt,
                 inv_dx,
             );
-            self.density.copy_from_slice(&scratch_a);
+            self.density.copy_from_slice(&sa);
         } else {
             Self::advect(
-                &mut scratch_a,
+                &mut sa,
                 &self.density,
                 &self.vx,
                 &self.vy,
@@ -838,11 +828,17 @@ impl FluidGrid {
                 dt,
                 inv_dx,
             );
-            self.density.copy_from_slice(&scratch_a);
+            self.density.copy_from_slice(&sa);
         }
         if config.boundary != BoundaryCondition::Periodic {
             Self::enforce_scalar_boundary(&mut self.density, nx, ny);
         }
+
+        // Return scratch buffers to self
+        self.scratch_a = sa;
+        self.scratch_b = sb;
+        self.scratch_c = sc;
+        self.diffuse_rhs = drhs;
 
         Ok(())
     }
@@ -1268,5 +1264,55 @@ mod tests {
         // Sampling at (-0.5, 0) should wrap to right side
         let val = FluidGrid::sample_periodic(&field, nx, ny, -0.5, 0.0);
         assert!(val.is_finite());
+    }
+
+    #[test]
+    fn test_no_alloc_after_first_step() {
+        let mut g = FluidGrid::new(10, 10, 0.1).unwrap();
+        let config = GridConfig::smoke();
+        g.step(&config).unwrap();
+        let cap_a = g.scratch_a.capacity();
+        let cap_b = g.scratch_b.capacity();
+        g.step(&config).unwrap();
+        assert_eq!(g.scratch_a.capacity(), cap_a);
+        assert_eq!(g.scratch_b.capacity(), cap_b);
+    }
+
+    #[test]
+    fn test_grid_serde_preserves_state() {
+        let mut g = FluidGrid::new(8, 8, 0.1).unwrap();
+        let config = GridConfig::smoke();
+        let center = g.idx(4, 4);
+        g.density[center] = 1.0;
+        g.step(&config).unwrap();
+
+        let json = serde_json::to_string(&g).unwrap();
+        let mut g2: FluidGrid = serde_json::from_str(&json).unwrap();
+        // Scratch buffers are skipped but should be rebuilt on next step
+        g2.step(&config).unwrap();
+        assert!(g2.max_speed().is_finite());
+    }
+
+    #[test]
+    fn test_free_slip_tangential_preserved() {
+        let mut g = FluidGrid::new(8, 8, 0.1).unwrap();
+        // Set tangential velocity on left boundary
+        let i = g.idx(1, 4);
+        g.vy[i] = 1.0;
+        FluidGrid::enforce_boundary(
+            &mut g.vx,
+            &mut g.vy,
+            g.nx,
+            g.ny,
+            BoundaryCondition::FreeSlip,
+        );
+        // Left boundary: normal (vx) should be 0, tangential (vy) should be preserved
+        let l = g.idx(0, 4);
+        assert!(g.vx[l].abs() < 1e-10, "free-slip: normal vx should be 0");
+        assert!(
+            (g.vy[l] - 1.0).abs() < 1e-10,
+            "free-slip: tangential vy should be preserved: {}",
+            g.vy[l]
+        );
     }
 }
