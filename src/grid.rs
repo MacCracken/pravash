@@ -88,8 +88,9 @@ impl FluidGrid {
         self.vx
             .iter()
             .zip(self.vy.iter())
-            .map(|(&vx, &vy)| (vx * vx + vy * vy).sqrt())
+            .map(|(&vx, &vy)| vx * vx + vy * vy)
             .fold(0.0f64, f64::max)
+            .sqrt()
     }
 
     /// Total kinetic energy.
@@ -119,13 +120,14 @@ impl FluidGrid {
         let _span = trace_span!("grid::diffuse", nx, ny, iterations).entered();
         debug_assert_eq!(field.len(), nx * ny, "field size must match nx*ny");
         let a = dt * diff_rate * (nx as f64) * (ny as f64);
+        let inv_denom = 1.0 / (1.0 + 4.0 * a);
         for _ in 0..iterations {
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let idx = y * nx + x;
                     let neighbors =
                         field[idx - 1] + field[idx + 1] + field[idx - nx] + field[idx + nx];
-                    field[idx] = (field[idx] + a * neighbors) / (1.0 + 4.0 * a);
+                    field[idx] = (field[idx] + a * neighbors) * inv_denom;
                 }
             }
         }

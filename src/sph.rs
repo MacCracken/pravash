@@ -78,14 +78,10 @@ impl KernelCoeffs {
 #[inline]
 #[must_use]
 pub fn kernel_poly6(r: f64, h: f64) -> f64 {
-    if r > h || r < 0.0 {
+    if r < 0.0 {
         return 0.0;
     }
-    let h2 = h * h;
-    let r2 = r * r;
-    let diff = h2 - r2;
-    let coeff = 315.0 / (64.0 * PI * h.powi(9));
-    coeff * diff * diff * diff
+    KernelCoeffs::new(h).poly6(r * r)
 }
 
 /// Spiky kernel gradient magnitude — used for pressure forces.
@@ -94,12 +90,7 @@ pub fn kernel_poly6(r: f64, h: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn kernel_spiky_grad(r: f64, h: f64) -> f64 {
-    if r > h || r <= 0.0 {
-        return 0.0;
-    }
-    let diff = h - r;
-    let coeff = -45.0 / (PI * h.powi(6));
-    coeff * diff * diff
+    KernelCoeffs::new(h).spiky_grad(r)
 }
 
 /// Viscosity kernel Laplacian — used for viscosity forces.
@@ -108,28 +99,31 @@ pub fn kernel_spiky_grad(r: f64, h: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn kernel_viscosity_laplacian(r: f64, h: f64) -> f64 {
-    if r > h || r <= 0.0 {
-        return 0.0;
-    }
-    let coeff = 45.0 / (PI * h.powi(6));
-    coeff * (h - r)
+    KernelCoeffs::new(h).visc_laplacian(r)
 }
 
 // ── Density & Pressure ──────────────────────────────────────────────────────
 
-/// Compute density for a particle from its neighbors.
+/// Compute density for a single particle from all neighbors.
 ///
 /// ρᵢ = Σⱼ mⱼ · W(|rᵢ - rⱼ|, h)
 #[inline]
 #[must_use]
 pub fn compute_density(particle_idx: usize, particles: &[FluidParticle], h: f64) -> f64 {
-    let kc = KernelCoeffs::new(h);
-    let pi = &particles[particle_idx];
-    let h2 = kc.h2;
+    compute_density_inner(&particles[particle_idx], particles, &KernelCoeffs::new(h))
+}
+
+/// Inner density computation shared by public API and step().
+#[inline]
+fn compute_density_inner(
+    pi: &FluidParticle,
+    particles: &[FluidParticle],
+    kc: &KernelCoeffs,
+) -> f64 {
     let mut density = 0.0;
     for pj in particles {
         let r2 = pi.distance_squared_to(pj);
-        if r2 <= h2 {
+        if r2 <= kc.h2 {
             density += pj.mass * kc.poly6(r2);
         }
     }
@@ -155,7 +149,6 @@ pub fn equation_of_state(density: f64, rest_density: f64, gas_constant: f64) -> 
 pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) -> [f64; 3] {
     let kc = KernelCoeffs::new(h);
     let pi = &particles[particle_idx];
-    let h2 = kc.h2;
     let mut force = [0.0; 3];
 
     for (j, pj) in particles.iter().enumerate() {
@@ -163,7 +156,7 @@ pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) 
             continue;
         }
         let r2 = pi.distance_squared_to(pj);
-        if r2 > h2 || r2 < 1e-20 {
+        if r2 > kc.h2 || r2 < 1e-20 {
             continue;
         }
         let r = r2.sqrt();
@@ -192,7 +185,6 @@ pub fn viscosity_force(
 ) -> [f64; 3] {
     let kc = KernelCoeffs::new(h);
     let pi = &particles[particle_idx];
-    let h2 = kc.h2;
     let mut force = [0.0; 3];
 
     for (j, pj) in particles.iter().enumerate() {
@@ -200,7 +192,7 @@ pub fn viscosity_force(
             continue;
         }
         let r2 = pi.distance_squared_to(pj);
-        if r2 > h2 || r2 < 1e-20 {
+        if r2 > kc.h2 || r2 < 1e-20 {
             continue;
         }
         let r = r2.sqrt();
@@ -238,22 +230,12 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
 
     let kc = KernelCoeffs::new(h);
 
-    // 1. Compute densities using precomputed coefficients
+    // Compute densities and pressures
     {
         let _span = trace_span!("sph::density", n).entered();
-        let h2 = kc.h2;
-        // Compute densities into a temporary buffer to avoid aliasing
         let mut densities = vec![0.0f64; n];
         for i in 0..n {
-            let pi = &particles[i];
-            let mut d = 0.0;
-            for pj in particles.iter() {
-                let r2 = pi.distance_squared_to(pj);
-                if r2 <= h2 {
-                    d += pj.mass * kc.poly6(r2);
-                }
-            }
-            densities[i] = d;
+            densities[i] = compute_density_inner(&particles[i], particles, &kc);
         }
         for (i, p) in particles.iter_mut().enumerate() {
             p.density = densities[i];
@@ -261,13 +243,10 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         }
     }
 
-    // 2. Compute forces
-    // Snapshot only position/velocity/density/pressure/mass — needed for force computation.
-    // With Copy on FluidParticle, this is a memcpy.
+    // Compute forces (fused pressure + viscosity in single neighbor pass)
     let snapshot: Vec<FluidParticle> = particles.to_vec();
     {
         let _span = trace_span!("sph::forces", n).entered();
-        let h2 = kc.h2;
         for i in 0..n {
             let pi = &snapshot[i];
             let mut ax = config.gravity[0];
@@ -280,13 +259,12 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                     continue;
                 }
                 let r2 = pi.distance_squared_to(pj);
-                if r2 > h2 || r2 < 1e-20 {
+                if r2 > kc.h2 || r2 < 1e-20 {
                     continue;
                 }
                 let r = r2.sqrt();
                 let rho_j = pj.density.max(1e-10);
 
-                // Pressure force contribution
                 let pressure_term = (pi.pressure + pj.pressure) / (2.0 * rho_j);
                 let grad = kc.spiky_grad(r);
                 let p_scale = -pj.mass * pressure_term * grad / r;
@@ -299,7 +277,6 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 ay += (p_scale * dy) / rho;
                 az += (p_scale * dz) / rho;
 
-                // Viscosity force contribution
                 let lap = kc.visc_laplacian(r);
                 let v_scale = viscosity * pj.mass * lap / rho_j / rho;
 
@@ -308,23 +285,18 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 az += v_scale * (pj.velocity[2] - pi.velocity[2]);
             }
 
+            // NaN/Inf check folded into force loop
+            if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
+                return Err(PravashError::Diverged {
+                    reason: format!("NaN/Inf in acceleration at particle {i}").into(),
+                });
+            }
+
             particles[i].acceleration = [ax, ay, az];
         }
     }
 
-    // Check for NaN/Inf divergence
-    for (i, p) in particles.iter().enumerate() {
-        if !p.acceleration[0].is_finite()
-            || !p.acceleration[1].is_finite()
-            || !p.acceleration[2].is_finite()
-        {
-            return Err(PravashError::Diverged {
-                reason: format!("NaN/Inf in acceleration at particle {i}").into(),
-            });
-        }
-    }
-
-    // 3. Integrate (symplectic Euler)
+    // Integrate (symplectic Euler)
     let dt = config.dt;
     for p in particles.iter_mut() {
         p.velocity[0] += p.acceleration[0] * dt;
@@ -336,7 +308,7 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         p.position[2] += p.velocity[2] * dt;
     }
 
-    // 4. Boundary enforcement
+    // Boundary enforcement
     let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
     let damp = config.boundary_damping;
     let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
@@ -364,7 +336,11 @@ pub fn total_kinetic_energy(particles: &[FluidParticle]) -> f64 {
 /// Maximum particle speed (for CFL checks).
 #[must_use]
 pub fn max_speed(particles: &[FluidParticle]) -> f64 {
-    particles.iter().map(|p| p.speed()).fold(0.0f64, f64::max)
+    particles
+        .iter()
+        .map(|p| p.speed_squared())
+        .fold(0.0f64, f64::max)
+        .sqrt()
 }
 
 /// Create a block of particles in a grid pattern.
@@ -403,7 +379,7 @@ mod tests {
     #[test]
     fn test_kernel_poly6_at_boundary() {
         let w = kernel_poly6(1.0, 1.0);
-        assert!(w.abs() < EPS); // W(h, h) = 0
+        assert!(w.abs() < EPS);
     }
 
     #[test]
@@ -416,13 +392,13 @@ mod tests {
     fn test_kernel_poly6_decreasing() {
         let w1 = kernel_poly6(0.1, 1.0);
         let w2 = kernel_poly6(0.5, 1.0);
-        assert!(w1 > w2); // closer → stronger
+        assert!(w1 > w2);
     }
 
     #[test]
     fn test_kernel_spiky_grad() {
         let g = kernel_spiky_grad(0.5, 1.0);
-        assert!(g < 0.0); // negative gradient (repulsive)
+        assert!(g < 0.0);
     }
 
     #[test]
@@ -453,13 +429,13 @@ mod tests {
     fn test_compute_density_self() {
         let particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
         let d = compute_density(0, &particles, 1.0);
-        assert!(d > 0.0); // self-contribution
+        assert!(d > 0.0);
     }
 
     #[test]
     fn test_create_particle_block() {
         let particles = create_particle_block([0.0, 0.0], [0.1, 0.1], 0.05, 0.01);
-        assert_eq!(particles.len(), 4); // 2x2 grid
+        assert_eq!(particles.len(), 4);
     }
 
     #[test]
@@ -486,11 +462,9 @@ mod tests {
     #[test]
     fn test_step_single_particle_falls() {
         let mut particles = vec![FluidParticle::new_2d(0.5, 0.5, 0.01)];
-        // Set initial density to avoid division by zero
         particles[0].density = 1000.0;
         let config = FluidConfig::water_2d();
         step(&mut particles, &config, 0.001).unwrap();
-        // Particle should have moved downward due to gravity
         assert!(particles[0].velocity[1] < 0.0);
     }
 
@@ -500,7 +474,6 @@ mod tests {
         particles[0].density = 1000.0;
         let config = FluidConfig::water_2d();
         step(&mut particles, &config, 0.001).unwrap();
-        // Should be clamped to min_y = 0.0
         assert!(particles[0].position[1] >= 0.0);
     }
 
@@ -534,16 +507,5 @@ mod tests {
         assert!(kernel_poly6(-1.0, 1.0).abs() < EPS);
         assert!(kernel_spiky_grad(-1.0, 1.0).abs() < EPS);
         assert!(kernel_viscosity_laplacian(-1.0, 1.0).abs() < EPS);
-    }
-
-    #[test]
-    fn test_kernel_coeffs_match_standalone() {
-        let h = 0.5;
-        let r = 0.3;
-        let kc = KernelCoeffs::new(h);
-        let r2 = r * r;
-        assert!((kc.poly6(r2) - kernel_poly6(r, h)).abs() < 1e-6);
-        assert!((kc.spiky_grad(r) - kernel_spiky_grad(r, h)).abs() < 1e-6);
-        assert!((kc.visc_laplacian(r) - kernel_viscosity_laplacian(r, h)).abs() < 1e-6);
     }
 }

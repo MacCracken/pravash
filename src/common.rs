@@ -119,22 +119,26 @@ impl FluidParticle {
         Self::new([x, y, 0.0], mass)
     }
 
+    /// Squared speed (avoids sqrt, useful for comparisons).
+    #[inline]
+    #[must_use]
+    pub fn speed_squared(&self) -> f64 {
+        let v = &self.velocity;
+        v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+    }
+
     /// Speed (magnitude of velocity).
     #[inline]
     #[must_use]
     pub fn speed(&self) -> f64 {
-        let v = &self.velocity;
-        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+        self.speed_squared().sqrt()
     }
 
     /// Kinetic energy: 0.5 * m * v².
     #[inline]
     #[must_use]
     pub fn kinetic_energy(&self) -> f64 {
-        let v2 = self.velocity[0] * self.velocity[0]
-            + self.velocity[1] * self.velocity[1]
-            + self.velocity[2] * self.velocity[2];
-        0.5 * self.mass * v2
+        0.5 * self.mass * self.speed_squared()
     }
 
     /// Squared distance to another particle (avoids sqrt).

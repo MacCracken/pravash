@@ -80,6 +80,8 @@ impl ShallowWater {
     /// Add a circular disturbance (drop/splash).
     pub fn add_disturbance(&mut self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
         let _span = trace_span!("shallow::disturbance").entered();
+        let r2 = radius * radius;
+        let inv_radius = 1.0 / radius;
         for y in 0..self.ny {
             for x in 0..self.nx {
                 let px = x as f64 * self.dx;
@@ -87,10 +89,8 @@ impl ShallowWater {
                 let dx = px - cx;
                 let dy = py - cy;
                 let dist2 = dx * dx + dy * dy;
-                let r2 = radius * radius;
                 if dist2 < r2 {
-                    let dist = dist2.sqrt();
-                    let factor = 1.0 - dist / radius;
+                    let factor = 1.0 - dist2.sqrt() * inv_radius;
                     let idx = self.idx(x, y);
                     self.height[idx] += amplitude * factor * factor;
                 }
@@ -125,9 +125,6 @@ impl ShallowWater {
             }
         }
 
-        // Snapshot velocities into scratch buffers (no allocation after first step)
-        self.scratch_vx.resize(nx * ny, 0.0);
-        self.scratch_vy.resize(nx * ny, 0.0);
         self.scratch_vx.copy_from_slice(&self.vx);
         self.scratch_vy.copy_from_slice(&self.vy);
 
