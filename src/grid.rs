@@ -311,26 +311,18 @@ impl FluidGrid {
                 let i = y * nx + x;
                 let corrected = dst[i] + 0.5 * (src[i] - temp[i]);
 
-                // Clamp to min/max of original neighbors to prevent oscillation
+                // Clamp to min/max of original neighbors (loop bounds guarantee in-range)
                 let s = src[i];
                 let mut lo = s;
                 let mut hi = s;
-                if x > 0 {
-                    lo = lo.min(src[i - 1]);
-                    hi = hi.max(src[i - 1]);
-                }
-                if x < nx - 1 {
-                    lo = lo.min(src[i + 1]);
-                    hi = hi.max(src[i + 1]);
-                }
-                if y > 0 {
-                    lo = lo.min(src[i - nx]);
-                    hi = hi.max(src[i - nx]);
-                }
-                if y < ny - 1 {
-                    lo = lo.min(src[i + nx]);
-                    hi = hi.max(src[i + nx]);
-                }
+                lo = lo.min(src[i - 1]);
+                hi = hi.max(src[i - 1]);
+                lo = lo.min(src[i + 1]);
+                hi = hi.max(src[i + 1]);
+                lo = lo.min(src[i - nx]);
+                hi = hi.max(src[i - nx]);
+                lo = lo.min(src[i + nx]);
+                hi = hi.max(src[i + nx]);
 
                 dst[i] = corrected.clamp(lo, hi);
             }
@@ -514,22 +506,28 @@ impl FluidGrid {
                 }
             }
             BoundaryCondition::Periodic => {
-                // No explicit enforcement needed — periodic sampling handles wrapping.
-                // But ensure edge cells match their periodic counterparts.
                 for x in 0..nx {
-                    // Bottom row = top interior, top row = bottom interior
                     vx[x] = vx[(ny - 2) * nx + x];
                     vy[x] = vy[(ny - 2) * nx + x];
                     vx[(ny - 1) * nx + x] = vx[nx + x];
                     vy[(ny - 1) * nx + x] = vy[nx + x];
                 }
                 for y in 0..ny {
-                    // Left col = right interior, right col = left interior
                     vx[y * nx] = vx[y * nx + nx - 2];
                     vy[y * nx] = vy[y * nx + nx - 2];
                     vx[y * nx + nx - 1] = vx[y * nx + 1];
                     vy[y * nx + nx - 1] = vy[y * nx + 1];
                 }
+                // Fix corners: must be consistent diagonal periodic cell
+                let c = (ny - 2) * nx + nx - 2;
+                vx[0] = vx[c];
+                vy[0] = vy[c];
+                vx[nx - 1] = vx[(ny - 2) * nx + 1];
+                vy[nx - 1] = vy[(ny - 2) * nx + 1];
+                vx[(ny - 1) * nx] = vx[nx + nx - 2];
+                vy[(ny - 1) * nx] = vy[nx + nx - 2];
+                vx[(ny - 1) * nx + nx - 1] = vx[nx + 1];
+                vy[(ny - 1) * nx + nx - 1] = vy[nx + 1];
             }
         }
     }

@@ -259,6 +259,11 @@ pub struct SphSolver {
     neighbor_offsets: Vec<u32>,
     /// Surface tension coefficient (0.0 to disable).
     pub surface_tension: f64,
+    // PCISPH scratch buffers (persistent across steps)
+    pcisph_accel: Vec<[f64; 3]>,
+    pcisph_pressures: Vec<f64>,
+    pcisph_pred_pos: Vec<[f64; 3]>,
+    pcisph_pred_vel: Vec<[f64; 3]>,
 }
 
 impl SphSolver {
@@ -274,6 +279,10 @@ impl SphSolver {
             neighbor_indices: Vec::new(),
             neighbor_offsets: Vec::new(),
             surface_tension: 0.0,
+            pcisph_accel: Vec::new(),
+            pcisph_pressures: Vec::new(),
+            pcisph_pred_pos: Vec::new(),
+            pcisph_pred_vel: Vec::new(),
         }
     }
 
@@ -579,7 +588,10 @@ impl SphSolver {
         self.snapshot.copy_from_slice(particles);
 
         let st = self.surface_tension;
-        let mut non_pressure_accel = vec![[0.0f64; 3]; n];
+        // Take persistent buffers out of self to avoid borrow conflicts
+        let mut non_pressure_accel = std::mem::take(&mut self.pcisph_accel);
+        non_pressure_accel.resize(n, [0.0; 3]);
+        non_pressure_accel.fill([0.0; 3]);
 
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
@@ -680,9 +692,13 @@ impl SphSolver {
             }
         };
 
-        let mut pressures = vec![0.0f64; n];
-        let mut predicted_pos = vec![[0.0f64; 3]; n];
-        let mut predicted_vel = vec![[0.0f64; 3]; n];
+        let mut pressures = std::mem::take(&mut self.pcisph_pressures);
+        pressures.resize(n, 0.0);
+        pressures.fill(0.0);
+        let mut predicted_pos = std::mem::take(&mut self.pcisph_pred_pos);
+        predicted_pos.resize(n, [0.0; 3]);
+        let mut predicted_vel = std::mem::take(&mut self.pcisph_pred_vel);
+        predicted_vel.resize(n, [0.0; 3]);
 
         for iter in 0..max_iterations {
             let _span = trace_span!("sph::pcisph_iter", iter).entered();
@@ -783,6 +799,12 @@ impl SphSolver {
             }
         }
 
+        // Return persistent buffers to self
+        self.pcisph_accel = non_pressure_accel;
+        self.pcisph_pressures = pressures;
+        self.pcisph_pred_pos = predicted_pos;
+        self.pcisph_pred_vel = predicted_vel;
+
         Ok(())
     }
 
@@ -797,6 +819,15 @@ impl SphSolver {
         dt_min: f64,
         dt_max: f64,
     ) -> f64 {
+        if !smoothing_radius.is_finite()
+            || smoothing_radius <= 0.0
+            || !cfl_factor.is_finite()
+            || cfl_factor <= 0.0
+            || !dt_min.is_finite()
+            || !dt_max.is_finite()
+        {
+            return dt_max.max(dt_min);
+        }
         let max_v = max_speed(particles);
         if max_v < 1e-20 {
             return dt_max;
