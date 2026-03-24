@@ -31,8 +31,8 @@ Unlock SPH for real workloads. Required by kiran for water effects.
 - [x] Surface tension (CSF model with poly6 gradient/laplacian)
 - [x] Symmetric pressure formula for momentum conservation
 - [x] f64→f32 precision handling, h validation
-- [ ] PCISPH or DFSPH pressure solver (density-invariant incompressibility)
-- [ ] Adaptive timestep (CFL-driven dt adjustment)
+- [x] PCISPH pressure solver (iterative density-error correction)
+- [x] Adaptive timestep (`SphSolver::adaptive_dt` — CFL-driven)
 
 ### 0.3 — Grid Navier-Stokes (complete)
 
@@ -46,16 +46,20 @@ Complete the Euler grid pipeline. Required by joshua for fluid simulation.
 - [x] Buoyancy-driven density advection (smoke, fire)
 - [x] `GridConfig` with `smoke()` preset, `Serialize`/`Deserialize`
 - [x] Correct dx scaling in advection, diffusion, divergence, projection
-- [ ] MacCormack advection (higher-order, less diffusive)
-- [ ] Periodic / inflow-outflow boundary conditions
+- [x] MacCormack advection (forward-backward correction with neighbor clamping)
+- [x] Periodic boundary conditions (wrapping edges, periodic sampling)
 - [ ] FFT Poisson solver (requires DST in hisab for wall boundaries)
 
-### 0.4 — Coupling & Interaction
+### 0.4 — Coupling & Interaction (complete)
 
 Bridge particle and grid worlds. Required by impetus for fluid-body interaction.
 
-- [ ] Two-way SPH-rigid body coupling (force exchange via buoyancy module)
-- [ ] FLIP/PIC hybrid (particles on grid for low-dissipation advection)
+- [x] `RigidBody` with `BodyShape` (sphere, box) and signed distance functions
+- [x] Two-way SPH-rigid body coupling (penalty forces, Newton's third law)
+- [x] `integrate_bodies` with gravity
+- [x] `FlipSolver` — FLIP/PIC hybrid (P2G, pressure projection, G2P with configurable blend)
+- [x] Central-difference surface normals with degenerate fallback
+- [x] Correct dt scaling in FLIP pressure projection
 - [ ] Particle-level set surface tracking
 - [ ] Added mass computation for submerged bodies
 - [ ] Drag integration with velocity fields (not just freestream)

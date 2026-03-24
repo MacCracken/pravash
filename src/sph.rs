@@ -518,6 +518,255 @@ impl SphSolver {
 
         Ok(())
     }
+
+    /// Perform one PCISPH step (Predictive-Corrective Incompressible SPH).
+    ///
+    /// Iteratively corrects pressure to enforce near-constant density.
+    /// `max_iterations` controls convergence (typically 3-10).
+    /// `max_density_error` is the convergence threshold (e.g., 0.01 = 1%).
+    pub fn step_pcisph(
+        &mut self,
+        particles: &mut [FluidParticle],
+        config: &FluidConfig,
+        viscosity: f64,
+        max_iterations: usize,
+        max_density_error: f64,
+    ) -> Result<()> {
+        let _span = trace_span!("sph::pcisph", n = particles.len()).entered();
+        config.validate()?;
+        let h = config.smoothing_radius;
+        let n = particles.len();
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let h_f32 = h as f32;
+        if !h_f32.is_finite() || h_f32 <= 0.0 {
+            return Err(PravashError::InvalidSmoothingRadius { h });
+        }
+
+        let kc = KernelCoeffs::new(h);
+        let dt = config.dt;
+        let rest_density = config.rest_density;
+
+        // Build neighbors
+        {
+            let _span = trace_span!("sph::build_neighbors", n).entered();
+            self.build_neighbors(particles, h_f32);
+        }
+
+        // Compute densities
+        self.densities.resize(n, 0.0);
+        for i in 0..n {
+            let pi = &particles[i];
+            let mut d = 0.0;
+            for &j in self.neighbors(i) {
+                let r2 = pi.distance_squared_to(&particles[j]);
+                if r2 <= kc.h2 {
+                    d += particles[j].mass * kc.poly6(r2);
+                }
+            }
+            self.densities[i] = d;
+        }
+        for (i, p) in particles.iter_mut().enumerate() {
+            p.density = self.densities[i];
+            p.pressure = 0.0; // start with zero pressure
+        }
+
+        // Compute non-pressure accelerations (viscosity + gravity + surface tension)
+        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot.copy_from_slice(particles);
+
+        let st = self.surface_tension;
+        let mut non_pressure_accel = vec![[0.0f64; 3]; n];
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            let pi = &self.snapshot[i];
+            let mut ax = config.gravity[0];
+            let mut ay = config.gravity[1];
+            let mut az = config.gravity[2];
+            let rho = pi.density.max(1e-10);
+
+            let mut cn_x = 0.0;
+            let mut cn_y = 0.0;
+            let mut cn_z = 0.0;
+            let mut laplacian_color = 0.0;
+
+            for &j in self.neighbors(i) {
+                if j == i {
+                    continue;
+                }
+                let pj = &self.snapshot[j];
+                let r2 = pi.distance_squared_to(pj);
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let rho_j = pj.density.max(1e-10);
+
+                // Viscosity
+                let lap = kc.visc_laplacian(r);
+                let v_scale = viscosity * pj.mass * lap / rho_j / rho;
+                ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
+                ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
+                az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+
+                if st > 0.0 {
+                    let dx = pi.position[0] - pj.position[0];
+                    let dy = pi.position[1] - pj.position[1];
+                    let dz = pi.position[2] - pj.position[2];
+                    let mass_over_rho = pj.mass / rho_j;
+                    let pg = kc.poly6_grad_scalar(r2);
+                    cn_x += mass_over_rho * pg * dx;
+                    cn_y += mass_over_rho * pg * dy;
+                    cn_z += mass_over_rho * pg * dz;
+                    laplacian_color += mass_over_rho * kc.poly6_laplacian(r2);
+                }
+            }
+
+            if st > 0.0 {
+                let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
+                if cn_mag > 1e-6 / kc.h {
+                    let kappa = -laplacian_color / cn_mag;
+                    let st_scale = st * kappa / (rho * cn_mag);
+                    ax += st_scale * cn_x;
+                    ay += st_scale * cn_y;
+                    az += st_scale * cn_z;
+                }
+            }
+
+            non_pressure_accel[i] = [ax, ay, az];
+        }
+
+        // PCISPH pressure correction loop
+        // Precompute scaling factor: δ = -dt² * Σ(m_j * ∇W)² (approximated)
+        let scaling = -1.0 / (dt * dt * rest_density * rest_density);
+
+        let mut pressures = vec![0.0f64; n];
+        let mut predicted_pos = vec![[0.0f64; 3]; n];
+        let mut predicted_vel = vec![[0.0f64; 3]; n];
+
+        for iter in 0..max_iterations {
+            let _span = trace_span!("sph::pcisph_iter", iter).entered();
+
+            // Predict position/velocity with current pressure + non-pressure forces
+            for i in 0..n {
+                let pi = &self.snapshot[i];
+                let rho = pi.density.max(1e-10);
+
+                // Compute pressure acceleration from current pressures
+                let mut pax = 0.0;
+                let mut pay = 0.0;
+                let mut paz = 0.0;
+
+                for &j in self.neighbors(i) {
+                    if j == i {
+                        continue;
+                    }
+                    let pj = &self.snapshot[j];
+                    let r2 = pi.distance_squared_to(pj);
+                    if r2 > kc.h2 || r2 < 1e-20 {
+                        continue;
+                    }
+                    let r = r2.sqrt();
+                    let rho_j = pj.density.max(1e-10);
+
+                    let sym = pressures[i] / (rho * rho) + pressures[j] / (rho_j * rho_j);
+                    let grad = kc.spiky_grad(r);
+                    let s = -pj.mass * sym * grad / r;
+
+                    pax += s * (pi.position[0] - pj.position[0]);
+                    pay += s * (pi.position[1] - pj.position[1]);
+                    paz += s * (pi.position[2] - pj.position[2]);
+                }
+
+                let total_ax = non_pressure_accel[i][0] + pax;
+                let total_ay = non_pressure_accel[i][1] + pay;
+                let total_az = non_pressure_accel[i][2] + paz;
+
+                predicted_vel[i] = [
+                    pi.velocity[0] + total_ax * dt,
+                    pi.velocity[1] + total_ay * dt,
+                    pi.velocity[2] + total_az * dt,
+                ];
+                predicted_pos[i] = [
+                    pi.position[0] + predicted_vel[i][0] * dt,
+                    pi.position[1] + predicted_vel[i][1] * dt,
+                    pi.position[2] + predicted_vel[i][2] * dt,
+                ];
+            }
+
+            // Compute predicted density and density error
+            let mut max_error = 0.0f64;
+            for i in 0..n {
+                let mut pred_density = 0.0;
+                for &j in self.neighbors(i) {
+                    let dx = predicted_pos[i][0] - predicted_pos[j][0];
+                    let dy = predicted_pos[i][1] - predicted_pos[j][1];
+                    let dz = predicted_pos[i][2] - predicted_pos[j][2];
+                    let r2 = dx * dx + dy * dy + dz * dz;
+                    if r2 <= kc.h2 {
+                        pred_density += self.snapshot[j].mass * kc.poly6(r2);
+                    }
+                }
+
+                let density_error = pred_density - rest_density;
+                max_error = max_error.max(density_error.abs() / rest_density);
+
+                // Update pressure: p += δ * (ρ_predicted - ρ_0)
+                pressures[i] += (density_error * scaling).max(0.0);
+            }
+
+            if max_error < max_density_error {
+                break;
+            }
+        }
+
+        // Apply final velocities and positions
+        for i in 0..n {
+            particles[i].velocity = predicted_vel[i];
+            particles[i].position = predicted_pos[i];
+            particles[i].pressure = pressures[i];
+        }
+
+        // Boundary enforcement
+        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let damp = config.boundary_damping;
+        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
+        for p in particles.iter_mut() {
+            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
+                if p.position[dim] < lo {
+                    p.position[dim] = lo;
+                    p.velocity[dim] *= -damp;
+                } else if p.position[dim] > hi && hi > lo {
+                    p.position[dim] = hi;
+                    p.velocity[dim] *= -damp;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compute CFL-limited timestep: dt = cfl_factor * h / max_velocity.
+    ///
+    /// Returns the computed dt clamped to `[dt_min, dt_max]`.
+    #[must_use]
+    pub fn adaptive_dt(
+        particles: &[FluidParticle],
+        smoothing_radius: f64,
+        cfl_factor: f64,
+        dt_min: f64,
+        dt_max: f64,
+    ) -> f64 {
+        let max_v = max_speed(particles);
+        if max_v < 1e-20 {
+            return dt_max;
+        }
+        (cfl_factor * smoothing_radius / max_v).clamp(dt_min, dt_max)
+    }
 }
 
 impl Default for SphSolver {
@@ -923,5 +1172,69 @@ mod tests {
         assert!(kc.poly6(1.1).abs() < EPS);
         assert!(kc.poly6_grad_scalar(1.1).abs() < EPS);
         assert!(kc.poly6_laplacian(1.1).abs() < EPS);
+    }
+
+    // ── PCISPH tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pcisph_empty() {
+        let mut particles = vec![];
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        assert!(
+            solver
+                .step_pcisph(&mut particles, &config, 0.001, 5, 0.01)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_pcisph_single_particle_falls() {
+        let mut particles = vec![FluidParticle::new_2d(0.5, 0.5, 0.01)];
+        particles[0].density = 1000.0;
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver
+            .step_pcisph(&mut particles, &config, 0.001, 5, 0.01)
+            .unwrap();
+        assert!(particles[0].velocity[1] < 0.0);
+    }
+
+    #[test]
+    fn test_pcisph_density_bounded() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+
+        for _ in 0..20 {
+            solver
+                .step_pcisph(&mut particles, &config, 0.001, 5, 0.01)
+                .unwrap();
+        }
+        // All densities should be finite and positive
+        for p in &particles {
+            assert!(p.density.is_finite() && p.density >= 0.0);
+            assert!(p.position[0].is_finite());
+        }
+    }
+
+    // ── Adaptive dt tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_adaptive_dt_stationary() {
+        let particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
+        // Stationary particles → max dt
+        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.4, 0.0001, 0.01);
+        assert!((dt - 0.01).abs() < EPS);
+    }
+
+    #[test]
+    fn test_adaptive_dt_fast_particles() {
+        let mut particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
+        particles[0].velocity = [100.0, 0.0, 0.0];
+        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.4, 0.0001, 0.01);
+        // dt = 0.4 * 0.05 / 100 = 0.0002
+        assert!(dt < 0.001);
+        assert!(dt >= 0.0001);
     }
 }

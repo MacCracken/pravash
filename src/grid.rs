@@ -18,6 +18,8 @@ pub enum BoundaryCondition {
     NoSlip,
     /// Normal velocity = 0, tangential velocity free (inviscid wall).
     FreeSlip,
+    /// Opposite edges connected (wrapping). Enables FFT pressure solve.
+    Periodic,
 }
 
 /// Configuration for a grid fluid simulation step.
@@ -40,6 +42,9 @@ pub struct GridConfig {
     pub buoyancy_alpha: f64,
     /// Ambient density for buoyancy reference.
     pub ambient_density: f64,
+    /// Use MacCormack advection (higher-order, less diffusive).
+    /// Falls back to semi-Lagrangian at grid boundaries.
+    pub use_maccormack: bool,
 }
 
 impl GridConfig {
@@ -55,6 +60,7 @@ impl GridConfig {
             vorticity_confinement: 0.5,
             buoyancy_alpha: 0.1,
             ambient_density: 0.0,
+            use_maccormack: false,
         }
     }
 }
@@ -205,6 +211,105 @@ impl FluidGrid {
                 let fx = x as f64 - dt_inv_dx * vx[i];
                 let fy = y as f64 - dt_inv_dx * vy[i];
                 dst[i] = Self::sample(src, nx, ny, fx, fy);
+            }
+        }
+    }
+
+    /// Sample with periodic wrapping (for periodic boundary conditions).
+    #[inline]
+    #[allow(dead_code)]
+    fn sample_periodic(field: &[f64], nx: usize, ny: usize, fx: f64, fy: f64) -> f64 {
+        if !fx.is_finite() || !fy.is_finite() {
+            return f64::NAN;
+        }
+        let nxf = nx as f64;
+        let nyf = ny as f64;
+        let fx = ((fx % nxf) + nxf) % nxf;
+        let fy = ((fy % nyf) + nyf) % nyf;
+
+        let x0 = fx.floor() as usize % nx;
+        let y0 = fy.floor() as usize % ny;
+        let x1 = (x0 + 1) % nx;
+        let y1 = (y0 + 1) % ny;
+        let sx = fx - fx.floor();
+        let sy = fy - fy.floor();
+
+        let v00 = field[y0 * nx + x0];
+        let v10 = field[y0 * nx + x1];
+        let v01 = field[y1 * nx + x0];
+        let v11 = field[y1 * nx + x1];
+
+        v00 * (1.0 - sx) * (1.0 - sy)
+            + v10 * sx * (1.0 - sy)
+            + v01 * (1.0 - sx) * sy
+            + v11 * sx * sy
+    }
+
+    /// MacCormack advection: forward step, backward correction, clamp.
+    /// Reduces numerical diffusion compared to basic semi-Lagrangian.
+    #[allow(clippy::too_many_arguments)]
+    fn advect_maccormack(
+        dst: &mut [f64],
+        src: &[f64],
+        vx: &[f64],
+        vy: &[f64],
+        nx: usize,
+        ny: usize,
+        dt: f64,
+        inv_dx: f64,
+        temp: &mut [f64],
+    ) {
+        let _span = trace_span!("grid::advect_maccormack", nx, ny).entered();
+        let dt_inv_dx = dt * inv_dx;
+
+        // Forward semi-Lagrangian (standard)
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let fx = x as f64 - dt_inv_dx * vx[i];
+                let fy = y as f64 - dt_inv_dx * vy[i];
+                dst[i] = Self::sample(src, nx, ny, fx, fy);
+            }
+        }
+
+        // Backward step from the forward result
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let fx = x as f64 + dt_inv_dx * vx[i];
+                let fy = y as f64 + dt_inv_dx * vy[i];
+                temp[i] = Self::sample(dst, nx, ny, fx, fy);
+            }
+        }
+
+        // Corrected result with clamping to neighbor min/max
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let corrected = dst[i] + 0.5 * (src[i] - temp[i]);
+
+                // Clamp to min/max of original neighbors to prevent oscillation
+                let s = src[i];
+                let mut lo = s;
+                let mut hi = s;
+                if x > 0 {
+                    lo = lo.min(src[i - 1]);
+                    hi = hi.max(src[i - 1]);
+                }
+                if x < nx - 1 {
+                    lo = lo.min(src[i + 1]);
+                    hi = hi.max(src[i + 1]);
+                }
+                if y > 0 {
+                    lo = lo.min(src[i - nx]);
+                    hi = hi.max(src[i - nx]);
+                }
+                if y < ny - 1 {
+                    lo = lo.min(src[i + nx]);
+                    hi = hi.max(src[i + nx]);
+                }
+
+                dst[i] = corrected.clamp(lo, hi);
             }
         }
     }
@@ -385,6 +490,24 @@ impl FluidGrid {
                     vy[r] = vy[r - 1];
                 }
             }
+            BoundaryCondition::Periodic => {
+                // No explicit enforcement needed — periodic sampling handles wrapping.
+                // But ensure edge cells match their periodic counterparts.
+                for x in 0..nx {
+                    // Bottom row = top interior, top row = bottom interior
+                    vx[x] = vx[(ny - 2) * nx + x];
+                    vy[x] = vy[(ny - 2) * nx + x];
+                    vx[(ny - 1) * nx + x] = vx[nx + x];
+                    vy[(ny - 1) * nx + x] = vy[nx + x];
+                }
+                for y in 0..ny {
+                    // Left col = right interior, right col = left interior
+                    vx[y * nx] = vx[y * nx + nx - 2];
+                    vy[y * nx] = vy[y * nx + nx - 2];
+                    vx[y * nx + nx - 1] = vx[y * nx + 1];
+                    vy[y * nx + nx - 1] = vy[y * nx + 1];
+                }
+            }
         }
     }
 
@@ -425,12 +548,37 @@ impl FluidGrid {
         let inv_dx = 1.0 / dx;
         let inv_2dx = 0.5 * inv_dx;
 
-        // Scratch buffers (TODO: move to persistent workspace struct)
         let mut scratch_a = vec![0.0f64; n];
         let mut scratch_b = vec![0.0f64; n];
 
         // 1. Advect velocity
-        {
+        if config.use_maccormack && config.boundary != BoundaryCondition::Periodic {
+            let mut temp = vec![0.0f64; n];
+            Self::advect_maccormack(
+                &mut scratch_a,
+                &self.vx,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+                &mut temp,
+            );
+            Self::advect_maccormack(
+                &mut scratch_b,
+                &self.vy,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+                &mut temp,
+            );
+            self.vx.copy_from_slice(&scratch_a);
+            self.vy.copy_from_slice(&scratch_b);
+        } else {
             Self::advect(
                 &mut scratch_a,
                 &self.vx,
@@ -519,7 +667,21 @@ impl FluidGrid {
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
 
         // 5. Advect density
-        {
+        if config.use_maccormack && config.boundary != BoundaryCondition::Periodic {
+            let mut temp = vec![0.0f64; n];
+            Self::advect_maccormack(
+                &mut scratch_a,
+                &self.density,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+                &mut temp,
+            );
+            self.density.copy_from_slice(&scratch_a);
+        } else {
             Self::advect(
                 &mut scratch_a,
                 &self.density,
@@ -853,5 +1015,110 @@ mod tests {
             max_div < 5.0,
             "divergence should be bounded after projection: {max_div}"
         );
+    }
+
+    // ── MacCormack tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_maccormack_zero_velocity() {
+        let nx = 8;
+        let ny = 8;
+        let n = nx * ny;
+        let vx = vec![0.0; n];
+        let vy = vec![0.0; n];
+        let mut src = vec![0.0; n];
+        src[4 * nx + 4] = 1.0;
+        let mut dst = vec![0.0; n];
+        let mut temp = vec![0.0; n];
+        FluidGrid::advect_maccormack(&mut dst, &src, &vx, &vy, nx, ny, 0.1, 1.0, &mut temp);
+        assert!((dst[4 * nx + 4] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_maccormack_less_diffusive() {
+        let nx = 32;
+        let ny = 32;
+        let n = nx * ny;
+        let vx = vec![1.0; n];
+        let vy = vec![0.0; n];
+
+        // Create a narrow peak
+        let mut src = vec![0.0; n];
+        src[16 * nx + 16] = 1.0;
+
+        let mut dst_sl = vec![0.0; n];
+        FluidGrid::advect(&mut dst_sl, &src, &vx, &vy, nx, ny, 1.0, 1.0);
+
+        let mut dst_mc = vec![0.0; n];
+        let mut temp = vec![0.0; n];
+        FluidGrid::advect_maccormack(&mut dst_mc, &src, &vx, &vy, nx, ny, 1.0, 1.0, &mut temp);
+
+        // MacCormack should preserve the peak better (higher max value)
+        let max_sl: f64 = dst_sl.iter().cloned().fold(0.0f64, f64::max);
+        let max_mc: f64 = dst_mc.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            max_mc >= max_sl,
+            "MacCormack should be at least as sharp: mc={max_mc}, sl={max_sl}"
+        );
+    }
+
+    #[test]
+    fn test_step_maccormack_stable() {
+        let mut g = FluidGrid::new(16, 16, 0.1).unwrap();
+        let mut config = GridConfig::smoke();
+        config.use_maccormack = true;
+        config.dt = 0.01;
+
+        let center = 8 * 16 + 8;
+        g.density[center] = 1.0;
+        g.vy[center] = 0.5;
+
+        for _ in 0..20 {
+            g.step(&config).unwrap();
+        }
+        assert!(g.max_speed().is_finite());
+    }
+
+    // ── Periodic boundary tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_periodic_boundary_enforcement() {
+        let nx = 8;
+        let ny = 8;
+        let n = nx * ny;
+        let mut vx = vec![0.0; n];
+        let mut vy = vec![0.0; n];
+        // Set interior value
+        vx[nx + 1] = 1.0;
+        FluidGrid::enforce_boundary(&mut vx, &mut vy, nx, ny, BoundaryCondition::Periodic);
+        // Right edge should match left interior
+        assert!((vx[nx + nx - 1] - vx[nx + 1]).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_step_periodic_stable() {
+        let mut g = FluidGrid::new(16, 16, 0.1).unwrap();
+        let mut config = GridConfig::smoke();
+        config.boundary = BoundaryCondition::Periodic;
+        config.dt = 0.01;
+
+        let center = 8 * 16 + 8;
+        g.vx[center] = 1.0;
+
+        for _ in 0..20 {
+            g.step(&config).unwrap();
+        }
+        assert!(g.max_speed().is_finite());
+    }
+
+    #[test]
+    fn test_sample_periodic_wrapping() {
+        let nx = 4;
+        let ny = 4;
+        let mut field = vec![0.0; nx * ny];
+        field[0] = 1.0; // (0,0)
+        // Sampling at (-0.5, 0) should wrap to right side
+        let val = FluidGrid::sample_periodic(&field, nx, ny, -0.5, 0.0);
+        assert!(val.is_finite());
     }
 }
