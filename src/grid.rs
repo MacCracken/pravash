@@ -215,9 +215,32 @@ impl FluidGrid {
         }
     }
 
+    /// Semi-Lagrangian advection with periodic wrapping.
+    #[allow(clippy::too_many_arguments)]
+    fn advect_periodic(
+        dst: &mut [f64],
+        src: &[f64],
+        vx: &[f64],
+        vy: &[f64],
+        nx: usize,
+        ny: usize,
+        dt: f64,
+        inv_dx: f64,
+    ) {
+        let _span = trace_span!("grid::advect_periodic", nx, ny).entered();
+        let dt_inv_dx = dt * inv_dx;
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = y * nx + x;
+                let fx = x as f64 - dt_inv_dx * vx[i];
+                let fy = y as f64 - dt_inv_dx * vy[i];
+                dst[i] = Self::sample_periodic(src, nx, ny, fx, fy);
+            }
+        }
+    }
+
     /// Sample with periodic wrapping (for periodic boundary conditions).
     #[inline]
-    #[allow(dead_code)]
     fn sample_periodic(field: &[f64], nx: usize, ny: usize, fx: f64, fy: f64) -> f64 {
         if !fx.is_finite() || !fy.is_finite() {
             return f64::NAN;
@@ -578,6 +601,29 @@ impl FluidGrid {
             );
             self.vx.copy_from_slice(&scratch_a);
             self.vy.copy_from_slice(&scratch_b);
+        } else if config.boundary == BoundaryCondition::Periodic {
+            Self::advect_periodic(
+                &mut scratch_a,
+                &self.vx,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+            );
+            Self::advect_periodic(
+                &mut scratch_b,
+                &self.vy,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+            );
+            self.vx.copy_from_slice(&scratch_a);
+            self.vy.copy_from_slice(&scratch_b);
         } else {
             Self::advect(
                 &mut scratch_a,
@@ -681,6 +727,18 @@ impl FluidGrid {
                 &mut temp,
             );
             self.density.copy_from_slice(&scratch_a);
+        } else if config.boundary == BoundaryCondition::Periodic {
+            Self::advect_periodic(
+                &mut scratch_a,
+                &self.density,
+                &self.vx,
+                &self.vy,
+                nx,
+                ny,
+                dt,
+                inv_dx,
+            );
+            self.density.copy_from_slice(&scratch_a);
         } else {
             Self::advect(
                 &mut scratch_a,
@@ -694,7 +752,9 @@ impl FluidGrid {
             );
             self.density.copy_from_slice(&scratch_a);
         }
-        Self::enforce_scalar_boundary(&mut self.density, nx, ny);
+        if config.boundary != BoundaryCondition::Periodic {
+            Self::enforce_scalar_boundary(&mut self.density, nx, ny);
+        }
 
         Ok(())
     }

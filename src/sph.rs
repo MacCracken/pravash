@@ -641,8 +641,44 @@ impl SphSolver {
         }
 
         // PCISPH pressure correction loop
-        // Precompute scaling factor: δ = -dt² * Σ(m_j * ∇W)² (approximated)
-        let scaling = -1.0 / (dt * dt * rest_density * rest_density);
+        // Precompute scaling factor δ from kernel gradient sums (Solenthaler 2009).
+        // Use a representative particle (particle 0) to estimate the scaling.
+        let delta = {
+            let pi = &self.snapshot[0];
+            let mut sum_grad = [0.0f64; 3];
+            let mut sum_grad_sq = 0.0f64;
+            for &j in self.neighbors(0) {
+                if j == 0 {
+                    continue;
+                }
+                let pj = &self.snapshot[j];
+                let r2 = pi.distance_squared_to(pj);
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let grad = kc.spiky_grad(r);
+                let grad_w = [
+                    grad / r * (pi.position[0] - pj.position[0]),
+                    grad / r * (pi.position[1] - pj.position[1]),
+                    grad / r * (pi.position[2] - pj.position[2]),
+                ];
+                sum_grad[0] += grad_w[0];
+                sum_grad[1] += grad_w[1];
+                sum_grad[2] += grad_w[2];
+                sum_grad_sq +=
+                    grad_w[0] * grad_w[0] + grad_w[1] * grad_w[1] + grad_w[2] * grad_w[2];
+            }
+            let sum_dot =
+                sum_grad[0] * sum_grad[0] + sum_grad[1] * sum_grad[1] + sum_grad[2] * sum_grad[2];
+            let beta = 2.0 * (dt * self.snapshot[0].mass / rest_density).powi(2);
+            let denom = beta * (sum_dot + sum_grad_sq);
+            if denom.abs() < 1e-20 {
+                0.0 // degenerate (single particle or no neighbors)
+            } else {
+                1.0 / denom
+            }
+        };
 
         let mut pressures = vec![0.0f64; n];
         let mut predicted_pos = vec![[0.0f64; 3]; n];
@@ -715,8 +751,8 @@ impl SphSolver {
                 let density_error = pred_density - rest_density;
                 max_error = max_error.max(density_error.abs() / rest_density);
 
-                // Update pressure: p += δ * (ρ_predicted - ρ_0)
-                pressures[i] += (density_error * scaling).max(0.0);
+                // Update pressure: p = max(0, p + δ * density_error)
+                pressures[i] = (pressures[i] + density_error * delta).max(0.0);
             }
 
             if max_error < max_density_error {
