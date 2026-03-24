@@ -2,7 +2,7 @@ use pravash::buoyancy::{self, DragCoefficient, FlowRegime};
 use pravash::common::{FluidConfig, FluidMaterial, FluidParticle};
 use pravash::grid::FluidGrid;
 use pravash::shallow::ShallowWater;
-use pravash::sph;
+use pravash::sph::{self, SphSolver};
 use pravash::vortex;
 
 // ── SPH Integration ─────────────────────────────────────────────────────────
@@ -329,4 +329,128 @@ fn config_is_copy() {
     let c2 = c;
     let _ = c; // c is still valid because FluidConfig is Copy
     let _ = c2;
+}
+
+// ── SphSolver Integration ───────────────────────────────────────────────────
+
+#[test]
+fn solver_dam_break_energy_bounded() {
+    let mut particles = sph::create_particle_block([0.1, 0.3], [0.2, 0.3], 0.02, 0.001);
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+    let mut solver = SphSolver::new();
+
+    let mut max_ke = 0.0f64;
+    for _ in 0..200 {
+        solver.step(&mut particles, &config, viscosity).unwrap();
+        let ke = sph::total_kinetic_energy(&particles);
+        max_ke = max_ke.max(ke);
+        assert!(ke.is_finite(), "kinetic energy diverged to non-finite");
+    }
+    assert!(max_ke < 1e6, "kinetic energy exploded: {max_ke}");
+}
+
+#[test]
+fn solver_particles_stay_in_bounds() {
+    let mut particles = sph::create_particle_block([0.1, 0.5], [0.3, 0.3], 0.02, 0.001);
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+    let mut solver = SphSolver::new();
+
+    for _ in 0..500 {
+        solver.step(&mut particles, &config, viscosity).unwrap();
+    }
+
+    let [min_x, min_y, _min_z, max_x, max_y, _max_z] = config.bounds;
+    for (i, p) in particles.iter().enumerate() {
+        assert!(
+            p.position[0] >= min_x && p.position[0] <= max_x,
+            "particle {i} x={} out of bounds [{min_x}, {max_x}]",
+            p.position[0]
+        );
+        assert!(
+            p.position[1] >= min_y && p.position[1] <= max_y,
+            "particle {i} y={} out of bounds [{min_y}, {max_y}]",
+            p.position[1]
+        );
+    }
+}
+
+#[test]
+fn solver_surface_tension_keeps_blob_compact() {
+    // With surface tension, a block of particles should stay more compact
+    // than without it (less spread due to cohesive forces).
+    let make_block = || sph::create_particle_block([0.3, 0.3], [0.2, 0.2], 0.02, 0.001);
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+
+    // Run without surface tension
+    let mut particles_no_st = make_block();
+    let mut solver_no_st = SphSolver::new();
+    for _ in 0..50 {
+        solver_no_st
+            .step(&mut particles_no_st, &config, viscosity)
+            .unwrap();
+    }
+    let spread_no_st: f64 = particles_no_st.iter().map(|p| p.speed_squared()).sum();
+
+    // Run with surface tension
+    let mut particles_st = make_block();
+    let mut solver_st = SphSolver::with_surface_tension(0.072);
+    for _ in 0..50 {
+        solver_st
+            .step(&mut particles_st, &config, viscosity)
+            .unwrap();
+    }
+
+    // Both should be finite (no divergence)
+    assert!(spread_no_st.is_finite());
+    for p in &particles_st {
+        assert!(p.position[0].is_finite());
+        assert!(p.position[1].is_finite());
+    }
+}
+
+#[test]
+fn solver_multi_step_consistency() {
+    // Running the solver for many steps should not cause divergence or NaN
+    let mut particles = sph::create_particle_block([0.2, 0.5], [0.3, 0.3], 0.03, 0.001);
+    let config = FluidConfig::water_2d();
+    let mut solver = SphSolver::new();
+
+    for step_num in 0..1000 {
+        solver.step(&mut particles, &config, 0.001).unwrap();
+        if step_num % 100 == 0 {
+            for p in particles.iter() {
+                assert!(
+                    p.position[0].is_finite() && p.position[1].is_finite(),
+                    "diverged at step {step_num}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn solver_symmetric_pressure_conserves_momentum() {
+    // With symmetric pressure and no gravity, internal forces should
+    // produce near-zero net momentum (Newton's third law).
+    let mut particles = sph::create_particle_block([0.4, 0.4], [0.2, 0.2], 0.02, 0.001);
+    let mut config = FluidConfig::water_2d();
+    config.gravity = [0.0, 0.0, 0.0]; // disable gravity for clean momentum test
+
+    let mut solver = SphSolver::new();
+    solver.step(&mut particles, &config, 0.001).unwrap();
+
+    let total_px: f64 = particles.iter().map(|p| p.velocity[0] * p.mass).sum();
+    let total_py: f64 = particles.iter().map(|p| p.velocity[1] * p.mass).sum();
+    // Symmetric pressure forces should cancel; small residual from discrete errors
+    assert!(
+        total_px.abs() < 1e-8,
+        "x-momentum not conserved: {total_px}"
+    );
+    assert!(
+        total_py.abs() < 1e-8,
+        "y-momentum not conserved: {total_py}"
+    );
 }

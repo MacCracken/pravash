@@ -253,6 +253,7 @@ pub struct SphSolver {
     cell_size: f32,
     densities: Vec<f64>,
     snapshot: Vec<FluidParticle>,
+    positions_f32: Vec<Vec3>,
     /// Cached neighbor indices per particle (flat buffer + offsets).
     neighbor_indices: Vec<usize>,
     neighbor_offsets: Vec<u32>,
@@ -269,6 +270,7 @@ impl SphSolver {
             cell_size: 1.0,
             densities: Vec::new(),
             snapshot: Vec::new(),
+            positions_f32: Vec::new(),
             neighbor_indices: Vec::new(),
             neighbor_offsets: Vec::new(),
             surface_tension: 0.0,
@@ -284,8 +286,11 @@ impl SphSolver {
     }
 
     /// Build spatial hash and cache neighbor lists for all particles.
-    fn build_neighbors(&mut self, particles: &[FluidParticle], h_f32: f32, query_radius: f32) {
+    /// Uses `query_cell` per neighbor cell (zero-alloc) instead of `query_radius`.
+    fn build_neighbors(&mut self, particles: &[FluidParticle], h_f32: f32) {
         let n = particles.len();
+        let inv_cs = 1.0 / h_f32;
+        let half_cs = h_f32 * 0.5;
 
         // Rebuild grid: clear retains HashMap capacity
         if (self.cell_size - h_f32).abs() > f32::EPSILON {
@@ -294,31 +299,46 @@ impl SphSolver {
         } else {
             self.grid.clear();
         }
+
+        // Cache f32 positions and insert into grid in one pass
+        self.positions_f32.clear();
+        self.positions_f32.reserve(n);
         for (i, p) in particles.iter().enumerate() {
-            self.grid.insert(
-                Vec3::new(
-                    p.position[0] as f32,
-                    p.position[1] as f32,
-                    p.position[2] as f32,
-                ),
-                i,
-            );
-        }
-
-        // Build neighbor cache: flat buffer + offset table
-        self.neighbor_indices.clear();
-        self.neighbor_offsets.clear();
-        self.neighbor_offsets.reserve(n + 1);
-        self.neighbor_offsets.push(0);
-
-        for p in particles {
             let pos = Vec3::new(
                 p.position[0] as f32,
                 p.position[1] as f32,
                 p.position[2] as f32,
             );
-            let candidates = self.grid.query_radius(pos, query_radius);
-            self.neighbor_indices.extend_from_slice(&candidates);
+            self.positions_f32.push(pos);
+            self.grid.insert(pos, i);
+        }
+
+        // Build neighbor cache using query_cell (zero allocation per particle).
+        // For cell_size = h, we check the 3x3x3 cube of cells around each particle.
+        self.neighbor_indices.clear();
+        self.neighbor_offsets.clear();
+        self.neighbor_offsets.reserve(n + 1);
+        self.neighbor_offsets.push(0);
+
+        for pos in &self.positions_f32 {
+            let cx = (pos.x * inv_cs).floor() as i32;
+            let cy = (pos.y * inv_cs).floor() as i32;
+            let cz = (pos.z * inv_cs).floor() as i32;
+
+            for dz in -1..=1i32 {
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
+                        // Construct a point that lands in the target cell
+                        let probe = Vec3::new(
+                            (cx + dx) as f32 * h_f32 + half_cs,
+                            (cy + dy) as f32 * h_f32 + half_cs,
+                            (cz + dz) as f32 * h_f32 + half_cs,
+                        );
+                        let cell = self.grid.query_cell(probe);
+                        self.neighbor_indices.extend_from_slice(cell);
+                    }
+                }
+            }
             self.neighbor_offsets
                 .push(self.neighbor_indices.len() as u32);
         }
@@ -352,15 +372,13 @@ impl SphSolver {
         if !h_f32.is_finite() || h_f32 <= 0.0 {
             return Err(PravashError::InvalidSmoothingRadius { h });
         }
-        // Add small epsilon to query radius to compensate for f64→f32 rounding
-        let query_radius = h_f32 + h_f32 * f32::EPSILON * 4.0;
 
         let kc = KernelCoeffs::new(h);
 
-        // Build spatial hash and cache neighbor lists (single query per particle)
+        // Build spatial hash and cache neighbor lists (zero-alloc query_cell)
         {
             let _span = trace_span!("sph::build_neighbors", n).entered();
-            self.build_neighbors(particles, h_f32, query_radius);
+            self.build_neighbors(particles, h_f32);
         }
 
         // Compute densities via cached neighbors
