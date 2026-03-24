@@ -9,7 +9,7 @@
 - [x] Wetting/drying (wet-dry transitions)
 - [x] Wave breaking detection
 - [x] Dispersive correction (Boussinesq-type)
-- [ ] Terrain-following coordinate system
+- [x] Terrain-following coordinate system
 
 ### 0.26.3 — Performance & Parallelism
 
