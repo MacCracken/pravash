@@ -3,7 +3,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pravash::common::{FluidConfig, FluidMaterial};
 use pravash::grid::FluidGrid;
 use pravash::shallow::ShallowWater;
-use pravash::sph;
+use pravash::sph::{self, SphSolver};
 
 // ── SPH Benchmarks ──────────────────────────────────────────────────────────
 
@@ -130,6 +130,28 @@ fn bench_shallow_volume(c: &mut Criterion) {
     group.finish();
 }
 
+// ── SphSolver Benchmarks (spatial hash) ─────────────────────────────────────
+
+fn bench_solver_step(c: &mut Criterion) {
+    let mut group = c.benchmark_group("solver_step");
+    let config = FluidConfig::water_2d();
+    let viscosity = FluidMaterial::WATER.viscosity;
+
+    for &n in &[25, 100, 225, 625, 1000] {
+        let spacing = 1.0 / (n as f64).sqrt();
+        let particles = sph::create_particle_block([0.1, 0.3], [0.5, 0.5], spacing, 0.001);
+        let mut solver = SphSolver::new();
+        group.bench_function(format!("{}_particles", particles.len()), |b| {
+            b.iter_batched(
+                || particles.clone(),
+                |mut p| solver.step(&mut p, &config, viscosity).unwrap(),
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 // ── Particle Creation ───────────────────────────────────────────────────────
 
 fn bench_create_particle_block(c: &mut Criterion) {
@@ -156,6 +178,7 @@ criterion_group!(
     bench_sph_density,
     bench_sph_step,
     bench_sph_pressure_force,
+    bench_solver_step,
     bench_grid_diffuse,
     bench_grid_max_speed,
     bench_shallow_step,

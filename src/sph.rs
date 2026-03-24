@@ -3,18 +3,32 @@
 //! SPH represents fluid as a collection of particles. Each particle carries
 //! mass, position, velocity, and density. Forces (pressure, viscosity, gravity)
 //! are computed from neighbor interactions using smoothing kernels.
+//!
+//! # Usage
+//!
+//! For best performance, use [`SphSolver`] which maintains a spatial hash for
+//! O(n·k) neighbor queries and persistent scratch buffers:
+//!
+//! ```ignore
+//! let mut solver = SphSolver::new();
+//! solver.step(&mut particles, &config, viscosity)?;
+//! ```
+//!
+//! The free function [`step`] is available for simple cases but uses O(n²)
+//! brute-force neighbor search.
 
 use crate::common::{FluidConfig, FluidParticle};
 use crate::error::{PravashError, Result};
 
 use std::f64::consts::PI;
 
+use hisab::SpatialHash;
+use hisab::Vec3;
 use tracing::trace_span;
 
 // ── Precomputed Kernel Coefficients ─────────────────────────────────────────
 
 /// Precomputed kernel coefficients for a given smoothing radius h.
-/// Avoids recomputing h^6, h^9 per particle pair.
 #[derive(Debug, Clone, Copy)]
 struct KernelCoeffs {
     h: f64,
@@ -40,7 +54,6 @@ impl KernelCoeffs {
         }
     }
 
-    /// Poly6 kernel from squared distance.
     #[inline]
     fn poly6(&self, r2: f64) -> f64 {
         if r2 > self.h2 {
@@ -50,7 +63,6 @@ impl KernelCoeffs {
         self.poly6 * diff * diff * diff
     }
 
-    /// Spiky gradient magnitude (requires actual distance r).
     #[inline]
     fn spiky_grad(&self, r: f64) -> f64 {
         if r > self.h || r <= 0.0 {
@@ -60,7 +72,6 @@ impl KernelCoeffs {
         self.spiky_grad * diff * diff
     }
 
-    /// Viscosity Laplacian (requires actual distance r).
     #[inline]
     fn visc_laplacian(&self, r: f64) -> f64 {
         if r > self.h || r <= 0.0 {
@@ -104,16 +115,13 @@ pub fn kernel_viscosity_laplacian(r: f64, h: f64) -> f64 {
 
 // ── Density & Pressure ──────────────────────────────────────────────────────
 
-/// Compute density for a single particle from all neighbors.
-///
-/// ρᵢ = Σⱼ mⱼ · W(|rᵢ - rⱼ|, h)
+/// Compute density for a single particle from all neighbors (brute-force).
 #[inline]
 #[must_use]
 pub fn compute_density(particle_idx: usize, particles: &[FluidParticle], h: f64) -> f64 {
     compute_density_inner(&particles[particle_idx], particles, &KernelCoeffs::new(h))
 }
 
-/// Inner density computation shared by public API and step().
 #[inline]
 fn compute_density_inner(
     pi: &FluidParticle,
@@ -133,18 +141,15 @@ fn compute_density_inner(
 /// Compute pressure from density using the equation of state.
 ///
 /// P = k · (ρ - ρ₀)
-/// where k = gas constant, ρ₀ = rest density.
 #[inline]
 #[must_use]
 pub fn equation_of_state(density: f64, rest_density: f64, gas_constant: f64) -> f64 {
     gas_constant * (density - rest_density)
 }
 
-// ── Forces ──────────────────────────────────────────────────────────────────
+// ── Forces (standalone, brute-force) ────────────────────────────────────────
 
-/// Compute pressure force on particle i from all neighbors.
-///
-/// fᵢᵖʳᵉˢˢ = -Σⱼ mⱼ · (Pᵢ + Pⱼ)/(2·ρⱼ) · ∇W(rᵢⱼ, h) · r̂ᵢⱼ
+/// Compute pressure force on particle i from all neighbors (brute-force).
 #[must_use]
 pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) -> [f64; 3] {
     let kc = KernelCoeffs::new(h);
@@ -173,9 +178,7 @@ pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) 
     force
 }
 
-/// Compute viscosity force on particle i from all neighbors.
-///
-/// fᵢᵛⁱˢᶜ = μ · Σⱼ mⱼ · (vⱼ - vᵢ)/ρⱼ · ∇²W(rᵢⱼ, h)
+/// Compute viscosity force on particle i from all neighbors (brute-force).
 #[must_use]
 pub fn viscosity_force(
     particle_idx: usize,
@@ -209,15 +212,251 @@ pub fn viscosity_force(
     force
 }
 
-// ── Simulation Step ─────────────────────────────────────────────────────────
+// ── SphSolver ───────────────────────────────────────────────────────────────
 
-/// Perform one SPH simulation step.
+/// Stateful SPH solver with spatial hash acceleration and persistent buffers.
 ///
-/// 1. Compute densities
-/// 2. Compute pressures
-/// 3. Compute forces (pressure + viscosity + gravity)
-/// 4. Integrate (symplectic Euler)
-/// 5. Enforce boundary conditions
+/// Maintains a spatial hash grid (via hisab) for O(n·k) neighbor queries
+/// instead of O(n²) brute-force. Also reuses scratch buffers across steps
+/// to avoid per-step allocations.
+pub struct SphSolver {
+    grid: SpatialHash,
+    densities: Vec<f64>,
+    snapshot: Vec<FluidParticle>,
+    /// Surface tension coefficient (0.0 to disable).
+    pub surface_tension: f64,
+}
+
+impl SphSolver {
+    /// Create a new solver. Call [`step`](SphSolver::step) to advance the simulation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            // Cell size set on first step based on smoothing radius
+            grid: SpatialHash::new(1.0),
+            densities: Vec::new(),
+            snapshot: Vec::new(),
+            surface_tension: 0.0,
+        }
+    }
+
+    /// Create a solver with surface tension enabled.
+    #[must_use]
+    pub fn with_surface_tension(surface_tension: f64) -> Self {
+        Self {
+            grid: SpatialHash::new(1.0),
+            densities: Vec::new(),
+            snapshot: Vec::new(),
+            surface_tension,
+        }
+    }
+
+    /// Build the spatial hash from current particle positions.
+    fn build_grid(&mut self, particles: &[FluidParticle], h: f32) {
+        self.grid = SpatialHash::new(h);
+        for (i, p) in particles.iter().enumerate() {
+            self.grid.insert(
+                Vec3::new(
+                    p.position[0] as f32,
+                    p.position[1] as f32,
+                    p.position[2] as f32,
+                ),
+                i,
+            );
+        }
+    }
+
+    /// Perform one SPH simulation step with spatial hash acceleration.
+    pub fn step(
+        &mut self,
+        particles: &mut [FluidParticle],
+        config: &FluidConfig,
+        viscosity: f64,
+    ) -> Result<()> {
+        let _span = trace_span!("sph::solver_step", n = particles.len()).entered();
+        config.validate()?;
+        let h = config.smoothing_radius;
+        let n = particles.len();
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let kc = KernelCoeffs::new(h);
+        let h_f32 = h as f32;
+
+        // Build spatial hash
+        {
+            let _span = trace_span!("sph::build_grid", n).entered();
+            self.build_grid(particles, h_f32);
+        }
+
+        // Compute densities via neighbor queries
+        {
+            let _span = trace_span!("sph::density", n).entered();
+            self.densities.resize(n, 0.0);
+            for i in 0..n {
+                let pi = &particles[i];
+                let pi_pos = Vec3::new(
+                    pi.position[0] as f32,
+                    pi.position[1] as f32,
+                    pi.position[2] as f32,
+                );
+                let neighbors = self.grid.query_radius(pi_pos, h_f32);
+                let mut d = 0.0;
+                for &j in &neighbors {
+                    let pj = &particles[j];
+                    let r2 = pi.distance_squared_to(pj);
+                    if r2 <= kc.h2 {
+                        d += pj.mass * kc.poly6(r2);
+                    }
+                }
+                self.densities[i] = d;
+            }
+            for (i, p) in particles.iter_mut().enumerate() {
+                p.density = self.densities[i];
+                p.pressure = equation_of_state(p.density, config.rest_density, config.gas_constant);
+            }
+        }
+
+        // Snapshot for force computation
+        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot.copy_from_slice(particles);
+
+        // Compute forces via neighbor queries
+        {
+            let _span = trace_span!("sph::forces", n).entered();
+            let st = self.surface_tension;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                let pi = &self.snapshot[i];
+                let pi_pos = Vec3::new(
+                    pi.position[0] as f32,
+                    pi.position[1] as f32,
+                    pi.position[2] as f32,
+                );
+                let neighbors = self.grid.query_radius(pi_pos, h_f32);
+
+                let mut ax = config.gravity[0];
+                let mut ay = config.gravity[1];
+                let mut az = config.gravity[2];
+                let rho = pi.density.max(1e-10);
+
+                // Surface tension: color field normal accumulation
+                let mut cn_x = 0.0;
+                let mut cn_y = 0.0;
+                let mut cn_z = 0.0;
+                let mut laplacian_color = 0.0;
+
+                for &j in &neighbors {
+                    if j == i {
+                        continue;
+                    }
+                    let pj = &self.snapshot[j];
+                    let r2 = pi.distance_squared_to(pj);
+                    if r2 > kc.h2 || r2 < 1e-20 {
+                        continue;
+                    }
+                    let r = r2.sqrt();
+                    let rho_j = pj.density.max(1e-10);
+
+                    let dx = pi.position[0] - pj.position[0];
+                    let dy = pi.position[1] - pj.position[1];
+                    let dz = pi.position[2] - pj.position[2];
+
+                    // Pressure force
+                    let pressure_term = (pi.pressure + pj.pressure) / (2.0 * rho_j);
+                    let grad = kc.spiky_grad(r);
+                    let p_scale = -pj.mass * pressure_term * grad / r;
+                    ax += (p_scale * dx) / rho;
+                    ay += (p_scale * dy) / rho;
+                    az += (p_scale * dz) / rho;
+
+                    // Viscosity force
+                    let lap = kc.visc_laplacian(r);
+                    let v_scale = viscosity * pj.mass * lap / rho_j / rho;
+                    ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
+                    ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
+                    az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+
+                    // Surface tension: accumulate color field gradient and Laplacian
+                    if st > 0.0 {
+                        let mass_over_rho = pj.mass / rho_j;
+                        let grad_dir = grad / r;
+                        cn_x += mass_over_rho * grad_dir * dx;
+                        cn_y += mass_over_rho * grad_dir * dy;
+                        cn_z += mass_over_rho * grad_dir * dz;
+                        laplacian_color += mass_over_rho * lap;
+                    }
+                }
+
+                // Surface tension force: F_st = -σ · κ · n̂
+                // where κ = -∇²c / |∇c|, n̂ = ∇c / |∇c|
+                if st > 0.0 {
+                    let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
+                    // Only apply at surfaces (where normal magnitude is significant)
+                    if cn_mag > 1e-6 {
+                        let kappa = -laplacian_color / cn_mag;
+                        let st_scale = st * kappa / (rho * cn_mag);
+                        ax += st_scale * cn_x;
+                        ay += st_scale * cn_y;
+                        az += st_scale * cn_z;
+                    }
+                }
+
+                if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
+                    return Err(PravashError::Diverged {
+                        reason: format!("NaN/Inf in acceleration at particle {i}").into(),
+                    });
+                }
+
+                particles[i].acceleration = [ax, ay, az];
+            }
+        }
+
+        // Integrate (symplectic Euler)
+        let dt = config.dt;
+        for p in particles.iter_mut() {
+            p.velocity[0] += p.acceleration[0] * dt;
+            p.velocity[1] += p.acceleration[1] * dt;
+            p.velocity[2] += p.acceleration[2] * dt;
+
+            p.position[0] += p.velocity[0] * dt;
+            p.position[1] += p.velocity[1] * dt;
+            p.position[2] += p.velocity[2] * dt;
+        }
+
+        // Boundary enforcement
+        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let damp = config.boundary_damping;
+        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
+        for p in particles.iter_mut() {
+            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
+                if p.position[dim] < lo {
+                    p.position[dim] = lo;
+                    p.velocity[dim] *= -damp;
+                } else if p.position[dim] > hi && hi > lo {
+                    p.position[dim] = hi;
+                    p.velocity[dim] *= -damp;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for SphSolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Free-function step (brute-force, kept for simplicity/backwards compat) ──
+
+/// Perform one SPH simulation step (brute-force O(n²)).
+///
+/// For better performance with >100 particles, use [`SphSolver::step`] instead.
 pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f64) -> Result<()> {
     let _span = trace_span!("sph::step", n = particles.len()).entered();
     config.validate()?;
@@ -243,7 +482,7 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         }
     }
 
-    // Compute forces (fused pressure + viscosity in single neighbor pass)
+    // Compute forces
     let snapshot: Vec<FluidParticle> = particles.to_vec();
     {
         let _span = trace_span!("sph::forces", n).entered();
@@ -285,7 +524,6 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 az += v_scale * (pj.velocity[2] - pi.velocity[2]);
             }
 
-            // NaN/Inf check folded into force loop
             if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
                 return Err(PravashError::Diverged {
                     reason: format!("NaN/Inf in acceleration at particle {i}").into(),
@@ -296,7 +534,6 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         }
     }
 
-    // Integrate (symplectic Euler)
     let dt = config.dt;
     for p in particles.iter_mut() {
         p.velocity[0] += p.acceleration[0] * dt;
@@ -308,7 +545,6 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         p.position[2] += p.velocity[2] * dt;
     }
 
-    // Boundary enforcement
     let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
     let damp = config.boundary_damping;
     let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
@@ -326,6 +562,8 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
 
     Ok(())
 }
+
+// ── Utility Functions ───────────────────────────────────────────────────────
 
 /// Total kinetic energy of the system.
 #[must_use]
@@ -507,5 +745,101 @@ mod tests {
         assert!(kernel_poly6(-1.0, 1.0).abs() < EPS);
         assert!(kernel_spiky_grad(-1.0, 1.0).abs() < EPS);
         assert!(kernel_viscosity_laplacian(-1.0, 1.0).abs() < EPS);
+    }
+
+    // ── SphSolver tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_solver_step_matches_brute_force() {
+        let mut particles_bf = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let mut particles_sh = particles_bf.clone();
+        let config = FluidConfig::water_2d();
+        let viscosity = 0.001;
+
+        step(&mut particles_bf, &config, viscosity).unwrap();
+
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles_sh, &config, viscosity).unwrap();
+
+        // Results should be very close (f64→f32→f64 rounding in spatial hash
+        // may cause tiny broadphase differences at boundary of h)
+        for (a, b) in particles_bf.iter().zip(particles_sh.iter()) {
+            for d in 0..3 {
+                assert!(
+                    (a.position[d] - b.position[d]).abs() < 1e-6,
+                    "position mismatch dim {d}: {} vs {}",
+                    a.position[d],
+                    b.position[d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_solver_empty() {
+        let mut particles = vec![];
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        assert!(solver.step(&mut particles, &config, 0.001).is_ok());
+    }
+
+    #[test]
+    fn test_solver_single_particle_falls() {
+        let mut particles = vec![FluidParticle::new_2d(0.5, 0.5, 0.01)];
+        particles[0].density = 1000.0;
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+        assert!(particles[0].velocity[1] < 0.0);
+    }
+
+    #[test]
+    fn test_solver_particles_stay_in_bounds() {
+        let mut particles = create_particle_block([0.1, 0.5], [0.3, 0.3], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        let viscosity = 0.001;
+
+        for _ in 0..100 {
+            solver.step(&mut particles, &config, viscosity).unwrap();
+        }
+
+        let [min_x, min_y, _, max_x, max_y, _] = config.bounds;
+        for p in &particles {
+            assert!(p.position[0] >= min_x && p.position[0] <= max_x);
+            assert!(p.position[1] >= min_y && p.position[1] <= max_y);
+        }
+    }
+
+    #[test]
+    fn test_solver_surface_tension() {
+        let mut particles = create_particle_block([0.3, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::with_surface_tension(0.072);
+        // Should not panic or diverge
+        for _ in 0..10 {
+            solver.step(&mut particles, &config, 0.001).unwrap();
+        }
+        // All particles should have finite positions
+        for p in &particles {
+            assert!(p.position[0].is_finite());
+            assert!(p.position[1].is_finite());
+        }
+    }
+
+    #[test]
+    fn test_solver_reuses_buffers() {
+        let mut particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+
+        solver.step(&mut particles, &config, 0.001).unwrap();
+        let cap_d = solver.densities.capacity();
+        let cap_s = solver.snapshot.capacity();
+
+        solver.step(&mut particles, &config, 0.001).unwrap();
+        // Capacities should not grow (no reallocation)
+        assert_eq!(solver.densities.capacity(), cap_d);
+        assert_eq!(solver.snapshot.capacity(), cap_s);
     }
 }
