@@ -21,7 +21,8 @@ pub enum BoundaryCondition {
 }
 
 /// Configuration for a grid fluid simulation step.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GridConfig {
     pub dt: f64,
     pub viscosity: f64,
@@ -29,9 +30,13 @@ pub struct GridConfig {
     pub pressure_iterations: usize,
     pub boundary: BoundaryCondition,
     /// Vorticity confinement strength (0.0 to disable).
+    /// Requires grid size ≥ 6x6 to have effect.
     pub vorticity_confinement: f64,
-    /// Buoyancy coefficient. Applied as vy += alpha * (density - ambient) * dt.
-    /// Sign convention: y-up, positive alpha = upward for high-density fluid.
+    /// Buoyancy coefficient. Applied as `vy += alpha * (density - ambient) * dt`.
+    ///
+    /// Sign convention (y-up): positive alpha pushes high-density fluid upward.
+    /// For thermal buoyancy (hot = light = rises), use negative alpha with
+    /// density representing temperature, or invert the density field.
     pub buoyancy_alpha: f64,
     /// Ambient density for buoyancy reference.
     pub ambient_density: f64,
@@ -51,6 +56,12 @@ impl GridConfig {
             buoyancy_alpha: 0.1,
             ambient_density: 0.0,
         }
+    }
+}
+
+impl Default for GridConfig {
+    fn default() -> Self {
+        Self::smoke()
     }
 }
 
@@ -151,6 +162,10 @@ impl FluidGrid {
     /// Bilinear interpolation at continuous position (fx, fy) in grid-cell units.
     #[inline]
     fn sample(field: &[f64], nx: usize, ny: usize, fx: f64, fy: f64) -> f64 {
+        // Propagate NaN from advection backtrace (fail-fast for divergence detection)
+        if !fx.is_finite() || !fy.is_finite() {
+            return f64::NAN;
+        }
         let x0 = fx.floor().max(0.0).min((nx - 2) as f64) as usize;
         let y0 = fy.floor().max(0.0).min((ny - 2) as f64) as usize;
         let x1 = x0 + 1;
