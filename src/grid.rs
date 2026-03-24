@@ -426,12 +426,12 @@ impl FluidGrid {
     ///
     /// Solves ∇²p = div on interior cells using 2D Discrete Sine Transform.
     /// Exact solve (no iterations needed). Works for any grid size.
-    fn pressure_solve_dst(pressure: &mut [f64], div: &[f64], nx: usize, ny: usize) {
+    fn pressure_solve_dst(pressure: &mut [f64], div: &[f64], nx: usize, ny: usize) -> Result<()> {
         let _span = trace_span!("grid::pressure_solve_dst", nx, ny).entered();
         let inx = nx - 2; // interior dimensions
         let iny = ny - 2;
         if inx == 0 || iny == 0 {
-            return;
+            return Ok(());
         }
 
         // Extract interior divergence into a flat buffer
@@ -442,13 +442,16 @@ impl FluidGrid {
             }
         }
 
+        let map_err = |_| PravashError::Diverged {
+            reason: "DST/IDST transform failed in pressure solve".into(),
+        };
+
         // 2D DST: rows then columns
         // Row DSTs
         for iy in 0..iny {
             let row: Vec<f64> = rhs[iy * inx..(iy + 1) * inx].to_vec();
-            if let Ok(transformed) = dst(&row) {
-                rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
-            }
+            let transformed = dst(&row).map_err(map_err)?;
+            rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
         }
         // Column DSTs
         let mut col = vec![0.0f64; iny];
@@ -456,10 +459,9 @@ impl FluidGrid {
             for iy in 0..iny {
                 col[iy] = rhs[iy * inx + ix];
             }
-            if let Ok(transformed) = dst(&col) {
-                for iy in 0..iny {
-                    rhs[iy * inx + ix] = transformed[iy];
-                }
+            let transformed = dst(&col).map_err(map_err)?;
+            for iy in 0..iny {
+                rhs[iy * inx + ix] = transformed[iy];
             }
         }
 
@@ -480,18 +482,16 @@ impl FluidGrid {
         // 2D IDST: rows then columns
         for iy in 0..iny {
             let row: Vec<f64> = rhs[iy * inx..(iy + 1) * inx].to_vec();
-            if let Ok(transformed) = idst(&row) {
-                rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
-            }
+            let transformed = idst(&row).map_err(map_err)?;
+            rhs[iy * inx..(iy + 1) * inx].copy_from_slice(&transformed);
         }
         for ix in 0..inx {
             for iy in 0..iny {
                 col[iy] = rhs[iy * inx + ix];
             }
-            if let Ok(transformed) = idst(&col) {
-                for iy in 0..iny {
-                    rhs[iy * inx + ix] = transformed[iy];
-                }
+            let transformed = idst(&col).map_err(map_err)?;
+            for iy in 0..iny {
+                rhs[iy * inx + ix] = transformed[iy];
             }
         }
 
@@ -504,6 +504,7 @@ impl FluidGrid {
                 pressure[(iy + 1) * nx + (ix + 1)] = rhs[iy * inx + ix];
             }
         }
+        Ok(())
     }
 
     /// Subtract pressure gradient from velocity to enforce divergence-free.
@@ -685,15 +686,8 @@ impl FluidGrid {
         let inv_dx = 1.0 / dx;
         let inv_2dx = 0.5 * inv_dx;
 
-        // Ensure scratch buffers are correct size (may be empty after deserialization)
-        self.scratch_a.resize(n, 0.0);
-        self.scratch_b.resize(n, 0.0);
-        self.scratch_c.resize(n, 0.0);
-        self.diffuse_rhs.resize(n, 0.0);
-        self.scratch_a.fill(0.0);
-        self.scratch_b.fill(0.0);
-
-        // Take scratch buffers out of self to avoid borrow conflicts with field slices
+        // Take scratch buffers out of self to avoid borrow conflicts with field slices.
+        // Resize handles post-deserialization empty buffers; fill zeroes for reuse.
         let mut sa = std::mem::take(&mut self.scratch_a);
         let mut sb = std::mem::take(&mut self.scratch_b);
         let mut sc = std::mem::take(&mut self.scratch_c);
@@ -784,7 +778,7 @@ impl FluidGrid {
             if config.boundary == BoundaryCondition::Periodic {
                 Self::pressure_solve(&mut self.pressure, &sa, nx, ny, config.pressure_iterations);
             } else {
-                Self::pressure_solve_dst(&mut self.pressure, &sa, nx, ny);
+                Self::pressure_solve_dst(&mut self.pressure, &sa, nx, ny)?;
             }
             Self::project_velocity(&mut self.vx, &mut self.vy, &self.pressure, nx, ny, inv_2dx);
         }

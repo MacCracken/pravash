@@ -101,7 +101,7 @@ impl ShallowWater {
     /// Step the simulation using a simple finite-difference scheme.
     pub fn step(&mut self, dt: f64) -> Result<()> {
         let _span = trace_span!("shallow::step", nx = self.nx, ny = self.ny).entered();
-        if dt <= 0.0 {
+        if !dt.is_finite() || dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
         }
 
@@ -267,6 +267,12 @@ mod tests {
     fn test_step_invalid_dt() {
         let mut sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
         assert!(sw.step(-0.001).is_err());
+    }
+
+    #[test]
+    fn test_step_nan_dt() {
+        let mut sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
+        assert!(sw.step(f64::NAN).is_err());
     }
 
     #[test]

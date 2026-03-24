@@ -662,6 +662,13 @@ impl SphSolver {
                 }
             }
 
+            if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
+                self.pcisph_accel = non_pressure_accel;
+                return Err(PravashError::Diverged {
+                    reason: format!("NaN/Inf in non-pressure acceleration at particle {i}").into(),
+                });
+            }
+
             non_pressure_accel[i] = [ax, ay, az];
         }
 
@@ -789,10 +796,20 @@ impl SphSolver {
             }
         }
 
-        // Apply final velocities and positions
+        // Apply final velocities and positions (with divergence check)
         for i in 0..n {
+            let pos = predicted_pos[i];
+            if !pos[0].is_finite() || !pos[1].is_finite() || !pos[2].is_finite() {
+                self.pcisph_accel = non_pressure_accel;
+                self.pcisph_pressures = pressures;
+                self.pcisph_pred_pos = predicted_pos;
+                self.pcisph_pred_vel = predicted_vel;
+                return Err(PravashError::Diverged {
+                    reason: format!("NaN/Inf in predicted position at particle {i}").into(),
+                });
+            }
             particles[i].velocity = predicted_vel[i];
-            particles[i].position = predicted_pos[i];
+            particles[i].position = pos;
             particles[i].pressure = pressures[i];
         }
 

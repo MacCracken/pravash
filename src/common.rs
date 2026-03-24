@@ -195,20 +195,20 @@ impl FluidConfig {
 
     /// Validate configuration.
     pub fn validate(&self) -> Result<()> {
-        if self.dt <= 0.0 {
+        if !self.dt.is_finite() || self.dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt: self.dt });
         }
-        if self.smoothing_radius <= 0.0 {
+        if !self.smoothing_radius.is_finite() || self.smoothing_radius <= 0.0 {
             return Err(PravashError::InvalidSmoothingRadius {
                 h: self.smoothing_radius,
             });
         }
-        if self.rest_density <= 0.0 {
+        if !self.rest_density.is_finite() || self.rest_density <= 0.0 {
             return Err(PravashError::InvalidDensity {
                 density: self.rest_density,
             });
         }
-        if self.gas_constant <= 0.0 {
+        if !self.gas_constant.is_finite() || self.gas_constant <= 0.0 {
             return Err(PravashError::InvalidParameter {
                 reason: format!("gas constant must be positive: {}", self.gas_constant).into(),
             });
@@ -337,6 +337,27 @@ mod tests {
     fn test_config_water_2d() {
         let c = FluidConfig::water_2d();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_nan_dt_rejected() {
+        let mut c = FluidConfig::water_2d();
+        c.dt = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_nan_smoothing_rejected() {
+        let mut c = FluidConfig::water_2d();
+        c.smoothing_radius = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_inf_density_rejected() {
+        let mut c = FluidConfig::water_2d();
+        c.rest_density = f64::INFINITY;
+        assert!(c.validate().is_err());
     }
 
     #[test]
