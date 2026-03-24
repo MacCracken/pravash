@@ -83,7 +83,7 @@ fn grid_diffusion_conserves_total() {
     field[nx * 10 + 10] = 100.0;
     let total_before: f64 = field.iter().sum();
 
-    FluidGrid::diffuse(&mut field, nx, ny, 0.1, 0.01, 50);
+    FluidGrid::diffuse(&mut field, nx, ny, 0.1, 0.01, 0.1, 50);
 
     let total_after: f64 = field.iter().sum();
     // Gauss-Seidel with zero-boundary doesn't perfectly conserve,

@@ -78,7 +78,7 @@ fn bench_grid_diffuse(c: &mut Criterion) {
         group.bench_function(format!("{n}x{n}"), |b| {
             b.iter_batched(
                 || field.clone(),
-                |mut f| FluidGrid::diffuse(&mut f, n, n, 0.1, 0.01, 20),
+                |mut f| FluidGrid::diffuse(&mut f, n, n, 0.1, 0.01, 0.1, 20),
                 criterion::BatchSize::SmallInput,
             )
         });
