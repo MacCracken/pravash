@@ -63,6 +63,7 @@ impl BodyShape {
 
 /// A rigid body that interacts with fluid particles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RigidBody {
     pub position: [f64; 3],
     pub velocity: [f64; 3],
@@ -92,26 +93,40 @@ impl RigidBody {
         self.shape.signed_distance(point, self.position)
     }
 
-    /// Surface normal at a point (gradient of signed distance, pointing outward).
+    /// Surface normal at a point (central-difference gradient of signed distance).
     #[must_use]
     pub fn surface_normal(&self, point: [f64; 3]) -> [f64; 3] {
         let eps = 1e-6;
-        let d = self.signed_distance(point);
         let dx = self
             .shape
             .signed_distance([point[0] + eps, point[1], point[2]], self.position)
-            - d;
+            - self
+                .shape
+                .signed_distance([point[0] - eps, point[1], point[2]], self.position);
         let dy = self
             .shape
             .signed_distance([point[0], point[1] + eps, point[2]], self.position)
-            - d;
+            - self
+                .shape
+                .signed_distance([point[0], point[1] - eps, point[2]], self.position);
         let dz = self
             .shape
             .signed_distance([point[0], point[1], point[2] + eps], self.position)
-            - d;
+            - self
+                .shape
+                .signed_distance([point[0], point[1], point[2] - eps], self.position);
         let mag = (dx * dx + dy * dy + dz * dz).sqrt();
         if mag < 1e-20 {
-            return [0.0; 3];
+            // Fallback: direction from body center to point
+            let fx = point[0] - self.position[0];
+            let fy = point[1] - self.position[1];
+            let fz = point[2] - self.position[2];
+            let fmag = (fx * fx + fy * fy + fz * fz).sqrt();
+            return if fmag < 1e-20 {
+                [1.0, 0.0, 0.0] // arbitrary fallback for exact center
+            } else {
+                [fx / fmag, fy / fmag, fz / fmag]
+            };
         }
         [dx / mag, dy / mag, dz / mag]
     }
@@ -202,10 +217,9 @@ pub fn integrate_bodies(bodies: &mut [RigidBody], gravity: [f64; 3], dt: f64) {
 /// - 1.0 = pure FLIP (low dissipation, can be noisy)
 /// - 0.95 = typical (mostly FLIP with a touch of PIC for stability)
 pub struct FlipSolver {
-    /// Grid resolution.
-    pub nx: usize,
-    pub ny: usize,
-    pub dx: f64,
+    nx: usize,
+    ny: usize,
+    dx: f64,
     /// FLIP/PIC blend ratio (0 = PIC, 1 = FLIP).
     pub flip_ratio: f64,
     // Grid fields
@@ -215,6 +229,7 @@ pub struct FlipSolver {
     vy_old: Vec<f64>,
     weight: Vec<f64>,
     pressure: Vec<f64>,
+    div: Vec<f64>,
 }
 
 impl FlipSolver {
@@ -240,7 +255,26 @@ impl FlipSolver {
             vy_old: vec![0.0; n],
             weight: vec![0.0; n],
             pressure: vec![0.0; n],
+            div: vec![0.0; n],
         })
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn grid_nx(&self) -> usize {
+        self.nx
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn grid_ny(&self) -> usize {
+        self.ny
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn grid_dx(&self) -> f64 {
+        self.dx
     }
 
     /// Transfer particle velocities to grid (Particle-to-Grid).
@@ -306,19 +340,17 @@ impl FlipSolver {
             let gx = p.position[0] * inv_dx;
             let gy = p.position[1] * inv_dx;
 
-            // Grid velocity (PIC component)
-            let pic_vx = Self::sample_field(&self.vx, nx, ny, gx, gy);
-            let pic_vy = Self::sample_field(&self.vy, nx, ny, gx, gy);
-
-            // Grid velocity change (FLIP component)
+            // Grid velocity (PIC component) and delta (FLIP component)
+            let new_vx = Self::sample_field(&self.vx, nx, ny, gx, gy);
+            let new_vy = Self::sample_field(&self.vy, nx, ny, gx, gy);
             let old_vx = Self::sample_field(&self.vx_old, nx, ny, gx, gy);
             let old_vy = Self::sample_field(&self.vy_old, nx, ny, gx, gy);
-            let dvx = Self::sample_field(&self.vx, nx, ny, gx, gy) - old_vx;
-            let dvy = Self::sample_field(&self.vy, nx, ny, gx, gy) - old_vy;
+            let dvx = new_vx - old_vx;
+            let dvy = new_vy - old_vy;
 
             // Blend: FLIP = particle_vel + grid_delta, PIC = grid_vel
-            p.velocity[0] = flip * (p.velocity[0] + dvx) + pic * pic_vx;
-            p.velocity[1] = flip * (p.velocity[1] + dvy) + pic * pic_vy;
+            p.velocity[0] = flip * (p.velocity[0] + dvx) + pic * new_vx;
+            p.velocity[1] = flip * (p.velocity[1] + dvy) + pic * new_vy;
         }
     }
 
@@ -369,24 +401,27 @@ impl FlipSolver {
         self.vx_old.copy_from_slice(&self.vx);
         self.vy_old.copy_from_slice(&self.vy);
 
-        // 2. Apply gravity to grid
-        for v in self.vy.iter_mut() {
-            *v += gravity[1] * dt;
+        // 2. Apply gravity to grid (both components)
+        for i in 0..nx * ny {
+            self.vx[i] += gravity[0] * dt;
+            self.vy[i] += gravity[1] * dt;
         }
 
-        // 3. Pressure projection on grid
+        // 3. Pressure projection on grid (with dt scaling)
         {
             let inv_2dx = 0.5 / self.dx;
-            let mut div = vec![0.0; nx * ny];
+            self.div.fill(0.0);
+            // Divergence scaled by 1/dt for correct pressure units
+            let div_scale = inv_2dx / dt;
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let i = y * nx + x;
-                    div[i] = -((self.vx[i + 1] - self.vx[i - 1])
+                    self.div[i] = -((self.vx[i + 1] - self.vx[i - 1])
                         + (self.vy[i + nx] - self.vy[i - nx]))
-                        * inv_2dx;
+                        * div_scale;
                 }
             }
-            // GS pressure solve
+            // GS pressure solve (warm start from previous step)
             for _ in 0..40 {
                 for y in 1..ny - 1 {
                     for x in 1..nx - 1 {
@@ -395,16 +430,17 @@ impl FlipSolver {
                             + self.pressure[i + 1]
                             + self.pressure[i - nx]
                             + self.pressure[i + nx];
-                        self.pressure[i] = (div[i] + neighbors) * 0.25;
+                        self.pressure[i] = (self.div[i] + neighbors) * 0.25;
                     }
                 }
             }
-            // Subtract pressure gradient
+            // Subtract pressure gradient scaled by dt
+            let grad_scale = dt * inv_2dx;
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let i = y * nx + x;
-                    self.vx[i] -= (self.pressure[i + 1] - self.pressure[i - 1]) * inv_2dx;
-                    self.vy[i] -= (self.pressure[i + nx] - self.pressure[i - nx]) * inv_2dx;
+                    self.vx[i] -= (self.pressure[i + 1] - self.pressure[i - 1]) * grad_scale;
+                    self.vy[i] -= (self.pressure[i + nx] - self.pressure[i - nx]) * grad_scale;
                 }
             }
         }
@@ -549,7 +585,7 @@ mod tests {
     #[test]
     fn test_flip_solver_new() {
         let solver = FlipSolver::new(16, 16, 0.1, 0.95).unwrap();
-        assert_eq!(solver.nx, 16);
+        assert_eq!(solver.grid_nx(), 16);
         assert!((solver.flip_ratio - 0.95).abs() < f64::EPSILON);
     }
 
