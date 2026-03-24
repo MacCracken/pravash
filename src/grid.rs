@@ -197,7 +197,9 @@ impl FluidGrid {
     // ── Diffusion ───────────────────────────────────────────────────────────
 
     /// Diffuse a field using Gauss-Seidel iteration.
-    /// Uses correct physical scaling: a = dt * diff_rate / (dx * dx).
+    ///
+    /// Solves the implicit equation `(I - a·∇²)·x_new = x_old` where
+    /// `a = dt · diff_rate / dx²`. The original field is preserved as the RHS.
     pub fn diffuse(
         field: &mut [f64],
         nx: usize,
@@ -211,13 +213,15 @@ impl FluidGrid {
         debug_assert_eq!(field.len(), nx * ny, "field size must match nx*ny");
         let a = dt * diff_rate / (dx * dx);
         let inv_denom = 1.0 / (1.0 + 4.0 * a);
+        // Preserve original field as the RHS of the implicit equation
+        let x0: Vec<f64> = field.to_vec();
         for _ in 0..iterations {
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let idx = y * nx + x;
                     let neighbors =
                         field[idx - 1] + field[idx + 1] + field[idx - nx] + field[idx + nx];
-                    field[idx] = (field[idx] + a * neighbors) * inv_denom;
+                    field[idx] = (x0[idx] + a * neighbors) * inv_denom;
                 }
             }
         }
@@ -236,11 +240,9 @@ impl FluidGrid {
     }
 
     /// Gauss-Seidel Poisson solver: ∇²p = div.
+    /// Uses the existing pressure field as initial guess (warm start).
     fn pressure_solve(pressure: &mut [f64], div: &[f64], nx: usize, ny: usize, iterations: usize) {
         let _span = trace_span!("grid::pressure_solve", nx, ny, iterations).entered();
-        for i in pressure.iter_mut() {
-            *i = 0.0;
-        }
         for _ in 0..iterations {
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
@@ -393,6 +395,11 @@ impl FluidGrid {
 
         if !config.dt.is_finite() || config.dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt: config.dt });
+        }
+        if config.viscosity < 0.0 || !config.viscosity.is_finite() {
+            return Err(PravashError::InvalidViscosity {
+                viscosity: config.viscosity,
+            });
         }
 
         let nx = self.nx;
@@ -685,8 +692,9 @@ mod tests {
         let ny = 8;
         let n = nx * ny;
         let div = vec![0.0; n];
-        let mut pressure = vec![1.0; n];
+        let mut pressure = vec![0.0; n];
         FluidGrid::pressure_solve(&mut pressure, &div, nx, ny, 50);
+        // Zero RHS + zero initial guess → stays zero
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 assert!(pressure[y * nx + x].abs() < 1e-6);
