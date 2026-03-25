@@ -1,6 +1,10 @@
 //! Shared fluid types — particles, materials, configuration.
+//!
+//! Uses hisab's `DVec3` (glam SIMD-accelerated) for all 3D vector quantities.
 
 use serde::{Deserialize, Serialize};
+
+use hisab::DVec3;
 
 use crate::error::{PravashError, Result};
 
@@ -85,12 +89,12 @@ impl FluidMaterial {
 /// A fluid particle (SPH).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FluidParticle {
-    /// Position [x, y] (2D) or [x, y, z] (3D — z=0 for 2D).
-    pub position: [f64; 3],
-    /// Velocity [vx, vy, vz].
-    pub velocity: [f64; 3],
+    /// Position (2D: z=0, 3D: full).
+    pub position: DVec3,
+    /// Velocity.
+    pub velocity: DVec3,
     /// Acceleration (accumulated forces / mass).
-    pub acceleration: [f64; 3],
+    pub acceleration: DVec3,
     /// Particle density (computed from neighbors).
     pub density: f64,
     /// Pressure (derived from density via equation of state).
@@ -111,11 +115,11 @@ pub struct FluidParticle {
 impl FluidParticle {
     /// Create a particle at rest.
     #[must_use]
-    pub fn new(position: [f64; 3], mass: f64) -> Self {
+    pub fn new(position: DVec3, mass: f64) -> Self {
         Self {
             position,
-            velocity: [0.0; 3],
-            acceleration: [0.0; 3],
+            velocity: DVec3::ZERO,
+            acceleration: DVec3::ZERO,
             density: 0.0,
             pressure: 0.0,
             mass,
@@ -130,22 +134,21 @@ impl FluidParticle {
     #[inline]
     #[must_use]
     pub fn new_2d(x: f64, y: f64, mass: f64) -> Self {
-        Self::new([x, y, 0.0], mass)
+        Self::new(DVec3::new(x, y, 0.0), mass)
     }
 
     /// Squared speed (avoids sqrt, useful for comparisons).
     #[inline]
     #[must_use]
     pub fn speed_squared(&self) -> f64 {
-        let v = &self.velocity;
-        v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+        self.velocity.length_squared()
     }
 
     /// Speed (magnitude of velocity).
     #[inline]
     #[must_use]
     pub fn speed(&self) -> f64 {
-        self.speed_squared().sqrt()
+        self.velocity.length()
     }
 
     /// Kinetic energy: 0.5 * m * v².
@@ -159,17 +162,14 @@ impl FluidParticle {
     #[inline]
     #[must_use]
     pub fn distance_squared_to(&self, other: &FluidParticle) -> f64 {
-        let dx = self.position[0] - other.position[0];
-        let dy = self.position[1] - other.position[1];
-        let dz = self.position[2] - other.position[2];
-        dx * dx + dy * dy + dz * dz
+        self.position.distance_squared(other.position)
     }
 
     /// Distance to another particle.
     #[inline]
     #[must_use]
     pub fn distance_to(&self, other: &FluidParticle) -> f64 {
-        self.distance_squared_to(other).sqrt()
+        self.position.distance(other.position)
     }
 }
 
@@ -271,15 +271,15 @@ impl ParticleSoa {
         let n = particles.len();
         let mut soa = Self::with_capacity(n);
         for p in particles {
-            soa.pos_x.push(p.position[0]);
-            soa.pos_y.push(p.position[1]);
-            soa.pos_z.push(p.position[2]);
-            soa.vel_x.push(p.velocity[0]);
-            soa.vel_y.push(p.velocity[1]);
-            soa.vel_z.push(p.velocity[2]);
-            soa.accel_x.push(p.acceleration[0]);
-            soa.accel_y.push(p.acceleration[1]);
-            soa.accel_z.push(p.acceleration[2]);
+            soa.pos_x.push(p.position.x);
+            soa.pos_y.push(p.position.y);
+            soa.pos_z.push(p.position.z);
+            soa.vel_x.push(p.velocity.x);
+            soa.vel_y.push(p.velocity.y);
+            soa.vel_z.push(p.velocity.z);
+            soa.accel_x.push(p.acceleration.x);
+            soa.accel_y.push(p.acceleration.y);
+            soa.accel_z.push(p.acceleration.z);
             soa.density.push(p.density);
             soa.pressure.push(p.pressure);
             soa.mass.push(p.mass);
@@ -300,9 +300,9 @@ impl ParticleSoa {
         let mut particles = Vec::with_capacity(n);
         for i in 0..n {
             particles.push(FluidParticle {
-                position: [self.pos_x[i], self.pos_y[i], self.pos_z[i]],
-                velocity: [self.vel_x[i], self.vel_y[i], self.vel_z[i]],
-                acceleration: [self.accel_x[i], self.accel_y[i], self.accel_z[i]],
+                position: DVec3::new(self.pos_x[i], self.pos_y[i], self.pos_z[i]),
+                velocity: DVec3::new(self.vel_x[i], self.vel_y[i], self.vel_z[i]),
+                acceleration: DVec3::new(self.accel_x[i], self.accel_y[i], self.accel_z[i]),
                 density: self.density[i],
                 pressure: self.pressure[i],
                 mass: self.mass[i],
@@ -319,9 +319,9 @@ impl ParticleSoa {
     pub fn write_to_aos(&self, particles: &mut [FluidParticle]) {
         let n = self.len().min(particles.len());
         for (i, p) in particles.iter_mut().enumerate().take(n) {
-            p.position = [self.pos_x[i], self.pos_y[i], self.pos_z[i]];
-            p.velocity = [self.vel_x[i], self.vel_y[i], self.vel_z[i]];
-            p.acceleration = [self.accel_x[i], self.accel_y[i], self.accel_z[i]];
+            p.position = DVec3::new(self.pos_x[i], self.pos_y[i], self.pos_z[i]);
+            p.velocity = DVec3::new(self.vel_x[i], self.vel_y[i], self.vel_z[i]);
+            p.acceleration = DVec3::new(self.accel_x[i], self.accel_y[i], self.accel_z[i]);
             p.density = self.density[i];
             p.pressure = self.pressure[i];
             p.mass = self.mass[i];
@@ -404,7 +404,7 @@ impl ParticleArena {
     /// Create an arena with the given maximum particle capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        let default_particle = FluidParticle::new([0.0; 3], 0.0);
+        let default_particle = FluidParticle::new(DVec3::ZERO, 0.0);
         Self {
             particles: vec![default_particle; capacity],
             capacity,
@@ -446,7 +446,7 @@ impl ParticleArena {
                     self.free_list[i] = (start + n, free_len - n);
                 }
                 // Zero the allocated particles
-                let default = FluidParticle::new([0.0; 3], 0.0);
+                let default = FluidParticle::new(DVec3::ZERO, 0.0);
                 for p in &mut self.particles[start..start + n] {
                     *p = default;
                 }
@@ -582,16 +582,18 @@ impl ParticleArena {
 pub struct FluidConfig {
     /// Timestep in seconds.
     pub dt: f64,
-    /// Gravity vector [gx, gy, gz].
-    pub gravity: [f64; 3],
+    /// Gravity vector.
+    pub gravity: DVec3,
     /// SPH smoothing radius (particle interaction distance).
     pub smoothing_radius: f64,
     /// Gas constant for equation of state (pressure from density).
     pub gas_constant: f64,
     /// Rest density of the fluid.
     pub rest_density: f64,
-    /// Domain bounds [min_x, min_y, min_z, max_x, max_y, max_z].
-    pub bounds: [f64; 6],
+    /// Domain bounds minimum corner.
+    pub bounds_min: DVec3,
+    /// Domain bounds maximum corner.
+    pub bounds_max: DVec3,
     /// Boundary damping (velocity multiplier on wall collision, 0-1).
     pub boundary_damping: f64,
 }
@@ -602,11 +604,12 @@ impl FluidConfig {
     pub fn water_2d() -> Self {
         Self {
             dt: 0.001,
-            gravity: [0.0, -9.81, 0.0],
+            gravity: DVec3::new(0.0, -9.81, 0.0),
             smoothing_radius: 0.05,
             gas_constant: 2000.0,
             rest_density: FluidMaterial::WATER.density,
-            bounds: [0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+            bounds_min: DVec3::ZERO,
+            bounds_max: DVec3::new(1.0, 1.0, 0.0),
             boundary_damping: 0.5,
         }
     }
@@ -641,11 +644,13 @@ impl FluidConfig {
             });
         }
         // Check bounds ordering: min must be <= max for each axis
-        let [min_x, min_y, min_z, max_x, max_y, max_z] = self.bounds;
-        if min_x > max_x || min_y > max_y || min_z > max_z {
+        let lo = self.bounds_min;
+        let hi = self.bounds_max;
+        if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
             return Err(PravashError::InvalidParameter {
                 reason: format!(
-                    "bounds min must be <= max: [{min_x}, {min_y}, {min_z}] to [{max_x}, {max_y}, {max_z}]"
+                    "bounds min must be <= max: [{}, {}, {}] to [{}, {}, {}]",
+                    lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
                 )
                 .into(),
             });
@@ -704,8 +709,8 @@ mod tests {
 
     #[test]
     fn test_particle_new() {
-        let p = FluidParticle::new([1.0, 2.0, 3.0], 0.01);
-        assert!((p.position[0] - 1.0).abs() < f64::EPSILON);
+        let p = FluidParticle::new(DVec3::new(1.0, 2.0, 3.0), 0.01);
+        assert!((p.position.x - 1.0).abs() < f64::EPSILON);
         assert!((p.speed()).abs() < f64::EPSILON);
     }
 
@@ -713,26 +718,26 @@ mod tests {
     fn test_particle_copy() {
         let p = FluidParticle::new_2d(1.0, 2.0, 0.01);
         let p2 = p; // Copy, not move
-        assert!((p.position[0] - p2.position[0]).abs() < f64::EPSILON);
+        assert!((p.position.x - p2.position.x).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_particle_2d() {
         let p = FluidParticle::new_2d(5.0, 10.0, 0.01);
-        assert!((p.position[2]).abs() < f64::EPSILON);
+        assert!((p.position.z).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_particle_speed() {
         let mut p = FluidParticle::new_2d(0.0, 0.0, 1.0);
-        p.velocity = [3.0, 4.0, 0.0];
+        p.velocity = DVec3::new(3.0, 4.0, 0.0);
         assert!((p.speed() - 5.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_particle_kinetic_energy() {
         let mut p = FluidParticle::new_2d(0.0, 0.0, 2.0);
-        p.velocity = [3.0, 4.0, 0.0];
+        p.velocity = DVec3::new(3.0, 4.0, 0.0);
         // KE = 0.5 * 2.0 * 25.0 = 25.0
         assert!((p.kinetic_energy() - 25.0).abs() < 1e-10);
     }
@@ -782,8 +787,8 @@ mod tests {
 
     #[test]
     fn test_soa_roundtrip() {
-        let mut p = FluidParticle::new([1.0, 2.0, 3.0], 0.5);
-        p.velocity = [4.0, 5.0, 6.0];
+        let mut p = FluidParticle::new(DVec3::new(1.0, 2.0, 3.0), 0.5);
+        p.velocity = DVec3::new(4.0, 5.0, 6.0);
         p.density = 1000.0;
         p.pressure = 200.0;
         let particles = vec![p];
@@ -795,8 +800,8 @@ mod tests {
         assert!((soa.mass[0] - 0.5).abs() < f64::EPSILON);
 
         let back = soa.to_aos();
-        assert!((back[0].position[0] - 1.0).abs() < f64::EPSILON);
-        assert!((back[0].velocity[1] - 5.0).abs() < f64::EPSILON);
+        assert!((back[0].position.x - 1.0).abs() < f64::EPSILON);
+        assert!((back[0].velocity.y - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -811,7 +816,7 @@ mod tests {
 
         let mut particles = particles_orig;
         soa.write_to_aos(&mut particles);
-        assert!((particles[0].position[0] - 99.0).abs() < f64::EPSILON);
+        assert!((particles[0].position.x - 99.0).abs() < f64::EPSILON);
         assert!((particles[1].density - 500.0).abs() < f64::EPSILON);
     }
 
@@ -897,8 +902,8 @@ mod tests {
         let h2 = arena.alloc(10).unwrap();
 
         // Write recognizable data
-        arena.get_mut(h1)[0] = FluidParticle::new([1.0, 0.0, 0.0], 1.0);
-        arena.get_mut(h2)[0] = FluidParticle::new([2.0, 0.0, 0.0], 2.0);
+        arena.get_mut(h1)[0] = FluidParticle::new(DVec3::new(1.0, 0.0, 0.0), 1.0);
+        arena.get_mut(h2)[0] = FluidParticle::new(DVec3::new(2.0, 0.0, 0.0), 2.0);
 
         // Free first block, creating a gap
         arena.free(h1);
@@ -907,7 +912,7 @@ mod tests {
         // Compact moves h2 data to front
         let active = arena.compact();
         assert_eq!(active, 10);
-        assert!((arena.active_particles()[0].position[0] - 2.0).abs() < f64::EPSILON);
+        assert!((arena.active_particles()[0].position.x - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -928,8 +933,8 @@ mod tests {
         let mut arena = ParticleArena::new(10);
         let h = arena.alloc(3).unwrap();
         let slice = arena.get_mut(h);
-        slice[0] = FluidParticle::new([99.0, 0.0, 0.0], 1.0);
-        assert!((arena.get(h)[0].position[0] - 99.0).abs() < f64::EPSILON);
+        slice[0] = FluidParticle::new(DVec3::new(99.0, 0.0, 0.0), 1.0);
+        assert!((arena.get(h)[0].position.x - 99.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -972,14 +977,16 @@ mod tests {
     #[test]
     fn test_config_invalid_bounds() {
         let mut c = FluidConfig::water_2d();
-        c.bounds = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // min_x > max_x
+        c.bounds_min = DVec3::new(1.0, 0.0, 0.0); // min_x > max_x
+        c.bounds_max = DVec3::new(0.0, 1.0, 0.0);
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn test_config_equal_bounds_valid() {
         let mut c = FluidConfig::water_2d();
-        c.bounds = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // min_x == max_x, valid (2D)
+        c.bounds_min = DVec3::new(0.0, 0.0, 0.0); // min_x == max_x, valid (2D)
+        c.bounds_max = DVec3::new(0.0, 1.0, 0.0);
         assert!(c.validate().is_ok());
     }
 

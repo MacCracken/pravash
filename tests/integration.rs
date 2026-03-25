@@ -1,3 +1,4 @@
+use hisab::DVec3;
 use pravash::buoyancy::{self, DragCoefficient, FlowRegime};
 use pravash::common::{FluidConfig, FluidMaterial, FluidParticle};
 use pravash::coupling::{self, BodyShape, FlipSolver, RigidBody};
@@ -35,17 +36,22 @@ fn sph_particles_stay_in_bounds() {
         sph::step(&mut particles, &config, viscosity).unwrap();
     }
 
-    let [min_x, min_y, _min_z, max_x, max_y, _max_z] = config.bounds;
+    let lo = config.bounds_min;
+    let hi = config.bounds_max;
     for (i, p) in particles.iter().enumerate() {
         assert!(
-            p.position[0] >= min_x && p.position[0] <= max_x,
-            "particle {i} x={} out of bounds [{min_x}, {max_x}]",
-            p.position[0]
+            p.position.x >= lo.x && p.position.x <= hi.x,
+            "particle {i} x={} out of bounds [{}, {}]",
+            p.position.x,
+            lo.x,
+            hi.x
         );
         assert!(
-            p.position[1] >= min_y && p.position[1] <= max_y,
-            "particle {i} y={} out of bounds [{min_y}, {max_y}]",
-            p.position[1]
+            p.position.y >= lo.y && p.position.y <= hi.y,
+            "particle {i} y={} out of bounds [{}, {}]",
+            p.position.y,
+            lo.y,
+            hi.y
         );
     }
 }
@@ -413,17 +419,22 @@ fn solver_particles_stay_in_bounds() {
         solver.step(&mut particles, &config, viscosity).unwrap();
     }
 
-    let [min_x, min_y, _min_z, max_x, max_y, _max_z] = config.bounds;
+    let lo = config.bounds_min;
+    let hi = config.bounds_max;
     for (i, p) in particles.iter().enumerate() {
         assert!(
-            p.position[0] >= min_x && p.position[0] <= max_x,
-            "particle {i} x={} out of bounds [{min_x}, {max_x}]",
-            p.position[0]
+            p.position.x >= lo.x && p.position.x <= hi.x,
+            "particle {i} x={} out of bounds [{}, {}]",
+            p.position.x,
+            lo.x,
+            hi.x
         );
         assert!(
-            p.position[1] >= min_y && p.position[1] <= max_y,
-            "particle {i} y={} out of bounds [{min_y}, {max_y}]",
-            p.position[1]
+            p.position.y >= lo.y && p.position.y <= hi.y,
+            "particle {i} y={} out of bounds [{}, {}]",
+            p.position.y,
+            lo.y,
+            hi.y
         );
     }
 }
@@ -489,13 +500,13 @@ fn solver_symmetric_pressure_conserves_momentum() {
     // produce near-zero net momentum (Newton's third law).
     let mut particles = sph::create_particle_block([0.4, 0.4], [0.2, 0.2], 0.02, 0.001);
     let mut config = FluidConfig::water_2d();
-    config.gravity = [0.0, 0.0, 0.0]; // disable gravity for clean momentum test
+    config.gravity = DVec3::ZERO; // disable gravity for clean momentum test
 
     let mut solver = SphSolver::new();
     solver.step(&mut particles, &config, 0.001).unwrap();
 
-    let total_px: f64 = particles.iter().map(|p| p.velocity[0] * p.mass).sum();
-    let total_py: f64 = particles.iter().map(|p| p.velocity[1] * p.mass).sum();
+    let total_px: f64 = particles.iter().map(|p| p.velocity.x * p.mass).sum();
+    let total_py: f64 = particles.iter().map(|p| p.velocity.y * p.mass).sum();
     // Symmetric pressure forces should cancel; small residual from discrete errors
     assert!(
         total_px.abs() < 1e-8,
@@ -515,9 +526,13 @@ fn coupling_sphere_falls_through_fluid() {
     let config = FluidConfig::water_2d();
     let mut solver = SphSolver::new();
 
-    let mut body = RigidBody::new([0.5, 0.7, 0.0], 0.1, BodyShape::Sphere { radius: 0.05 });
+    let mut body = RigidBody::new(
+        DVec3::new(0.5, 0.7, 0.0),
+        0.1,
+        BodyShape::Sphere { radius: 0.05 },
+    );
 
-    let y_start = body.position[1];
+    let y_start = body.position.y;
     for _ in 0..50 {
         solver.step(&mut particles, &config, 0.001).unwrap();
         coupling::couple_sph_bodies(&mut particles, &mut [body.clone()], 0.05, 500.0, 5.0);
@@ -526,20 +541,20 @@ fn coupling_sphere_falls_through_fluid() {
 
     // Body should have fallen under gravity
     assert!(
-        body.position[1] < y_start,
+        body.position.y < y_start,
         "body should fall: y_start={y_start}, y_now={}",
-        body.position[1]
+        body.position.y
     );
-    assert!(body.position[1].is_finite());
+    assert!(body.position.y.is_finite());
 }
 
 #[test]
 fn coupling_body_receives_force() {
-    let mut particles = vec![FluidParticle::new([0.55, 0.0, 0.0], 1.0)];
+    let mut particles = vec![FluidParticle::new(DVec3::new(0.55, 0.0, 0.0), 1.0)];
     particles[0].density = 1000.0;
-    particles[0].velocity = [1.0, 0.0, 0.0];
+    particles[0].velocity = DVec3::new(1.0, 0.0, 0.0);
     let mut bodies = vec![RigidBody::new(
-        [0.5, 0.0, 0.0],
+        DVec3::new(0.5, 0.0, 0.0),
         10.0,
         BodyShape::Sphere { radius: 0.1 },
     )];
@@ -547,9 +562,7 @@ fn coupling_body_receives_force() {
     coupling::couple_sph_bodies(&mut particles, &mut bodies, 0.15, 1000.0, 10.0);
 
     // Body should receive a force from the particle
-    let force_mag =
-        (bodies[0].force[0].powi(2) + bodies[0].force[1].powi(2) + bodies[0].force[2].powi(2))
-            .sqrt();
+    let force_mag = bodies[0].force.length();
     assert!(force_mag > 0.0, "body should receive force from particle");
 }
 
@@ -564,14 +577,14 @@ fn flip_particles_fall_under_gravity() {
 
     for _ in 0..10 {
         solver
-            .step(&mut particles, [0.0, -9.81, 0.0], 0.01)
+            .step(&mut particles, DVec3::new(0.0, -9.81, 0.0), 0.01)
             .unwrap();
     }
 
     // All particles should have fallen
     for p in &particles {
-        assert!(p.position[1] < 0.8, "particle should fall");
-        assert!(p.position[1].is_finite());
+        assert!(p.position.y < 0.8, "particle should fall");
+        assert!(p.position.y.is_finite());
     }
 }
 
@@ -587,11 +600,13 @@ fn flip_multi_step_stable() {
         .collect();
 
     for _ in 0..100 {
-        solver.step(&mut particles, [0.0, -1.0, 0.0], 0.01).unwrap();
+        solver
+            .step(&mut particles, DVec3::new(0.0, -1.0, 0.0), 0.01)
+            .unwrap();
     }
 
     for p in &particles {
-        assert!(p.position[0].is_finite());
-        assert!(p.position[1].is_finite());
+        assert!(p.position.x.is_finite());
+        assert!(p.position.y.is_finite());
     }
 }

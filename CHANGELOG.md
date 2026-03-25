@@ -11,6 +11,9 @@
 - sph: Enhanced `adaptive_dt` with force and viscous CFL constraints
 - grid: `FluidGrid::cfl_dt()` — advective + viscous CFL timestep
 - grid: Smagorinsky SGS turbulence model (`GridConfig.smagorinsky_cs`)
+- sph: `ReactionProvider` trait for pluggable chemistry backends (kimiya, etc.)
+- sph: `update_reaction()` — generic reaction step using any `ReactionProvider`
+- sph: `CombustionConfig` implements `ReactionProvider` for backward compatibility
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

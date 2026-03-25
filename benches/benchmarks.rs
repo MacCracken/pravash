@@ -1,5 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
+use hisab::DVec3;
 use pravash::common::{FluidConfig, FluidMaterial, FluidParticle};
 use pravash::coupling::{self, BodyShape, FlipSolver, RigidBody};
 use pravash::grid::{FluidGrid, GridConfig};
@@ -272,7 +273,7 @@ fn bench_sph_viscosity_force(c: &mut Criterion) {
     let mut particles = sph::create_particle_block([0.0, 0.0], [0.5, 0.5], 0.02, 0.001);
     for (i, p) in particles.iter_mut().enumerate() {
         p.density = 1000.0;
-        p.velocity = [(i as f64 * 0.1).sin(), (i as f64 * 0.1).cos(), 0.0];
+        p.velocity = DVec3::new((i as f64 * 0.1).sin(), (i as f64 * 0.1).cos(), 0.0);
     }
     let h = 0.05;
     group.bench_function(format!("{}_particles", particles.len()), |b| {
@@ -314,9 +315,13 @@ fn bench_coupling_sph_bodies(c: &mut Criterion) {
     let mut group = c.benchmark_group("coupling_sph_bodies");
     let particles_base = sph::create_particle_block([0.1, 0.1], [0.5, 0.5], 0.02, 0.001);
     let bodies = vec![
-        RigidBody::new([0.3, 0.3, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 }),
         RigidBody::new(
-            [0.5, 0.3, 0.0],
+            DVec3::new(0.3, 0.3, 0.0),
+            1.0,
+            BodyShape::Sphere { radius: 0.1 },
+        ),
+        RigidBody::new(
+            DVec3::new(0.5, 0.3, 0.0),
             1.0,
             BodyShape::Box {
                 half_extents: [0.05, 0.05, 0.05],
@@ -365,8 +370,12 @@ fn bench_particle_level_set(c: &mut Criterion) {
 fn bench_drag_from_particles(c: &mut Criterion) {
     let mut group = c.benchmark_group("drag_from_particles");
     let particles = sph::create_particle_block([0.1, 0.1], [0.5, 0.5], 0.02, 0.001);
-    let mut body = RigidBody::new([0.3, 0.3, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
-    body.velocity = [1.0, 0.0, 0.0];
+    let mut body = RigidBody::new(
+        DVec3::new(0.3, 0.3, 0.0),
+        1.0,
+        BodyShape::Sphere { radius: 0.1 },
+    );
+    body.velocity = DVec3::new(1.0, 0.0, 0.0);
     group.bench_function(format!("{}_particles", particles.len()), |b| {
         b.iter(|| {
             coupling::drag_from_particles(
@@ -412,7 +421,11 @@ fn bench_flip_step(c: &mut Criterion) {
         group.bench_function(format!("{n}_particles"), |b| {
             b.iter_batched(
                 || particles.clone(),
-                |mut p| solver.step(&mut p, [0.0, -9.81, 0.0], 0.01).unwrap(),
+                |mut p| {
+                    solver
+                        .step(&mut p, DVec3::new(0.0, -9.81, 0.0), 0.01)
+                        .unwrap()
+                },
                 criterion::BatchSize::SmallInput,
             )
         });

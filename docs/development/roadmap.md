@@ -4,8 +4,8 @@
 
 ### 0.25.3 — Integration & Research
 
-- [ ] kimiya integration (chemistry crate crosstalk — reaction trait, species transport piping)
-- [ ] soorat `ComputeBackend` implementation (GPU-accelerated SPH/grid via wgpu)
+- [x] kimiya integration (ReactionProvider trait — no-vendor-lock-in crosstalk)
+- [x] soorat integration (ComputeBackend trait — GPU-agnostic, no wgpu dependency)
 - [x] Deep research: thermodynamic formulas, breakthroughs, new theories to watch
 
 ### 0.26.0 — Numerical Quality & Correctness

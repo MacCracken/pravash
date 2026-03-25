@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use hisab::DVec3;
+
 use crate::common::FluidParticle;
 use crate::error::{PravashError, Result};
 
@@ -28,10 +30,10 @@ impl BodyShape {
     /// Negative = inside, positive = outside.
     #[inline]
     #[must_use]
-    pub fn signed_distance(&self, point: [f64; 3], body_pos: [f64; 3]) -> f64 {
-        let dx = point[0] - body_pos[0];
-        let dy = point[1] - body_pos[1];
-        let dz = point[2] - body_pos[2];
+    pub fn signed_distance(&self, point: DVec3, body_pos: DVec3) -> f64 {
+        let dx = point.x - body_pos.x;
+        let dy = point.y - body_pos.y;
+        let dz = point.z - body_pos.z;
         match *self {
             BodyShape::Sphere { radius } => (dx * dx + dy * dy + dz * dz).sqrt() - radius,
             BodyShape::Box { half_extents } => {
@@ -65,70 +67,70 @@ impl BodyShape {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RigidBody {
-    pub position: [f64; 3],
-    pub velocity: [f64; 3],
+    pub position: DVec3,
+    pub velocity: DVec3,
     pub mass: f64,
     pub shape: BodyShape,
     /// Accumulated force from fluid interaction (reset each step).
-    pub force: [f64; 3],
+    pub force: DVec3,
 }
 
 impl RigidBody {
     /// Create a new rigid body at rest.
     #[must_use]
-    pub fn new(position: [f64; 3], mass: f64, shape: BodyShape) -> Self {
+    pub fn new(position: DVec3, mass: f64, shape: BodyShape) -> Self {
         Self {
             position,
-            velocity: [0.0; 3],
+            velocity: DVec3::ZERO,
             mass,
             shape,
-            force: [0.0; 3],
+            force: DVec3::ZERO,
         }
     }
 
     /// Signed distance from a point to this body's surface.
     #[inline]
     #[must_use]
-    pub fn signed_distance(&self, point: [f64; 3]) -> f64 {
+    pub fn signed_distance(&self, point: DVec3) -> f64 {
         self.shape.signed_distance(point, self.position)
     }
 
     /// Surface normal at a point (central-difference gradient of signed distance).
     #[must_use]
-    pub fn surface_normal(&self, point: [f64; 3]) -> [f64; 3] {
+    pub fn surface_normal(&self, point: DVec3) -> DVec3 {
         let eps = 1e-6;
         let dx = self
             .shape
-            .signed_distance([point[0] + eps, point[1], point[2]], self.position)
+            .signed_distance(DVec3::new(point.x + eps, point.y, point.z), self.position)
             - self
                 .shape
-                .signed_distance([point[0] - eps, point[1], point[2]], self.position);
+                .signed_distance(DVec3::new(point.x - eps, point.y, point.z), self.position);
         let dy = self
             .shape
-            .signed_distance([point[0], point[1] + eps, point[2]], self.position)
+            .signed_distance(DVec3::new(point.x, point.y + eps, point.z), self.position)
             - self
                 .shape
-                .signed_distance([point[0], point[1] - eps, point[2]], self.position);
+                .signed_distance(DVec3::new(point.x, point.y - eps, point.z), self.position);
         let dz = self
             .shape
-            .signed_distance([point[0], point[1], point[2] + eps], self.position)
+            .signed_distance(DVec3::new(point.x, point.y, point.z + eps), self.position)
             - self
                 .shape
-                .signed_distance([point[0], point[1], point[2] - eps], self.position);
+                .signed_distance(DVec3::new(point.x, point.y, point.z - eps), self.position);
         let mag = (dx * dx + dy * dy + dz * dz).sqrt();
         if mag < 1e-20 {
             // Fallback: direction from body center to point
-            let fx = point[0] - self.position[0];
-            let fy = point[1] - self.position[1];
-            let fz = point[2] - self.position[2];
+            let fx = point.x - self.position.x;
+            let fy = point.y - self.position.y;
+            let fz = point.z - self.position.z;
             let fmag = (fx * fx + fy * fy + fz * fz).sqrt();
             return if fmag < 1e-20 {
-                [1.0, 0.0, 0.0] // arbitrary fallback for exact center
+                DVec3::new(1.0, 0.0, 0.0) // arbitrary fallback for exact center
             } else {
-                [fx / fmag, fy / fmag, fz / fmag]
+                DVec3::new(fx / fmag, fy / fmag, fz / fmag)
             };
         }
-        [dx / mag, dy / mag, dz / mag]
+        DVec3::new(dx / mag, dy / mag, dz / mag)
     }
 }
 
@@ -153,7 +155,7 @@ pub fn couple_sph_bodies(
 
     // Reset body forces
     for body in bodies.iter_mut() {
-        body.force = [0.0; 3];
+        body.force = DVec3::ZERO;
     }
 
     for p in particles.iter_mut() {
@@ -168,12 +170,10 @@ pub fn couple_sph_bodies(
                 let pen_force = stiffness * penetration;
 
                 // Relative velocity (particle relative to body surface)
-                let rel_vx = p.velocity[0] - body.velocity[0];
-                let rel_vy = p.velocity[1] - body.velocity[1];
-                let rel_vz = p.velocity[2] - body.velocity[2];
+                let rel_vel = p.velocity - body.velocity;
 
                 // Normal component of relative velocity
-                let vn = rel_vx * normal[0] + rel_vy * normal[1] + rel_vz * normal[2];
+                let vn = rel_vel.dot(normal);
 
                 // Damping force (only when approaching)
                 let damp_force = if vn < 0.0 { -damping * vn } else { 0.0 };
@@ -181,29 +181,21 @@ pub fn couple_sph_bodies(
                 let total = pen_force + damp_force;
 
                 // Apply force to particle (push outward)
-                p.acceleration[0] += total * normal[0] / p.mass.max(1e-20);
-                p.acceleration[1] += total * normal[1] / p.mass.max(1e-20);
-                p.acceleration[2] += total * normal[2] / p.mass.max(1e-20);
+                p.acceleration += total * normal / p.mass.max(1e-20);
 
                 // Reaction force on body (Newton's third law)
-                body.force[0] -= total * normal[0];
-                body.force[1] -= total * normal[1];
-                body.force[2] -= total * normal[2];
+                body.force -= total * normal;
             }
         }
     }
 }
 
 /// Integrate rigid body motion from accumulated forces.
-pub fn integrate_bodies(bodies: &mut [RigidBody], gravity: [f64; 3], dt: f64) {
+pub fn integrate_bodies(bodies: &mut [RigidBody], gravity: DVec3, dt: f64) {
     for body in bodies {
         let inv_mass = 1.0 / body.mass.max(1e-20);
-        body.velocity[0] += (body.force[0] * inv_mass + gravity[0]) * dt;
-        body.velocity[1] += (body.force[1] * inv_mass + gravity[1]) * dt;
-        body.velocity[2] += (body.force[2] * inv_mass + gravity[2]) * dt;
-        body.position[0] += body.velocity[0] * dt;
-        body.position[1] += body.velocity[1] * dt;
-        body.position[2] += body.velocity[2] * dt;
+        body.velocity += (body.force * inv_mass + gravity) * dt;
+        body.position += body.velocity * dt;
     }
 }
 
@@ -239,7 +231,7 @@ pub fn effective_mass(body_mass: f64, fluid_density: f64, body_volume: f64, ca: 
 /// (shape-dependent, 0.5 for sphere).
 pub fn integrate_bodies_with_added_mass(
     bodies: &mut [RigidBody],
-    gravity: [f64; 3],
+    gravity: DVec3,
     dt: f64,
     fluid_density: f64,
     ca: f64,
@@ -248,12 +240,8 @@ pub fn integrate_bodies_with_added_mass(
         let vol = body.shape.volume();
         let m_eff = effective_mass(body.mass, fluid_density, vol, ca);
         let inv_m = 1.0 / m_eff.max(1e-20);
-        body.velocity[0] += (body.force[0] * inv_m + gravity[0]) * dt;
-        body.velocity[1] += (body.force[1] * inv_m + gravity[1]) * dt;
-        body.velocity[2] += (body.force[2] * inv_m + gravity[2]) * dt;
-        body.position[0] += body.velocity[0] * dt;
-        body.position[1] += body.velocity[1] * dt;
-        body.position[2] += body.velocity[2] * dt;
+        body.velocity += (body.force * inv_m + gravity) * dt;
+        body.position += body.velocity * dt;
     }
 }
 
@@ -273,7 +261,7 @@ pub fn drag_from_particles(
     fluid_density: f64,
     drag_coefficient: f64,
     sample_radius: f64,
-) -> [f64; 3] {
+) -> DVec3 {
     let _span = trace_span!("coupling::drag_from_particles").entered();
     // Average fluid velocity near the body surface
     let mut avg_vx = 0.0;
@@ -284,15 +272,15 @@ pub fn drag_from_particles(
     for p in particles {
         let sd = body.signed_distance(p.position);
         if sd.abs() < sample_radius {
-            avg_vx += p.velocity[0];
-            avg_vy += p.velocity[1];
-            avg_vz += p.velocity[2];
+            avg_vx += p.velocity.x;
+            avg_vy += p.velocity.y;
+            avg_vz += p.velocity.z;
             count += 1.0;
         }
     }
 
     if count < 1.0 {
-        return [0.0; 3];
+        return DVec3::ZERO;
     }
 
     avg_vx /= count;
@@ -300,13 +288,13 @@ pub fn drag_from_particles(
     avg_vz /= count;
 
     // Relative velocity (fluid relative to body)
-    let rel_vx = avg_vx - body.velocity[0];
-    let rel_vy = avg_vy - body.velocity[1];
-    let rel_vz = avg_vz - body.velocity[2];
+    let rel_vx = avg_vx - body.velocity.x;
+    let rel_vy = avg_vy - body.velocity.y;
+    let rel_vz = avg_vz - body.velocity.z;
     let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz).sqrt();
 
     if rel_speed < 1e-20 {
-        return [0.0; 3];
+        return DVec3::ZERO;
     }
 
     // Cross-section area projected onto the velocity-normal plane
@@ -326,11 +314,11 @@ pub fn drag_from_particles(
 
     // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
     let drag_mag = 0.5 * fluid_density * rel_speed * drag_coefficient * area;
-    [
+    DVec3::new(
         drag_mag * rel_vx / rel_speed,
         drag_mag * rel_vy / rel_speed,
         drag_mag * rel_vz / rel_speed,
-    ]
+    )
 }
 
 // ── Particle-Level Set Surface Tracking ─────────────────────────────────────
@@ -364,8 +352,8 @@ pub fn particle_level_set(
             let mut min_dist = far;
 
             for p in particles {
-                let ddx = gx - p.position[0];
-                let ddy = gy - p.position[1];
+                let ddx = gx - p.position.x;
+                let ddy = gy - p.position.y;
                 let dist = (ddx * ddx + ddy * ddy).sqrt() - particle_radius;
                 if dist < min_dist {
                     min_dist = dist;
@@ -458,8 +446,8 @@ impl FlipSolver {
         self.weight.fill(0.0);
 
         for p in particles {
-            let gx = p.position[0] * inv_dx;
-            let gy = p.position[1] * inv_dx;
+            let gx = p.position.x * inv_dx;
+            let gy = p.position.y * inv_dx;
 
             let x0 = gx.floor().max(0.0).min((nx - 2) as f64) as usize;
             let y0 = gy.floor().max(0.0).min((self.ny - 2) as f64) as usize;
@@ -482,8 +470,8 @@ impl FlipSolver {
             ];
 
             for (&idx, &w) in indices.iter().zip(weights.iter()) {
-                self.vx[idx] += w * p.velocity[0];
-                self.vy[idx] += w * p.velocity[1];
+                self.vx[idx] += w * p.velocity.x;
+                self.vy[idx] += w * p.velocity.y;
                 self.weight[idx] += w;
             }
         }
@@ -507,8 +495,8 @@ impl FlipSolver {
         let pic = 1.0 - flip;
 
         for p in particles.iter_mut() {
-            let gx = p.position[0] * inv_dx;
-            let gy = p.position[1] * inv_dx;
+            let gx = p.position.x * inv_dx;
+            let gy = p.position.y * inv_dx;
 
             // Grid velocity (PIC component) and delta (FLIP component)
             let new_vx = Self::sample_field(&self.vx, nx, ny, gx, gy);
@@ -519,8 +507,8 @@ impl FlipSolver {
             let dvy = new_vy - old_vy;
 
             // Blend: FLIP = particle_vel + grid_delta, PIC = grid_vel
-            p.velocity[0] = flip * (p.velocity[0] + dvx) + pic * new_vx;
-            p.velocity[1] = flip * (p.velocity[1] + dvy) + pic * new_vy;
+            p.velocity.x = flip * (p.velocity.x + dvx) + pic * new_vx;
+            p.velocity.y = flip * (p.velocity.y + dvy) + pic * new_vy;
         }
     }
 
@@ -550,12 +538,7 @@ impl FlipSolver {
     /// 3. Pressure projection on grid
     /// 4. Transfer grid velocity back to particles (G2P) with FLIP/PIC blend
     /// 5. Advect particles through velocity field
-    pub fn step(
-        &mut self,
-        particles: &mut [FluidParticle],
-        gravity: [f64; 3],
-        dt: f64,
-    ) -> Result<()> {
+    pub fn step(&mut self, particles: &mut [FluidParticle], gravity: DVec3, dt: f64) -> Result<()> {
         let _span = trace_span!("flip::step", n = particles.len()).entered();
         if !dt.is_finite() || dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
@@ -573,8 +556,8 @@ impl FlipSolver {
 
         // 2. Apply gravity to grid (both components)
         for i in 0..nx * ny {
-            self.vx[i] += gravity[0] * dt;
-            self.vy[i] += gravity[1] * dt;
+            self.vx[i] += gravity.x * dt;
+            self.vy[i] += gravity.y * dt;
         }
 
         // 3. Pressure projection on grid (with dt scaling)
@@ -622,24 +605,22 @@ impl FlipSolver {
         let max_x = (nx - 1) as f64 * self.dx;
         let max_y = (ny - 1) as f64 * self.dx;
         for p in particles.iter_mut() {
-            p.position[0] += p.velocity[0] * dt;
-            p.position[1] += p.velocity[1] * dt;
-            p.position[2] += p.velocity[2] * dt;
+            p.position += p.velocity * dt;
 
             // Clamp to grid domain with velocity reflection
-            if p.position[0] < 0.0 {
-                p.position[0] = 0.0;
-                p.velocity[0] = 0.0;
-            } else if p.position[0] > max_x {
-                p.position[0] = max_x;
-                p.velocity[0] = 0.0;
+            if p.position.x < 0.0 {
+                p.position.x = 0.0;
+                p.velocity.x = 0.0;
+            } else if p.position.x > max_x {
+                p.position.x = max_x;
+                p.velocity.x = 0.0;
             }
-            if p.position[1] < 0.0 {
-                p.position[1] = 0.0;
-                p.velocity[1] = 0.0;
-            } else if p.position[1] > max_y {
-                p.position[1] = max_y;
-                p.velocity[1] = 0.0;
+            if p.position.y < 0.0 {
+                p.position.y = 0.0;
+                p.velocity.y = 0.0;
+            } else if p.position.y > max_y {
+                p.position.y = max_y;
+                p.velocity.y = 0.0;
             }
         }
 
@@ -656,19 +637,24 @@ mod tests {
     #[test]
     fn test_sphere_sdf_center() {
         let shape = BodyShape::Sphere { radius: 1.0 };
-        assert!((shape.signed_distance([0.0; 3], [0.0; 3]) - (-1.0)).abs() < 1e-10);
+        assert!((shape.signed_distance(DVec3::ZERO, DVec3::ZERO) - (-1.0)).abs() < 1e-10);
     }
 
     #[test]
     fn test_sphere_sdf_surface() {
         let shape = BodyShape::Sphere { radius: 1.0 };
-        assert!(shape.signed_distance([1.0, 0.0, 0.0], [0.0; 3]).abs() < 1e-10);
+        assert!(
+            shape
+                .signed_distance(DVec3::new(1.0, 0.0, 0.0), DVec3::ZERO)
+                .abs()
+                < 1e-10
+        );
     }
 
     #[test]
     fn test_sphere_sdf_outside() {
         let shape = BodyShape::Sphere { radius: 1.0 };
-        let sd = shape.signed_distance([2.0, 0.0, 0.0], [0.0; 3]);
+        let sd = shape.signed_distance(DVec3::new(2.0, 0.0, 0.0), DVec3::ZERO);
         assert!((sd - 1.0).abs() < 1e-10);
     }
 
@@ -677,7 +663,7 @@ mod tests {
         let shape = BodyShape::Box {
             half_extents: [1.0, 1.0, 1.0],
         };
-        assert!(shape.signed_distance([0.0; 3], [0.0; 3]) < 0.0);
+        assert!(shape.signed_distance(DVec3::ZERO, DVec3::ZERO) < 0.0);
     }
 
     #[test]
@@ -685,7 +671,7 @@ mod tests {
         let shape = BodyShape::Box {
             half_extents: [1.0, 1.0, 1.0],
         };
-        let sd = shape.signed_distance([2.0, 0.0, 0.0], [0.0; 3]);
+        let sd = shape.signed_distance(DVec3::new(2.0, 0.0, 0.0), DVec3::ZERO);
         assert!((sd - 1.0).abs() < 1e-10);
     }
 
@@ -708,18 +694,18 @@ mod tests {
 
     #[test]
     fn test_rigid_body_surface_normal() {
-        let body = RigidBody::new([0.0; 3], 1.0, BodyShape::Sphere { radius: 1.0 });
-        let n = body.surface_normal([2.0, 0.0, 0.0]);
-        assert!((n[0] - 1.0).abs() < 1e-4);
-        assert!(n[1].abs() < 1e-4);
+        let body = RigidBody::new(DVec3::ZERO, 1.0, BodyShape::Sphere { radius: 1.0 });
+        let n = body.surface_normal(DVec3::new(2.0, 0.0, 0.0));
+        assert!((n.x - 1.0).abs() < 1e-4);
+        assert!(n.y.abs() < 1e-4);
     }
 
     #[test]
     fn test_coupling_pushes_particle_out() {
-        let mut particles = vec![FluidParticle::new([0.0, 0.0, 0.0], 1.0)];
+        let mut particles = vec![FluidParticle::new(DVec3::ZERO, 1.0)];
         particles[0].density = 1000.0;
         let mut bodies = vec![RigidBody::new(
-            [0.0; 3],
+            DVec3::ZERO,
             10.0,
             BodyShape::Sphere { radius: 0.5 },
         )];
@@ -727,19 +713,16 @@ mod tests {
         couple_sph_bodies(&mut particles, &mut bodies, 0.1, 1000.0, 10.0);
 
         // Particle at center of sphere should get pushed outward
-        let accel_mag = (particles[0].acceleration[0].powi(2)
-            + particles[0].acceleration[1].powi(2)
-            + particles[0].acceleration[2].powi(2))
-        .sqrt();
+        let accel_mag = particles[0].acceleration.length();
         assert!(accel_mag > 0.0, "particle should be accelerated outward");
     }
 
     #[test]
     fn test_coupling_newton_third_law() {
-        let mut particles = vec![FluidParticle::new([0.6, 0.0, 0.0], 1.0)];
+        let mut particles = vec![FluidParticle::new(DVec3::new(0.6, 0.0, 0.0), 1.0)];
         particles[0].density = 1000.0;
         let mut bodies = vec![RigidBody::new(
-            [0.0; 3],
+            DVec3::ZERO,
             10.0,
             BodyShape::Sphere { radius: 0.5 },
         )];
@@ -747,8 +730,8 @@ mod tests {
         couple_sph_bodies(&mut particles, &mut bodies, 0.2, 1000.0, 10.0);
 
         // Body force should be opposite to particle acceleration * mass
-        let f_on_particle_x = particles[0].acceleration[0] * particles[0].mass;
-        let f_on_body_x = bodies[0].force[0];
+        let f_on_particle_x = particles[0].acceleration.x * particles[0].mass;
+        let f_on_body_x = bodies[0].force.x;
         assert!(
             (f_on_particle_x + f_on_body_x).abs() < 1e-10,
             "forces should be equal and opposite: particle={f_on_particle_x}, body={f_on_body_x}"
@@ -758,14 +741,14 @@ mod tests {
     #[test]
     fn test_integrate_bodies() {
         let mut bodies = vec![RigidBody::new(
-            [0.0, 1.0, 0.0],
+            DVec3::new(0.0, 1.0, 0.0),
             1.0,
             BodyShape::Sphere { radius: 0.1 },
         )];
-        bodies[0].force = [0.0; 3];
-        integrate_bodies(&mut bodies, [0.0, -9.81, 0.0], 0.01);
-        assert!(bodies[0].velocity[1] < 0.0);
-        assert!(bodies[0].position[1] < 1.0);
+        bodies[0].force = DVec3::ZERO;
+        integrate_bodies(&mut bodies, DVec3::new(0.0, -9.81, 0.0), 0.01);
+        assert!(bodies[0].velocity.y < 0.0);
+        assert!(bodies[0].position.y < 1.0);
     }
 
     // ── FLIP/PIC tests ──────────────────────────────────────────────────────
@@ -788,7 +771,7 @@ mod tests {
         let mut solver = FlipSolver::new(8, 8, 0.1, 0.95).unwrap();
         let mut particles = vec![];
         solver
-            .step(&mut particles, [0.0, -9.81, 0.0], 0.01)
+            .step(&mut particles, DVec3::new(0.0, -9.81, 0.0), 0.01)
             .unwrap();
     }
 
@@ -796,15 +779,15 @@ mod tests {
     fn test_flip_step_particles_move() {
         let mut solver = FlipSolver::new(16, 16, 0.1, 0.95).unwrap();
         let mut particles = vec![FluidParticle::new_2d(0.8, 0.8, 0.01)];
-        particles[0].velocity = [1.0, 0.0, 0.0];
+        particles[0].velocity = DVec3::new(1.0, 0.0, 0.0);
 
-        let x_before = particles[0].position[0];
-        solver.step(&mut particles, [0.0, 0.0, 0.0], 0.1).unwrap();
+        let x_before = particles[0].position.x;
+        solver.step(&mut particles, DVec3::ZERO, 0.1).unwrap();
         // Particle should move (velocity may change from projection, but position advances)
         assert!(
-            (particles[0].position[0] - x_before).abs() > 1e-6,
+            (particles[0].position.x - x_before).abs() > 1e-6,
             "particle should have moved: before={x_before}, after={}",
-            particles[0].position[0]
+            particles[0].position.x
         );
     }
 
@@ -814,10 +797,10 @@ mod tests {
         let mut particles = vec![FluidParticle::new_2d(0.8, 0.8, 0.01)];
 
         solver
-            .step(&mut particles, [0.0, -9.81, 0.0], 0.01)
+            .step(&mut particles, DVec3::new(0.0, -9.81, 0.0), 0.01)
             .unwrap();
         assert!(
-            particles[0].velocity[1] < 0.0,
+            particles[0].velocity.y < 0.0,
             "particle should fall under gravity"
         );
     }
@@ -830,17 +813,19 @@ mod tests {
         let p_init = FluidParticle::new_2d(0.4, 0.4, 0.01);
         let mut particles_flip = vec![p_init];
         let mut particles_pic = vec![p_init];
-        particles_flip[0].velocity = [1.0, 0.0, 0.0];
-        particles_pic[0].velocity = [1.0, 0.0, 0.0];
+        particles_flip[0].velocity = DVec3::new(1.0, 0.0, 0.0);
+        particles_pic[0].velocity = DVec3::new(1.0, 0.0, 0.0);
 
         solver_flip
-            .step(&mut particles_flip, [0.0; 3], 0.01)
+            .step(&mut particles_flip, DVec3::ZERO, 0.01)
             .unwrap();
-        solver_pic.step(&mut particles_pic, [0.0; 3], 0.01).unwrap();
+        solver_pic
+            .step(&mut particles_pic, DVec3::ZERO, 0.01)
+            .unwrap();
 
         // Both should produce finite results
-        assert!(particles_flip[0].velocity[0].is_finite());
-        assert!(particles_pic[0].velocity[0].is_finite());
+        assert!(particles_flip[0].velocity.x.is_finite());
+        assert!(particles_pic[0].velocity.x.is_finite());
     }
 
     #[test]
@@ -848,26 +833,26 @@ mod tests {
         let mut solver = FlipSolver::new(8, 8, 0.1, 0.95).unwrap();
         // Particle with high velocity heading out of domain
         let mut particles = vec![FluidParticle::new_2d(0.05, 0.05, 0.01)];
-        particles[0].velocity = [-10.0, -10.0, 0.0];
+        particles[0].velocity = DVec3::new(-10.0, -10.0, 0.0);
 
-        solver.step(&mut particles, [0.0; 3], 0.1).unwrap();
+        solver.step(&mut particles, DVec3::ZERO, 0.1).unwrap();
 
         // Particle should be clamped to domain [0, (nx-1)*dx]
         assert!(
-            particles[0].position[0] >= 0.0,
+            particles[0].position.x >= 0.0,
             "x should be >= 0: {}",
-            particles[0].position[0]
+            particles[0].position.x
         );
         assert!(
-            particles[0].position[1] >= 0.0,
+            particles[0].position.y >= 0.0,
             "y should be >= 0: {}",
-            particles[0].position[1]
+            particles[0].position.y
         );
         // Velocity should be zeroed at boundary
         assert!(
-            particles[0].velocity[0].abs() < 1e-10,
+            particles[0].velocity.x.abs() < 1e-10,
             "vx should be 0 at boundary: {}",
-            particles[0].velocity[0]
+            particles[0].velocity.x
         );
     }
 
@@ -885,17 +870,20 @@ mod tests {
 
     #[test]
     fn test_integrate_with_added_mass_slower() {
-        let mut body_normal =
-            RigidBody::new([0.0, 1.0, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
+        let mut body_normal = RigidBody::new(
+            DVec3::new(0.0, 1.0, 0.0),
+            1.0,
+            BodyShape::Sphere { radius: 0.1 },
+        );
         let mut body_added = body_normal.clone();
         // Apply same force, zero gravity to isolate added mass effect
-        body_normal.force = [10.0, 0.0, 0.0];
-        body_added.force = [10.0, 0.0, 0.0];
+        body_normal.force = DVec3::new(10.0, 0.0, 0.0);
+        body_added.force = DVec3::new(10.0, 0.0, 0.0);
 
-        integrate_bodies(std::slice::from_mut(&mut body_normal), [0.0; 3], 0.01);
+        integrate_bodies(std::slice::from_mut(&mut body_normal), DVec3::ZERO, 0.01);
         integrate_bodies_with_added_mass(
             std::slice::from_mut(&mut body_added),
-            [0.0; 3],
+            DVec3::ZERO,
             0.01,
             1000.0,
             AddedMassCoefficient::SPHERE,
@@ -903,10 +891,10 @@ mod tests {
 
         // Added mass body should accelerate less from the same force
         assert!(
-            body_added.velocity[0].abs() < body_normal.velocity[0].abs(),
+            body_added.velocity.x.abs() < body_normal.velocity.x.abs(),
             "added mass should reduce force response: normal={}, added={}",
-            body_normal.velocity[0],
-            body_added.velocity[0]
+            body_normal.velocity.x,
+            body_added.velocity.x
         );
     }
 
@@ -914,27 +902,31 @@ mod tests {
 
     #[test]
     fn test_drag_no_particles() {
-        let body = RigidBody::new([0.0; 3], 1.0, BodyShape::Sphere { radius: 0.1 });
+        let body = RigidBody::new(DVec3::ZERO, 1.0, BodyShape::Sphere { radius: 0.1 });
         let drag = drag_from_particles(&body, &[], 1000.0, 0.47, 0.2);
-        assert!(drag[0].abs() < 1e-20);
+        assert!(drag.x.abs() < 1e-20);
     }
 
     #[test]
     fn test_drag_opposing_motion() {
-        let mut body = RigidBody::new([0.5, 0.5, 0.0], 1.0, BodyShape::Sphere { radius: 0.1 });
-        body.velocity = [1.0, 0.0, 0.0]; // body moving right
+        let mut body = RigidBody::new(
+            DVec3::new(0.5, 0.5, 0.0),
+            1.0,
+            BodyShape::Sphere { radius: 0.1 },
+        );
+        body.velocity = DVec3::new(1.0, 0.0, 0.0); // body moving right
 
         // Stationary fluid particles nearby
         let particles: Vec<FluidParticle> = (0..5)
-            .map(|i| FluidParticle::new([0.45 + i as f64 * 0.025, 0.5, 0.0], 0.01))
+            .map(|i| FluidParticle::new(DVec3::new(0.45 + i as f64 * 0.025, 0.5, 0.0), 0.01))
             .collect();
 
         let drag = drag_from_particles(&body, &particles, 1000.0, 0.47, 0.2);
         // Drag should oppose body motion (point left, negative x)
         assert!(
-            drag[0] < 0.0,
+            drag.x < 0.0,
             "drag should oppose rightward motion: {}",
-            drag[0]
+            drag.x
         );
     }
 
@@ -950,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_level_set_single_particle() {
-        let particles = vec![FluidParticle::new([0.2, 0.2, 0.0], 0.01)];
+        let particles = vec![FluidParticle::new(DVec3::new(0.2, 0.2, 0.0), 0.01)];
         let mut ls = vec![0.0; 25];
         particle_level_set(&mut ls, 5, 5, 0.1, &particles, 0.05);
         // Cell at (2,2) = 0.2,0.2 should be inside (negative)
@@ -965,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_level_set_continuous() {
-        let particles = vec![FluidParticle::new([0.5, 0.5, 0.0], 0.01)];
+        let particles = vec![FluidParticle::new(DVec3::new(0.5, 0.5, 0.0), 0.01)];
         let mut ls = vec![0.0; 100];
         particle_level_set(&mut ls, 10, 10, 0.1, &particles, 0.1);
         // Level set should be smooth (no sharp jumps between adjacent cells)

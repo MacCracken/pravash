@@ -22,6 +22,7 @@ use crate::error::{PravashError, Result};
 
 use std::f64::consts::PI;
 
+use hisab::DVec3;
 use hisab::SpatialHash;
 use hisab::Vec3;
 use tracing::trace_span;
@@ -468,6 +469,64 @@ pub fn update_heat(
 
 // ── Chemical Reaction ─────────────────────────────────────────────────────
 
+/// Trait for pluggable chemistry backends (e.g., kimiya).
+///
+/// Implement this to replace the built-in `CombustionConfig` with
+/// advanced reaction kinetics (Arrhenius, multi-step, equilibrium).
+/// Pravash calls `react()` per particle per step — the implementation
+/// decides how much fuel is consumed and how much heat is released.
+///
+/// # No vendor lock-in
+///
+/// Pravash defines this trait. Chemistry crates (kimiya, etc.) implement it.
+/// Neither depends on the other — the consumer wires them together.
+///
+/// ```ignore
+/// // In your app:
+/// struct KimiyaReactor { /* kimiya types */ }
+/// impl ReactionProvider for KimiyaReactor {
+///     fn react(&self, temperature: f64, fuel: f64, dt: f64) -> (f64, f64) {
+///         let rate = kimiya::kinetics::arrhenius_rate(a, ea, temperature).unwrap();
+///         let consumed = fuel * (1.0 - (-rate * dt).exp());
+///         let heat = consumed * delta_h;
+///         (consumed, heat)
+///     }
+/// }
+/// ```
+pub trait ReactionProvider {
+    /// Compute reaction for a single particle.
+    ///
+    /// Given current `temperature` (K), `fuel` concentration (0–1), and `dt` (s),
+    /// returns `(fuel_consumed, temperature_increase)`.
+    fn react(&self, temperature: f64, fuel: f64, dt: f64) -> (f64, f64);
+}
+
+/// Update particles using a pluggable reaction provider.
+///
+/// Drop-in replacement for `update_combustion` that accepts any
+/// `ReactionProvider` implementation.
+pub fn update_reaction(particles: &mut [FluidParticle], provider: &dyn ReactionProvider, dt: f64) {
+    let _span = trace_span!("sph::reaction", n = particles.len()).entered();
+    for p in particles.iter_mut() {
+        if p.fuel > 0.0 {
+            let (consumed, heat) = provider.react(p.temperature, p.fuel, dt);
+            p.fuel = (p.fuel - consumed).max(0.0);
+            p.temperature += heat;
+        }
+    }
+}
+
+// Make CombustionConfig implement ReactionProvider for backward compatibility
+impl ReactionProvider for CombustionConfig {
+    fn react(&self, temperature: f64, fuel: f64, dt: f64) -> (f64, f64) {
+        if temperature <= self.ignition_temperature || fuel <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let consumed = fuel - fuel / (1.0 + self.reaction_rate * dt);
+        (consumed, self.heat_release * consumed)
+    }
+}
+
 /// Combustion reaction configuration.
 ///
 /// Simple one-step reaction model: fuel → products + heat.
@@ -600,7 +659,7 @@ pub fn apply_delta_sph(
 
     let kc = KernelCoeffs::new(h);
     let eps = 0.01 * h * h;
-    let snap: Vec<(f64, [f64; 3], f64)> = particles
+    let snap: Vec<(f64, DVec3, f64)> = particles
         .iter()
         .map(|p| (p.density, p.position, p.mass))
         .collect();
@@ -616,9 +675,9 @@ pub fn apply_delta_sph(
                 continue;
             }
             let (rho_j, pos_j, mass_j) = snap[j];
-            let dx = pos_i[0] - pos_j[0];
-            let dy = pos_i[1] - pos_j[1];
-            let dz = pos_i[2] - pos_j[2];
+            let dx = pos_i.x - pos_j.x;
+            let dy = pos_i.y - pos_j.y;
+            let dz = pos_i.z - pos_j.z;
             let r2 = dx * dx + dy * dy + dz * dz;
             if r2 > kc.h2 || r2 < 1e-20 {
                 continue;
@@ -700,9 +759,9 @@ pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) 
         let grad = kc.spiky_grad(r);
         let scale = -pi.mass * pj.mass * sym_pressure * grad / r;
 
-        force[0] += scale * (pi.position[0] - pj.position[0]);
-        force[1] += scale * (pi.position[1] - pj.position[1]);
-        force[2] += scale * (pi.position[2] - pj.position[2]);
+        force[0] += scale * (pi.position.x - pj.position.x);
+        force[1] += scale * (pi.position.y - pj.position.y);
+        force[2] += scale * (pi.position.z - pj.position.z);
     }
 
     force
@@ -734,9 +793,9 @@ pub fn viscosity_force(
         let rho_j = pj.density.max(1e-10);
         let scale = viscosity * pj.mass * lap / rho_j;
 
-        force[0] += scale * (pj.velocity[0] - pi.velocity[0]);
-        force[1] += scale * (pj.velocity[1] - pi.velocity[1]);
-        force[2] += scale * (pj.velocity[2] - pi.velocity[2]);
+        force[0] += scale * (pj.velocity.x - pi.velocity.x);
+        force[1] += scale * (pj.velocity.y - pi.velocity.y);
+        force[2] += scale * (pj.velocity.z - pi.velocity.z);
     }
 
     force
@@ -762,14 +821,14 @@ pub struct SphSolver {
     /// Surface tension coefficient (0.0 to disable).
     pub surface_tension: f64,
     // PCISPH scratch buffers (persistent across steps)
-    pcisph_accel: Vec<[f64; 3]>,
+    pcisph_accel: Vec<DVec3>,
     pcisph_pressures: Vec<f64>,
-    pcisph_pred_pos: Vec<[f64; 3]>,
-    pcisph_pred_vel: Vec<[f64; 3]>,
+    pcisph_pred_pos: Vec<DVec3>,
+    pcisph_pred_vel: Vec<DVec3>,
     /// Use Velocity Verlet integration instead of symplectic Euler.
     pub use_verlet: bool,
     /// Previous accelerations for Verlet half-step.
-    prev_accel: Vec<[f64; 3]>,
+    prev_accel: Vec<DVec3>,
 }
 
 impl SphSolver {
@@ -947,7 +1006,8 @@ impl SphSolver {
         }
 
         // Snapshot for force computation
-        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot
+            .resize(n, FluidParticle::new(DVec3::ZERO, 0.0));
         self.snapshot.copy_from_slice(particles);
 
         // Compute forces via cached neighbors
@@ -959,11 +1019,11 @@ impl SphSolver {
             let indices = &self.neighbor_indices;
             let gravity = config.gravity;
 
-            let compute_accel_i = |i: usize| -> [f64; 3] {
+            let compute_accel_i = |i: usize| -> DVec3 {
                 let pi = &snapshot[i];
-                let mut ax = gravity[0];
-                let mut ay = gravity[1];
-                let mut az = gravity[2];
+                let mut ax = gravity.x;
+                let mut ay = gravity.y;
+                let mut az = gravity.z;
                 let rho = pi.density.max(1e-10);
 
                 let mut cn_x = 0.0;
@@ -985,9 +1045,9 @@ impl SphSolver {
                     let r = r2.sqrt();
                     let rho_j = pj.density.max(1e-10);
 
-                    let dx = pi.position[0] - pj.position[0];
-                    let dy = pi.position[1] - pj.position[1];
-                    let dz = pi.position[2] - pj.position[2];
+                    let dx = pi.position.x - pj.position.x;
+                    let dy = pi.position.y - pj.position.y;
+                    let dz = pi.position.z - pj.position.z;
 
                     let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
                     let grad = kc.spiky_grad(r);
@@ -998,9 +1058,9 @@ impl SphSolver {
 
                     let lap = kc.visc_laplacian(r);
                     let v_scale = viscosity * pj.mass * lap / rho_j / rho;
-                    ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
-                    ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
-                    az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+                    ax += v_scale * (pj.velocity.x - pi.velocity.x);
+                    ay += v_scale * (pj.velocity.y - pi.velocity.y);
+                    az += v_scale * (pj.velocity.z - pi.velocity.z);
 
                     if st > 0.0 {
                         let mass_over_rho = pj.mass / rho_j;
@@ -1023,16 +1083,16 @@ impl SphSolver {
                     }
                 }
 
-                [ax, ay, az]
+                DVec3::new(ax, ay, az)
             };
 
             #[cfg(feature = "parallel")]
-            let accels: Vec<[f64; 3]> = (0..n).into_par_iter().map(compute_accel_i).collect();
+            let accels: Vec<DVec3> = (0..n).into_par_iter().map(compute_accel_i).collect();
             #[cfg(not(feature = "parallel"))]
-            let accels: Vec<[f64; 3]> = (0..n).map(compute_accel_i).collect();
+            let accels: Vec<DVec3> = (0..n).map(compute_accel_i).collect();
 
             for (i, accel) in accels.iter().enumerate() {
-                if !accel[0].is_finite() || !accel[1].is_finite() || !accel[2].is_finite() {
+                if !accel.x.is_finite() || !accel.y.is_finite() || !accel.z.is_finite() {
                     return Err(PravashError::Diverged {
                         reason: format!("NaN/Inf in acceleration at particle {i}").into(),
                     });
@@ -1045,42 +1105,46 @@ impl SphSolver {
         let dt = config.dt;
         if self.use_verlet {
             // Velocity Verlet: x += v·dt + 0.5·a·dt², v += 0.5·(a_old + a_new)·dt
-            self.prev_accel.resize(n, [0.0; 3]);
+            self.prev_accel.resize(n, DVec3::ZERO);
             for (i, p) in particles.iter_mut().enumerate() {
                 let a_old = self.prev_accel[i];
-                p.position[0] += p.velocity[0] * dt + 0.5 * a_old[0] * dt * dt;
-                p.position[1] += p.velocity[1] * dt + 0.5 * a_old[1] * dt * dt;
-                p.position[2] += p.velocity[2] * dt + 0.5 * a_old[2] * dt * dt;
-                p.velocity[0] += 0.5 * (a_old[0] + p.acceleration[0]) * dt;
-                p.velocity[1] += 0.5 * (a_old[1] + p.acceleration[1]) * dt;
-                p.velocity[2] += 0.5 * (a_old[2] + p.acceleration[2]) * dt;
+                p.position += p.velocity * dt + 0.5 * a_old * dt * dt;
+                p.velocity += 0.5 * (a_old + p.acceleration) * dt;
                 self.prev_accel[i] = p.acceleration;
             }
         } else {
             // Symplectic Euler
             for p in particles.iter_mut() {
-                p.velocity[0] += p.acceleration[0] * dt;
-                p.velocity[1] += p.acceleration[1] * dt;
-                p.velocity[2] += p.acceleration[2] * dt;
-                p.position[0] += p.velocity[0] * dt;
-                p.position[1] += p.velocity[1] * dt;
-                p.position[2] += p.velocity[2] * dt;
+                p.velocity += p.acceleration * dt;
+                p.position += p.velocity * dt;
             }
         }
 
         // Boundary enforcement
-        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let lo = config.bounds_min;
+        let hi = config.bounds_max;
         let damp = config.boundary_damping;
-        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
         for p in particles.iter_mut() {
-            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
-                if p.position[dim] < lo {
-                    p.position[dim] = lo;
-                    p.velocity[dim] *= -damp;
-                } else if p.position[dim] > hi && hi > lo {
-                    p.position[dim] = hi;
-                    p.velocity[dim] *= -damp;
-                }
+            if p.position.x < lo.x {
+                p.position.x = lo.x;
+                p.velocity.x *= -damp;
+            } else if p.position.x > hi.x && hi.x > lo.x {
+                p.position.x = hi.x;
+                p.velocity.x *= -damp;
+            }
+            if p.position.y < lo.y {
+                p.position.y = lo.y;
+                p.velocity.y *= -damp;
+            } else if p.position.y > hi.y && hi.y > lo.y {
+                p.position.y = hi.y;
+                p.velocity.y *= -damp;
+            }
+            if p.position.z < lo.z {
+                p.position.z = lo.z;
+                p.velocity.z *= -damp;
+            } else if p.position.z > hi.z && hi.z > lo.z {
+                p.position.z = hi.z;
+                p.velocity.z *= -damp;
             }
         }
 
@@ -1143,21 +1207,22 @@ impl SphSolver {
         }
 
         // Compute non-pressure accelerations (viscosity + gravity + surface tension)
-        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot
+            .resize(n, FluidParticle::new(DVec3::ZERO, 0.0));
         self.snapshot.copy_from_slice(particles);
 
         let st = self.surface_tension;
         // Take persistent buffers out of self to avoid borrow conflicts
         let mut non_pressure_accel = std::mem::take(&mut self.pcisph_accel);
-        non_pressure_accel.resize(n, [0.0; 3]);
-        non_pressure_accel.fill([0.0; 3]);
+        non_pressure_accel.resize(n, DVec3::ZERO);
+        non_pressure_accel.fill(DVec3::ZERO);
 
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let pi = &self.snapshot[i];
-            let mut ax = config.gravity[0];
-            let mut ay = config.gravity[1];
-            let mut az = config.gravity[2];
+            let mut ax = config.gravity.x;
+            let mut ay = config.gravity.y;
+            let mut az = config.gravity.z;
             let rho = pi.density.max(1e-10);
 
             let mut cn_x = 0.0;
@@ -1180,14 +1245,14 @@ impl SphSolver {
                 // Viscosity
                 let lap = kc.visc_laplacian(r);
                 let v_scale = viscosity * pj.mass * lap / rho_j / rho;
-                ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
-                ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
-                az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+                ax += v_scale * (pj.velocity.x - pi.velocity.x);
+                ay += v_scale * (pj.velocity.y - pi.velocity.y);
+                az += v_scale * (pj.velocity.z - pi.velocity.z);
 
                 if st > 0.0 {
-                    let dx = pi.position[0] - pj.position[0];
-                    let dy = pi.position[1] - pj.position[1];
-                    let dz = pi.position[2] - pj.position[2];
+                    let dx = pi.position.x - pj.position.x;
+                    let dy = pi.position.y - pj.position.y;
+                    let dz = pi.position.z - pj.position.z;
                     let mass_over_rho = pj.mass / rho_j;
                     let pg = kc.poly6_grad_scalar(r2);
                     cn_x += mass_over_rho * pg * dx;
@@ -1215,7 +1280,7 @@ impl SphSolver {
                 });
             }
 
-            non_pressure_accel[i] = [ax, ay, az];
+            non_pressure_accel[i] = DVec3::new(ax, ay, az);
         }
 
         // PCISPH pressure correction loop
@@ -1237,9 +1302,9 @@ impl SphSolver {
                 let r = r2.sqrt();
                 let grad = kc.spiky_grad(r);
                 let grad_w = [
-                    grad / r * (pi.position[0] - pj.position[0]),
-                    grad / r * (pi.position[1] - pj.position[1]),
-                    grad / r * (pi.position[2] - pj.position[2]),
+                    grad / r * (pi.position.x - pj.position.x),
+                    grad / r * (pi.position.y - pj.position.y),
+                    grad / r * (pi.position.z - pj.position.z),
                 ];
                 sum_grad[0] += grad_w[0];
                 sum_grad[1] += grad_w[1];
@@ -1262,9 +1327,9 @@ impl SphSolver {
         pressures.resize(n, 0.0);
         pressures.fill(0.0);
         let mut predicted_pos = std::mem::take(&mut self.pcisph_pred_pos);
-        predicted_pos.resize(n, [0.0; 3]);
+        predicted_pos.resize(n, DVec3::ZERO);
         let mut predicted_vel = std::mem::take(&mut self.pcisph_pred_vel);
-        predicted_vel.resize(n, [0.0; 3]);
+        predicted_vel.resize(n, DVec3::ZERO);
 
         for iter in 0..max_iterations {
             let _span = trace_span!("sph::pcisph_iter", iter).entered();
@@ -1295,25 +1360,25 @@ impl SphSolver {
                     let grad = kc.spiky_grad(r);
                     let s = -pj.mass * sym * grad / r;
 
-                    pax += s * (pi.position[0] - pj.position[0]);
-                    pay += s * (pi.position[1] - pj.position[1]);
-                    paz += s * (pi.position[2] - pj.position[2]);
+                    pax += s * (pi.position.x - pj.position.x);
+                    pay += s * (pi.position.y - pj.position.y);
+                    paz += s * (pi.position.z - pj.position.z);
                 }
 
-                let total_ax = non_pressure_accel[i][0] + pax;
-                let total_ay = non_pressure_accel[i][1] + pay;
-                let total_az = non_pressure_accel[i][2] + paz;
+                let total_ax = non_pressure_accel[i].x + pax;
+                let total_ay = non_pressure_accel[i].y + pay;
+                let total_az = non_pressure_accel[i].z + paz;
 
-                predicted_vel[i] = [
-                    pi.velocity[0] + total_ax * dt,
-                    pi.velocity[1] + total_ay * dt,
-                    pi.velocity[2] + total_az * dt,
-                ];
-                predicted_pos[i] = [
-                    pi.position[0] + predicted_vel[i][0] * dt,
-                    pi.position[1] + predicted_vel[i][1] * dt,
-                    pi.position[2] + predicted_vel[i][2] * dt,
-                ];
+                predicted_vel[i] = DVec3::new(
+                    pi.velocity.x + total_ax * dt,
+                    pi.velocity.y + total_ay * dt,
+                    pi.velocity.z + total_az * dt,
+                );
+                predicted_pos[i] = DVec3::new(
+                    pi.position.x + predicted_vel[i].x * dt,
+                    pi.position.y + predicted_vel[i].y * dt,
+                    pi.position.z + predicted_vel[i].z * dt,
+                );
             }
 
             // Compute predicted density and density error
@@ -1321,9 +1386,9 @@ impl SphSolver {
             for i in 0..n {
                 let mut pred_density = 0.0;
                 for &j in self.neighbors(i) {
-                    let dx = predicted_pos[i][0] - predicted_pos[j][0];
-                    let dy = predicted_pos[i][1] - predicted_pos[j][1];
-                    let dz = predicted_pos[i][2] - predicted_pos[j][2];
+                    let dx = predicted_pos[i].x - predicted_pos[j].x;
+                    let dy = predicted_pos[i].y - predicted_pos[j].y;
+                    let dz = predicted_pos[i].z - predicted_pos[j].z;
                     let r2 = dx * dx + dy * dy + dz * dz;
                     if r2 <= kc.h2 {
                         pred_density += self.snapshot[j].mass * kc.poly6(r2);
@@ -1345,7 +1410,7 @@ impl SphSolver {
         // Apply final velocities and positions (with divergence check)
         for i in 0..n {
             let pos = predicted_pos[i];
-            if !pos[0].is_finite() || !pos[1].is_finite() || !pos[2].is_finite() {
+            if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
                 self.pcisph_accel = non_pressure_accel;
                 self.pcisph_pressures = pressures;
                 self.pcisph_pred_pos = predicted_pos;
@@ -1360,18 +1425,30 @@ impl SphSolver {
         }
 
         // Boundary enforcement
-        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let lo = config.bounds_min;
+        let hi = config.bounds_max;
         let damp = config.boundary_damping;
-        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
         for p in particles.iter_mut() {
-            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
-                if p.position[dim] < lo {
-                    p.position[dim] = lo;
-                    p.velocity[dim] *= -damp;
-                } else if p.position[dim] > hi && hi > lo {
-                    p.position[dim] = hi;
-                    p.velocity[dim] *= -damp;
-                }
+            if p.position.x < lo.x {
+                p.position.x = lo.x;
+                p.velocity.x *= -damp;
+            } else if p.position.x > hi.x && hi.x > lo.x {
+                p.position.x = hi.x;
+                p.velocity.x *= -damp;
+            }
+            if p.position.y < lo.y {
+                p.position.y = lo.y;
+                p.velocity.y *= -damp;
+            } else if p.position.y > hi.y && hi.y > lo.y {
+                p.position.y = hi.y;
+                p.velocity.y *= -damp;
+            }
+            if p.position.z < lo.z {
+                p.position.z = lo.z;
+                p.velocity.z *= -damp;
+            } else if p.position.z > hi.z && hi.z > lo.z {
+                p.position.z = hi.z;
+                p.velocity.z *= -damp;
             }
         }
 
@@ -1496,7 +1573,8 @@ impl SphSolver {
         }
 
         // Snapshot for force computation
-        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot
+            .resize(n, FluidParticle::new(DVec3::ZERO, 0.0));
         self.snapshot.copy_from_slice(particles);
 
         // Compute forces with per-phase viscosity and interface tension
@@ -1509,11 +1587,11 @@ impl SphSolver {
             let indices = &self.neighbor_indices;
             let gravity = config.gravity;
 
-            let compute_accel_i = |i: usize| -> [f64; 3] {
+            let compute_accel_i = |i: usize| -> DVec3 {
                 let pi = &snapshot[i];
-                let mut ax = gravity[0];
-                let mut ay = gravity[1];
-                let mut az = gravity[2];
+                let mut ax = gravity.x;
+                let mut ay = gravity.y;
+                let mut az = gravity.z;
                 let rho = pi.density.max(1e-10);
                 let props_i = phase_config.get(pi.phase);
 
@@ -1536,9 +1614,9 @@ impl SphSolver {
                     let r = r2.sqrt();
                     let rho_j = pj.density.max(1e-10);
 
-                    let dx = pi.position[0] - pj.position[0];
-                    let dy = pi.position[1] - pj.position[1];
-                    let dz = pi.position[2] - pj.position[2];
+                    let dx = pi.position.x - pj.position.x;
+                    let dy = pi.position.y - pj.position.y;
+                    let dz = pi.position.z - pj.position.z;
 
                     // Pressure force (symmetric)
                     let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
@@ -1553,9 +1631,9 @@ impl SphSolver {
                     let visc = 0.5 * (props_i.viscosity + props_j.viscosity);
                     let lap = kc.visc_laplacian(r);
                     let v_scale = visc * pj.mass * lap / rho_j / rho;
-                    ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
-                    ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
-                    az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+                    ax += v_scale * (pj.velocity.x - pi.velocity.x);
+                    ay += v_scale * (pj.velocity.y - pi.velocity.y);
+                    az += v_scale * (pj.velocity.z - pi.velocity.z);
 
                     // Surface tension (CSF) + interface tension between different phases
                     let effective_st = if pi.phase != pj.phase { st + it } else { st };
@@ -1582,16 +1660,16 @@ impl SphSolver {
                     }
                 }
 
-                [ax, ay, az]
+                DVec3::new(ax, ay, az)
             };
 
             #[cfg(feature = "parallel")]
-            let accels: Vec<[f64; 3]> = (0..n).into_par_iter().map(compute_accel_i).collect();
+            let accels: Vec<DVec3> = (0..n).into_par_iter().map(compute_accel_i).collect();
             #[cfg(not(feature = "parallel"))]
-            let accels: Vec<[f64; 3]> = (0..n).map(compute_accel_i).collect();
+            let accels: Vec<DVec3> = (0..n).map(compute_accel_i).collect();
 
             for (i, accel) in accels.iter().enumerate() {
-                if !accel[0].is_finite() || !accel[1].is_finite() || !accel[2].is_finite() {
+                if !accel.x.is_finite() || !accel.y.is_finite() || !accel.z.is_finite() {
                     return Err(PravashError::Diverged {
                         reason: format!("NaN/Inf in acceleration at particle {i}").into(),
                     });
@@ -1603,27 +1681,35 @@ impl SphSolver {
         // Integrate (symplectic Euler)
         let dt = config.dt;
         for p in particles.iter_mut() {
-            p.velocity[0] += p.acceleration[0] * dt;
-            p.velocity[1] += p.acceleration[1] * dt;
-            p.velocity[2] += p.acceleration[2] * dt;
-            p.position[0] += p.velocity[0] * dt;
-            p.position[1] += p.velocity[1] * dt;
-            p.position[2] += p.velocity[2] * dt;
+            p.velocity += p.acceleration * dt;
+            p.position += p.velocity * dt;
         }
 
         // Boundary enforcement
-        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let lo = config.bounds_min;
+        let hi = config.bounds_max;
         let damp = config.boundary_damping;
-        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
         for p in particles.iter_mut() {
-            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
-                if p.position[dim] < lo {
-                    p.position[dim] = lo;
-                    p.velocity[dim] *= -damp;
-                } else if p.position[dim] > hi && hi > lo {
-                    p.position[dim] = hi;
-                    p.velocity[dim] *= -damp;
-                }
+            if p.position.x < lo.x {
+                p.position.x = lo.x;
+                p.velocity.x *= -damp;
+            } else if p.position.x > hi.x && hi.x > lo.x {
+                p.position.x = hi.x;
+                p.velocity.x *= -damp;
+            }
+            if p.position.y < lo.y {
+                p.position.y = lo.y;
+                p.velocity.y *= -damp;
+            } else if p.position.y > hi.y && hi.y > lo.y {
+                p.position.y = hi.y;
+                p.velocity.y *= -damp;
+            }
+            if p.position.z < lo.z {
+                p.position.z = lo.z;
+                p.velocity.z *= -damp;
+            } else if p.position.z > hi.z && hi.z > lo.z {
+                p.position.z = hi.z;
+                p.velocity.z *= -damp;
             }
         }
 
@@ -1672,9 +1758,9 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
         let _span = trace_span!("sph::forces", n).entered();
         for i in 0..n {
             let pi = &snapshot[i];
-            let mut ax = config.gravity[0];
-            let mut ay = config.gravity[1];
-            let mut az = config.gravity[2];
+            let mut ax = config.gravity.x;
+            let mut ay = config.gravity.y;
+            let mut az = config.gravity.z;
             let rho = pi.density.max(1e-10);
 
             for (j, pj) in snapshot.iter().enumerate() {
@@ -1693,9 +1779,9 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 let grad = kc.spiky_grad(r);
                 let p_scale = -pj.mass * sym_pressure * grad / r;
 
-                let dx = pi.position[0] - pj.position[0];
-                let dy = pi.position[1] - pj.position[1];
-                let dz = pi.position[2] - pj.position[2];
+                let dx = pi.position.x - pj.position.x;
+                let dy = pi.position.y - pj.position.y;
+                let dz = pi.position.z - pj.position.z;
 
                 ax += p_scale * dx;
                 ay += p_scale * dy;
@@ -1704,9 +1790,9 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 let lap = kc.visc_laplacian(r);
                 let v_scale = viscosity * pj.mass * lap / rho_j / rho;
 
-                ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
-                ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
-                az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+                ax += v_scale * (pj.velocity.x - pi.velocity.x);
+                ay += v_scale * (pj.velocity.y - pi.velocity.y);
+                az += v_scale * (pj.velocity.z - pi.velocity.z);
             }
 
             if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
@@ -1715,33 +1801,40 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                 });
             }
 
-            particles[i].acceleration = [ax, ay, az];
+            particles[i].acceleration = DVec3::new(ax, ay, az);
         }
     }
 
     let dt = config.dt;
     for p in particles.iter_mut() {
-        p.velocity[0] += p.acceleration[0] * dt;
-        p.velocity[1] += p.acceleration[1] * dt;
-        p.velocity[2] += p.acceleration[2] * dt;
-
-        p.position[0] += p.velocity[0] * dt;
-        p.position[1] += p.velocity[1] * dt;
-        p.position[2] += p.velocity[2] * dt;
+        p.velocity += p.acceleration * dt;
+        p.position += p.velocity * dt;
     }
 
-    let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+    let lo = config.bounds_min;
+    let hi = config.bounds_max;
     let damp = config.boundary_damping;
-    let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
     for p in particles.iter_mut() {
-        for (dim, &(lo, hi)) in bounds.iter().enumerate() {
-            if p.position[dim] < lo {
-                p.position[dim] = lo;
-                p.velocity[dim] *= -damp;
-            } else if p.position[dim] > hi && hi > lo {
-                p.position[dim] = hi;
-                p.velocity[dim] *= -damp;
-            }
+        if p.position.x < lo.x {
+            p.position.x = lo.x;
+            p.velocity.x *= -damp;
+        } else if p.position.x > hi.x && hi.x > lo.x {
+            p.position.x = hi.x;
+            p.velocity.x *= -damp;
+        }
+        if p.position.y < lo.y {
+            p.position.y = lo.y;
+            p.velocity.y *= -damp;
+        } else if p.position.y > hi.y && hi.y > lo.y {
+            p.position.y = hi.y;
+            p.velocity.y *= -damp;
+        }
+        if p.position.z < lo.z {
+            p.position.z = lo.z;
+            p.velocity.z *= -damp;
+        } else if p.position.z > hi.z && hi.z > lo.z {
+            p.position.z = hi.z;
+            p.velocity.z *= -damp;
         }
     }
 
@@ -1938,7 +2031,7 @@ mod tests {
     #[test]
     fn test_total_kinetic_energy() {
         let mut p = FluidParticle::new_2d(0.0, 0.0, 2.0);
-        p.velocity = [3.0, 4.0, 0.0];
+        p.velocity = DVec3::new(3.0, 4.0, 0.0);
         let ke = total_kinetic_energy(&[p]);
         assert!((ke - 25.0).abs() < EPS);
     }
@@ -1947,8 +2040,8 @@ mod tests {
     fn test_max_speed() {
         let mut p1 = FluidParticle::new_2d(0.0, 0.0, 1.0);
         let mut p2 = FluidParticle::new_2d(1.0, 0.0, 1.0);
-        p1.velocity = [1.0, 0.0, 0.0];
-        p2.velocity = [3.0, 4.0, 0.0];
+        p1.velocity = DVec3::new(1.0, 0.0, 0.0);
+        p2.velocity = DVec3::new(3.0, 4.0, 0.0);
         assert!((max_speed(&[p1, p2]) - 5.0).abs() < EPS);
     }
 
@@ -1998,10 +2091,11 @@ mod tests {
             solver.step(&mut particles, &config, viscosity).unwrap();
         }
 
-        let [min_x, min_y, _, max_x, max_y, _] = config.bounds;
+        let lo = config.bounds_min;
+        let hi = config.bounds_max;
         for p in &particles {
-            assert!(p.position[0] >= min_x && p.position[0] <= max_x);
-            assert!(p.position[1] >= min_y && p.position[1] <= max_y);
+            assert!(p.position.x >= lo.x && p.position.x <= hi.x);
+            assert!(p.position.y >= lo.y && p.position.y <= hi.y);
         }
     }
 
@@ -2521,7 +2615,7 @@ mod tests {
     #[test]
     fn test_adaptive_dt_fast_particles() {
         let mut particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
-        particles[0].velocity = [100.0, 0.0, 0.0];
+        particles[0].velocity = DVec3::new(100.0, 0.0, 0.0);
         let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.001, 0.4, 0.0001, 0.01);
         // dt = 0.4 * 0.05 / 100 = 0.0002
         assert!(dt < 0.001);
@@ -2645,7 +2739,7 @@ mod tests {
     #[test]
     fn test_sort_by_zorder_preserves_data() {
         let mut particles = create_particle_block([0.0, 0.0], [0.5, 0.5], 0.1, 0.001);
-        particles[0].velocity = [99.0, 0.0, 0.0];
+        particles[0].velocity = DVec3::new(99.0, 0.0, 0.0);
         let total_mass_before: f64 = particles.iter().map(|p| p.mass).sum();
         sort_by_zorder(&mut particles, 0.1);
         let total_mass_after: f64 = particles.iter().map(|p| p.mass).sum();

@@ -6,6 +6,21 @@
 //!
 //! Pravash never depends on any GPU library — it only describes **what** to
 //! compute via parameter structs and flat f32 buffer layouts.
+//!
+//! # No vendor lock-in
+//!
+//! ```ignore
+//! // In soorat (or any GPU backend):
+//! struct WgpuBackend { device: wgpu::Device, /* ... */ }
+//! impl pravash::compute::ComputeBackend for WgpuBackend {
+//!     fn supports(&self, op: ComputeOp) -> bool { true }
+//!     fn sph_density(&self, p: &mut PackedParticles, params: &SphKernelParams) -> Result<()> {
+//!         // upload, dispatch compute shader, readback
+//!         Ok(())
+//!     }
+//!     // ...
+//! }
+//! ```
 
 use serde::{Deserialize, Serialize};
 
@@ -206,12 +221,13 @@ pub trait ComputeBackend {
 mod tests {
     use super::*;
     use crate::common::{FluidParticle, ParticleSoa};
+    use hisab::DVec3;
 
     #[test]
     fn test_packed_particles_roundtrip() {
         let particles = vec![
-            FluidParticle::new([1.0, 2.0, 3.0], 0.5),
-            FluidParticle::new([4.0, 5.0, 6.0], 0.25),
+            FluidParticle::new(DVec3::new(1.0, 2.0, 3.0), 0.5),
+            FluidParticle::new(DVec3::new(4.0, 5.0, 6.0), 0.25),
         ];
         let soa = ParticleSoa::from_aos(&particles);
         let packed = PackedParticles::from_soa(&soa);
@@ -228,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_packed_unpack_density() {
-        let particles = vec![FluidParticle::new([0.0; 3], 1.0)];
+        let particles = vec![FluidParticle::new(DVec3::ZERO, 1.0)];
         let mut soa = ParticleSoa::from_aos(&particles);
         let mut packed = PackedParticles::from_soa(&soa);
 
@@ -243,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_packed_unpack_velocity() {
-        let particles = vec![FluidParticle::new([0.0; 3], 1.0)];
+        let particles = vec![FluidParticle::new(DVec3::ZERO, 1.0)];
         let mut soa = ParticleSoa::from_aos(&particles);
         let mut packed = PackedParticles::from_soa(&soa);
 
