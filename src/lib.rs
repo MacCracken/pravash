@@ -37,6 +37,9 @@ pub mod vortex;
 #[cfg(feature = "grid")]
 pub mod phase_field;
 
+#[cfg(feature = "grid")]
+pub mod vof;
+
 #[cfg(feature = "coupling")]
 pub mod coupling;
 

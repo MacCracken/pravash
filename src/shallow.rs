@@ -511,6 +511,93 @@ impl ShallowWater {
     }
 }
 
+// ── Sediment Transport ──────────────────────────────────────────────────────
+
+/// Sediment transport configuration for shallow water.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SedimentConfig {
+    /// Shields parameter threshold for bed load initiation. Typical: 0.047.
+    pub shields_critical: f64,
+    /// Sediment grain diameter (m). Typical: 0.001 (1mm sand).
+    pub grain_diameter: f64,
+    /// Sediment density (kg/m³). Typical: 2650 (quartz).
+    pub sediment_density: f64,
+    /// Water density (kg/m³). Typical: 1000.
+    pub water_density: f64,
+    /// Erosion rate coefficient. Controls how fast bed erodes.
+    pub erosion_rate: f64,
+    /// Deposition rate coefficient. Controls how fast sediment settles.
+    pub deposition_rate: f64,
+}
+
+impl Default for SedimentConfig {
+    fn default() -> Self {
+        Self {
+            shields_critical: 0.047,
+            grain_diameter: 0.001,
+            sediment_density: 2650.0,
+            water_density: 1000.0,
+            erosion_rate: 0.01,
+            deposition_rate: 0.02,
+        }
+    }
+}
+
+/// Update sediment transport: erosion/deposition modifying bathymetry.
+///
+/// Uses Shields criterion to determine bed load initiation.
+/// Erodes ground where flow exceeds critical shear, deposits where it doesn't.
+/// `concentration` is suspended sediment per cell (modified in place).
+/// `sw.ground` is modified by erosion/deposition.
+pub fn update_sediment(
+    sw: &mut ShallowWater,
+    concentration: &mut [f64],
+    config: &SedimentConfig,
+    dt: f64,
+) {
+    let _span = trace_span!("shallow::sediment", nx = sw.nx, ny = sw.ny).entered();
+    let nx = sw.nx;
+    let g = sw.gravity;
+    let rho_s = config.sediment_density;
+    let rho_w = config.water_density;
+    let d = config.grain_diameter;
+    let tau_cr = config.shields_critical * (rho_s - rho_w) * g * d;
+
+    debug_assert!(concentration.len() >= nx * sw.ny);
+
+    for y in 1..sw.ny - 1 {
+        for x in 1..nx - 1 {
+            let i = y * nx + x;
+            let depth = (sw.height[i] - sw.ground[i]).max(0.0);
+            if depth < 1e-6 {
+                continue;
+            }
+
+            // Bed shear stress: τ_b = ρ_w · g · n² · |u|² / h^(1/3)
+            let speed_sq = sw.vx[i] * sw.vx[i] + sw.vy[i] * sw.vy[i];
+            let n_manning = sw.manning_n[i].max(0.01);
+            let tau_b = rho_w * g * n_manning * n_manning * speed_sq / depth.cbrt();
+
+            if tau_b > tau_cr {
+                // Erosion: lift sediment from bed into suspension
+                let erosion = config.erosion_rate * (tau_b - tau_cr) * dt;
+                sw.ground[i] -= erosion;
+                concentration[i] += erosion / depth;
+            }
+
+            // Deposition: settle suspended sediment onto bed
+            if concentration[i] > 0.0 {
+                let depo = config.deposition_rate * concentration[i] * dt;
+                let actual_depo = depo.min(concentration[i] * depth);
+                sw.ground[i] += actual_depo;
+                concentration[i] -= actual_depo / depth.max(1e-6);
+                concentration[i] = concentration[i].max(0.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

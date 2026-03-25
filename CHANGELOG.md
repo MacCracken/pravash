@@ -20,6 +20,12 @@
 - shallow: HLL Riemann solver for flux computation (`ShallowWater.use_riemann`)
 - coupling: APIC transfers (`FlipSolver.use_apic`) — affine particle-in-cell, angular momentum conserving
 - All vector types migrated from `[f64; 3]` to `hisab::DVec3` (SIMD-accelerated)
+- grid: Staggered MAC grid (`MacGrid`) — velocity at faces, pressure at centers, no checkerboard
+- grid: Ghost fluid method (`apply_ghost_fluid`) — pressure jump at multi-phase interfaces
+- vof: Volume of Fluid (`VofField`) — free surface tracking with donor-acceptor advection
+- sph: Contact angle / wetting (`apply_contact_angle`) — Young's equation at solid boundaries
+- sph: Phase change (`PhaseChangeConfig`, `update_phase_change`) — melting, solidification, evaporation
+- shallow: Sediment transport (`SedimentConfig`, `update_sediment`) — Shields criterion, erosion/deposition
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

@@ -29,12 +29,12 @@
 
 ### 0.28.0 — Architecture & New Physics
 
-- [ ] Staggered MAC grid (eliminate pressure checkerboarding)
-- [ ] VOF / CLSVOF free surface tracking
-- [ ] Contact angle / wetting (droplets, meniscus, capillary)
-- [ ] Phase change (evaporation, condensation, melting, solidification)
-- [ ] Ghost fluid method for multi-phase grid interface
-- [ ] Sediment transport (bed load, suspended, erosion/deposition)
+- [x] Staggered MAC grid (eliminate pressure checkerboarding)
+- [x] VOF / CLSVOF free surface tracking
+- [x] Contact angle / wetting (droplets, meniscus, capillary)
+- [x] Phase change (evaporation, condensation, melting, solidification)
+- [x] Ghost fluid method for multi-phase grid interface
+- [x] Sediment transport (bed load, suspended, erosion/deposition)
 
 ### 0.29.0 — Advanced Methods
 

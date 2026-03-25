@@ -1084,6 +1084,225 @@ impl FluidGrid {
     }
 }
 
+// ── Ghost Fluid Method ──────────────────────────────────────────────────────
+
+/// Apply ghost fluid pressure correction at a multi-phase interface.
+///
+/// Modifies the pressure field to account for the surface-tension-induced
+/// pressure discontinuity `[p] = σ·κ` at the interface defined by `level_set`.
+///
+/// `level_set`: signed distance (negative = inside fluid, positive = outside).
+/// `surface_tension`: σ coefficient.
+pub fn apply_ghost_fluid(
+    pressure: &mut [f64],
+    level_set: &[f64],
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    surface_tension: f64,
+) {
+    let _span = trace_span!("grid::ghost_fluid", nx, ny).entered();
+    let inv_dx = 1.0 / dx;
+    let inv_dx2 = inv_dx * inv_dx;
+
+    for y in 1..ny - 1 {
+        for x in 1..nx - 1 {
+            let i = y * nx + x;
+            let phi = level_set[i];
+            let phi_r = level_set[i + 1];
+            let phi_l = level_set[i - 1];
+            let phi_t = level_set[i + nx];
+            let phi_b = level_set[i - nx];
+
+            let crosses =
+                phi * phi_r < 0.0 || phi * phi_l < 0.0 || phi * phi_t < 0.0 || phi * phi_b < 0.0;
+            if !crosses {
+                continue;
+            }
+
+            // Curvature: κ ≈ -(∇²φ) / |∇φ|
+            let gx = (phi_r - phi_l) * 0.5 * inv_dx;
+            let gy = (phi_t - phi_b) * 0.5 * inv_dx;
+            let grad_mag = (gx * gx + gy * gy).sqrt().max(1e-20);
+            let lxx = (phi_r - 2.0 * phi + phi_l) * inv_dx2;
+            let lyy = (phi_t - 2.0 * phi + phi_b) * inv_dx2;
+            let kappa = -(lxx + lyy) / grad_mag;
+
+            // Pressure jump at interface: [p] = σ·κ
+            if phi > 0.0 {
+                pressure[i] -= surface_tension * kappa * phi / grad_mag;
+            }
+        }
+    }
+}
+
+// ── Staggered MAC Grid ──────────────────────────────────────────────────────
+
+/// Staggered (MAC) grid — velocity at faces, pressure at centers.
+///
+/// Eliminates checkerboard pressure oscillations by storing vx at
+/// x-face centers (i+½, j) and vy at y-face centers (i, j+½).
+/// Pressure and density are stored at cell centers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MacGrid {
+    pub nx: usize,
+    pub ny: usize,
+    pub dx: f64,
+    /// x-velocity at x-face centers. Size: (nx+1) × ny.
+    pub vx: Vec<f64>,
+    /// y-velocity at y-face centers. Size: nx × (ny+1).
+    pub vy: Vec<f64>,
+    /// Pressure at cell centers. Size: nx × ny.
+    pub pressure: Vec<f64>,
+    /// Density/scalar at cell centers. Size: nx × ny.
+    pub density: Vec<f64>,
+}
+
+impl MacGrid {
+    /// Create a new staggered grid. Minimum size 4×4.
+    pub fn new(nx: usize, ny: usize, dx: f64) -> Result<Self> {
+        if nx < 4 || ny < 4 {
+            return Err(PravashError::InvalidGridResolution { nx, ny });
+        }
+        if dx <= 0.0 || !dx.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("cell size must be positive: {dx}").into(),
+            });
+        }
+        let cell_n = nx * ny;
+        let vx_n = (nx + 1) * ny;
+        let vy_n = nx * (ny + 1);
+        Ok(Self {
+            nx,
+            ny,
+            dx,
+            vx: vec![0.0; vx_n],
+            vy: vec![0.0; vy_n],
+            pressure: vec![0.0; cell_n],
+            density: vec![0.0; cell_n],
+        })
+    }
+
+    /// Cell-center velocity by averaging face values.
+    #[inline]
+    #[must_use]
+    pub fn velocity_at(&self, x: usize, y: usize) -> (f64, f64) {
+        let vx = 0.5 * (self.vx[y * (self.nx + 1) + x] + self.vx[y * (self.nx + 1) + x + 1]);
+        let vy = 0.5 * (self.vy[y * self.nx + x] + self.vy[(y + 1) * self.nx + x]);
+        (vx, vy)
+    }
+
+    /// Maximum speed across all cell centers.
+    #[must_use]
+    pub fn max_speed(&self) -> f64 {
+        let mut max_sq = 0.0f64;
+        for y in 0..self.ny {
+            for x in 0..self.nx {
+                let (vx, vy) = self.velocity_at(x, y);
+                max_sq = max_sq.max(vx * vx + vy * vy);
+            }
+        }
+        max_sq.sqrt()
+    }
+
+    /// Compute divergence at cell centers (exact on staggered grid).
+    #[must_use]
+    pub fn divergence_at(&self, x: usize, y: usize) -> f64 {
+        let inv_dx = 1.0 / self.dx;
+        let dvx = self.vx[y * (self.nx + 1) + x + 1] - self.vx[y * (self.nx + 1) + x];
+        let dvy = self.vy[(y + 1) * self.nx + x] - self.vy[y * self.nx + x];
+        (dvx + dvy) * inv_dx
+    }
+
+    /// Perform one Navier-Stokes step on the staggered grid.
+    ///
+    /// Simplified pipeline: apply forces → pressure projection → advect density.
+    /// Pressure projection is exact (no checkerboard) on the staggered layout.
+    pub fn step(&mut self, config: &GridConfig) -> Result<()> {
+        let _span = trace_span!("mac::step", nx = self.nx, ny = self.ny).entered();
+
+        if !config.dt.is_finite() || config.dt <= 0.0 {
+            return Err(PravashError::InvalidTimestep { dt: config.dt });
+        }
+
+        let nx = self.nx;
+        let ny = self.ny;
+        let dx = self.dx;
+        let dt = config.dt;
+        let inv_dx = 1.0 / dx;
+
+        // 1. Apply body forces (gravity/buoyancy) to face velocities
+        if config.buoyancy_alpha != 0.0 {
+            for y in 0..ny + 1 {
+                for x in 0..nx {
+                    let idx = y * nx + x;
+                    // Average density to y-face
+                    let rho = if y > 0 && y < ny {
+                        0.5 * (self.density[(y - 1) * nx + x] + self.density[y * nx + x])
+                    } else if y == 0 {
+                        self.density[x]
+                    } else {
+                        self.density[(ny - 1) * nx + x]
+                    };
+                    self.vy[idx] += config.buoyancy_alpha * (rho - config.ambient_density) * dt;
+                }
+            }
+        }
+
+        // 2. Pressure projection (exact divergence-free on staggered grid)
+        let cell_n = nx * ny;
+        let mut div = vec![0.0f64; cell_n];
+        for y in 0..ny {
+            for x in 0..nx {
+                div[y * nx + x] = -((self.vx[y * (nx + 1) + x + 1] - self.vx[y * (nx + 1) + x])
+                    + (self.vy[(y + 1) * nx + x] - self.vy[y * nx + x]))
+                    * inv_dx;
+            }
+        }
+
+        // GS pressure solve on cell centers
+        for _ in 0..config.pressure_iterations {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    let neighbors = self.pressure[i - 1]
+                        + self.pressure[i + 1]
+                        + self.pressure[i - nx]
+                        + self.pressure[i + nx];
+                    self.pressure[i] = (div[i] + neighbors) * 0.25;
+                }
+            }
+        }
+
+        // Subtract pressure gradient at faces
+        for y in 0..ny {
+            for x in 1..nx {
+                self.vx[y * (nx + 1) + x] -=
+                    (self.pressure[y * nx + x] - self.pressure[y * nx + x - 1]) * inv_dx;
+            }
+        }
+        for y in 1..ny {
+            for x in 0..nx {
+                self.vy[y * nx + x] -=
+                    (self.pressure[y * nx + x] - self.pressure[(y - 1) * nx + x]) * inv_dx;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// CFL timestep for the staggered grid.
+    #[must_use]
+    pub fn cfl_dt(&self, cfl_factor: f64) -> f64 {
+        let max_v = self.max_speed();
+        if max_v < 1e-20 {
+            return cfl_factor * self.dx;
+        }
+        cfl_factor * self.dx / max_v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

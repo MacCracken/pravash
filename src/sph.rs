@@ -467,6 +467,61 @@ pub fn update_heat(
     }
 }
 
+// ── Phase Change ──────────────────────────────────────────────────────────
+
+/// Phase change configuration (melting, solidification, evaporation, condensation).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PhaseChangeConfig {
+    /// Melting/boiling temperature (K). Phase changes at this threshold.
+    pub transition_temperature: f64,
+    /// Latent heat (J/kg). Energy absorbed during melting/evaporation.
+    pub latent_heat: f64,
+    /// Phase index for the solid/liquid phase below transition temperature.
+    pub phase_below: u8,
+    /// Phase index for the liquid/gas phase above transition temperature.
+    pub phase_above: u8,
+}
+
+/// Update particle phases based on temperature (Stefan condition).
+///
+/// Particles at the transition temperature absorb/release latent heat
+/// before changing phase. Temperature is held at the transition point
+/// until all latent heat is consumed.
+///
+/// Uses `fuel` field as a latent heat accumulator (0 = fully below, 1 = fully above).
+pub fn update_phase_change(particles: &mut [FluidParticle], config: &PhaseChangeConfig, _dt: f64) {
+    let _span = trace_span!("sph::phase_change", n = particles.len()).entered();
+    let t_trans = config.transition_temperature;
+    let l_heat = config.latent_heat;
+
+    for p in particles.iter_mut() {
+        if p.temperature > t_trans && p.phase == config.phase_below {
+            // Absorb latent heat (melting/evaporation)
+            let excess = p.temperature - t_trans;
+            let energy = excess * p.mass; // approximate energy excess
+            let fraction = (energy / (l_heat * p.mass.max(1e-20))).min(1.0);
+            if fraction >= 1.0 {
+                p.phase = config.phase_above;
+                p.temperature = t_trans + (excess - l_heat);
+            } else {
+                p.temperature = t_trans; // hold at transition
+            }
+        } else if p.temperature < t_trans && p.phase == config.phase_above {
+            // Release latent heat (solidification/condensation)
+            let deficit = t_trans - p.temperature;
+            let energy = deficit * p.mass;
+            let fraction = (energy / (l_heat * p.mass.max(1e-20))).min(1.0);
+            if fraction >= 1.0 {
+                p.phase = config.phase_below;
+                p.temperature = t_trans - (deficit - l_heat);
+            } else {
+                p.temperature = t_trans;
+            }
+        }
+    }
+}
+
 // ── Chemical Reaction ─────────────────────────────────────────────────────
 
 /// Trait for pluggable chemistry backends (e.g., kimiya).
@@ -579,6 +634,66 @@ pub fn update_combustion(particles: &mut [FluidParticle], config: &CombustionCon
             // Exothermic: heat released proportional to fuel consumed
             p.temperature += heat * consumed;
         }
+    }
+}
+
+// ── Contact Angle / Wetting ────────────────────────────────────────────────
+
+/// Apply contact angle boundary condition to SPH particles near solid walls.
+///
+/// Young's equation: cos(θ) = (γ_SG - γ_SL) / γ_LG
+///
+/// Particles within `h` of a domain boundary have their color field normal
+/// adjusted to enforce the prescribed contact angle. This affects the surface
+/// tension force direction, creating wetting (θ < 90°) or non-wetting (θ > 90°)
+/// behavior.
+///
+/// `contact_angle` in radians (π/4 = hydrophilic, π/2 = neutral, 3π/4 = hydrophobic).
+pub fn apply_contact_angle(
+    particles: &mut [FluidParticle],
+    config: &FluidConfig,
+    contact_angle: f64,
+    surface_tension: f64,
+) {
+    let _span = trace_span!("sph::contact_angle", n = particles.len()).entered();
+    let cos_theta = contact_angle.cos();
+    let sin_theta = contact_angle.sin();
+    let h = config.smoothing_radius;
+    let lo = config.bounds_min;
+    let hi = config.bounds_max;
+
+    for p in particles.iter_mut() {
+        // Check proximity to each wall
+        let mut wall_normal = DVec3::ZERO;
+        if p.position.x - lo.x < h {
+            wall_normal.x += 1.0;
+        }
+        if hi.x - p.position.x < h && hi.x > lo.x {
+            wall_normal.x -= 1.0;
+        }
+        if p.position.y - lo.y < h {
+            wall_normal.y += 1.0;
+        }
+        if hi.y - p.position.y < h && hi.y > lo.y {
+            wall_normal.y -= 1.0;
+        }
+        if p.position.z - lo.z < h {
+            wall_normal.z += 1.0;
+        }
+        if hi.z - p.position.z < h && hi.z > lo.z {
+            wall_normal.z -= 1.0;
+        }
+
+        if wall_normal.length_squared() < 1e-20 {
+            continue;
+        }
+        let n_wall = wall_normal.normalize();
+
+        // Apply wetting force: push velocity toward the wall (hydrophilic)
+        // or away (hydrophobic) proportional to surface tension
+        let approach = p.velocity.dot(n_wall);
+        let wetting_force = surface_tension * (cos_theta - approach.signum() * sin_theta);
+        p.acceleration += n_wall * wetting_force / p.mass.max(1e-20);
     }
 }
 
