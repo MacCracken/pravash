@@ -19,6 +19,7 @@ use crate::error::Result;
 /// All positions, velocities, etc. are converted from f64 to f32 and stored
 /// in contiguous arrays. The backend uploads these directly to storage buffers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PackedParticles {
     pub count: u32,
     /// Interleaved [x, y, z, mass] per particle (4 floats each).
@@ -95,6 +96,7 @@ impl PackedParticles {
 
 /// Parameters for SPH density/force computation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SphKernelParams {
     pub smoothing_radius: f32,
     pub rest_density: f32,
@@ -107,6 +109,7 @@ pub struct SphKernelParams {
 
 /// Parameters for grid-based Navier-Stokes step.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GridKernelParams {
     pub nx: u32,
     pub ny: u32,
@@ -119,6 +122,7 @@ pub struct GridKernelParams {
 
 /// Parameters for shallow water step.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShallowKernelParams {
     pub nx: u32,
     pub ny: u32,

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DaimonConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
@@ -17,6 +18,7 @@ impl Default for DaimonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HooshConfig {
     pub endpoint: String,
 }

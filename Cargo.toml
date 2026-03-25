@@ -57,3 +57,11 @@ required-features = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling"]
 [[example]]
 name = "basic_fluid"
 required-features = ["sph"]
+
+[[example]]
+name = "shallow_water"
+required-features = ["shallow"]
+
+[[example]]
+name = "multiphase"
+required-features = ["sph"]

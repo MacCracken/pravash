@@ -13,6 +13,7 @@ use tracing::trace_span;
 
 /// Shallow water state on a 2D grid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ShallowWater {
     pub nx: usize,
     pub ny: usize,

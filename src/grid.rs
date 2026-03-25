@@ -77,6 +77,7 @@ impl Default for GridConfig {
 
 /// 2D grid-based fluid state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FluidGrid {
     pub nx: usize,
     pub ny: usize,

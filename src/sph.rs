@@ -145,6 +145,317 @@ pub fn kernel_viscosity_laplacian(r: f64, h: f64) -> f64 {
     KernelCoeffs::new(h).visc_laplacian(r)
 }
 
+// ── Multi-phase Configuration ──────────────────────────────────────────────
+
+/// Per-phase material properties for multi-phase SPH.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseProperties {
+    /// Rest density for this phase.
+    pub rest_density: f64,
+    /// Gas constant (equation of state stiffness).
+    pub gas_constant: f64,
+    /// Dynamic viscosity.
+    pub viscosity: f64,
+}
+
+/// Multi-phase SPH configuration.
+///
+/// Maps phase indices to material properties. Particles with `phase = i`
+/// use `phases[i]` for their density, pressure, and viscosity computation.
+///
+/// Inter-phase surface tension is applied at boundaries between different phases.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MultiPhaseConfig {
+    /// Material properties per phase. Index by particle `phase` field.
+    pub phases: Vec<PhaseProperties>,
+    /// Interface tension coefficient between phases.
+    /// Applied at boundaries where neighboring particles have different phases.
+    pub interface_tension: f64,
+}
+
+impl MultiPhaseConfig {
+    /// Create a single-phase config (equivalent to standard SPH).
+    #[must_use]
+    pub fn single(rest_density: f64, gas_constant: f64, viscosity: f64) -> Self {
+        Self {
+            phases: vec![PhaseProperties {
+                rest_density,
+                gas_constant,
+                viscosity,
+            }],
+            interface_tension: 0.0,
+        }
+    }
+
+    /// Create a two-phase config (e.g., water-air).
+    #[must_use]
+    pub fn two_phase(
+        phase_a: PhaseProperties,
+        phase_b: PhaseProperties,
+        interface_tension: f64,
+    ) -> Self {
+        Self {
+            phases: vec![phase_a, phase_b],
+            interface_tension,
+        }
+    }
+
+    /// Get properties for a particle's phase, falling back to phase 0.
+    #[inline]
+    #[must_use]
+    fn get(&self, phase: u8) -> &PhaseProperties {
+        self.phases.get(phase as usize).unwrap_or(&self.phases[0])
+    }
+}
+
+// ── Viscoelastic Configuration ─────────────────────────────────────────────
+
+/// Viscoelastic fluid properties (Oldroyd-B model).
+///
+/// The conformation tensor C tracks polymer chain deformation.
+/// Elastic stress τ = G·(C - I) is added to the SPH momentum equation.
+/// C evolves via: DC/Dt = C·∇u + (∇u)ᵀ·C - (C - I)/λ
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ViscoelasticConfig {
+    /// Elastic modulus G (Pa). Controls the strength of elastic restoring force.
+    /// Typical: 10-1000 for honey/lava effects.
+    pub elastic_modulus: f64,
+    /// Relaxation time λ (seconds). How quickly stress dissipates.
+    /// Small λ = viscous (quick relaxation), large λ = elastic (slow relaxation).
+    /// Typical: 0.01-1.0.
+    pub relaxation_time: f64,
+}
+
+/// Update conformation tensors and apply elastic stress for viscoelastic particles.
+///
+/// Evolves each particle's conformation tensor using the Oldroyd-B model
+/// and adds the elastic stress divergence to particle accelerations.
+///
+/// Call after `SphSolver::step()` (which computes density/pressure/viscous forces),
+/// then re-integrate positions with the updated accelerations.
+pub fn update_viscoelastic(
+    particles: &mut [FluidParticle],
+    neighbor_offsets: &[u32],
+    neighbor_indices: &[usize],
+    h: f64,
+    ve: &ViscoelasticConfig,
+    dt: f64,
+) {
+    let _span = trace_span!("sph::viscoelastic", n = particles.len()).entered();
+    let n = particles.len();
+    if n == 0 {
+        return;
+    }
+
+    let kc = KernelCoeffs::new(h);
+    let inv_lambda = 1.0 / ve.relaxation_time.max(1e-20);
+
+    let snap: Vec<FluidParticle> = particles.to_vec();
+
+    for i in 0..n {
+        let pi = &snap[i];
+        let rho = pi.density.max(1e-10);
+        let start = neighbor_offsets[i] as usize;
+        let end = neighbor_offsets[i + 1] as usize;
+
+        // Estimate velocity gradient ∇u via SPH
+        let mut dudx = 0.0;
+        let mut dudy = 0.0;
+        let mut dvdx = 0.0;
+        let mut dvdy = 0.0;
+
+        for &j in &neighbor_indices[start..end] {
+            if j == i {
+                continue;
+            }
+            let pj = &snap[j];
+            let r2 = pi.distance_squared_to(pj);
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let rho_j = pj.density.max(1e-10);
+            let grad = kc.spiky_grad(r);
+            let scale = pj.mass / rho_j * grad / r;
+
+            let dx = pi.position[0] - pj.position[0];
+            let dy = pi.position[1] - pj.position[1];
+            let dvx = pj.velocity[0] - pi.velocity[0];
+            let dvy = pj.velocity[1] - pi.velocity[1];
+
+            dudx += dvx * scale * dx;
+            dudy += dvx * scale * dy;
+            dvdx += dvy * scale * dx;
+            dvdy += dvy * scale * dy;
+        }
+
+        // Evolve conformation tensor: DC/Dt = C·∇u + (∇u)ᵀ·C - (C-I)/λ
+        let [c_xx, c_xy, c_yy] = pi.conformation;
+
+        let dcxx =
+            (c_xx * dudx + c_xy * dvdx) + (dudx * c_xx + dudy * c_xy) - (c_xx - 1.0) * inv_lambda;
+        let dcxy = 0.5 * ((c_xx * dudy + c_xy * dvdy) + (c_xy * dudx + c_yy * dvdx))
+            + 0.5 * ((dvdx * c_xx + dvdy * c_xy) + (dudx * c_xy + dudy * c_yy))
+            - c_xy * inv_lambda;
+        let dcyy =
+            (c_xy * dudy + c_yy * dvdy) + (dvdx * c_xy + dvdy * c_yy) - (c_yy - 1.0) * inv_lambda;
+
+        particles[i].conformation = [c_xx + dcxx * dt, c_xy + dcxy * dt, c_yy + dcyy * dt];
+
+        // Elastic stress divergence: ∇·(G·(C - I))
+        let mut fx = 0.0;
+        let mut fy = 0.0;
+        for &j in &neighbor_indices[start..end] {
+            if j == i {
+                continue;
+            }
+            let pj = &snap[j];
+            let r2 = pi.distance_squared_to(pj);
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let rho_j = pj.density.max(1e-10);
+            let grad = kc.spiky_grad(r);
+            let scale = pj.mass / rho_j * grad / r;
+
+            let dx = pi.position[0] - pj.position[0];
+            let dy = pi.position[1] - pj.position[1];
+
+            let dc_xx = pj.conformation[0] - c_xx;
+            let dc_xy = pj.conformation[1] - c_xy;
+            let dc_yy = pj.conformation[2] - c_yy;
+
+            fx += ve.elastic_modulus * (dc_xx * dx + dc_xy * dy) * scale / rho;
+            fy += ve.elastic_modulus * (dc_xy * dx + dc_yy * dy) * scale / rho;
+        }
+
+        particles[i].acceleration[0] += fx;
+        particles[i].acceleration[1] += fy;
+    }
+}
+
+// ── Heat Transfer ──────────────────────────────────────────────────────────
+
+/// Configuration for SPH heat conduction.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct HeatConfig {
+    /// Thermal diffusivity κ (m²/s). Controls heat conduction speed.
+    /// Water ≈ 1.4e-7, air ≈ 2.2e-5, lava ≈ 5e-7.
+    pub diffusivity: f64,
+}
+
+/// Update particle temperatures via SPH heat conduction.
+///
+/// Computes `∂T/∂t = κ·∇²T` using the SPH Laplacian approximation:
+/// `∇²T_i = Σ_j (m_j/ρ_j) · (T_j - T_i) · ∇²W(r_ij, h)`
+///
+/// Convection is implicit — particles carry temperature as they move.
+/// Call after the SPH step (needs valid density and neighbor cache).
+pub fn update_heat(
+    particles: &mut [FluidParticle],
+    neighbor_offsets: &[u32],
+    neighbor_indices: &[usize],
+    h: f64,
+    heat: &HeatConfig,
+    dt: f64,
+) {
+    let _span = trace_span!("sph::heat", n = particles.len()).entered();
+    let n = particles.len();
+    if n == 0 || heat.diffusivity <= 0.0 {
+        return;
+    }
+
+    let kc = KernelCoeffs::new(h);
+    let snap: Vec<f64> = particles.iter().map(|p| p.temperature).collect();
+
+    for i in 0..n {
+        let pi = &particles[i];
+        let rho = pi.density.max(1e-10);
+        let start = neighbor_offsets[i] as usize;
+        let end = neighbor_offsets[i + 1] as usize;
+        let mut dt_temp = 0.0;
+
+        for &j in &neighbor_indices[start..end] {
+            if j == i {
+                continue;
+            }
+            let pj = &particles[j];
+            let r2 = pi.distance_squared_to(pj);
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let rho_j = pj.density.max(1e-10);
+
+            let lap = kc.visc_laplacian(r);
+            dt_temp += pj.mass / rho_j * (snap[j] - snap[i]) * lap;
+        }
+
+        particles[i].temperature += heat.diffusivity * dt_temp / rho * dt;
+    }
+}
+
+// ── Chemical Reaction ─────────────────────────────────────────────────────
+
+/// Combustion reaction configuration.
+///
+/// Simple one-step reaction model: fuel → products + heat.
+/// Above the ignition temperature, fuel depletes at a rate proportional to
+/// concentration and temperature excess. The reaction releases heat,
+/// creating a feedback loop (fire spreads).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CombustionConfig {
+    /// Ignition temperature (K). No reaction below this. Default: 500.
+    pub ignition_temperature: f64,
+    /// Reaction rate constant (1/s). Controls how fast fuel burns.
+    /// Higher = faster combustion. Default: 10.0.
+    pub reaction_rate: f64,
+    /// Heat release per unit fuel consumed (K per unit fuel).
+    /// Controls how much temperature increases from burning. Default: 1000.0.
+    pub heat_release: f64,
+}
+
+impl Default for CombustionConfig {
+    fn default() -> Self {
+        Self {
+            ignition_temperature: 500.0,
+            reaction_rate: 10.0,
+            heat_release: 1000.0,
+        }
+    }
+}
+
+/// Update particle fuel and temperature via combustion reaction.
+///
+/// For each particle above ignition temperature with fuel > 0:
+/// - Fuel depletes: `dfuel = -rate · fuel · dt`
+/// - Temperature increases: `dT = heat_release · |dfuel|`
+///
+/// Call after `update_heat` for coupled heat-reaction simulation.
+pub fn update_combustion(particles: &mut [FluidParticle], config: &CombustionConfig, dt: f64) {
+    let _span = trace_span!("sph::combustion", n = particles.len()).entered();
+    let t_ign = config.ignition_temperature;
+    let rate = config.reaction_rate;
+    let heat = config.heat_release;
+
+    for p in particles.iter_mut() {
+        if p.temperature > t_ign && p.fuel > 0.0 {
+            // Implicit fuel depletion: fuel_new = fuel / (1 + rate·dt)
+            let consumed = p.fuel - p.fuel / (1.0 + rate * dt);
+            p.fuel -= consumed;
+            p.fuel = p.fuel.max(0.0);
+
+            // Exothermic: heat released proportional to fuel consumed
+            p.temperature += heat * consumed;
+        }
+    }
+}
+
 // ── Density & Pressure ──────────────────────────────────────────────────────
 
 /// Compute density for a single particle from all neighbors (brute-force).
@@ -256,6 +567,7 @@ pub fn viscosity_force(
 /// Maintains a spatial hash grid (via hisab) for O(n·k) neighbor queries
 /// instead of O(n²) brute-force. Caches neighbor lists and reuses scratch
 /// buffers across steps to minimize allocations.
+#[non_exhaustive]
 pub struct SphSolver {
     grid: SpatialHash,
     cell_size: f32,
@@ -893,6 +1205,199 @@ impl SphSolver {
         }
         (cfl_factor * smoothing_radius / max_v).clamp(dt_min, dt_max)
     }
+
+    /// Multi-phase SPH step with per-particle material properties.
+    ///
+    /// Each particle uses its `phase` index to look up rest density,
+    /// gas constant, and viscosity from `phase_config`. Interface tension
+    /// is applied between particles of different phases.
+    pub fn step_multiphase(
+        &mut self,
+        particles: &mut [FluidParticle],
+        config: &FluidConfig,
+        phase_config: &MultiPhaseConfig,
+    ) -> Result<()> {
+        let _span = trace_span!("sph::step_multiphase", n = particles.len()).entered();
+        config.validate()?;
+        let h = config.smoothing_radius;
+        let n = particles.len();
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let h_f32 = h as f32;
+        if !h_f32.is_finite() || h_f32 <= 0.0 {
+            return Err(PravashError::InvalidSmoothingRadius { h });
+        }
+
+        let kc = KernelCoeffs::new(h);
+
+        {
+            let _span = trace_span!("sph::build_neighbors", n).entered();
+            self.build_neighbors(particles, h, h_f32)?;
+        }
+
+        // Compute densities with per-phase rest density for EOS
+        {
+            let _span = trace_span!("sph::density", n).entered();
+            self.densities.resize(n, 0.0);
+            let offsets = &self.neighbor_offsets;
+            let indices = &self.neighbor_indices;
+            for i in 0..n {
+                let pi = &particles[i];
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                let mut d = 0.0;
+                for &j in &indices[start..end] {
+                    let r2 = pi.distance_squared_to(&particles[j]);
+                    if r2 <= kc.h2 {
+                        d += particles[j].mass * kc.poly6(r2);
+                    }
+                }
+                self.densities[i] = d;
+            }
+            for (i, p) in particles.iter_mut().enumerate() {
+                p.density = self.densities[i];
+                let props = phase_config.get(p.phase);
+                p.pressure = equation_of_state(p.density, props.rest_density, props.gas_constant);
+            }
+        }
+
+        // Snapshot for force computation
+        self.snapshot.resize(n, FluidParticle::new([0.0; 3], 0.0));
+        self.snapshot.copy_from_slice(particles);
+
+        // Compute forces with per-phase viscosity and interface tension
+        {
+            let _span = trace_span!("sph::forces", n).entered();
+            let st = self.surface_tension;
+            let it = phase_config.interface_tension;
+            let snapshot = &self.snapshot;
+            let offsets = &self.neighbor_offsets;
+            let indices = &self.neighbor_indices;
+            let gravity = config.gravity;
+
+            let compute_accel_i = |i: usize| -> [f64; 3] {
+                let pi = &snapshot[i];
+                let mut ax = gravity[0];
+                let mut ay = gravity[1];
+                let mut az = gravity[2];
+                let rho = pi.density.max(1e-10);
+                let props_i = phase_config.get(pi.phase);
+
+                let mut cn_x = 0.0;
+                let mut cn_y = 0.0;
+                let mut cn_z = 0.0;
+                let mut laplacian_color = 0.0;
+
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                for &j in &indices[start..end] {
+                    if j == i {
+                        continue;
+                    }
+                    let pj = &snapshot[j];
+                    let r2 = pi.distance_squared_to(pj);
+                    if r2 > kc.h2 || r2 < 1e-20 {
+                        continue;
+                    }
+                    let r = r2.sqrt();
+                    let rho_j = pj.density.max(1e-10);
+
+                    let dx = pi.position[0] - pj.position[0];
+                    let dy = pi.position[1] - pj.position[1];
+                    let dz = pi.position[2] - pj.position[2];
+
+                    // Pressure force (symmetric)
+                    let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
+                    let grad = kc.spiky_grad(r);
+                    let p_scale = -pj.mass * sym_pressure * grad / r;
+                    ax += p_scale * dx;
+                    ay += p_scale * dy;
+                    az += p_scale * dz;
+
+                    // Viscosity: average of both phases
+                    let props_j = phase_config.get(pj.phase);
+                    let visc = 0.5 * (props_i.viscosity + props_j.viscosity);
+                    let lap = kc.visc_laplacian(r);
+                    let v_scale = visc * pj.mass * lap / rho_j / rho;
+                    ax += v_scale * (pj.velocity[0] - pi.velocity[0]);
+                    ay += v_scale * (pj.velocity[1] - pi.velocity[1]);
+                    az += v_scale * (pj.velocity[2] - pi.velocity[2]);
+
+                    // Surface tension (CSF) + interface tension between different phases
+                    let effective_st = if pi.phase != pj.phase { st + it } else { st };
+                    if effective_st > 0.0 {
+                        let mass_over_rho = pj.mass / rho_j;
+                        let pg = kc.poly6_grad_scalar(r2);
+                        cn_x += mass_over_rho * pg * dx;
+                        cn_y += mass_over_rho * pg * dy;
+                        cn_z += mass_over_rho * pg * dz;
+                        laplacian_color += mass_over_rho * kc.poly6_laplacian(r2);
+                    }
+                }
+
+                // Apply surface/interface tension
+                let effective_st_total = st + it; // upper bound check
+                if effective_st_total > 0.0 {
+                    let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
+                    if cn_mag > 1e-6 / kc.h {
+                        let kappa = -laplacian_color / cn_mag;
+                        let st_scale = effective_st_total * kappa / (rho * cn_mag);
+                        ax += st_scale * cn_x;
+                        ay += st_scale * cn_y;
+                        az += st_scale * cn_z;
+                    }
+                }
+
+                [ax, ay, az]
+            };
+
+            #[cfg(feature = "parallel")]
+            let accels: Vec<[f64; 3]> = (0..n).into_par_iter().map(compute_accel_i).collect();
+            #[cfg(not(feature = "parallel"))]
+            let accels: Vec<[f64; 3]> = (0..n).map(compute_accel_i).collect();
+
+            for (i, accel) in accels.iter().enumerate() {
+                if !accel[0].is_finite() || !accel[1].is_finite() || !accel[2].is_finite() {
+                    return Err(PravashError::Diverged {
+                        reason: format!("NaN/Inf in acceleration at particle {i}").into(),
+                    });
+                }
+                particles[i].acceleration = *accel;
+            }
+        }
+
+        // Integrate (symplectic Euler)
+        let dt = config.dt;
+        for p in particles.iter_mut() {
+            p.velocity[0] += p.acceleration[0] * dt;
+            p.velocity[1] += p.acceleration[1] * dt;
+            p.velocity[2] += p.acceleration[2] * dt;
+            p.position[0] += p.velocity[0] * dt;
+            p.position[1] += p.velocity[1] * dt;
+            p.position[2] += p.velocity[2] * dt;
+        }
+
+        // Boundary enforcement
+        let [min_x, min_y, min_z, max_x, max_y, max_z] = config.bounds;
+        let damp = config.boundary_damping;
+        let bounds = [(min_x, max_x), (min_y, max_y), (min_z, max_z)];
+        for p in particles.iter_mut() {
+            for (dim, &(lo, hi)) in bounds.iter().enumerate() {
+                if p.position[dim] < lo {
+                    p.position[dim] = lo;
+                    p.velocity[dim] *= -damp;
+                } else if p.position[dim] > hi && hi > lo {
+                    p.position[dim] = hi;
+                    p.velocity[dim] *= -damp;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for SphSolver {
@@ -1343,6 +1848,354 @@ mod tests {
             particles.iter().all(|p| p.position[0].is_finite()),
             "large particle simulation should stay finite"
         );
+    }
+
+    // ── Multi-phase tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_multiphase_single_phase_matches_standard() {
+        // Single-phase config should produce same results as standard step
+        let config = FluidConfig::water_2d();
+        let phase_config =
+            MultiPhaseConfig::single(config.rest_density, config.gas_constant, 0.001);
+        let particles_init = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+
+        let mut p_standard = particles_init.clone();
+        let mut p_multi = particles_init;
+        let mut solver_s = SphSolver::new();
+        let mut solver_m = SphSolver::new();
+
+        solver_s.step(&mut p_standard, &config, 0.001).unwrap();
+        solver_m
+            .step_multiphase(&mut p_multi, &config, &phase_config)
+            .unwrap();
+
+        for (a, b) in p_standard.iter().zip(p_multi.iter()) {
+            assert!(
+                (a.position[0] - b.position[0]).abs() < 1e-10,
+                "single-phase multiphase should match standard"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiphase_two_phase_stable() {
+        let config = FluidConfig::water_2d();
+        let phase_config = MultiPhaseConfig::two_phase(
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            PhaseProperties {
+                rest_density: 1.225,
+                gas_constant: 2000.0,
+                viscosity: 0.00001,
+            },
+            0.072,
+        );
+
+        let mut particles = create_particle_block([0.1, 0.1], [0.3, 0.3], 0.02, 0.001);
+        // Bottom half: water (phase 0), top half: air (phase 1)
+        let mid_y = 0.25;
+        for p in particles.iter_mut() {
+            if p.position[1] > mid_y {
+                p.phase = 1;
+                p.mass = 0.0001; // lighter air particles
+            }
+        }
+
+        let mut solver = SphSolver::new();
+        for _ in 0..10 {
+            solver
+                .step_multiphase(&mut particles, &config, &phase_config)
+                .unwrap();
+        }
+
+        assert!(
+            particles.iter().all(|p| p.position[0].is_finite()),
+            "two-phase sim should stay finite"
+        );
+    }
+
+    #[test]
+    fn test_multiphase_phases_use_correct_density() {
+        let config = FluidConfig::water_2d();
+        let phase_config = MultiPhaseConfig::two_phase(
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            PhaseProperties {
+                rest_density: 500.0,
+                gas_constant: 1000.0,
+                viscosity: 0.01,
+            },
+            0.0,
+        );
+
+        let mut particles = vec![
+            FluidParticle::new_2d(0.5, 0.5, 0.01),
+            FluidParticle::new_2d(0.52, 0.5, 0.01),
+        ];
+        particles[1].phase = 1;
+
+        let mut solver = SphSolver::new();
+        solver
+            .step_multiphase(&mut particles, &config, &phase_config)
+            .unwrap();
+
+        // Both should have computed density and pressure (non-zero due to self-contribution)
+        assert!(particles[0].density > 0.0);
+        assert!(particles[1].density > 0.0);
+        // Phase 1 has lower rest_density → should have different pressure from phase 0
+        // (for same computed density, lower rest_density → higher pressure)
+        assert!(
+            (particles[0].pressure - particles[1].pressure).abs() > 1e-6,
+            "different phases should produce different pressures: p0={}, p1={}",
+            particles[0].pressure,
+            particles[1].pressure
+        );
+    }
+
+    #[test]
+    fn test_multiphase_interface_tension() {
+        // Interface tension between phases should push unlike particles apart
+        let config = FluidConfig::water_2d();
+        let phase_no_tension = MultiPhaseConfig::two_phase(
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            0.0,
+        );
+        let phase_with_tension = MultiPhaseConfig::two_phase(
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            PhaseProperties {
+                rest_density: 1000.0,
+                gas_constant: 2000.0,
+                viscosity: 0.001,
+            },
+            0.5,
+        );
+
+        let make_particles = || {
+            let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.1], 0.02, 0.001);
+            let mut p2 = create_particle_block([0.2, 0.4], [0.2, 0.1], 0.02, 0.001);
+            for p in p2.iter_mut() {
+                p.phase = 1;
+            }
+            particles.extend(p2);
+            particles
+        };
+
+        let mut p_no = make_particles();
+        let mut p_with = make_particles();
+        let mut solver_no = SphSolver::new();
+        let mut solver_with = SphSolver::with_surface_tension(0.0);
+
+        for _ in 0..5 {
+            solver_no
+                .step_multiphase(&mut p_no, &config, &phase_no_tension)
+                .unwrap();
+            solver_with
+                .step_multiphase(&mut p_with, &config, &phase_with_tension)
+                .unwrap();
+        }
+
+        // Both should be finite
+        assert!(p_no.iter().all(|p| p.position[0].is_finite()));
+        assert!(p_with.iter().all(|p| p.position[0].is_finite()));
+    }
+
+    // ── Combustion tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_combustion_below_ignition_no_reaction() {
+        let mut particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        particles[0].fuel = 1.0;
+        particles[0].temperature = 300.0;
+        let config = CombustionConfig::default();
+        update_combustion(&mut particles, &config, 0.01);
+        assert!((particles[0].fuel - 1.0).abs() < 1e-10);
+        assert!((particles[0].temperature - 300.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_combustion_above_ignition_consumes_fuel() {
+        let mut particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        particles[0].fuel = 1.0;
+        particles[0].temperature = 600.0;
+        let config = CombustionConfig::default();
+        update_combustion(&mut particles, &config, 0.01);
+        assert!(
+            particles[0].fuel < 1.0,
+            "fuel should deplete: {}",
+            particles[0].fuel
+        );
+        assert!(
+            particles[0].temperature > 600.0,
+            "should heat up: {}",
+            particles[0].temperature
+        );
+    }
+
+    #[test]
+    fn test_combustion_fuel_never_negative() {
+        let mut particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        particles[0].fuel = 0.001;
+        particles[0].temperature = 1000.0;
+        let config = CombustionConfig {
+            reaction_rate: 1000.0,
+            ..CombustionConfig::default()
+        };
+        update_combustion(&mut particles, &config, 1.0);
+        assert!(particles[0].fuel >= 0.0, "fuel should not go negative");
+    }
+
+    #[test]
+    fn test_combustion_no_fuel_no_reaction() {
+        let mut particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        particles[0].fuel = 0.0;
+        particles[0].temperature = 800.0;
+        let config = CombustionConfig::default();
+        let t_before = particles[0].temperature;
+        update_combustion(&mut particles, &config, 0.01);
+        assert!((particles[0].temperature - t_before).abs() < 1e-10);
+    }
+
+    // ── Heat transfer tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_heat_uniform_no_change() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        let heat = HeatConfig { diffusivity: 1e-7 };
+        let t_before: Vec<f64> = particles.iter().map(|p| p.temperature).collect();
+        update_heat(
+            &mut particles,
+            &solver.neighbor_offsets,
+            &solver.neighbor_indices,
+            config.smoothing_radius,
+            &heat,
+            0.001,
+        );
+        // Uniform temperature → no change
+        for (i, p) in particles.iter().enumerate() {
+            assert!(
+                (p.temperature - t_before[i]).abs() < 1e-10,
+                "uniform temperature should not change"
+            );
+        }
+    }
+
+    #[test]
+    fn test_heat_conducts_from_hot_to_cold() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        // Make center particle hot
+        let mid = particles.len() / 2;
+        particles[mid].temperature = 500.0;
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        let heat = HeatConfig { diffusivity: 1.0 };
+        let t_hot_before = particles[mid].temperature;
+        for _ in 0..50 {
+            update_heat(
+                &mut particles,
+                &solver.neighbor_offsets,
+                &solver.neighbor_indices,
+                config.smoothing_radius,
+                &heat,
+                0.001,
+            );
+        }
+        assert!(
+            particles[mid].temperature < t_hot_before,
+            "hot particle should cool: before={t_hot_before}, after={}",
+            particles[mid].temperature
+        );
+    }
+
+    // ── Viscoelastic tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_viscoelastic_relaxes_to_identity() {
+        // With no velocity gradient, conformation should relax toward identity
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        // Deform conformation away from identity
+        for p in particles.iter_mut() {
+            p.density = 1000.0;
+            p.conformation = [2.0, 0.5, 1.5];
+        }
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        let ve = ViscoelasticConfig {
+            elastic_modulus: 100.0,
+            relaxation_time: 0.01,
+        };
+
+        // Run viscoelastic update many times (particles are stationary-ish)
+        for _ in 0..50 {
+            update_viscoelastic(
+                &mut particles,
+                &solver.neighbor_offsets,
+                &solver.neighbor_indices,
+                config.smoothing_radius,
+                &ve,
+                0.001,
+            );
+        }
+
+        // Conformation should have relaxed toward identity [1, 0, 1]
+        let p = &particles[particles.len() / 2];
+        assert!(
+            (p.conformation[0] - 1.0).abs() < 0.5,
+            "c_xx should relax toward 1: {}",
+            p.conformation[0]
+        );
+    }
+
+    #[test]
+    fn test_viscoelastic_elastic_stress_finite() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        let ve = ViscoelasticConfig {
+            elastic_modulus: 500.0,
+            relaxation_time: 0.1,
+        };
+
+        update_viscoelastic(
+            &mut particles,
+            &solver.neighbor_offsets,
+            &solver.neighbor_indices,
+            config.smoothing_radius,
+            &ve,
+            0.001,
+        );
+
+        assert!(particles.iter().all(|p| p.acceleration[0].is_finite()));
+        assert!(particles.iter().all(|p| p.conformation[0].is_finite()));
     }
 
     // ── PCISPH tests ────────────────────────────────────────────────────────

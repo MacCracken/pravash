@@ -17,6 +17,21 @@
 - compute: GPU-agnostic `ComputeBackend` trait, `PackedParticles` f32 buffer packing, kernel parameter structs for SPH/grid/shallow
 - common: `ParticleArena` — pre-allocated pool with alloc/free/compact, `ArenaHandle` for block references
 - logging: `init_profiling()` — chrome://tracing JSON output for flame graph analysis via tracing-chrome
+- sph: Multi-phase SPH (`step_multiphase`, `MultiPhaseConfig`, `PhaseProperties`) with per-phase EOS, viscosity, and interface tension
+- common: `FluidParticle.phase` field (u8) for multi-phase particle identification
+- phase_field: `PhaseField` — Allen-Cahn interface tracking with advection, double-well potential, Neumann BCs
+- sph: Viscoelastic fluids (`ViscoelasticConfig`, `update_viscoelastic`) — Oldroyd-B conformation tensor evolution with elastic stress
+- sph: Heat transfer (`HeatConfig`, `update_heat`) — SPH Laplacian-based conduction with implicit advection
+- common: `FluidParticle.temperature` field (default 293.15 K)
+- sph: Combustion reaction (`CombustionConfig`, `update_combustion`) — fuel depletion with exothermic heat release
+- common: `FluidParticle.fuel` field for combustion concentration
+
+### Changed
+- `#[non_exhaustive]` added to 18 public structs for forward-compatible API evolution
+- Cargo.toml: license corrected from deprecated `GPL-3.0` to `GPL-3.0-only`
+- shallow: NaN dt now rejected (consistent with grid.rs)
+- sph: `SpatialHash::new()` error properly propagated (hisab API change)
+- sph: Aligned standalone `pressure_force()` and brute-force `step()` with symmetric formula
 - grid: Persistent scratch buffers (zero allocation after first step)
 - grid: DST pressure solver now propagates transform errors instead of silent ignore
 - common: `FluidConfig::validate()` rejects NaN/Inf for dt, smoothing_radius, density, gas_constant

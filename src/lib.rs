@@ -34,6 +34,9 @@ pub mod buoyancy;
 #[cfg(feature = "vortex")]
 pub mod vortex;
 
+#[cfg(feature = "grid")]
+pub mod phase_field;
+
 #[cfg(feature = "coupling")]
 pub mod coupling;
 

@@ -6,6 +6,7 @@ use crate::error::{PravashError, Result};
 
 /// Physical properties of a fluid material.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FluidMaterial {
     /// Rest density in kg/m³ (water ≈ 1000).
     pub density: f64,
@@ -96,6 +97,15 @@ pub struct FluidParticle {
     pub pressure: f64,
     /// Mass of this particle.
     pub mass: f64,
+    /// Phase index for multi-phase simulation (0 = default/primary phase).
+    pub phase: u8,
+    /// Conformation tensor for viscoelastic fluids (2D symmetric: [c_xx, c_xy, c_yy]).
+    /// Initialized to identity [1, 0, 1]. Only used when viscoelastic config is active.
+    pub conformation: [f64; 3],
+    /// Temperature (Kelvin). Default: 293.15 (20°C). Used for heat transfer.
+    pub temperature: f64,
+    /// Fuel concentration (0.0–1.0). Depleted by combustion above ignition temperature.
+    pub fuel: f64,
 }
 
 impl FluidParticle {
@@ -109,6 +119,10 @@ impl FluidParticle {
             density: 0.0,
             pressure: 0.0,
             mass,
+            phase: 0,
+            conformation: [1.0, 0.0, 1.0], // identity
+            temperature: 293.15,           // 20°C
+            fuel: 0.0,
         }
     }
 
@@ -178,6 +192,12 @@ pub struct ParticleSoa {
     pub density: Vec<f64>,
     pub pressure: Vec<f64>,
     pub mass: Vec<f64>,
+    pub phase: Vec<u8>,
+    pub conf_xx: Vec<f64>,
+    pub conf_xy: Vec<f64>,
+    pub conf_yy: Vec<f64>,
+    pub temperature: Vec<f64>,
+    pub fuel: Vec<f64>,
 }
 
 impl ParticleSoa {
@@ -197,6 +217,12 @@ impl ParticleSoa {
             density: Vec::new(),
             pressure: Vec::new(),
             mass: Vec::new(),
+            phase: Vec::new(),
+            conf_xx: Vec::new(),
+            conf_xy: Vec::new(),
+            conf_yy: Vec::new(),
+            temperature: Vec::new(),
+            fuel: Vec::new(),
         }
     }
 
@@ -216,6 +242,12 @@ impl ParticleSoa {
             density: Vec::with_capacity(n),
             pressure: Vec::with_capacity(n),
             mass: Vec::with_capacity(n),
+            phase: Vec::with_capacity(n),
+            conf_xx: Vec::with_capacity(n),
+            conf_xy: Vec::with_capacity(n),
+            conf_yy: Vec::with_capacity(n),
+            temperature: Vec::with_capacity(n),
+            fuel: Vec::with_capacity(n),
         }
     }
 
@@ -251,6 +283,12 @@ impl ParticleSoa {
             soa.density.push(p.density);
             soa.pressure.push(p.pressure);
             soa.mass.push(p.mass);
+            soa.phase.push(p.phase);
+            soa.conf_xx.push(p.conformation[0]);
+            soa.conf_xy.push(p.conformation[1]);
+            soa.conf_yy.push(p.conformation[2]);
+            soa.temperature.push(p.temperature);
+            soa.fuel.push(p.fuel);
         }
         soa
     }
@@ -268,6 +306,10 @@ impl ParticleSoa {
                 density: self.density[i],
                 pressure: self.pressure[i],
                 mass: self.mass[i],
+                phase: self.phase[i],
+                conformation: [self.conf_xx[i], self.conf_xy[i], self.conf_yy[i]],
+                temperature: self.temperature[i],
+                fuel: self.fuel[i],
             });
         }
         particles
@@ -283,6 +325,10 @@ impl ParticleSoa {
             p.density = self.density[i];
             p.pressure = self.pressure[i];
             p.mass = self.mass[i];
+            p.phase = self.phase[i];
+            p.conformation = [self.conf_xx[i], self.conf_xy[i], self.conf_yy[i]];
+            p.temperature = self.temperature[i];
+            p.fuel = self.fuel[i];
         }
     }
 
@@ -344,6 +390,7 @@ impl ArenaHandle {
 /// Active particles can be accessed as a contiguous slice via
 /// [`active_particles`](ParticleArena::active_particles) after calling
 /// [`compact`](ParticleArena::compact).
+#[non_exhaustive]
 pub struct ParticleArena {
     particles: Vec<FluidParticle>,
     capacity: usize,
@@ -531,6 +578,7 @@ impl ParticleArena {
 
 /// Simulation configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FluidConfig {
     /// Timestep in seconds.
     pub dt: f64,

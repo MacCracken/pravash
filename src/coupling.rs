@@ -385,6 +385,7 @@ pub fn particle_level_set(
 /// - 0.0 = pure PIC (stable, diffusive)
 /// - 1.0 = pure FLIP (low dissipation, can be noisy)
 /// - 0.95 = typical (mostly FLIP with a touch of PIC for stability)
+#[non_exhaustive]
 pub struct FlipSolver {
     nx: usize,
     ny: usize,

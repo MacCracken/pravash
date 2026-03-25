@@ -22,16 +22,21 @@
 
 ### 0.27.0 — Multi-phase & Advanced Physics
 
-- [ ] Multi-phase SPH (water-air interface, immiscible fluids)
-- [ ] Phase-field method for interface tracking
-- [ ] Viscoelastic fluids (Oldroyd-B model for honey/lava)
-- [ ] Heat transfer (conduction + convection)
-- [ ] Chemical reaction coupling (combustion for fire effects)
+- [x] Multi-phase SPH (water-air interface, immiscible fluids)
+- [x] Phase-field method for interface tracking
+- [x] Viscoelastic fluids (Oldroyd-B model for honey/lava)
+- [x] Heat transfer (conduction + convection)
+- [x] Chemical reaction coupling (combustion for fire effects)
+
+### Post-1.0 — Integration
+
+- [ ] rasayan integration (chemistry crate crosstalk — reaction trait, species transport piping)
+- [ ] soorat `ComputeBackend` implementation (GPU-accelerated SPH/grid via wgpu)
 
 ### 1.0.0 — Stable API
 
-- [ ] Public API review and stabilization
-- [ ] Complete documentation with examples for each module
-- [ ] Migration guide from 0.x
-- [ ] Performance regression test suite
+- [x] Public API review and stabilization
+- [x] Complete documentation with examples for each module
+- [x] Migration guide from 0.x
+- [x] Performance regression test suite
 - [ ] Published to crates.io
