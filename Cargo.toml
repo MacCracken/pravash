@@ -28,7 +28,7 @@ logging = ["dep:tracing-subscriber", "dep:tracing-chrome"]
 full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute", "parallel", "ai", "logging"]
 
 [dependencies]
-hisab = { version = "0.24", path = "../hisab" }
+hisab = "0.24"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
