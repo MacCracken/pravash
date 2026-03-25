@@ -145,6 +145,68 @@ pub fn kernel_viscosity_laplacian(r: f64, h: f64) -> f64 {
     KernelCoeffs::new(h).visc_laplacian(r)
 }
 
+// ── Wendland Kernels ──────────────────────────────────────────────────────
+
+/// Wendland C2 kernel — recommended replacement for Poly6.
+///
+/// W(r, h) = (7 / (4·π·h²)) · (1 - q/2)⁴ · (1 + 2q)  for q = r/h ≤ 2
+///
+/// Strictly positive definite, no tensile instability, C2 smooth.
+/// Note: compact support is 2h (vs h for Poly6).
+#[inline]
+#[must_use]
+pub fn kernel_wendland_c2(r: f64, h: f64) -> f64 {
+    let q = r / h;
+    if !(0.0..2.0).contains(&q) {
+        return 0.0;
+    }
+    let t = 1.0 - 0.5 * q;
+    (7.0 / (4.0 * PI * h * h)) * t * t * t * t * (1.0 + 2.0 * q)
+}
+
+/// Wendland C2 gradient magnitude.
+///
+/// ∂W/∂r = (7 / (4·π·h²)) · (-5q) · (1 - q/2)³ / h
+#[inline]
+#[must_use]
+pub fn kernel_wendland_c2_grad(r: f64, h: f64) -> f64 {
+    let q = r / h;
+    if q >= 2.0 || q <= 0.0 {
+        return 0.0;
+    }
+    let t = 1.0 - 0.5 * q;
+    (7.0 / (4.0 * PI * h * h)) * (-5.0 * q) * t * t * t / h
+}
+
+/// Wendland C4 kernel — higher-order alternative to C2.
+///
+/// W(r, h) = (9 / (4·π·h²)) · (1 - q/2)⁶ · (1 + 3q + 35q²/12)  for q = r/h ≤ 2
+#[inline]
+#[must_use]
+pub fn kernel_wendland_c4(r: f64, h: f64) -> f64 {
+    let q = r / h;
+    if !(0.0..2.0).contains(&q) {
+        return 0.0;
+    }
+    let t = 1.0 - 0.5 * q;
+    let t6 = t * t * t * t * t * t;
+    (9.0 / (4.0 * PI * h * h)) * t6 * (1.0 + 3.0 * q + 35.0 / 12.0 * q * q)
+}
+
+/// Wendland C4 gradient magnitude.
+#[inline]
+#[must_use]
+pub fn kernel_wendland_c4_grad(r: f64, h: f64) -> f64 {
+    let q = r / h;
+    if q >= 2.0 || q <= 0.0 {
+        return 0.0;
+    }
+    let t = 1.0 - 0.5 * q;
+    let t5 = t * t * t * t * t;
+    // d/dr [(1-q/2)^6 (1+3q+35q²/12)] = -(56q/3)(1+5q/2)(1-q/2)^5 / (2h)
+    (9.0 / (4.0 * PI * h * h)) * (-56.0 * q / 3.0) * (1.0 + 2.5 * q) * t5 / (2.0 * h)
+}
+
 // ── Multi-phase Configuration ──────────────────────────────────────────────
 
 /// Per-phase material properties for multi-phase SPH.
@@ -456,6 +518,121 @@ pub fn update_combustion(particles: &mut [FluidParticle], config: &CombustionCon
     }
 }
 
+// ── Non-Newtonian Viscosity ────────────────────────────────────────────────
+
+/// Non-Newtonian viscosity model.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum NonNewtonianViscosity {
+    /// Power-law: μ_eff = K · |γ̇|^(n-1).
+    /// n < 1: shear-thinning (blood, paint). n > 1: shear-thickening (cornstarch).
+    PowerLaw { consistency: f64, power_index: f64 },
+    /// Bingham plastic: solid below yield stress, flows above.
+    /// μ_eff = μ_p + τ_y / (|γ̇| + ε)
+    Bingham {
+        yield_stress: f64,
+        plastic_viscosity: f64,
+    },
+    /// Herschel-Bulkley: yield stress + power-law.
+    /// μ_eff = K · |γ̇|^(n-1) + τ_y / (|γ̇| + ε)
+    HerschelBulkley {
+        yield_stress: f64,
+        consistency: f64,
+        power_index: f64,
+    },
+}
+
+impl NonNewtonianViscosity {
+    /// Compute effective viscosity from strain rate magnitude.
+    ///
+    /// `strain_rate` = |γ̇| = sqrt(2 · Sᵢⱼ · Sᵢⱼ)
+    #[inline]
+    #[must_use]
+    pub fn effective_viscosity(&self, strain_rate: f64) -> f64 {
+        let eps = 1e-10;
+        let sr = strain_rate.max(eps);
+        match *self {
+            NonNewtonianViscosity::PowerLaw {
+                consistency,
+                power_index,
+            } => consistency * sr.powf(power_index - 1.0),
+            NonNewtonianViscosity::Bingham {
+                yield_stress,
+                plastic_viscosity,
+            } => plastic_viscosity + yield_stress / sr,
+            NonNewtonianViscosity::HerschelBulkley {
+                yield_stress,
+                consistency,
+                power_index,
+            } => consistency * sr.powf(power_index - 1.0) + yield_stress / sr,
+        }
+    }
+}
+
+// ── Delta-SPH Density Diffusion ────────────────────────────────────────────
+
+/// Apply delta-SPH density diffusion to reduce pressure noise.
+///
+/// Adds a diffusive correction: `δ·h·c₀·Σ Vⱼ·ψᵢⱼ·∇Wᵢⱼ`
+/// where `ψᵢⱼ = 2(ρⱼ-ρᵢ)·rᵢⱼ / (|rᵢⱼ|² + 0.01h²)`.
+///
+/// Call after density computation, before pressure/force evaluation.
+/// Typical `delta` value: 0.05–0.1.
+pub fn apply_delta_sph(
+    particles: &mut [FluidParticle],
+    neighbor_offsets: &[u32],
+    neighbor_indices: &[usize],
+    h: f64,
+    speed_of_sound: f64,
+    delta: f64,
+    dt: f64,
+) {
+    let _span = trace_span!("sph::delta_sph", n = particles.len()).entered();
+    let n = particles.len();
+    if n == 0 || delta <= 0.0 {
+        return;
+    }
+
+    let kc = KernelCoeffs::new(h);
+    let eps = 0.01 * h * h;
+    let snap: Vec<(f64, [f64; 3], f64)> = particles
+        .iter()
+        .map(|p| (p.density, p.position, p.mass))
+        .collect();
+
+    for i in 0..n {
+        let (rho_i, pos_i, _) = snap[i];
+        let start = neighbor_offsets[i] as usize;
+        let end = neighbor_offsets[i + 1] as usize;
+        let mut correction = 0.0;
+
+        for &j in &neighbor_indices[start..end] {
+            if j == i {
+                continue;
+            }
+            let (rho_j, pos_j, mass_j) = snap[j];
+            let dx = pos_i[0] - pos_j[0];
+            let dy = pos_i[1] - pos_j[1];
+            let dz = pos_i[2] - pos_j[2];
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let rho_j_safe = rho_j.max(1e-10);
+            let vol_j = mass_j / rho_j_safe;
+
+            // ψᵢⱼ · ∇Wᵢⱼ (dot product of psi vector with kernel gradient direction)
+            let psi_scale = 2.0 * (rho_j - rho_i) / (r2 + eps);
+            let grad = kc.spiky_grad(r);
+            let grad_dot_r = grad; // |∇W| already scaled, dot with r̂ gives magnitude
+            correction += vol_j * psi_scale * r * grad_dot_r;
+        }
+
+        particles[i].density += delta * h * speed_of_sound * correction * dt;
+    }
+}
+
 // ── Density & Pressure ──────────────────────────────────────────────────────
 
 /// Compute density for a single particle from all neighbors (brute-force).
@@ -584,6 +761,10 @@ pub struct SphSolver {
     pcisph_pressures: Vec<f64>,
     pcisph_pred_pos: Vec<[f64; 3]>,
     pcisph_pred_vel: Vec<[f64; 3]>,
+    /// Use Velocity Verlet integration instead of symplectic Euler.
+    pub use_verlet: bool,
+    /// Previous accelerations for Verlet half-step.
+    prev_accel: Vec<[f64; 3]>,
 }
 
 impl SphSolver {
@@ -609,6 +790,8 @@ impl SphSolver {
             pcisph_pressures: Vec::new(),
             pcisph_pred_pos: Vec::new(),
             pcisph_pred_vel: Vec::new(),
+            use_verlet: false,
+            prev_accel: Vec::new(),
         }
     }
 
@@ -851,16 +1034,31 @@ impl SphSolver {
             }
         }
 
-        // Integrate (symplectic Euler)
+        // Integrate
         let dt = config.dt;
-        for p in particles.iter_mut() {
-            p.velocity[0] += p.acceleration[0] * dt;
-            p.velocity[1] += p.acceleration[1] * dt;
-            p.velocity[2] += p.acceleration[2] * dt;
-
-            p.position[0] += p.velocity[0] * dt;
-            p.position[1] += p.velocity[1] * dt;
-            p.position[2] += p.velocity[2] * dt;
+        if self.use_verlet {
+            // Velocity Verlet: x += v·dt + 0.5·a·dt², v += 0.5·(a_old + a_new)·dt
+            self.prev_accel.resize(n, [0.0; 3]);
+            for (i, p) in particles.iter_mut().enumerate() {
+                let a_old = self.prev_accel[i];
+                p.position[0] += p.velocity[0] * dt + 0.5 * a_old[0] * dt * dt;
+                p.position[1] += p.velocity[1] * dt + 0.5 * a_old[1] * dt * dt;
+                p.position[2] += p.velocity[2] * dt + 0.5 * a_old[2] * dt * dt;
+                p.velocity[0] += 0.5 * (a_old[0] + p.acceleration[0]) * dt;
+                p.velocity[1] += 0.5 * (a_old[1] + p.acceleration[1]) * dt;
+                p.velocity[2] += 0.5 * (a_old[2] + p.acceleration[2]) * dt;
+                self.prev_accel[i] = p.acceleration;
+            }
+        } else {
+            // Symplectic Euler
+            for p in particles.iter_mut() {
+                p.velocity[0] += p.acceleration[0] * dt;
+                p.velocity[1] += p.acceleration[1] * dt;
+                p.velocity[2] += p.acceleration[2] * dt;
+                p.position[0] += p.velocity[0] * dt;
+                p.position[1] += p.velocity[1] * dt;
+                p.position[2] += p.velocity[2] * dt;
+            }
         }
 
         // Boundary enforcement
@@ -1179,13 +1377,16 @@ impl SphSolver {
         Ok(())
     }
 
-    /// Compute CFL-limited timestep: dt = cfl_factor * h / max_velocity.
+    /// Compute CFL-limited timestep from advective, force, and viscous constraints.
+    ///
+    /// dt = cfl · min(h/v_max, sqrt(h/a_max), h²/(6·ν))
     ///
     /// Returns the computed dt clamped to `[dt_min, dt_max]`.
     #[must_use]
     pub fn adaptive_dt(
         particles: &[FluidParticle],
         smoothing_radius: f64,
+        viscosity: f64,
         cfl_factor: f64,
         dt_min: f64,
         dt_max: f64,
@@ -1199,11 +1400,34 @@ impl SphSolver {
         {
             return dt_max.max(dt_min);
         }
+        let h = smoothing_radius;
+        let mut dt_cfl = f64::MAX;
+
+        // Advective: h / v_max
         let max_v = max_speed(particles);
-        if max_v < 1e-20 {
-            return dt_max;
+        if max_v > 1e-20 {
+            dt_cfl = dt_cfl.min(h / max_v);
         }
-        (cfl_factor * smoothing_radius / max_v).clamp(dt_min, dt_max)
+
+        // Force: sqrt(h / a_max)
+        let max_a = particles
+            .iter()
+            .map(|p| {
+                let a = &p.acceleration;
+                a[0] * a[0] + a[1] * a[1] + a[2] * a[2]
+            })
+            .fold(0.0f64, f64::max)
+            .sqrt();
+        if max_a > 1e-20 {
+            dt_cfl = dt_cfl.min((h / max_a).sqrt());
+        }
+
+        // Viscous: h² / (6·ν)
+        if viscosity > 1e-20 {
+            dt_cfl = dt_cfl.min(h * h / (6.0 * viscosity));
+        }
+
+        (cfl_factor * dt_cfl).clamp(dt_min, dt_max)
     }
 
     /// Multi-phase SPH step with per-particle material properties.
@@ -1515,6 +1739,41 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
     }
 
     Ok(())
+}
+
+// ── Z-Order Sorting ───────────────────────────────────────────────────────
+
+/// Spread bits for 2D Morton code: insert a zero between each bit.
+#[inline]
+fn spread_bits(x: u32) -> u64 {
+    let mut v = x as u64;
+    v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+    v = (v | (v << 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v | (v << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v | (v << 2)) & 0x3333_3333_3333_3333;
+    v = (v | (v << 1)) & 0x5555_5555_5555_5555;
+    v
+}
+
+/// Compute 2D Morton code (Z-order curve index) for a position.
+#[inline]
+#[must_use]
+fn morton_code_2d(x: f64, y: f64, inv_cell: f64) -> u64 {
+    let ix = (x * inv_cell).max(0.0) as u32;
+    let iy = (y * inv_cell).max(0.0) as u32;
+    spread_bits(ix) | (spread_bits(iy) << 1)
+}
+
+/// Sort particles by Z-order (Morton code) for cache-friendly spatial access.
+///
+/// Call before `SphSolver::step()` for improved cache hit rates during
+/// neighbor traversal. The cell size should match the smoothing radius.
+pub fn sort_by_zorder(particles: &mut [FluidParticle], cell_size: f64) {
+    if particles.len() < 2 || cell_size <= 0.0 {
+        return;
+    }
+    let inv_cell = 1.0 / cell_size;
+    particles.sort_unstable_by_key(|p| morton_code_2d(p.position[0], p.position[1], inv_cell));
 }
 
 // ── Utility Functions ───────────────────────────────────────────────────────
@@ -2248,7 +2507,7 @@ mod tests {
     fn test_adaptive_dt_stationary() {
         let particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
         // Stationary particles → max dt
-        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.4, 0.0001, 0.01);
+        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.001, 0.4, 0.0001, 0.01);
         assert!((dt - 0.01).abs() < EPS);
     }
 
@@ -2256,9 +2515,131 @@ mod tests {
     fn test_adaptive_dt_fast_particles() {
         let mut particles = create_particle_block([0.1, 0.1], [0.2, 0.2], 0.05, 0.001);
         particles[0].velocity = [100.0, 0.0, 0.0];
-        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.4, 0.0001, 0.01);
+        let dt = SphSolver::adaptive_dt(&particles, 0.05, 0.001, 0.4, 0.0001, 0.01);
         // dt = 0.4 * 0.05 / 100 = 0.0002
         assert!(dt < 0.001);
         assert!(dt >= 0.0001);
+    }
+
+    // ── Wendland kernel tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_wendland_c2_at_zero() {
+        let w = kernel_wendland_c2(0.0, 1.0);
+        assert!(w > 0.0);
+    }
+
+    #[test]
+    fn test_wendland_c2_at_boundary() {
+        let w = kernel_wendland_c2(2.0, 1.0);
+        assert!(w.abs() < EPS);
+    }
+
+    #[test]
+    fn test_wendland_c2_decreasing() {
+        let w1 = kernel_wendland_c2(0.1, 1.0);
+        let w2 = kernel_wendland_c2(0.5, 1.0);
+        assert!(w1 > w2);
+    }
+
+    #[test]
+    fn test_wendland_c4_at_zero() {
+        assert!(kernel_wendland_c4(0.0, 1.0) > 0.0);
+    }
+
+    #[test]
+    fn test_wendland_c2_grad_sign() {
+        let g = kernel_wendland_c2_grad(0.5, 1.0);
+        assert!(g < 0.0, "gradient should be negative (decreasing)");
+    }
+
+    // ── Non-Newtonian tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_power_law_shear_thinning() {
+        let nn = NonNewtonianViscosity::PowerLaw {
+            consistency: 1.0,
+            power_index: 0.5,
+        };
+        let low_rate = nn.effective_viscosity(0.1);
+        let high_rate = nn.effective_viscosity(10.0);
+        assert!(
+            high_rate < low_rate,
+            "shear-thinning: viscosity should decrease with rate"
+        );
+    }
+
+    #[test]
+    fn test_bingham_yield_stress() {
+        let nn = NonNewtonianViscosity::Bingham {
+            yield_stress: 100.0,
+            plastic_viscosity: 0.1,
+        };
+        let low_rate = nn.effective_viscosity(0.001);
+        assert!(
+            low_rate > 1000.0,
+            "low strain rate should give very high effective viscosity"
+        );
+    }
+
+    #[test]
+    fn test_herschel_bulkley() {
+        let nn = NonNewtonianViscosity::HerschelBulkley {
+            yield_stress: 50.0,
+            consistency: 1.0,
+            power_index: 0.5,
+        };
+        let visc = nn.effective_viscosity(1.0);
+        assert!(visc > 50.0, "should include yield stress contribution");
+        assert!(visc.is_finite());
+    }
+
+    // ── Z-order sorting tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_sort_by_zorder() {
+        let mut particles = create_particle_block([0.0, 0.0], [1.0, 1.0], 0.1, 0.001);
+        let n = particles.len();
+        sort_by_zorder(&mut particles, 0.1);
+        assert_eq!(particles.len(), n);
+        // All positions should still be finite
+        assert!(particles.iter().all(|p| p.position[0].is_finite()));
+    }
+
+    #[test]
+    fn test_sort_by_zorder_preserves_data() {
+        let mut particles = create_particle_block([0.0, 0.0], [0.5, 0.5], 0.1, 0.001);
+        particles[0].velocity = [99.0, 0.0, 0.0];
+        let total_mass_before: f64 = particles.iter().map(|p| p.mass).sum();
+        sort_by_zorder(&mut particles, 0.1);
+        let total_mass_after: f64 = particles.iter().map(|p| p.mass).sum();
+        assert!((total_mass_before - total_mass_after).abs() < EPS);
+        // The tagged particle should still exist
+        assert!(particles.iter().any(|p| (p.velocity[0] - 99.0).abs() < EPS));
+    }
+
+    // ── Grid CFL test ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_grid_cfl_dt() {
+        use crate::grid::FluidGrid;
+        let mut g = FluidGrid::new(10, 10, 0.1).unwrap();
+        let i = g.idx(5, 5);
+        g.vx[i] = 1.0;
+        let dt = g.cfl_dt(0.001, 0.5);
+        assert!(dt > 0.0 && dt.is_finite());
+        assert!(dt <= 0.5 * 0.1 / 1.0); // CFL * dx / v
+    }
+
+    // ── Shallow CFL test ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_shallow_cfl_dt() {
+        use crate::shallow::ShallowWater;
+        let sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
+        let dt = sw.cfl_dt(0.5);
+        assert!(dt > 0.0 && dt.is_finite());
+        // For still water: dt = CFL * dx / sqrt(g*h) = 0.5 * 0.1 / sqrt(9.81) ≈ 0.016
+        assert!(dt < 0.1);
     }
 }

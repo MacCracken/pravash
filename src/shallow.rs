@@ -436,6 +436,25 @@ impl ShallowWater {
             .map(|&h| (h - rest_height).abs())
             .fold(0.0f64, f64::max)
     }
+
+    /// Compute CFL-limited timestep for the shallow water solver.
+    ///
+    /// dt = cfl · dx / max(|u| + sqrt(g·h))
+    #[must_use]
+    pub fn cfl_dt(&self, cfl_factor: f64) -> f64 {
+        let g = self.gravity;
+        let mut max_wave_speed = 0.0f64;
+        for i in 0..self.height.len() {
+            let depth = (self.height[i] - self.ground[i]).max(0.0);
+            let speed = (self.vx[i] * self.vx[i] + self.vy[i] * self.vy[i]).sqrt();
+            let wave_speed = speed + (g * depth).sqrt();
+            max_wave_speed = max_wave_speed.max(wave_speed);
+        }
+        if max_wave_speed < 1e-20 {
+            return cfl_factor * self.dx; // fallback
+        }
+        cfl_factor * self.dx / max_wave_speed
+    }
 }
 
 #[cfg(test)]

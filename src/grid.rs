@@ -49,6 +49,9 @@ pub struct GridConfig {
     /// Use MacCormack advection (higher-order, less diffusive).
     /// Falls back to semi-Lagrangian at grid boundaries.
     pub use_maccormack: bool,
+    /// Smagorinsky SGS turbulence model coefficient (0.0 to disable).
+    /// ν_t = (Cs·dx)²·|S|. Typical Cs: 0.1–0.2. Default: 0.0.
+    pub smagorinsky_cs: f64,
 }
 
 impl GridConfig {
@@ -65,6 +68,7 @@ impl GridConfig {
             buoyancy_alpha: 0.1,
             ambient_density: 0.0,
             use_maccormack: false,
+            smagorinsky_cs: 0.0,
         }
     }
 }
@@ -169,6 +173,22 @@ impl FluidGrid {
             .map(|(&vx, &vy)| vx * vx + vy * vy)
             .fold(0.0f64, f64::max)
             .sqrt()
+    }
+
+    /// Compute CFL-limited timestep for the grid solver.
+    ///
+    /// dt = cfl · min(dx/v_max, dx²/(4·ν))
+    #[must_use]
+    pub fn cfl_dt(&self, viscosity: f64, cfl_factor: f64) -> f64 {
+        let mut dt = f64::MAX;
+        let max_v = self.max_speed();
+        if max_v > 1e-20 {
+            dt = dt.min(self.dx / max_v);
+        }
+        if viscosity > 1e-20 {
+            dt = dt.min(self.dx * self.dx / (4.0 * viscosity));
+        }
+        cfl_factor * dt
     }
 
     #[must_use]
@@ -792,13 +812,40 @@ impl FluidGrid {
         }
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
 
-        // 2. Diffuse velocity
-        if config.viscosity > 0.0 {
+        // 2. Diffuse velocity (with Smagorinsky SGS turbulent viscosity if enabled)
+        let eff_viscosity = if config.smagorinsky_cs > 0.0 {
+            // ν_t = (Cs·dx)²·|S| averaged over the grid
+            let cs_dx = config.smagorinsky_cs * dx;
+            let cs_dx2 = cs_dx * cs_dx;
+            let inv_2dx_local = inv_2dx;
+            let mut sum_nu_t = 0.0;
+            let mut count = 0.0;
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    let dudx = (self.vx[i + 1] - self.vx[i - 1]) * inv_2dx_local;
+                    let dudy = (self.vx[i + nx] - self.vx[i - nx]) * inv_2dx_local;
+                    let dvdx = (self.vy[i + 1] - self.vy[i - 1]) * inv_2dx_local;
+                    let dvdy = (self.vy[i + nx] - self.vy[i - nx]) * inv_2dx_local;
+                    let s11 = dudx;
+                    let s22 = dvdy;
+                    let s12 = 0.5 * (dudy + dvdx);
+                    let s_mag = (2.0 * (s11 * s11 + s22 * s22 + 2.0 * s12 * s12)).sqrt();
+                    sum_nu_t += cs_dx2 * s_mag;
+                    count += 1.0;
+                }
+            }
+            config.viscosity + if count > 0.0 { sum_nu_t / count } else { 0.0 }
+        } else {
+            config.viscosity
+        };
+
+        if eff_viscosity > 0.0 {
             Self::diffuse_with_buf(
                 &mut self.vx,
                 nx,
                 ny,
-                config.viscosity,
+                eff_viscosity,
                 dt,
                 dx,
                 config.diffusion_iterations,
@@ -808,7 +855,7 @@ impl FluidGrid {
                 &mut self.vy,
                 nx,
                 ny,
-                config.viscosity,
+                eff_viscosity,
                 dt,
                 dx,
                 config.diffusion_iterations,

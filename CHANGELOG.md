@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- sph: Wendland C2/C4 kernels (`kernel_wendland_c2`, `kernel_wendland_c4`) — no tensile instability
+- sph: Delta-SPH density diffusion (`apply_delta_sph`) — pressure noise reduction
+- sph: Velocity Verlet integration (`SphSolver.use_verlet`) — 2nd-order symplectic
+- sph: Non-Newtonian viscosity (`NonNewtonianViscosity`) — power-law, Bingham, Herschel-Bulkley
+- sph: Z-order particle sorting (`sort_by_zorder`) — Morton code for cache-friendly access
+- sph: Enhanced `adaptive_dt` with force and viscous CFL constraints
+- grid: `FluidGrid::cfl_dt()` — advective + viscous CFL timestep
+- grid: Smagorinsky SGS turbulence model (`GridConfig.smagorinsky_cs`)
+- shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
+
+### Previously Added
 - shallow: Non-linear shallow water equations with convective acceleration (u·∇u)
 - shallow: Flux-form continuity equation (∂(hu)/∂x + ∂(hv)/∂y) for proper mass transport
 - shallow: Neumann boundary enforcement (zero-gradient height, reflected normal velocity)
