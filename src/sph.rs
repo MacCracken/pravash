@@ -194,6 +194,8 @@ pub fn kernel_wendland_c4(r: f64, h: f64) -> f64 {
 }
 
 /// Wendland C4 gradient magnitude.
+///
+/// dW/dr = σ/h · (1-q/2)⁵ · [-3(1+3q+35q²/12) + (1-q/2)(3+35q/6)]
 #[inline]
 #[must_use]
 pub fn kernel_wendland_c4_grad(r: f64, h: f64) -> f64 {
@@ -203,8 +205,11 @@ pub fn kernel_wendland_c4_grad(r: f64, h: f64) -> f64 {
     }
     let t = 1.0 - 0.5 * q;
     let t5 = t * t * t * t * t;
-    // d/dr [(1-q/2)^6 (1+3q+35q²/12)] = -(56q/3)(1+5q/2)(1-q/2)^5 / (2h)
-    (9.0 / (4.0 * PI * h * h)) * (-56.0 * q / 3.0) * (1.0 + 2.5 * q) * t5 / (2.0 * h)
+    let g = 1.0 + 3.0 * q + 35.0 / 12.0 * q * q;
+    let gp = 3.0 + 35.0 / 6.0 * q;
+    // Product rule: d/dq[(1-q/2)^6 · g] = -3(1-q/2)^5 · g + (1-q/2)^6 · g'
+    let dfdq = t5 * (-3.0 * g + t * gp);
+    (9.0 / (4.0 * PI * h * h)) * dfdq / h
 }
 
 // ── Multi-phase Configuration ──────────────────────────────────────────────
@@ -923,8 +928,10 @@ impl SphSolver {
 
             #[cfg(feature = "parallel")]
             {
-                let densities: Vec<f64> = (0..n).into_par_iter().map(compute_density_i).collect();
-                self.densities.copy_from_slice(&densities);
+                self.densities
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, d)| *d = compute_density_i(i));
             }
             #[cfg(not(feature = "parallel"))]
             {
@@ -2533,6 +2540,35 @@ mod tests {
     fn test_wendland_c2_at_boundary() {
         let w = kernel_wendland_c2(2.0, 1.0);
         assert!(w.abs() < EPS);
+    }
+
+    #[test]
+    fn test_wendland_c4_grad_numerical() {
+        // Verify analytical gradient matches numerical finite difference
+        let h = 1.0;
+        let r = 0.7;
+        let dr = 1e-6;
+        let numerical =
+            (kernel_wendland_c4(r + dr, h) - kernel_wendland_c4(r - dr, h)) / (2.0 * dr);
+        let analytical = kernel_wendland_c4_grad(r, h);
+        assert!(
+            (numerical - analytical).abs() < 1e-4,
+            "C4 gradient mismatch: numerical={numerical}, analytical={analytical}"
+        );
+    }
+
+    #[test]
+    fn test_wendland_c2_grad_numerical() {
+        let h = 1.0;
+        let r = 0.7;
+        let dr = 1e-6;
+        let numerical =
+            (kernel_wendland_c2(r + dr, h) - kernel_wendland_c2(r - dr, h)) / (2.0 * dr);
+        let analytical = kernel_wendland_c2_grad(r, h);
+        assert!(
+            (numerical - analytical).abs() < 1e-4,
+            "C2 gradient mismatch: numerical={numerical}, analytical={analytical}"
+        );
     }
 
     #[test]
