@@ -14,6 +14,12 @@
 - sph: `ReactionProvider` trait for pluggable chemistry backends (kimiya, etc.)
 - sph: `update_reaction()` — generic reaction step using any `ReactionProvider`
 - sph: `CombustionConfig` implements `ReactionProvider` for backward compatibility
+- sph: DFSPH solver (`step_dfsph`) — divergence-free SPH, 2-stage correction
+- sph: MLS gradient correction (`compute_gradient_corrections`, `apply_gradient_correction`)
+- grid: Multigrid V-cycle pressure solver (`GridConfig.use_multigrid`)
+- shallow: HLL Riemann solver for flux computation (`ShallowWater.use_riemann`)
+- coupling: APIC transfers (`FlipSolver.use_apic`) — affine particle-in-cell, angular momentum conserving
+- All vector types migrated from `[f64; 3]` to `hisab::DVec3` (SIMD-accelerated)
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

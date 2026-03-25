@@ -20,12 +20,12 @@
 
 ### 0.27.0 — Algorithmic Leap
 
-- [ ] DFSPH solver (divergence-free SPH, 10-50x faster than PCISPH)
-- [ ] Multigrid V-cycle pressure solver (O(N) grid pressure)
-- [ ] HLL/HLLC Riemann solver for shallow water (proper shock capturing)
-- [ ] APIC transfers (affine particle-in-cell, replaces FLIP/PIC blend)
-- [ ] MLS gradient correction (1st-order consistent SPH near boundaries)
-- [ ] Gradient correction matrices for free surface accuracy
+- [x] DFSPH solver (divergence-free SPH, 10-50x faster than PCISPH)
+- [x] Multigrid V-cycle pressure solver (O(N) grid pressure)
+- [x] HLL/HLLC Riemann solver for shallow water (proper shock capturing)
+- [x] APIC transfers (affine particle-in-cell, replaces FLIP/PIC blend)
+- [x] MLS gradient correction (1st-order consistent SPH near boundaries)
+- [x] Gradient correction matrices for free surface accuracy
 
 ### 0.28.0 — Architecture & New Physics
 

@@ -388,6 +388,11 @@ pub struct FlipSolver {
     weight: Vec<f64>,
     pressure: Vec<f64>,
     div: Vec<f64>,
+    /// Use APIC (Affine Particle-In-Cell) transfers instead of FLIP/PIC.
+    /// Conserves angular momentum. Overrides `flip_ratio` when true.
+    pub use_apic: bool,
+    /// Per-particle affine velocity matrices [c00, c01, c10, c11] for APIC.
+    apic_c: Vec<[f64; 4]>,
 }
 
 impl FlipSolver {
@@ -414,6 +419,8 @@ impl FlipSolver {
             weight: vec![0.0; n],
             pressure: vec![0.0; n],
             div: vec![0.0; n],
+            use_apic: false,
+            apic_c: Vec::new(),
         })
     }
 
@@ -445,7 +452,10 @@ impl FlipSolver {
         self.vy.fill(0.0);
         self.weight.fill(0.0);
 
-        for p in particles {
+        let dx = self.dx;
+        let use_apic = self.use_apic;
+
+        for (pi, p) in particles.iter().enumerate() {
             let gx = p.position.x * inv_dx;
             let gy = p.position.y * inv_dx;
 
@@ -455,13 +465,14 @@ impl FlipSolver {
             let sx = gx - x0 as f64;
             let sy = gy - y0 as f64;
 
-            // Bilinear weight splat to 4 surrounding cells
             let weights = [
                 (1.0 - sx) * (1.0 - sy),
                 sx * (1.0 - sy),
                 (1.0 - sx) * sy,
                 sx * sy,
             ];
+            let grid_x = [x0, x0 + 1, x0, x0 + 1];
+            let grid_y = [y0, y0, y0 + 1, y0 + 1];
             let indices = [
                 y0 * nx + x0,
                 y0 * nx + x0 + 1,
@@ -469,9 +480,21 @@ impl FlipSolver {
                 (y0 + 1) * nx + x0 + 1,
             ];
 
-            for (&idx, &w) in indices.iter().zip(weights.iter()) {
-                self.vx[idx] += w * p.velocity.x;
-                self.vy[idx] += w * p.velocity.y;
+            // APIC: splat v_p + C_p · (x_i - x_p) instead of just v_p
+            let c = if use_apic && pi < self.apic_c.len() {
+                self.apic_c[pi]
+            } else {
+                [0.0; 4]
+            };
+
+            for k in 0..4 {
+                let w = weights[k];
+                let idx = indices[k];
+                let dxi = grid_x[k] as f64 * dx - p.position.x;
+                let dyi = grid_y[k] as f64 * dx - p.position.y;
+                // v_splat = v_p + C_p · (x_i - x_p)
+                self.vx[idx] += w * (p.velocity.x + c[0] * dxi + c[1] * dyi);
+                self.vy[idx] += w * (p.velocity.y + c[2] * dxi + c[3] * dyi);
                 self.weight[idx] += w;
             }
         }
@@ -486,29 +509,71 @@ impl FlipSolver {
     }
 
     /// Transfer grid velocities back to particles (Grid-to-Particle).
-    fn grid_to_particles(&self, particles: &mut [FluidParticle]) {
+    fn grid_to_particles(&mut self, particles: &mut [FluidParticle]) {
         let _span = trace_span!("flip::g2p", n = particles.len()).entered();
         let nx = self.nx;
         let ny = self.ny;
-        let inv_dx = 1.0 / self.dx;
-        let flip = self.flip_ratio;
-        let pic = 1.0 - flip;
+        let dx = self.dx;
+        let inv_dx = 1.0 / dx;
 
-        for p in particles.iter_mut() {
-            let gx = p.position.x * inv_dx;
-            let gy = p.position.y * inv_dx;
+        if self.use_apic {
+            // APIC G2P: v_p = Σ v_i w_ip, C_p = (4/dx²) Σ v_i (x_i - x_p)^T w_ip
+            self.apic_c.resize(particles.len(), [0.0; 4]);
+            let scale = 4.0 / (dx * dx);
+            for (pi, p) in particles.iter_mut().enumerate() {
+                let gx = p.position.x * inv_dx;
+                let gy = p.position.y * inv_dx;
+                let x0 = gx.floor().max(0.0).min((nx - 2) as f64) as usize;
+                let y0 = gy.floor().max(0.0).min((ny - 2) as f64) as usize;
+                let sx = (gx - x0 as f64).clamp(0.0, 1.0);
+                let sy = (gy - y0 as f64).clamp(0.0, 1.0);
 
-            // Grid velocity (PIC component) and delta (FLIP component)
-            let new_vx = Self::sample_field(&self.vx, nx, ny, gx, gy);
-            let new_vy = Self::sample_field(&self.vy, nx, ny, gx, gy);
-            let old_vx = Self::sample_field(&self.vx_old, nx, ny, gx, gy);
-            let old_vy = Self::sample_field(&self.vy_old, nx, ny, gx, gy);
-            let dvx = new_vx - old_vx;
-            let dvy = new_vy - old_vy;
+                let mut vx_new = 0.0;
+                let mut vy_new = 0.0;
+                let mut c00 = 0.0;
+                let mut c01 = 0.0;
+                let mut c10 = 0.0;
+                let mut c11 = 0.0;
 
-            // Blend: FLIP = particle_vel + grid_delta, PIC = grid_vel
-            p.velocity.x = flip * (p.velocity.x + dvx) + pic * new_vx;
-            p.velocity.y = flip * (p.velocity.y + dvy) + pic * new_vy;
+                let weights = [
+                    ((x0, y0), (1.0 - sx) * (1.0 - sy)),
+                    ((x0 + 1, y0), sx * (1.0 - sy)),
+                    ((x0, y0 + 1), (1.0 - sx) * sy),
+                    ((x0 + 1, y0 + 1), sx * sy),
+                ];
+                for &((ix, iy), w) in &weights {
+                    let idx = iy * nx + ix;
+                    let grid_vx = self.vx[idx];
+                    let grid_vy = self.vy[idx];
+                    vx_new += w * grid_vx;
+                    vy_new += w * grid_vy;
+                    let dxi = ix as f64 * dx - p.position.x;
+                    let dyi = iy as f64 * dx - p.position.y;
+                    c00 += w * grid_vx * dxi * scale;
+                    c01 += w * grid_vx * dyi * scale;
+                    c10 += w * grid_vy * dxi * scale;
+                    c11 += w * grid_vy * dyi * scale;
+                }
+                p.velocity.x = vx_new;
+                p.velocity.y = vy_new;
+                self.apic_c[pi] = [c00, c01, c10, c11];
+            }
+        } else {
+            // Standard FLIP/PIC blend
+            let flip = self.flip_ratio;
+            let pic = 1.0 - flip;
+            for p in particles.iter_mut() {
+                let gx = p.position.x * inv_dx;
+                let gy = p.position.y * inv_dx;
+                let new_vx = Self::sample_field(&self.vx, nx, ny, gx, gy);
+                let new_vy = Self::sample_field(&self.vy, nx, ny, gx, gy);
+                let old_vx = Self::sample_field(&self.vx_old, nx, ny, gx, gy);
+                let old_vy = Self::sample_field(&self.vy_old, nx, ny, gx, gy);
+                let dvx = new_vx - old_vx;
+                let dvy = new_vy - old_vy;
+                p.velocity.x = flip * (p.velocity.x + dvx) + pic * new_vx;
+                p.velocity.y = flip * (p.velocity.y + dvy) + pic * new_vy;
+            }
         }
     }
 

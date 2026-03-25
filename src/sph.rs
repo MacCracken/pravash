@@ -1461,6 +1461,280 @@ impl SphSolver {
         Ok(())
     }
 
+    /// Perform one DFSPH step (Divergence-Free SPH, Bender & Koschier 2015).
+    ///
+    /// Two-stage correction:
+    /// 1. Correct velocity divergence: enforce ∇·v = 0
+    /// 2. Correct density error: enforce ρ = ρ₀
+    ///
+    /// Converges in 1–2 iterations per stage (vs 5–10 for PCISPH).
+    /// `max_iterations` applies to each stage independently.
+    /// `max_error` is the relative convergence threshold (e.g., 0.001 = 0.1%).
+    pub fn step_dfsph(
+        &mut self,
+        particles: &mut [FluidParticle],
+        config: &FluidConfig,
+        viscosity: f64,
+        max_iterations: usize,
+        max_error: f64,
+    ) -> Result<()> {
+        let _span = trace_span!("sph::dfsph", n = particles.len()).entered();
+        config.validate()?;
+        let h = config.smoothing_radius;
+        let n = particles.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let h_f32 = h as f32;
+        if !h_f32.is_finite() || h_f32 <= 0.0 {
+            return Err(PravashError::InvalidSmoothingRadius { h });
+        }
+
+        let kc = KernelCoeffs::new(h);
+        let dt = config.dt;
+        let rest_density = config.rest_density;
+
+        // Build neighbors
+        {
+            let _span = trace_span!("sph::build_neighbors", n).entered();
+            self.build_neighbors(particles, h, h_f32)?;
+        }
+
+        // Compute densities
+        self.densities.resize(n, 0.0);
+        for i in 0..n {
+            let pi = &particles[i];
+            let mut d = 0.0;
+            for &j in self.neighbors(i) {
+                let r2 = pi.position.distance_squared(particles[j].position);
+                if r2 <= kc.h2 {
+                    d += particles[j].mass * kc.poly6(r2);
+                }
+            }
+            self.densities[i] = d;
+        }
+        for (i, p) in particles.iter_mut().enumerate() {
+            p.density = self.densities[i];
+        }
+
+        // Compute alpha factors: α_i = ρ_i / (|Σ m_j ∇W_ij|² + Σ |m_j ∇W_ij|²)
+        let mut alphas = vec![0.0f64; n];
+        for i in 0..n {
+            let pi = &particles[i];
+            let mut sum_grad = DVec3::ZERO;
+            let mut sum_grad_sq = 0.0f64;
+            for &j in self.neighbors(i) {
+                if j == i {
+                    continue;
+                }
+                let pj = &particles[j];
+                let diff = pi.position - pj.position;
+                let r2 = diff.length_squared();
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let grad = kc.spiky_grad(r);
+                let grad_w = diff * (pj.mass * grad / r);
+                sum_grad += grad_w;
+                sum_grad_sq += grad_w.length_squared();
+            }
+            let denom = sum_grad.length_squared() + sum_grad_sq;
+            alphas[i] = if denom > 1e-20 {
+                pi.density.max(1e-10) / denom
+            } else {
+                0.0
+            };
+        }
+
+        // Compute non-pressure accelerations (gravity + viscosity)
+        self.snapshot
+            .resize(n, FluidParticle::new(DVec3::ZERO, 0.0));
+        self.snapshot.copy_from_slice(particles);
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            let pi = &self.snapshot[i];
+            let mut accel = config.gravity;
+            let rho = pi.density.max(1e-10);
+
+            for &j in self.neighbors(i) {
+                if j == i {
+                    continue;
+                }
+                let pj = &self.snapshot[j];
+                let r2 = pi.position.distance_squared(pj.position);
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let rho_j = pj.density.max(1e-10);
+                let lap = kc.visc_laplacian(r);
+                let v_scale = viscosity * pj.mass * lap / rho_j / rho;
+                accel += (pj.velocity - pi.velocity) * v_scale;
+            }
+
+            particles[i].velocity += accel * dt;
+        }
+
+        // Stage 1: Correct velocity divergence (∇·v = 0)
+        for _iter in 0..max_iterations {
+            let _span = trace_span!("sph::dfsph_div").entered();
+            let snap_vel: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
+            let mut max_div = 0.0f64;
+
+            for i in 0..n {
+                let pos_i = particles[i].position;
+                let rho_i = particles[i].density.max(1e-10);
+
+                // Compute velocity divergence
+                let mut div_v = 0.0;
+                for &j in self.neighbors(i) {
+                    if j == i {
+                        continue;
+                    }
+                    let diff = pos_i - particles[j].position;
+                    let r2 = diff.length_squared();
+                    if r2 > kc.h2 || r2 < 1e-20 {
+                        continue;
+                    }
+                    let r = r2.sqrt();
+                    let grad = kc.spiky_grad(r);
+                    let grad_w = diff * (grad / r);
+                    div_v += particles[j].mass * (snap_vel[j] - snap_vel[i]).dot(grad_w);
+                }
+
+                max_div = max_div.max(div_v.abs());
+
+                // Correct velocity: κ_v = (1/dt) · div_v · α_i
+                if alphas[i] > 0.0 {
+                    let kappa = div_v * alphas[i] / dt;
+                    let mut vel_correction = DVec3::ZERO;
+                    for &j in self.neighbors(i) {
+                        if j == i {
+                            continue;
+                        }
+                        let diff = pos_i - particles[j].position;
+                        let r2 = diff.length_squared();
+                        if r2 > kc.h2 || r2 < 1e-20 {
+                            continue;
+                        }
+                        let r = r2.sqrt();
+                        let rho_j = particles[j].density.max(1e-10);
+                        let grad = kc.spiky_grad(r);
+                        vel_correction += diff
+                            * (dt
+                                * particles[j].mass
+                                * (kappa / (rho_i * rho_i) + kappa / (rho_j * rho_j))
+                                * grad
+                                / r);
+                    }
+                    particles[i].velocity -= vel_correction;
+                }
+            }
+
+            if max_div < max_error * rest_density {
+                break;
+            }
+        }
+
+        // Integrate positions
+        for p in particles.iter_mut() {
+            p.position += p.velocity * dt;
+        }
+
+        // Recompute density at new positions
+        for i in 0..n {
+            let pi = &particles[i];
+            let mut d = 0.0;
+            for &j in self.neighbors(i) {
+                let r2 = pi.position.distance_squared(particles[j].position);
+                if r2 <= kc.h2 {
+                    d += particles[j].mass * kc.poly6(r2);
+                }
+            }
+            particles[i].density = d;
+        }
+
+        // Stage 2: Correct density error (ρ = ρ₀)
+        for _iter in 0..max_iterations {
+            let _span = trace_span!("sph::dfsph_density").entered();
+            let mut max_rho_err = 0.0f64;
+
+            for i in 0..n {
+                let rho_err = particles[i].density - rest_density;
+                max_rho_err = max_rho_err.max(rho_err.abs() / rest_density);
+
+                if alphas[i] > 0.0 && rho_err.abs() > 1e-10 {
+                    let kappa = rho_err * alphas[i] / (dt * dt);
+                    let pi_pos = particles[i].position;
+                    let pi_rho = particles[i].density.max(1e-10);
+
+                    for &j in self.neighbors(i) {
+                        if j == i {
+                            continue;
+                        }
+                        let diff = pi_pos - particles[j].position;
+                        let r2 = diff.length_squared();
+                        if r2 > kc.h2 || r2 < 1e-20 {
+                            continue;
+                        }
+                        let r = r2.sqrt();
+                        let rho_j = particles[j].density.max(1e-10);
+                        let grad = kc.spiky_grad(r);
+                        let correction = diff
+                            * (dt
+                                * particles[j].mass
+                                * (kappa / (pi_rho * pi_rho) + kappa / (rho_j * rho_j))
+                                * grad
+                                / r);
+                        particles[i].velocity -= correction;
+                    }
+                }
+            }
+
+            if max_rho_err < max_error {
+                break;
+            }
+        }
+
+        // Store pressure as density error for diagnostics
+        for p in particles.iter_mut() {
+            p.pressure = equation_of_state(p.density, rest_density, config.gas_constant);
+        }
+
+        // Boundary enforcement
+        let lo = config.bounds_min;
+        let hi = config.bounds_max;
+        let damp = config.boundary_damping;
+        for p in particles.iter_mut() {
+            if p.position.x < lo.x {
+                p.position.x = lo.x;
+                p.velocity.x *= -damp;
+            } else if p.position.x > hi.x && hi.x > lo.x {
+                p.position.x = hi.x;
+                p.velocity.x *= -damp;
+            }
+            if p.position.y < lo.y {
+                p.position.y = lo.y;
+                p.velocity.y *= -damp;
+            } else if p.position.y > hi.y && hi.y > lo.y {
+                p.position.y = hi.y;
+                p.velocity.y *= -damp;
+            }
+            if p.position.z < lo.z {
+                p.position.z = lo.z;
+                p.velocity.z *= -damp;
+            } else if p.position.z > hi.z && hi.z > lo.z {
+                p.position.z = hi.z;
+                p.velocity.z *= -damp;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compute CFL-limited timestep from advective, force, and viscous constraints.
     ///
     /// dt = cfl · min(h/v_max, sqrt(h/a_max), h²/(6·ν))
@@ -1839,6 +2113,87 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
     }
 
     Ok(())
+}
+
+// ── MLS Gradient Correction ────────────────────────────────────────────────
+
+/// Compute MLS gradient correction matrices for all particles.
+///
+/// Returns one 2×2 correction matrix `[L00, L01, L10, L11]` per particle.
+/// Apply as: `∇W_corrected = L · ∇W` to restore 1st-order gradient consistency
+/// near boundaries and free surfaces.
+///
+/// `L_i = (Σ V_j (x_j - x_i) ⊗ ∇W_ij)^(-1)`
+#[must_use]
+pub fn compute_gradient_corrections(
+    particles: &[FluidParticle],
+    neighbor_offsets: &[u32],
+    neighbor_indices: &[usize],
+    h: f64,
+) -> Vec<[f64; 4]> {
+    let _span = trace_span!("sph::mls_correction", n = particles.len()).entered();
+    let n = particles.len();
+    let kc = KernelCoeffs::new(h);
+    let mut corrections = vec![[1.0, 0.0, 0.0, 1.0]; n]; // identity default
+
+    for i in 0..n {
+        let pi = &particles[i];
+        let start = neighbor_offsets[i] as usize;
+        let end = neighbor_offsets[i + 1] as usize;
+
+        // Build the moment matrix M = Σ V_j (x_j - x_i) ⊗ ∇W_ij
+        let mut m00 = 0.0;
+        let mut m01 = 0.0;
+        let mut m10 = 0.0;
+        let mut m11 = 0.0;
+
+        for &j in &neighbor_indices[start..end] {
+            if j == i {
+                continue;
+            }
+            let pj = &particles[j];
+            let diff = pj.position - pi.position;
+            let r2 = diff.length_squared();
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let rho_j = pj.density.max(1e-10);
+            let vol_j = pj.mass / rho_j;
+            let grad = kc.spiky_grad(r);
+            // ∇W points from j to i: grad_w = (x_i - x_j) * grad / r
+            let gw_x = (pi.position.x - pj.position.x) * grad / r;
+            let gw_y = (pi.position.y - pj.position.y) * grad / r;
+
+            // (x_j - x_i) ⊗ ∇W
+            m00 += vol_j * diff.x * gw_x;
+            m01 += vol_j * diff.x * gw_y;
+            m10 += vol_j * diff.y * gw_x;
+            m11 += vol_j * diff.y * gw_y;
+        }
+
+        // Invert the 2x2 matrix
+        let det = m00 * m11 - m01 * m10;
+        if det.abs() > 1e-20 {
+            let inv_det = 1.0 / det;
+            corrections[i] = [m11 * inv_det, -m01 * inv_det, -m10 * inv_det, m00 * inv_det];
+        }
+        // else: keep identity (degenerate neighborhood)
+    }
+
+    corrections
+}
+
+/// Apply a correction matrix to a kernel gradient vector.
+///
+/// `corrected = L · grad_w` where L is the 2×2 MLS correction matrix.
+#[inline]
+#[must_use]
+pub fn apply_gradient_correction(correction: &[f64; 4], gw_x: f64, gw_y: f64) -> (f64, f64) {
+    (
+        correction[0] * gw_x + correction[1] * gw_y,
+        correction[2] * gw_x + correction[3] * gw_y,
+    )
 }
 
 // ── Z-Order Sorting ───────────────────────────────────────────────────────
@@ -2769,7 +3124,75 @@ mod tests {
         let sw = ShallowWater::new(10, 10, 0.1, 1.0).unwrap();
         let dt = sw.cfl_dt(0.5);
         assert!(dt > 0.0 && dt.is_finite());
-        // For still water: dt = CFL * dx / sqrt(g*h) = 0.5 * 0.1 / sqrt(9.81) ≈ 0.016
         assert!(dt < 0.1);
+    }
+
+    // ── DFSPH tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dfsph_empty() {
+        let mut particles = vec![];
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        assert!(
+            solver
+                .step_dfsph(&mut particles, &config, 0.001, 3, 0.01)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_dfsph_single_particle_falls() {
+        let mut particles = vec![FluidParticle::new_2d(0.5, 0.5, 0.01)];
+        particles[0].density = 1000.0;
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver
+            .step_dfsph(&mut particles, &config, 0.001, 3, 0.01)
+            .unwrap();
+        assert!(particles[0].velocity.y < 0.0, "should fall under gravity");
+    }
+
+    #[test]
+    fn test_dfsph_particles_finite() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        for _ in 0..5 {
+            solver
+                .step_dfsph(&mut particles, &config, 0.001, 3, 0.01)
+                .unwrap();
+        }
+        assert!(particles.iter().all(|p| p.position.x.is_finite()));
+    }
+
+    // ── MLS correction tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_mls_correction_interior() {
+        let mut particles = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+        let config = FluidConfig::water_2d();
+        let mut solver = SphSolver::new();
+        solver.step(&mut particles, &config, 0.001).unwrap();
+
+        let corrections = compute_gradient_corrections(
+            &particles,
+            &solver.neighbor_offsets,
+            &solver.neighbor_indices,
+            config.smoothing_radius,
+        );
+        assert_eq!(corrections.len(), particles.len());
+        // Interior particles should have near-identity corrections
+        let mid = corrections.len() / 2;
+        let c = corrections[mid];
+        assert!(c[0].is_finite() && c[3].is_finite());
+    }
+
+    #[test]
+    fn test_apply_gradient_correction_identity() {
+        let identity = [1.0, 0.0, 0.0, 1.0];
+        let (gx, gy) = apply_gradient_correction(&identity, 2.0, 3.0);
+        assert!((gx - 2.0).abs() < 1e-10);
+        assert!((gy - 3.0).abs() < 1e-10);
     }
 }

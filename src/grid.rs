@@ -52,6 +52,10 @@ pub struct GridConfig {
     /// Smagorinsky SGS turbulence model coefficient (0.0 to disable).
     /// ν_t = (Cs·dx)²·|S|. Typical Cs: 0.1–0.2. Default: 0.0.
     pub smagorinsky_cs: f64,
+    /// Use multigrid V-cycle for pressure solve (O(N) vs O(N²) for GS).
+    /// Falls back to DST for non-periodic, GS for periodic when disabled.
+    /// Default: false.
+    pub use_multigrid: bool,
 }
 
 impl GridConfig {
@@ -69,6 +73,7 @@ impl GridConfig {
             ambient_density: 0.0,
             use_maccormack: false,
             smagorinsky_cs: 0.0,
+            use_multigrid: false,
         }
     }
 }
@@ -567,6 +572,100 @@ impl FluidGrid {
         Ok(())
     }
 
+    /// Multigrid V-cycle Poisson solver. O(N) total work.
+    ///
+    /// Recursively restricts the residual to coarser grids, solves, and
+    /// prolongates the correction. Uses Red-Black Gauss-Seidel smoothing.
+    fn pressure_solve_multigrid(
+        pressure: &mut [f64],
+        div: &[f64],
+        nx: usize,
+        ny: usize,
+        nu_smooth: usize,
+    ) {
+        let _span = trace_span!("grid::multigrid", nx, ny).entered();
+        Self::mg_vcycle(pressure, div, nx, ny, nu_smooth);
+    }
+
+    fn mg_vcycle(p: &mut [f64], rhs: &[f64], nx: usize, ny: usize, nu: usize) {
+        // Base case: solve directly with many GS iterations
+        if nx <= 6 || ny <= 6 {
+            Self::pressure_solve(p, rhs, nx, ny, 50);
+            return;
+        }
+
+        // Pre-smooth
+        Self::pressure_solve(p, rhs, nx, ny, nu);
+
+        // Compute residual: r = rhs - L(p)
+        let n = nx * ny;
+        let mut residual = vec![0.0f64; n];
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let lap = p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx] - 4.0 * p[i];
+                residual[i] = rhs[i] - lap;
+            }
+        }
+
+        // Restrict to coarse grid (full weighting)
+        let cnx = nx / 2;
+        let cny = ny / 2;
+        if cnx < 4 || cny < 4 {
+            Self::pressure_solve(p, rhs, nx, ny, nu * 4);
+            return;
+        }
+        let cn = cnx * cny;
+        let mut coarse_rhs = vec![0.0f64; cn];
+        for cy in 1..cny - 1 {
+            for cx in 1..cnx - 1 {
+                let fx = cx * 2;
+                let fy = cy * 2;
+                let fi = fy * nx + fx;
+                // Full weighting: center=4, edges=2, corners=1, /16
+                coarse_rhs[cy * cnx + cx] = (4.0 * residual[fi]
+                    + 2.0
+                        * (residual[fi - 1]
+                            + residual[fi + 1]
+                            + residual[fi - nx]
+                            + residual[fi + nx])
+                    + residual[fi - nx - 1]
+                    + residual[fi - nx + 1]
+                    + residual[fi + nx - 1]
+                    + residual[fi + nx + 1])
+                    / 16.0;
+            }
+        }
+
+        // Solve on coarse grid (recurse)
+        let mut coarse_p = vec![0.0f64; cn];
+        Self::mg_vcycle(&mut coarse_p, &coarse_rhs, cnx, cny, nu);
+
+        // Prolongate correction to fine grid (bilinear interpolation)
+        for cy in 0..cny {
+            for cx in 0..cnx {
+                let val = coarse_p[cy * cnx + cx];
+                let fx = cx * 2;
+                let fy = cy * 2;
+                if fx < nx && fy < ny {
+                    p[fy * nx + fx] += val;
+                }
+                if fx + 1 < nx && fy < ny {
+                    p[fy * nx + fx + 1] += val * 0.5;
+                }
+                if fx < nx && fy + 1 < ny {
+                    p[(fy + 1) * nx + fx] += val * 0.5;
+                }
+                if fx + 1 < nx && fy + 1 < ny {
+                    p[(fy + 1) * nx + fx + 1] += val * 0.25;
+                }
+            }
+        }
+
+        // Post-smooth
+        Self::pressure_solve(p, rhs, nx, ny, nu);
+    }
+
     /// Subtract pressure gradient from velocity to enforce divergence-free.
     fn project_velocity(
         vx: &mut [f64],
@@ -891,7 +990,9 @@ impl FluidGrid {
         {
             sa.fill(0.0);
             Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, inv_2dx);
-            if config.boundary == BoundaryCondition::Periodic {
+            if config.use_multigrid {
+                Self::pressure_solve_multigrid(&mut self.pressure, &sa, nx, ny, 4);
+            } else if config.boundary == BoundaryCondition::Periodic {
                 Self::pressure_solve(&mut self.pressure, &sa, nx, ny, config.pressure_iterations);
             } else {
                 Self::pressure_solve_dst(&mut self.pressure, &sa, nx, ny)?;

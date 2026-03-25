@@ -57,6 +57,9 @@ pub struct ShallowWater {
     /// `dt < dx² / (coeff · h² · g)`. For `dx=0.1, h=1, coeff=0.05`:
     /// `dt < 0.01 / (0.05 · 9.81) ≈ 0.02`.
     pub dispersion_coeff: f64,
+    /// Use HLL Riemann solver for flux computation (better shock capturing).
+    /// Default: false (uses averaged fluxes).
+    pub use_riemann: bool,
     /// Scratch buffers (persistent across steps to avoid allocation).
     #[serde(skip)]
     scratch_vx: Vec<f64>,
@@ -91,6 +94,7 @@ impl ShallowWater {
             breaking_threshold: 0.5,
             breaking_dissipation: 5.0,
             dispersion_coeff: 0.0,
+            use_riemann: false,
             scratch_vx: vec![0.0; size],
             scratch_vy: vec![0.0; size],
             scratch_h: vec![0.0; size],
@@ -164,6 +168,36 @@ impl ShallowWater {
                     self.height[idx] += amplitude * factor * factor;
                 }
             }
+        }
+    }
+
+    /// HLL flux for 1D shallow water Riemann problem.
+    /// Returns (flux_h, flux_hu) at the interface between left and right states.
+    #[inline]
+    fn hll_flux(h_l: f64, u_l: f64, h_r: f64, u_r: f64, g: f64) -> (f64, f64) {
+        let eps = 1e-10;
+        let c_l = (g * h_l.max(0.0)).sqrt();
+        let c_r = (g * h_r.max(0.0)).sqrt();
+
+        // Wave speed estimates (Davis)
+        let s_l = (u_l - c_l).min(u_r - c_r);
+        let s_r = (u_l + c_l).max(u_r + c_r);
+
+        // Fluxes
+        let f_h_l = h_l * u_l;
+        let f_hu_l = h_l * u_l * u_l + 0.5 * g * h_l * h_l;
+        let f_h_r = h_r * u_r;
+        let f_hu_r = h_r * u_r * u_r + 0.5 * g * h_r * h_r;
+
+        if s_l >= 0.0 {
+            (f_h_l, f_hu_l)
+        } else if s_r <= 0.0 {
+            (f_h_r, f_hu_r)
+        } else {
+            let denom = 1.0 / (s_r - s_l).max(eps);
+            let f_h = (s_r * f_h_l - s_l * f_h_r + s_l * s_r * (h_r - h_l)) * denom;
+            let f_hu = (s_r * f_hu_l - s_l * f_hu_r + s_l * s_r * (h_r * u_r - h_l * u_l)) * denom;
+            (f_h, f_hu)
         }
     }
 
@@ -346,32 +380,46 @@ impl ShallowWater {
         }
 
         // Continuity update (flux form): ∂h/∂t + ∂(h·u)/∂x + ∂(h·v)/∂y = 0
-        // Flux limited at dry fronts: no outgoing flux from dry cells.
+        let use_riemann = self.use_riemann;
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
                 let depth = (sh[i] - self.ground[i]).max(0.0);
 
-                // Compute fluxes at cell faces using averaged depth and velocity.
-                // Dry cells (velocity already zeroed) contribute zero flux naturally.
-                let hu_right = {
-                    let d = (sh[i + 1] - self.ground[i + 1]).max(0.0);
-                    0.5 * (depth * self.vx[i] + d * self.vx[i + 1])
-                };
-                let hu_left = {
-                    let d = (sh[i - 1] - self.ground[i - 1]).max(0.0);
-                    0.5 * (depth * self.vx[i] + d * self.vx[i - 1])
-                };
-                let hv_top = {
-                    let d = (sh[i + nx] - self.ground[i + nx]).max(0.0);
-                    0.5 * (depth * self.vy[i] + d * self.vy[i + nx])
-                };
-                let hv_bottom = {
-                    let d = (sh[i - nx] - self.ground[i - nx]).max(0.0);
-                    0.5 * (depth * self.vy[i] + d * self.vy[i - nx])
+                let flux_div = if use_riemann {
+                    // HLL Riemann solver at each cell face
+                    let d_r = (sh[i + 1] - self.ground[i + 1]).max(0.0);
+                    let d_l = (sh[i - 1] - self.ground[i - 1]).max(0.0);
+                    let d_t = (sh[i + nx] - self.ground[i + nx]).max(0.0);
+                    let d_b = (sh[i - nx] - self.ground[i - nx]).max(0.0);
+
+                    let (fh_r, _) = Self::hll_flux(depth, self.vx[i], d_r, self.vx[i + 1], g);
+                    let (fh_l, _) = Self::hll_flux(d_l, self.vx[i - 1], depth, self.vx[i], g);
+                    let (fh_t, _) = Self::hll_flux(depth, self.vy[i], d_t, self.vy[i + nx], g);
+                    let (fh_b, _) = Self::hll_flux(d_b, self.vy[i - nx], depth, self.vy[i], g);
+
+                    (fh_r - fh_l) / dx + (fh_t - fh_b) / dx
+                } else {
+                    // Averaged fluxes (original method)
+                    let hu_right = {
+                        let d = (sh[i + 1] - self.ground[i + 1]).max(0.0);
+                        0.5 * (depth * self.vx[i] + d * self.vx[i + 1])
+                    };
+                    let hu_left = {
+                        let d = (sh[i - 1] - self.ground[i - 1]).max(0.0);
+                        0.5 * (depth * self.vx[i] + d * self.vx[i - 1])
+                    };
+                    let hv_top = {
+                        let d = (sh[i + nx] - self.ground[i + nx]).max(0.0);
+                        0.5 * (depth * self.vy[i] + d * self.vy[i + nx])
+                    };
+                    let hv_bottom = {
+                        let d = (sh[i - nx] - self.ground[i - nx]).max(0.0);
+                        0.5 * (depth * self.vy[i] + d * self.vy[i - nx])
+                    };
+                    (hu_right - hu_left + hv_top - hv_bottom) * inv_2dx
                 };
 
-                let flux_div = (hu_right - hu_left + hv_top - hv_bottom) * inv_2dx;
                 self.height[i] -= flux_div * dt;
 
                 // Clamp: depth must never go negative
