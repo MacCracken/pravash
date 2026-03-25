@@ -387,16 +387,22 @@ impl ShallowWater {
                 let depth = (sh[i] - self.ground[i]).max(0.0);
 
                 let flux_div = if use_riemann {
-                    // HLL Riemann solver at each cell face
+                    // HLL Riemann solver at each cell face (mass + momentum fluxes)
                     let d_r = (sh[i + 1] - self.ground[i + 1]).max(0.0);
                     let d_l = (sh[i - 1] - self.ground[i - 1]).max(0.0);
                     let d_t = (sh[i + nx] - self.ground[i + nx]).max(0.0);
                     let d_b = (sh[i - nx] - self.ground[i - nx]).max(0.0);
 
-                    let (fh_r, _) = Self::hll_flux(depth, self.vx[i], d_r, self.vx[i + 1], g);
-                    let (fh_l, _) = Self::hll_flux(d_l, self.vx[i - 1], depth, self.vx[i], g);
-                    let (fh_t, _) = Self::hll_flux(depth, self.vy[i], d_t, self.vy[i + nx], g);
-                    let (fh_b, _) = Self::hll_flux(d_b, self.vy[i - nx], depth, self.vy[i], g);
+                    let (fh_r, fhu_r) = Self::hll_flux(depth, self.vx[i], d_r, self.vx[i + 1], g);
+                    let (fh_l, fhu_l) = Self::hll_flux(d_l, self.vx[i - 1], depth, self.vx[i], g);
+                    let (fh_t, fhv_t) = Self::hll_flux(depth, self.vy[i], d_t, self.vy[i + nx], g);
+                    let (fh_b, fhv_b) = Self::hll_flux(d_b, self.vy[i - nx], depth, self.vy[i], g);
+
+                    // Update velocity from momentum flux divergence: ∂(hu)/∂t = -∂F_hu/∂x
+                    if depth > dry_thr {
+                        self.vx[i] -= (fhu_r - fhu_l) / (dx * depth) * dt;
+                        self.vy[i] -= (fhv_t - fhv_b) / (dx * depth) * dt;
+                    }
 
                     (fh_r - fh_l) / dx + (fh_t - fh_b) / dx
                 } else {

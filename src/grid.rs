@@ -110,6 +110,9 @@ pub struct FluidGrid {
     /// Diffusion RHS buffer.
     #[serde(skip)]
     diffuse_rhs: Vec<f64>,
+    /// Persistent multigrid level buffers (residual, coarse_rhs, coarse_p per level).
+    #[serde(skip)]
+    mg_levels: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
 }
 
 impl FluidGrid {
@@ -141,6 +144,7 @@ impl FluidGrid {
             scratch_b: vec![0.0; size],
             scratch_c: vec![0.0; size],
             diffuse_rhs: vec![0.0; size],
+            mg_levels: Vec::new(),
         })
     }
 
@@ -575,20 +579,29 @@ impl FluidGrid {
     /// Multigrid V-cycle Poisson solver. O(N) total work.
     ///
     /// Recursively restricts the residual to coarser grids, solves, and
-    /// prolongates the correction. Uses Red-Black Gauss-Seidel smoothing.
+    /// prolongates the correction. Uses Gauss-Seidel smoothing.
+    /// `levels` provides persistent scratch buffers (residual, coarse_rhs, coarse_p) per level.
     fn pressure_solve_multigrid(
         pressure: &mut [f64],
         div: &[f64],
         nx: usize,
         ny: usize,
         nu_smooth: usize,
+        levels: &mut Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
     ) {
         let _span = trace_span!("grid::multigrid", nx, ny).entered();
-        Self::mg_vcycle(pressure, div, nx, ny, nu_smooth);
+        Self::mg_vcycle(pressure, div, nx, ny, nu_smooth, levels, 0);
     }
 
-    fn mg_vcycle(p: &mut [f64], rhs: &[f64], nx: usize, ny: usize, nu: usize) {
-        // Base case: solve directly with many GS iterations
+    fn mg_vcycle(
+        p: &mut [f64],
+        rhs: &[f64],
+        nx: usize,
+        ny: usize,
+        nu: usize,
+        levels: &mut Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
+        depth: usize,
+    ) {
         if nx <= 6 || ny <= 6 {
             Self::pressure_solve(p, rhs, nx, ny, 50);
             return;
@@ -597,9 +610,29 @@ impl FluidGrid {
         // Pre-smooth
         Self::pressure_solve(p, rhs, nx, ny, nu);
 
-        // Compute residual: r = rhs - L(p)
         let n = nx * ny;
-        let mut residual = vec![0.0f64; n];
+        let cnx = nx / 2;
+        let cny = ny / 2;
+        if cnx < 4 || cny < 4 {
+            Self::pressure_solve(p, rhs, nx, ny, nu * 4);
+            return;
+        }
+        let cn = cnx * cny;
+
+        // Ensure persistent buffers exist for this level
+        while levels.len() <= depth {
+            levels.push((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        // Take this level's buffers out to avoid borrow conflict with recursive call
+        let (mut residual, mut c_rhs, mut c_p) = std::mem::take(&mut levels[depth]);
+        residual.resize(n, 0.0);
+        c_rhs.resize(cn, 0.0);
+        c_p.resize(cn, 0.0);
+        c_p.fill(0.0);
+
+        // Compute residual
+        residual.fill(0.0);
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
@@ -608,22 +641,14 @@ impl FluidGrid {
             }
         }
 
-        // Restrict to coarse grid (full weighting)
-        let cnx = nx / 2;
-        let cny = ny / 2;
-        if cnx < 4 || cny < 4 {
-            Self::pressure_solve(p, rhs, nx, ny, nu * 4);
-            return;
-        }
-        let cn = cnx * cny;
-        let mut coarse_rhs = vec![0.0f64; cn];
+        // Restrict (full weighting)
+        c_rhs.fill(0.0);
         for cy in 1..cny - 1 {
             for cx in 1..cnx - 1 {
                 let fx = cx * 2;
                 let fy = cy * 2;
                 let fi = fy * nx + fx;
-                // Full weighting: center=4, edges=2, corners=1, /16
-                coarse_rhs[cy * cnx + cx] = (4.0 * residual[fi]
+                c_rhs[cy * cnx + cx] = (4.0 * residual[fi]
                     + 2.0
                         * (residual[fi - 1]
                             + residual[fi + 1]
@@ -637,14 +662,13 @@ impl FluidGrid {
             }
         }
 
-        // Solve on coarse grid (recurse)
-        let mut coarse_p = vec![0.0f64; cn];
-        Self::mg_vcycle(&mut coarse_p, &coarse_rhs, cnx, cny, nu);
+        // Recurse
+        Self::mg_vcycle(&mut c_p, &c_rhs, cnx, cny, nu, levels, depth + 1);
 
-        // Prolongate correction to fine grid (bilinear interpolation)
+        // Prolongate
         for cy in 0..cny {
             for cx in 0..cnx {
-                let val = coarse_p[cy * cnx + cx];
+                let val = c_p[cy * cnx + cx];
                 let fx = cx * 2;
                 let fy = cy * 2;
                 if fx < nx && fy < ny {
@@ -661,6 +685,9 @@ impl FluidGrid {
                 }
             }
         }
+
+        // Return buffers to level cache
+        levels[depth] = (residual, c_rhs, c_p);
 
         // Post-smooth
         Self::pressure_solve(p, rhs, nx, ny, nu);
@@ -991,7 +1018,9 @@ impl FluidGrid {
             sa.fill(0.0);
             Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, inv_2dx);
             if config.use_multigrid {
-                Self::pressure_solve_multigrid(&mut self.pressure, &sa, nx, ny, 4);
+                let mut mg = std::mem::take(&mut self.mg_levels);
+                Self::pressure_solve_multigrid(&mut self.pressure, &sa, nx, ny, 4, &mut mg);
+                self.mg_levels = mg;
             } else if config.boundary == BoundaryCondition::Periodic {
                 Self::pressure_solve(&mut self.pressure, &sa, nx, ny, config.pressure_iterations);
             } else {

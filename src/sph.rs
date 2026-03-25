@@ -2117,9 +2117,9 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
 
 // ── MLS Gradient Correction ────────────────────────────────────────────────
 
-/// Compute MLS gradient correction matrices for all particles.
+/// Compute MLS gradient correction matrices for all particles (3D).
 ///
-/// Returns one 2×2 correction matrix `[L00, L01, L10, L11]` per particle.
+/// Returns one 3×3 correction matrix `[L00..L22]` (9 elements, row-major) per particle.
 /// Apply as: `∇W_corrected = L · ∇W` to restore 1st-order gradient consistency
 /// near boundaries and free surfaces.
 ///
@@ -2130,22 +2130,21 @@ pub fn compute_gradient_corrections(
     neighbor_offsets: &[u32],
     neighbor_indices: &[usize],
     h: f64,
-) -> Vec<[f64; 4]> {
+) -> Vec<[f64; 9]> {
     let _span = trace_span!("sph::mls_correction", n = particles.len()).entered();
     let n = particles.len();
     let kc = KernelCoeffs::new(h);
-    let mut corrections = vec![[1.0, 0.0, 0.0, 1.0]; n]; // identity default
+    // Identity 3x3: [1,0,0, 0,1,0, 0,0,1]
+    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let mut corrections = vec![identity; n];
 
     for i in 0..n {
         let pi = &particles[i];
         let start = neighbor_offsets[i] as usize;
         let end = neighbor_offsets[i + 1] as usize;
 
-        // Build the moment matrix M = Σ V_j (x_j - x_i) ⊗ ∇W_ij
-        let mut m00 = 0.0;
-        let mut m01 = 0.0;
-        let mut m10 = 0.0;
-        let mut m11 = 0.0;
+        // Build the 3×3 moment matrix M = Σ V_j (x_j - x_i) ⊗ ∇W_ij
+        let mut m = [0.0f64; 9];
 
         for &j in &neighbor_indices[start..end] {
             if j == i {
@@ -2161,22 +2160,22 @@ pub fn compute_gradient_corrections(
             let rho_j = pj.density.max(1e-10);
             let vol_j = pj.mass / rho_j;
             let grad = kc.spiky_grad(r);
-            // ∇W points from j to i: grad_w = (x_i - x_j) * grad / r
-            let gw_x = (pi.position.x - pj.position.x) * grad / r;
-            let gw_y = (pi.position.y - pj.position.y) * grad / r;
+            // ∇W points from j to i
+            let dir = (pi.position - pj.position) * (grad / r);
+            let gw = [dir.x, dir.y, dir.z];
+            let d = [diff.x, diff.y, diff.z];
 
-            // (x_j - x_i) ⊗ ∇W
-            m00 += vol_j * diff.x * gw_x;
-            m01 += vol_j * diff.x * gw_y;
-            m10 += vol_j * diff.y * gw_x;
-            m11 += vol_j * diff.y * gw_y;
+            // (x_j - x_i) ⊗ ∇W  →  M[row][col] += V_j * d[row] * gw[col]
+            for row in 0..3 {
+                for col in 0..3 {
+                    m[row * 3 + col] += vol_j * d[row] * gw[col];
+                }
+            }
         }
 
-        // Invert the 2x2 matrix
-        let det = m00 * m11 - m01 * m10;
-        if det.abs() > 1e-20 {
-            let inv_det = 1.0 / det;
-            corrections[i] = [m11 * inv_det, -m01 * inv_det, -m10 * inv_det, m00 * inv_det];
+        // Invert the 3x3 matrix
+        if let Some(inv) = invert_3x3(&m) {
+            corrections[i] = inv;
         }
         // else: keep identity (degenerate neighborhood)
     }
@@ -2184,15 +2183,39 @@ pub fn compute_gradient_corrections(
     corrections
 }
 
-/// Apply a correction matrix to a kernel gradient vector.
+/// Invert a 3×3 matrix stored as 9-element row-major array.
+/// Returns None if singular.
+#[inline]
+fn invert_3x3(m: &[f64; 9]) -> Option<[f64; 9]> {
+    let [a, b, c, d, e, f, g, h, k] = *m;
+    let det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    if det.abs() < 1e-20 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    Some([
+        (e * k - f * h) * inv_det,
+        (c * h - b * k) * inv_det,
+        (b * f - c * e) * inv_det,
+        (f * g - d * k) * inv_det,
+        (a * k - c * g) * inv_det,
+        (c * d - a * f) * inv_det,
+        (d * h - e * g) * inv_det,
+        (b * g - a * h) * inv_det,
+        (a * e - b * d) * inv_det,
+    ])
+}
+
+/// Apply a 3×3 correction matrix to a kernel gradient vector.
 ///
-/// `corrected = L · grad_w` where L is the 2×2 MLS correction matrix.
+/// `corrected = L · ∇W` where L is the 3×3 MLS correction matrix.
 #[inline]
 #[must_use]
-pub fn apply_gradient_correction(correction: &[f64; 4], gw_x: f64, gw_y: f64) -> (f64, f64) {
-    (
-        correction[0] * gw_x + correction[1] * gw_y,
-        correction[2] * gw_x + correction[3] * gw_y,
+pub fn apply_gradient_correction(correction: &[f64; 9], gw: DVec3) -> DVec3 {
+    DVec3::new(
+        correction[0] * gw.x + correction[1] * gw.y + correction[2] * gw.z,
+        correction[3] * gw.x + correction[4] * gw.y + correction[5] * gw.z,
+        correction[6] * gw.x + correction[7] * gw.y + correction[8] * gw.z,
     )
 }
 
@@ -3185,14 +3208,15 @@ mod tests {
         // Interior particles should have near-identity corrections
         let mid = corrections.len() / 2;
         let c = corrections[mid];
-        assert!(c[0].is_finite() && c[3].is_finite());
+        assert!(c[0].is_finite() && c[4].is_finite() && c[8].is_finite());
     }
 
     #[test]
     fn test_apply_gradient_correction_identity() {
-        let identity = [1.0, 0.0, 0.0, 1.0];
-        let (gx, gy) = apply_gradient_correction(&identity, 2.0, 3.0);
-        assert!((gx - 2.0).abs() < 1e-10);
-        assert!((gy - 3.0).abs() < 1e-10);
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let result = apply_gradient_correction(&identity, DVec3::new(2.0, 3.0, 4.0));
+        assert!((result.x - 2.0).abs() < 1e-10);
+        assert!((result.y - 3.0).abs() < 1e-10);
+        assert!((result.z - 4.0).abs() < 1e-10);
     }
 }
