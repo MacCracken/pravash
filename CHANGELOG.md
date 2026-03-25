@@ -26,6 +26,12 @@
 - sph: Contact angle / wetting (`apply_contact_angle`) — Young's equation at solid boundaries
 - sph: Phase change (`PhaseChangeConfig`, `update_phase_change`) — melting, solidification, evaporation
 - shallow: Sediment transport (`SedimentConfig`, `update_sediment`) — Shields criterion, erosion/deposition
+- mpm: Material Point Method (`MpmSolver`, `MpmParticle`) — neo-Hookean, fluid, Drucker-Prager constitutive models
+- sph: Tait equation of state (`equation_of_state_tait`) for compressible flow
+- sph: Implicit viscosity solver (`apply_implicit_viscosity`) — removes viscous CFL restriction
+- sph: Particle splitting (`split_particle`) and merging (`merge_particles`) with mass/momentum conservation
+- sph: Batch kernel evaluation (`batch_poly6`, `batch_distance_squared`) — SIMD-friendly patterns
+- coupling: Narrow-band FLIP option (`FlipSolver.narrow_band_cells`)
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

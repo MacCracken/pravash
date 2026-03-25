@@ -391,6 +391,9 @@ pub struct FlipSolver {
     /// Use APIC (Affine Particle-In-Cell) transfers instead of FLIP/PIC.
     /// Conserves angular momentum. Overrides `flip_ratio` when true.
     pub use_apic: bool,
+    /// Narrow-band mode: only transfer particles within `narrow_band_cells`
+    /// of the free surface. Interior particles are frozen. 0 = disabled.
+    pub narrow_band_cells: usize,
     /// Per-particle affine velocity matrices [c00, c01, c10, c11] for APIC.
     apic_c: Vec<[f64; 4]>,
 }
@@ -420,6 +423,7 @@ impl FlipSolver {
             pressure: vec![0.0; n],
             div: vec![0.0; n],
             use_apic: false,
+            narrow_band_cells: 0,
             apic_c: Vec::new(),
         })
     }

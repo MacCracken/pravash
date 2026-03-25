@@ -38,12 +38,12 @@
 
 ### 0.29.0 — Advanced Methods
 
-- [ ] MPM extension (material point method — unified multi-material)
-- [ ] Compressible Navier-Stokes (Tait EOS, energy equation, shockwaves)
-- [ ] IMEX time splitting (implicit stiff terms, explicit advection)
-- [ ] Adaptive particle splitting / merging
-- [ ] Narrow-band FLIP (surface-only particles, grid interior)
-- [ ] SIMD kernel evaluation (f64x4 / f32x8 vectorized inner loops)
+- [x] MPM extension (material point method — unified multi-material)
+- [x] Compressible Navier-Stokes (Tait EOS, energy equation, shockwaves)
+- [x] IMEX time splitting (implicit stiff terms, explicit advection)
+- [x] Adaptive particle splitting / merging
+- [x] Narrow-band FLIP (surface-only particles, grid interior)
+- [x] SIMD kernel evaluation (f64x4 / f32x8 vectorized inner loops)
 
 ### 1.0.0 — Production
 

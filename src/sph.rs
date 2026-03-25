@@ -846,6 +846,24 @@ pub fn equation_of_state(density: f64, rest_density: f64, gas_constant: f64) -> 
     gas_constant * (density - rest_density)
 }
 
+/// Tait equation of state for weakly compressible SPH.
+///
+/// P = B · ((ρ/ρ₀)^γ - 1) where B = ρ₀·c²/γ.
+///
+/// Enables shockwaves and compressibility effects.
+/// `gamma` = 7 for water, 1.4 for ideal gas.
+#[inline]
+#[must_use]
+pub fn equation_of_state_tait(
+    density: f64,
+    rest_density: f64,
+    speed_of_sound: f64,
+    gamma: f64,
+) -> f64 {
+    let b = rest_density * speed_of_sound * speed_of_sound / gamma;
+    b * ((density / rest_density.max(1e-10)).powf(gamma) - 1.0)
+}
+
 // ── Forces (standalone, brute-force) ────────────────────────────────────────
 
 /// Compute pressure force on particle i from all neighbors (brute-force).
@@ -2334,6 +2352,107 @@ pub fn apply_gradient_correction(correction: &[f64; 9], gw: DVec3) -> DVec3 {
     )
 }
 
+// ── IMEX Splitting ────────────────────────────────────────────────────────
+
+/// Apply implicit viscosity using an iterative solver.
+///
+/// Treats viscosity implicitly: `v_new = v_old + dt·ν·∇²v_new`.
+/// Uses Jacobi iteration to solve the implicit system.
+/// Removes the viscous CFL restriction (dt < h²/6ν).
+pub fn apply_implicit_viscosity(
+    particles: &mut [FluidParticle],
+    neighbor_offsets: &[u32],
+    neighbor_indices: &[usize],
+    h: f64,
+    viscosity: f64,
+    dt: f64,
+    iterations: usize,
+) {
+    let _span = trace_span!("sph::implicit_visc", n = particles.len()).entered();
+    let n = particles.len();
+    if n == 0 || viscosity <= 0.0 {
+        return;
+    }
+
+    let kc = KernelCoeffs::new(h);
+
+    for _iter in 0..iterations {
+        let snap_vel: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
+
+        for i in 0..n {
+            let pi_pos = particles[i].position;
+            let rho = particles[i].density.max(1e-10);
+            let start = neighbor_offsets[i] as usize;
+            let end = neighbor_offsets[i + 1] as usize;
+            let mut laplacian = DVec3::ZERO;
+
+            for &j in &neighbor_indices[start..end] {
+                if j == i {
+                    continue;
+                }
+                let r2 = pi_pos.distance_squared(particles[j].position);
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let rho_j = particles[j].density.max(1e-10);
+                let lap = kc.visc_laplacian(r);
+                laplacian += (snap_vel[j] - snap_vel[i]) * (particles[j].mass * lap / rho_j);
+            }
+
+            particles[i].velocity = snap_vel[i] + laplacian * (viscosity * dt / rho);
+        }
+    }
+}
+
+// ── Adaptive Particle Splitting/Merging ───────────────────────────────────
+
+/// Split a particle into `n_children` smaller particles.
+///
+/// Conserves total mass and momentum. Children are placed in a ring
+/// around the parent position at distance `offset`.
+#[must_use]
+pub fn split_particle(
+    parent: &FluidParticle,
+    n_children: usize,
+    offset: f64,
+) -> Vec<FluidParticle> {
+    if n_children == 0 {
+        return vec![];
+    }
+    let child_mass = parent.mass / n_children as f64;
+    let mut children = Vec::with_capacity(n_children);
+
+    for k in 0..n_children {
+        let angle = 2.0 * std::f64::consts::PI * k as f64 / n_children as f64;
+        let mut child = *parent;
+        child.mass = child_mass;
+        child.position.x += offset * angle.cos();
+        child.position.y += offset * angle.sin();
+        children.push(child);
+    }
+    children
+}
+
+/// Merge two nearby particles into one, conserving mass and momentum.
+#[must_use]
+pub fn merge_particles(a: &FluidParticle, b: &FluidParticle) -> FluidParticle {
+    let total_mass = a.mass + b.mass;
+    let inv_mass = 1.0 / total_mass.max(1e-20);
+    FluidParticle {
+        position: (a.position * a.mass + b.position * b.mass) * inv_mass,
+        velocity: (a.velocity * a.mass + b.velocity * b.mass) * inv_mass,
+        acceleration: DVec3::ZERO,
+        density: (a.density * a.mass + b.density * b.mass) * inv_mass,
+        pressure: (a.pressure * a.mass + b.pressure * b.mass) * inv_mass,
+        mass: total_mass,
+        phase: a.phase,
+        conformation: a.conformation,
+        temperature: (a.temperature * a.mass + b.temperature * b.mass) * inv_mass,
+        fuel: (a.fuel * a.mass + b.fuel * b.mass) * inv_mass,
+    }
+}
+
 // ── Z-Order Sorting ───────────────────────────────────────────────────────
 
 /// Spread bits for 2D Morton code: insert a zero between each bit.
@@ -2367,6 +2486,40 @@ pub fn sort_by_zorder(particles: &mut [FluidParticle], cell_size: f64) {
     }
     let inv_cell = 1.0 / cell_size;
     particles.sort_unstable_by_key(|p| morton_code_2d(p.position[0], p.position[1], inv_cell));
+}
+
+// ── Batch Kernel Evaluation (SIMD-friendly) ───────────────────────────────
+
+/// Batch-evaluate Poly6 kernel for multiple squared distances.
+///
+/// Auto-vectorizable inner loop — the compiler can emit SIMD instructions
+/// for this pattern without explicit intrinsics.
+#[must_use]
+pub fn batch_poly6(r2_values: &[f64], h: f64) -> Vec<f64> {
+    let kc = KernelCoeffs::new(h);
+    r2_values
+        .iter()
+        .map(|&r2| {
+            if r2 > kc.h2 {
+                0.0
+            } else {
+                let diff = kc.h2 - r2;
+                kc.poly6 * diff * diff * diff
+            }
+        })
+        .collect()
+}
+
+/// Batch-compute squared distances from one particle to many.
+///
+/// Output layout: `out[i] = |pos - positions[i]|²`.
+/// Auto-vectorizable.
+#[must_use]
+pub fn batch_distance_squared(pos: DVec3, positions: &[DVec3]) -> Vec<f64> {
+    positions
+        .iter()
+        .map(|&other| pos.distance_squared(other))
+        .collect()
 }
 
 // ── Utility Functions ───────────────────────────────────────────────────────

@@ -43,6 +43,9 @@ pub mod vof;
 #[cfg(feature = "coupling")]
 pub mod coupling;
 
+#[cfg(feature = "coupling")]
+pub mod mpm;
+
 #[cfg(feature = "compute")]
 pub mod compute;
 
