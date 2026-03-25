@@ -1,6 +1,6 @@
 [package]
 name = "pravash"
-version = "0.25.3"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-only"
@@ -28,7 +28,7 @@ logging = ["dep:tracing-subscriber", "dep:tracing-chrome"]
 full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute", "parallel", "ai", "logging"]
 
 [dependencies]
-hisab = { version = "1.1", path = "../hisab", features = ["num", "geo", "autodiff"] }
+hisab = { version = "1.1", features = ["num", "geo", "autodiff"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

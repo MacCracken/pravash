@@ -330,6 +330,7 @@ impl KernelDerivatives {
     ///     &[0.5], // input: r = 0.5
     /// );
     /// ```
+    ///
     /// Compute gradient using hisab's reverse-mode automatic differentiation.
     ///
     /// Wraps `hisab::autodiff::reverse_gradient` for convenience.
