@@ -57,6 +57,10 @@ pub struct ShallowWater {
     /// `dt < dx² / (coeff · h² · g)`. For `dx=0.1, h=1, coeff=0.05`:
     /// `dt < 0.01 / (0.05 · 9.81) ≈ 0.02`.
     pub dispersion_coeff: f64,
+    /// Use Green-Naghdi fully nonlinear dispersion instead of Boussinesq.
+    /// More accurate for large-amplitude waves. Requires `dispersion_coeff > 0`.
+    /// Default: false.
+    pub use_green_naghdi: bool,
     /// Use HLL Riemann solver for flux computation (better shock capturing).
     /// Default: false (uses averaged fluxes).
     pub use_riemann: bool,
@@ -94,6 +98,7 @@ impl ShallowWater {
             breaking_threshold: 0.5,
             breaking_dissipation: 5.0,
             dispersion_coeff: 0.0,
+            use_green_naghdi: false,
             use_riemann: false,
             scratch_vx: vec![0.0; size],
             scratch_vy: vec![0.0; size],
@@ -327,17 +332,31 @@ impl ShallowWater {
                 self.vx[i] -= (dhdx + u * dudx + v * dudy) * dt;
                 self.vy[i] -= (dhdy + u * dvdx + v * dvdy) * dt;
 
-                // Boussinesq dispersive correction: -coeff · h² · g · ∇(∇²η)
-                // Gradient of the Laplacian gives the dispersive pressure term.
+                // Dispersive correction
                 if disp > 0.0 {
                     let depth = (sh[i] - self.ground[i]).max(0.0);
                     if depth > dry_thr {
                         let lap = &self.scratch_lap;
-                        let dlap_dx = (lap[i + 1] - lap[i - 1]) * inv_2dx;
-                        let dlap_dy = (lap[i + nx] - lap[i - nx]) * inv_2dx;
-                        let scale = disp * depth * depth * g;
-                        self.vx[i] -= scale * dlap_dx * dt;
-                        self.vy[i] -= scale * dlap_dy * dt;
+                        if self.use_green_naghdi {
+                            // Green-Naghdi: -(h²/3)·g·∂/∂x(h·∇²η)
+                            // Uses depth-weighted Laplacian for fully nonlinear dispersion
+                            let h_lap_r = (sh[i + 1] - self.ground[i + 1]).max(0.0) * lap[i + 1];
+                            let h_lap_l = (sh[i - 1] - self.ground[i - 1]).max(0.0) * lap[i - 1];
+                            let h_lap_t = (sh[i + nx] - self.ground[i + nx]).max(0.0) * lap[i + nx];
+                            let h_lap_b = (sh[i - nx] - self.ground[i - nx]).max(0.0) * lap[i - nx];
+                            let dhl_dx = (h_lap_r - h_lap_l) * inv_2dx;
+                            let dhl_dy = (h_lap_t - h_lap_b) * inv_2dx;
+                            let scale = disp * depth * depth * g / 3.0;
+                            self.vx[i] -= scale * dhl_dx * dt;
+                            self.vy[i] -= scale * dhl_dy * dt;
+                        } else {
+                            // Boussinesq: -coeff · h² · g · ∇(∇²η)
+                            let dlap_dx = (lap[i + 1] - lap[i - 1]) * inv_2dx;
+                            let dlap_dy = (lap[i + nx] - lap[i - nx]) * inv_2dx;
+                            let scale = disp * depth * depth * g;
+                            self.vx[i] -= scale * dlap_dx * dt;
+                            self.vy[i] -= scale * dlap_dy * dt;
+                        }
                     }
                 }
 

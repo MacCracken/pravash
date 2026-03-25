@@ -2488,6 +2488,78 @@ pub fn sort_by_zorder(particles: &mut [FluidParticle], cell_size: f64) {
     particles.sort_unstable_by_key(|p| morton_code_2d(p.position[0], p.position[1], inv_cell));
 }
 
+// ── Foam / Spray / Bubble Generation ──────────────────────────────────────
+
+/// Type of secondary particle for visual effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecondaryType {
+    Foam,
+    Spray,
+    Bubble,
+}
+
+/// A secondary (decorative) particle.
+#[derive(Debug, Clone, Copy)]
+pub struct SecondaryParticle {
+    pub position: DVec3,
+    pub velocity: DVec3,
+    pub lifetime: f64,
+    pub kind: SecondaryType,
+}
+
+/// Generate secondary particles from fluid surface based on acceleration.
+#[must_use]
+pub fn generate_secondary_particles(
+    particles: &[FluidParticle],
+    accel_threshold: f64,
+    max_lifetime: f64,
+) -> Vec<SecondaryParticle> {
+    let _span = trace_span!("sph::secondary", n = particles.len()).entered();
+    let mut secondary = Vec::new();
+
+    for p in particles {
+        let accel_mag = p.acceleration.length();
+        if accel_mag > accel_threshold {
+            secondary.push(SecondaryParticle {
+                position: p.position,
+                velocity: p.velocity * 1.2,
+                lifetime: max_lifetime * 0.5,
+                kind: SecondaryType::Spray,
+            });
+        } else if accel_mag > accel_threshold * 0.3 {
+            secondary.push(SecondaryParticle {
+                position: p.position,
+                velocity: p.velocity * 0.1,
+                lifetime: max_lifetime,
+                kind: SecondaryType::Foam,
+            });
+        }
+    }
+    secondary
+}
+
+/// Advect and age secondary particles. Removes dead ones.
+pub fn update_secondary_particles(
+    secondaries: &mut Vec<SecondaryParticle>,
+    gravity: DVec3,
+    dt: f64,
+) {
+    for s in secondaries.iter_mut() {
+        match s.kind {
+            SecondaryType::Spray => s.velocity += gravity * dt,
+            SecondaryType::Foam => s.velocity *= 0.98,
+            SecondaryType::Bubble => {
+                s.velocity.y += 0.5 * dt;
+                s.velocity *= 0.95;
+            }
+        }
+        s.position += s.velocity * dt;
+        s.lifetime -= dt;
+    }
+    secondaries.retain(|s| s.lifetime > 0.0);
+}
+
 // ── Batch Kernel Evaluation (SIMD-friendly) ───────────────────────────────
 
 /// Batch-evaluate Poly6 kernel for multiple squared distances.

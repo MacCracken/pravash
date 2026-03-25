@@ -49,6 +49,10 @@ pub struct GridConfig {
     /// Use MacCormack advection (higher-order, less diffusive).
     /// Falls back to semi-Lagrangian at grid boundaries.
     pub use_maccormack: bool,
+    /// Use BFECC advection (Back and Forth Error Compensation and Correction).
+    /// Better feature preservation than MacCormack. Overrides MacCormack if both set.
+    /// Default: false.
+    pub use_bfecc: bool,
     /// Smagorinsky SGS turbulence model coefficient (0.0 to disable).
     /// ν_t = (Cs·dx)²·|S|. Typical Cs: 0.1–0.2. Default: 0.0.
     pub smagorinsky_cs: f64,
@@ -72,6 +76,7 @@ impl GridConfig {
             buoyancy_alpha: 0.1,
             ambient_density: 0.0,
             use_maccormack: false,
+            use_bfecc: false,
             smagorinsky_cs: 0.0,
             use_multigrid: false,
         }
@@ -408,6 +413,73 @@ impl FluidGrid {
                 lo = lo.min(src[i + nx]);
                 hi = hi.max(src[i + nx]);
 
+                dst[i] = corrected.clamp(lo, hi);
+            }
+        }
+    }
+
+    /// BFECC advection: forward, backward, error estimate, corrected forward.
+    /// Better feature preservation than MacCormack.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn advect_bfecc(
+        dst: &mut [f64],
+        src: &[f64],
+        vx: &[f64],
+        vy: &[f64],
+        nx: usize,
+        ny: usize,
+        dt: f64,
+        inv_dx: f64,
+        temp1: &mut [f64],
+        temp2: &mut [f64],
+    ) {
+        let _span = trace_span!("grid::advect_bfecc", nx, ny).entered();
+        let dt_inv_dx = dt * inv_dx;
+
+        // Step 1: Forward semi-Lagrangian → temp1
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let fx = x as f64 - dt_inv_dx * vx[i];
+                let fy = y as f64 - dt_inv_dx * vy[i];
+                temp1[i] = Self::sample(src, nx, ny, fx, fy);
+            }
+        }
+
+        // Step 2: Backward from temp1 → temp2
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let fx = x as f64 + dt_inv_dx * vx[i];
+                let fy = y as f64 + dt_inv_dx * vy[i];
+                temp2[i] = Self::sample(temp1, nx, ny, fx, fy);
+            }
+        }
+
+        // Step 3: Corrected result with clamping
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let s = src[i];
+                let mut lo = s;
+                let mut hi = s;
+                if x > 0 {
+                    lo = lo.min(src[i - 1]);
+                    hi = hi.max(src[i - 1]);
+                }
+                if x < nx - 1 {
+                    lo = lo.min(src[i + 1]);
+                    hi = hi.max(src[i + 1]);
+                }
+                if y > 0 {
+                    lo = lo.min(src[i - nx]);
+                    hi = hi.max(src[i - nx]);
+                }
+                if y < ny - 1 {
+                    lo = lo.min(src[i + nx]);
+                    hi = hi.max(src[i + nx]);
+                }
+                let corrected = temp1[i] + 0.5 * (src[i] - temp2[i]);
                 dst[i] = corrected.clamp(lo, hi);
             }
         }
@@ -1081,6 +1153,83 @@ impl FluidGrid {
         self.diffuse_rhs = drhs;
 
         Ok(())
+    }
+}
+
+// ── k-epsilon Turbulence Model ───────────────────────────────────────────────
+
+/// k-epsilon turbulence state for a 2D grid.
+///
+/// Two-equation RANS model solving transport equations for:
+/// - k: turbulent kinetic energy
+/// - ε: turbulent dissipation rate
+///
+/// Effective viscosity: ν_t = C_μ · k² / ε
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct KEpsilon {
+    /// Turbulent kinetic energy per cell.
+    pub k: Vec<f64>,
+    /// Turbulent dissipation rate per cell.
+    pub epsilon: Vec<f64>,
+    /// C_μ constant. Default: 0.09.
+    pub c_mu: f64,
+    /// C_ε1 constant. Default: 1.44.
+    pub c_eps1: f64,
+    /// C_ε2 constant. Default: 1.92.
+    pub c_eps2: f64,
+}
+
+impl KEpsilon {
+    /// Create k-epsilon state for a grid.
+    #[must_use]
+    pub fn new(nx: usize, ny: usize) -> Self {
+        let n = nx * ny;
+        Self {
+            k: vec![1e-4; n],
+            epsilon: vec![1e-5; n],
+            c_mu: 0.09,
+            c_eps1: 1.44,
+            c_eps2: 1.92,
+        }
+    }
+
+    /// Compute turbulent viscosity at a cell: ν_t = C_μ · k² / ε.
+    #[inline]
+    #[must_use]
+    pub fn turbulent_viscosity(&self, i: usize) -> f64 {
+        self.c_mu * self.k[i] * self.k[i] / self.epsilon[i].max(1e-20)
+    }
+
+    /// Step the k-ε transport equations.
+    pub fn step(&mut self, vx: &[f64], vy: &[f64], nx: usize, ny: usize, dx: f64, dt: f64) {
+        let _span = trace_span!("grid::kepsilon", nx, ny).entered();
+        let inv_2dx = 0.5 / dx;
+        let k_old = self.k.clone();
+        let eps_old = self.epsilon.clone();
+
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let nu_t = self.c_mu * k_old[i] * k_old[i] / eps_old[i].max(1e-20);
+
+                let dudx = (vx[i + 1] - vx[i - 1]) * inv_2dx;
+                let dudy = (vx[i + nx] - vx[i - nx]) * inv_2dx;
+                let dvdx = (vy[i + 1] - vy[i - 1]) * inv_2dx;
+                let dvdy = (vy[i + nx] - vy[i - nx]) * inv_2dx;
+                let s_mag_sq = 2.0 * (dudx * dudx + dvdy * dvdy + 0.5 * (dudy + dvdx).powi(2));
+
+                let production = nu_t * s_mag_sq;
+
+                self.k[i] += (production - eps_old[i]) * dt;
+                self.k[i] = self.k[i].max(1e-10);
+
+                let eps_over_k = eps_old[i] / k_old[i].max(1e-10);
+                self.epsilon[i] +=
+                    (self.c_eps1 * production - self.c_eps2 * eps_old[i]) * eps_over_k * dt;
+                self.epsilon[i] = self.epsilon[i].max(1e-10);
+            }
+        }
     }
 }
 

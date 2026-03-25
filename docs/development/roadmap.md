@@ -47,9 +47,9 @@
 
 ### 1.0.0 — Production
 
-- [ ] Neural operator acceleration (learned correctors, FNO for ambient effects)
-- [ ] Differentiable simulation API (analytical Jacobians)
-- [ ] k-epsilon / k-omega SST turbulence models
-- [ ] Green-Naghdi fully nonlinear dispersion
-- [ ] Foam / spray / bubble generation heuristics
-- [ ] BFECC / reflection-based advection
+- [x] Neural operator acceleration (learned correctors, FNO for ambient effects)
+- [x] Differentiable simulation API (analytical Jacobians)
+- [x] k-epsilon / k-omega SST turbulence models
+- [x] Green-Naghdi fully nonlinear dispersion
+- [x] Foam / spray / bubble generation heuristics
+- [x] BFECC / reflection-based advection

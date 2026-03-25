@@ -32,6 +32,12 @@
 - sph: Particle splitting (`split_particle`) and merging (`merge_particles`) with mass/momentum conservation
 - sph: Batch kernel evaluation (`batch_poly6`, `batch_distance_squared`) — SIMD-friendly patterns
 - coupling: Narrow-band FLIP option (`FlipSolver.narrow_band_cells`)
+- compute: `NeuralCorrector` trait for learned simulation correction (FNO, GNS backends)
+- compute: `KernelDerivatives` — analytical Jacobians for differentiable simulation (dPoly6/dr², dEOS/dρ, dTait/dρ)
+- grid: k-epsilon turbulence model (`KEpsilon`) — two-equation RANS with production/dissipation transport
+- grid: BFECC advection (`advect_bfecc`) — 2nd-order error-compensating advection
+- shallow: Green-Naghdi fully nonlinear dispersion (`use_green_naghdi`)
+- sph: Foam/spray/bubble generation (`SecondaryParticle`, `generate_secondary_particles`, `update_secondary_particles`)
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

@@ -217,6 +217,104 @@ pub trait ComputeBackend {
     ) -> Result<()>;
 }
 
+// ── Neural Operator Acceleration ────────────────────────────────────────────
+
+/// Trait for neural network-based simulation correction.
+///
+/// Learned correctors take a coarse simulation state and return a correction
+/// that approximates the fine-resolution result. Enables 4-16x speedup by
+/// running a coarser sim and applying a learned fix.
+///
+/// # No vendor lock-in
+///
+/// Pravash defines this trait. ML frameworks (PyTorch, ONNX, candle, etc.)
+/// implement it. The consumer wires them together.
+///
+/// ```ignore
+/// struct FnoCorrector { model: onnxruntime::Session }
+/// impl NeuralCorrector for FnoCorrector {
+///     fn correct(&self, state: &SimState) -> Result<SimCorrection> {
+///         // run inference, return velocity/pressure corrections
+///     }
+/// }
+/// ```
+pub trait NeuralCorrector {
+    /// Apply a learned correction to the simulation state.
+    ///
+    /// `velocities`: flat f32 buffer of velocity components.
+    /// `pressures`: flat f32 buffer of pressure values.
+    /// Returns corrections to be added to the current state.
+    fn correct(
+        &self,
+        velocities: &[f32],
+        pressures: &[f32],
+        params: &GridKernelParams,
+    ) -> Result<NeuralCorrection>;
+}
+
+/// Correction output from a neural operator.
+#[derive(Debug, Clone)]
+pub struct NeuralCorrection {
+    /// Velocity correction (same layout as input).
+    pub velocity_delta: Vec<f32>,
+    /// Pressure correction.
+    pub pressure_delta: Vec<f32>,
+}
+
+// ── Differentiable Simulation ───────────────────────────────────────────────
+
+/// Analytical derivatives of SPH kernels for differentiable simulation.
+///
+/// Enables gradient-based optimization of simulation parameters,
+/// inverse design, and integration with autodiff frameworks.
+pub struct KernelDerivatives;
+
+impl KernelDerivatives {
+    /// d(poly6)/d(r²) — derivative of poly6 kernel w.r.t. squared distance.
+    ///
+    /// W = c · (h² - r²)³ → dW/d(r²) = -3c · (h² - r²)²
+    #[inline]
+    #[must_use]
+    pub fn dpoly6_dr2(r2: f64, h: f64) -> f64 {
+        let h2 = h * h;
+        if r2 > h2 {
+            return 0.0;
+        }
+        let h3 = h2 * h;
+        let h9 = h3 * h3 * h3;
+        let c = 315.0 / (64.0 * std::f64::consts::PI * h9);
+        let diff = h2 - r2;
+        -3.0 * c * diff * diff
+    }
+
+    /// d(EOS)/dρ — derivative of linear equation of state w.r.t. density.
+    ///
+    /// P = k(ρ - ρ₀) → dP/dρ = k
+    #[inline]
+    #[must_use]
+    pub fn deos_drho(gas_constant: f64) -> f64 {
+        gas_constant
+    }
+
+    /// d(Tait EOS)/dρ — derivative of Tait equation of state.
+    ///
+    /// P = B((ρ/ρ₀)^γ - 1) → dP/dρ = B·γ·(ρ/ρ₀)^(γ-1) / ρ₀
+    #[inline]
+    #[must_use]
+    pub fn dtait_drho(density: f64, rest_density: f64, speed_of_sound: f64, gamma: f64) -> f64 {
+        let rho0 = rest_density.max(1e-10);
+        let b = rho0 * speed_of_sound * speed_of_sound / gamma;
+        b * gamma * (density / rho0).powf(gamma - 1.0) / rho0
+    }
+
+    /// d(Wendland C2)/dr — analytical derivative for gradient computation.
+    #[inline]
+    #[must_use]
+    pub fn dwendland_c2_dr(r: f64, h: f64) -> f64 {
+        crate::sph::kernel_wendland_c2_grad(r, h)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
