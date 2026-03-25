@@ -38,6 +38,8 @@
 - grid: BFECC advection (`advect_bfecc`) — 2nd-order error-compensating advection
 - shallow: Green-Naghdi fully nonlinear dispersion (`use_green_naghdi`)
 - sph: Foam/spray/bubble generation (`SecondaryParticle`, `generate_secondary_particles`, `update_secondary_particles`)
+- compute: `KernelDerivatives::autodiff_gradient()` — reverse-mode autodiff via hisab's `Tape`/`Var`
+- hisab dependency updated to 1.1 (reverse-mode autodiff, stiff ODE solvers, SDFs, k-epsilon eigendecomposition)
 - shallow: `ShallowWater::cfl_dt()` — wave speed CFL timestep
 
 ### Previously Added

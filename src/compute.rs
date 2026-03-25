@@ -313,6 +313,33 @@ impl KernelDerivatives {
     pub fn dwendland_c2_dr(r: f64, h: f64) -> f64 {
         crate::sph::kernel_wendland_c2_grad(r, h)
     }
+
+    /// Compute gradient of an arbitrary scalar function using hisab's
+    /// reverse-mode automatic differentiation.
+    ///
+    /// `f` takes a tape and input variables, returns a scalar output.
+    /// Returns the gradient ∂f/∂x for each input dimension.
+    ///
+    /// ```ignore
+    /// let grad = KernelDerivatives::autodiff_gradient(
+    ///     |tape, vars| {
+    ///         let r2 = tape.mul(vars[0], vars[0]);
+    ///         // ... kernel computation ...
+    ///         result
+    ///     },
+    ///     &[0.5], // input: r = 0.5
+    /// );
+    /// ```
+    /// Compute gradient using hisab's reverse-mode automatic differentiation.
+    ///
+    /// Wraps `hisab::autodiff::reverse_gradient` for convenience.
+    #[must_use]
+    pub fn autodiff_gradient(
+        f: impl Fn(&mut hisab::autodiff::Tape, &[hisab::autodiff::Var]) -> hisab::autodiff::Var,
+        x: &[f64],
+    ) -> Vec<f64> {
+        hisab::autodiff::reverse_gradient(f, x)
+    }
 }
 
 #[cfg(test)]
