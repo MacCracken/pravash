@@ -57,6 +57,11 @@ pub fn terminal_velocity(
     drag_coefficient: f64,
     area: f64,
 ) -> Result<f64> {
+    if !gravity.is_finite() {
+        return Err(PravashError::InvalidParameter {
+            reason: "terminal_velocity: gravity must be finite".into(),
+        });
+    }
     let denom = fluid_density * drag_coefficient * area;
     if denom <= 0.0 {
         return Err(PravashError::InvalidParameter {
@@ -86,6 +91,21 @@ pub fn reynolds_number(
 ) -> Result<f64> {
     if viscosity <= 0.0 {
         return Err(PravashError::InvalidViscosity { viscosity });
+    }
+    if !fluid_density.is_finite() {
+        return Err(PravashError::InvalidParameter {
+            reason: "reynolds_number: fluid_density must be finite".into(),
+        });
+    }
+    if !velocity.is_finite() {
+        return Err(PravashError::InvalidParameter {
+            reason: "reynolds_number: velocity must be finite".into(),
+        });
+    }
+    if !length.is_finite() {
+        return Err(PravashError::InvalidParameter {
+            reason: "reynolds_number: length must be finite".into(),
+        });
     }
     Ok(fluid_density * velocity * length / viscosity)
 }

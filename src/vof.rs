@@ -39,26 +39,55 @@ impl VofField {
         })
     }
 
-    /// Whether a cell is a surface cell (partially filled).
+    /// Whether a cell is a surface cell (partially filled), using the default
+    /// threshold of `1e-6`.
     #[inline]
     #[must_use]
     pub fn is_surface(&self, x: usize, y: usize) -> bool {
-        let a = self.alpha[y * self.nx + x];
-        a > 1e-6 && a < 1.0 - 1e-6
+        self.is_surface_with_threshold(x, y, 1e-6)
     }
 
-    /// Whether a cell is full.
+    /// Whether a cell is a surface cell (partially filled) using a custom threshold.
+    ///
+    /// A cell is considered a surface cell when its volume fraction is between
+    /// `threshold` and `1.0 - threshold`.
+    #[inline]
+    #[must_use]
+    pub fn is_surface_with_threshold(&self, x: usize, y: usize, threshold: f64) -> bool {
+        let a = self.alpha[y * self.nx + x];
+        a > threshold && a < 1.0 - threshold
+    }
+
+    /// Whether a cell is full, using the default threshold of `1e-6`.
     #[inline]
     #[must_use]
     pub fn is_full(&self, x: usize, y: usize) -> bool {
-        self.alpha[y * self.nx + x] > 1.0 - 1e-6
+        self.is_full_with_threshold(x, y, 1e-6)
     }
 
-    /// Whether a cell is empty.
+    /// Whether a cell is full using a custom threshold.
+    ///
+    /// A cell is considered full when its volume fraction exceeds `1.0 - threshold`.
+    #[inline]
+    #[must_use]
+    pub fn is_full_with_threshold(&self, x: usize, y: usize, threshold: f64) -> bool {
+        self.alpha[y * self.nx + x] > 1.0 - threshold
+    }
+
+    /// Whether a cell is empty, using the default threshold of `1e-6`.
     #[inline]
     #[must_use]
     pub fn is_empty(&self, x: usize, y: usize) -> bool {
-        self.alpha[y * self.nx + x] < 1e-6
+        self.is_empty_with_threshold(x, y, 1e-6)
+    }
+
+    /// Whether a cell is empty using a custom threshold.
+    ///
+    /// A cell is considered empty when its volume fraction is below `threshold`.
+    #[inline]
+    #[must_use]
+    pub fn is_empty_with_threshold(&self, x: usize, y: usize, threshold: f64) -> bool {
+        self.alpha[y * self.nx + x] < threshold
     }
 
     /// Fill a rectangular region with fluid (α = 1).

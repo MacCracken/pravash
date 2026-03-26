@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Fixed
+- sph: Surface tension div-by-zero in solver step, PCISPH, and multiphase — added threshold floor
+- sph: Phase change energy conservation — added `heat_capacity` to `PhaseChangeConfig`, proper J/kg↔K conversion
+- sph: Verlet integration used zero prev_accel on every step — fixed resize guard to preserve existing values
+- sph: PCISPH delta computed from particle 0 only — now averages over all particles with neighbors
+- sph: Implicit viscosity solver ran fixed iterations — added convergence check with early exit
+- sph: Contact angle force missing length scale — added smoothing radius divisor
+- sph: Non-Newtonian viscosity (Bingham/Herschel-Bulkley) could produce extreme values — added saturation cap
+- sph: Multi-phase surface tension early exit used wrong condition — fixed to check `st > 0 || it > 0`
+- grid: DST eigenvalue division threshold too small (1e-20 → 1e-12)
+- grid: NaN from `sample()` propagated silently — added post-advection divergence check
+- grid: Multigrid recursion had no depth limit — capped at 10 levels
+- shallow: Riemann solver epsilon too small (1e-10 → 1e-8)
+- shallow: HLL flux mixed old/new time levels — now uses consistent snapshot velocities
+- shallow: Friction calculation NaN risk near dry threshold — added depth guard
+- shallow: Well-balanced pressure gradient used hardcoded 1e-3 — now uses dry threshold
+- shallow: Grid minimum size was 1 — raised to 3
+- shallow: Sediment array bounds only checked in debug — added runtime check
+- coupling: FLIP pressure solver ran fixed 40 iterations — added convergence check with early exit
+- coupling: APIC silently degraded to PIC on first step — auto-resize apic_c
+- coupling: NaN could propagate through FLIP step — added post-pressure-solve check
+- mpm: Deformation gradient could explode — added det(F) clamping
+- mpm: Particle/mpm_data count mismatch silently truncated — now returns error
+- common: `ParticleArena::active_count` could underflow — switched to `saturating_sub`
+- vortex: `lamb_oseen_velocity` div-by-zero when viscosity=0 — added guard
+- buoyancy: `reynolds_number` and `terminal_velocity` accepted NaN/Inf inputs — added validation
+
+### Added
+- mpm: `ConstitutiveModel::validate()` — validates material parameters (Young's modulus, Poisson ratio, bulk modulus)
+- grid: `GridConfig` validation — smagorinsky_cs, vorticity_confinement, iteration counts
+- grid: BFECC advection wired up via `use_bfecc` flag
+- vof: `is_surface_with_threshold()`, `is_full_with_threshold()`, `is_empty_with_threshold()` — configurable threshold
+
+### Changed
+- sph: Density threshold standardized via `MIN_DENSITY` constant across all solvers
+- sph: `MultiPhaseConfig::get()` now logs warning on invalid phase index fallback
+- grid: All pressure solvers now return `Result<()>` consistently
+- grid: k-epsilon solver uses scratch buffer swap instead of cloning
+- vortex: `kolmogorov_scale` uses log-form for numeric stability
+- phase_field: Phase field clamping now warns via tracing when |φ| > 1.5
+- shallow: CFL condition accounts for dispersive stability limit
+
 ## [1.1.0] - 2026-03-26
 
 ### Added

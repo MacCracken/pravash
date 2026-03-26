@@ -50,6 +50,15 @@ impl PackedParticles {
     #[must_use]
     pub fn from_soa(soa: &ParticleSoa) -> Self {
         let n = soa.len();
+        debug_assert_eq!(soa.pos_x.len(), n, "pos_x length mismatch");
+        debug_assert_eq!(soa.pos_y.len(), n, "pos_y length mismatch");
+        debug_assert_eq!(soa.pos_z.len(), n, "pos_z length mismatch");
+        debug_assert_eq!(soa.vel_x.len(), n, "vel_x length mismatch");
+        debug_assert_eq!(soa.vel_y.len(), n, "vel_y length mismatch");
+        debug_assert_eq!(soa.vel_z.len(), n, "vel_z length mismatch");
+        debug_assert_eq!(soa.mass.len(), n, "mass length mismatch");
+        debug_assert_eq!(soa.density.len(), n, "density length mismatch");
+        debug_assert_eq!(soa.pressure.len(), n, "pressure length mismatch");
         let mut position_mass = Vec::with_capacity(n * 4);
         let mut velocity = Vec::with_capacity(n * 4);
         let mut density_pressure = Vec::with_capacity(n * 2);

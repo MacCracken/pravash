@@ -154,10 +154,15 @@ impl PhaseField {
                     0.0
                 };
 
-                self.phi[i] += (advection + reaction) * dt;
+                let new_phi = self.phi[i] + (advection + reaction) * dt;
+
+                // Warn if the phase field is diverging significantly
+                if new_phi.abs() > 1.5 {
+                    tracing::warn!(x, y, new_phi, "phase field divergence detected (|φ| > 1.5)");
+                }
 
                 // Clamp to [-1, 1] for stability
-                self.phi[i] = self.phi[i].clamp(-1.0, 1.0);
+                self.phi[i] = new_phi.clamp(-1.0, 1.0);
             }
         }
 

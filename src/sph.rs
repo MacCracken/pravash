@@ -30,6 +30,9 @@ use tracing::trace_span;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Minimum density floor to prevent division-by-zero in pressure/force calculations.
+const MIN_DENSITY: f64 = 1e-10;
+
 // ── Precomputed Kernel Coefficients ─────────────────────────────────────────
 
 /// Precomputed kernel coefficients for a given smoothing radius h.
@@ -49,6 +52,7 @@ struct KernelCoeffs {
 impl KernelCoeffs {
     #[inline]
     fn new(h: f64) -> Self {
+        debug_assert!(h > 0.0, "smoothing radius must be positive");
         let h2 = h * h;
         let h3 = h2 * h;
         let h6 = h3 * h3;
@@ -273,7 +277,14 @@ impl MultiPhaseConfig {
     #[inline]
     #[must_use]
     fn get(&self, phase: u8) -> &PhaseProperties {
-        self.phases.get(phase as usize).unwrap_or(&self.phases[0])
+        self.phases.get(phase as usize).unwrap_or_else(|| {
+            tracing::warn!(
+                requested = phase,
+                available = self.phases.len(),
+                "phase index out of bounds, falling back to phase 0"
+            );
+            &self.phases[0]
+        })
     }
 }
 
@@ -324,7 +335,7 @@ pub fn update_viscoelastic(
 
     for i in 0..n {
         let pi = &snap[i];
-        let rho = pi.density.max(1e-10);
+        let rho = pi.density.max(MIN_DENSITY);
         let start = neighbor_offsets[i] as usize;
         let end = neighbor_offsets[i + 1] as usize;
 
@@ -344,7 +355,7 @@ pub fn update_viscoelastic(
                 continue;
             }
             let r = r2.sqrt();
-            let rho_j = pj.density.max(1e-10);
+            let rho_j = pj.density.max(MIN_DENSITY);
             let grad = kc.spiky_grad(r);
             let scale = pj.mass / rho_j * grad / r;
 
@@ -385,7 +396,7 @@ pub fn update_viscoelastic(
                 continue;
             }
             let r = r2.sqrt();
-            let rho_j = pj.density.max(1e-10);
+            let rho_j = pj.density.max(MIN_DENSITY);
             let grad = kc.spiky_grad(r);
             let scale = pj.mass / rho_j * grad / r;
 
@@ -442,7 +453,7 @@ pub fn update_heat(
 
     for i in 0..n {
         let pi = &particles[i];
-        let rho = pi.density.max(1e-10);
+        let rho = pi.density.max(MIN_DENSITY);
         let start = neighbor_offsets[i] as usize;
         let end = neighbor_offsets[i + 1] as usize;
         let mut dt_temp = 0.0;
@@ -457,7 +468,7 @@ pub fn update_heat(
                 continue;
             }
             let r = r2.sqrt();
-            let rho_j = pj.density.max(1e-10);
+            let rho_j = pj.density.max(MIN_DENSITY);
 
             let lap = kc.visc_laplacian(r);
             dt_temp += pj.mass / rho_j * (snap[j] - snap[i]) * lap;
@@ -477,6 +488,9 @@ pub struct PhaseChangeConfig {
     pub transition_temperature: f64,
     /// Latent heat (J/kg). Energy absorbed during melting/evaporation.
     pub latent_heat: f64,
+    /// Specific heat capacity (J/(kg·K)). Converts temperature to energy.
+    /// Water ≈ 4186, ice ≈ 2090, steam ≈ 2010.
+    pub heat_capacity: f64,
     /// Phase index for the solid/liquid phase below transition temperature.
     pub phase_below: u8,
     /// Phase index for the liquid/gas phase above transition temperature.
@@ -494,27 +508,30 @@ pub fn update_phase_change(particles: &mut [FluidParticle], config: &PhaseChange
     let _span = trace_span!("sph::phase_change", n = particles.len()).entered();
     let t_trans = config.transition_temperature;
     let l_heat = config.latent_heat;
+    let cp = config.heat_capacity.max(1e-10);
 
     for p in particles.iter_mut() {
         if p.temperature > t_trans && p.phase == config.phase_below {
             // Absorb latent heat (melting/evaporation)
+            // Thermal energy available = cp · ΔT (J/kg), need l_heat (J/kg) to transition
             let excess = p.temperature - t_trans;
-            let energy = excess * p.mass; // approximate energy excess
-            let fraction = (energy / (l_heat * p.mass.max(1e-20))).min(1.0);
+            let thermal_energy = excess * cp;
+            let fraction = (thermal_energy / l_heat).min(1.0);
             if fraction >= 1.0 {
                 p.phase = config.phase_above;
-                p.temperature = t_trans + (excess - l_heat);
+                // Remaining temperature above transition after consuming latent heat
+                p.temperature = t_trans + (thermal_energy - l_heat) / cp;
             } else {
                 p.temperature = t_trans; // hold at transition
             }
         } else if p.temperature < t_trans && p.phase == config.phase_above {
             // Release latent heat (solidification/condensation)
             let deficit = t_trans - p.temperature;
-            let energy = deficit * p.mass;
-            let fraction = (energy / (l_heat * p.mass.max(1e-20))).min(1.0);
+            let thermal_energy = deficit * cp;
+            let fraction = (thermal_energy / l_heat).min(1.0);
             if fraction >= 1.0 {
                 p.phase = config.phase_below;
-                p.temperature = t_trans - (deficit - l_heat);
+                p.temperature = t_trans - (thermal_energy - l_heat) / cp;
             } else {
                 p.temperature = t_trans;
             }
@@ -690,9 +707,14 @@ pub fn apply_contact_angle(
         let n_wall = wall_normal.normalize();
 
         // Apply wetting force: push velocity toward the wall (hydrophilic)
-        // or away (hydrophobic) proportional to surface tension
+        // or away (hydrophobic) proportional to surface tension.
+        //
+        // Simplified contact angle model: `surface_tension` acts as a
+        // force-per-unit-mass scale (units: m/s²). The smoothing radius `h`
+        // is used as the characteristic length scale so the force magnitude
+        // remains consistent across resolutions.
         let approach = p.velocity.dot(n_wall);
-        let wetting_force = surface_tension * (cos_theta - approach.signum() * sin_theta);
+        let wetting_force = surface_tension * (cos_theta - approach.signum() * sin_theta) / h;
         p.acceleration += n_wall * wetting_force / p.mass.max(1e-20);
     }
 }
@@ -738,12 +760,21 @@ impl NonNewtonianViscosity {
             NonNewtonianViscosity::Bingham {
                 yield_stress,
                 plastic_viscosity,
-            } => plastic_viscosity + yield_stress / sr,
+            } => {
+                let mu = plastic_viscosity + yield_stress / sr;
+                // Cap viscosity to prevent extreme values at near-zero strain rates
+                mu.min(1e6 * plastic_viscosity)
+            }
             NonNewtonianViscosity::HerschelBulkley {
                 yield_stress,
                 consistency,
                 power_index,
-            } => consistency * sr.powf(power_index - 1.0) + yield_stress / sr,
+            } => {
+                let base_visc = consistency * sr.powf(power_index - 1.0);
+                let mu = base_visc + yield_stress / sr;
+                // Cap viscosity to prevent extreme values at near-zero strain rates
+                mu.min(1e6 * consistency)
+            }
         }
     }
 }
@@ -798,7 +829,7 @@ pub fn apply_delta_sph(
                 continue;
             }
             let r = r2.sqrt();
-            let rho_j_safe = rho_j.max(1e-10);
+            let rho_j_safe = rho_j.max(MIN_DENSITY);
             let vol_j = mass_j / rho_j_safe;
 
             // ψᵢⱼ · ∇Wᵢⱼ (dot product of psi vector with kernel gradient direction)
@@ -861,7 +892,7 @@ pub fn equation_of_state_tait(
     gamma: f64,
 ) -> f64 {
     let b = rest_density * speed_of_sound * speed_of_sound / gamma;
-    b * ((density / rest_density.max(1e-10)).powf(gamma) - 1.0)
+    b * ((density / rest_density.max(MIN_DENSITY)).powf(gamma) - 1.0)
 }
 
 // ── Forces (standalone, brute-force) ────────────────────────────────────────
@@ -872,10 +903,11 @@ pub fn equation_of_state_tait(
 /// F_i = -m_i Σ_j m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W(r_ij, h)
 #[must_use]
 pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) -> [f64; 3] {
+    let _span = trace_span!("sph::pressure_force", n = particles.len()).entered();
     let kc = KernelCoeffs::new(h);
     let pi = &particles[particle_idx];
     let mut force = [0.0; 3];
-    let rho_i = pi.density.max(1e-10);
+    let rho_i = pi.density.max(MIN_DENSITY);
 
     for (j, pj) in particles.iter().enumerate() {
         if j == particle_idx {
@@ -886,7 +918,7 @@ pub fn pressure_force(particle_idx: usize, particles: &[FluidParticle], h: f64) 
             continue;
         }
         let r = r2.sqrt();
-        let rho_j = pj.density.max(1e-10);
+        let rho_j = pj.density.max(MIN_DENSITY);
 
         let sym_pressure = pi.pressure / (rho_i * rho_i) + pj.pressure / (rho_j * rho_j);
         let grad = kc.spiky_grad(r);
@@ -908,6 +940,7 @@ pub fn viscosity_force(
     h: f64,
     viscosity: f64,
 ) -> [f64; 3] {
+    let _span = trace_span!("sph::viscosity_force", n = particles.len()).entered();
     let kc = KernelCoeffs::new(h);
     let pi = &particles[particle_idx];
     let mut force = [0.0; 3];
@@ -923,7 +956,7 @@ pub fn viscosity_force(
         let r = r2.sqrt();
 
         let lap = kc.visc_laplacian(r);
-        let rho_j = pj.density.max(1e-10);
+        let rho_j = pj.density.max(MIN_DENSITY);
         let scale = viscosity * pj.mass * lap / rho_j;
 
         force[0] += scale * (pj.velocity.x - pi.velocity.x);
@@ -1157,7 +1190,7 @@ impl SphSolver {
                 let mut ax = gravity.x;
                 let mut ay = gravity.y;
                 let mut az = gravity.z;
-                let rho = pi.density.max(1e-10);
+                let rho = pi.density.max(MIN_DENSITY);
 
                 let mut cn_x = 0.0;
                 let mut cn_y = 0.0;
@@ -1176,7 +1209,7 @@ impl SphSolver {
                         continue;
                     }
                     let r = r2.sqrt();
-                    let rho_j = pj.density.max(1e-10);
+                    let rho_j = pj.density.max(MIN_DENSITY);
 
                     let dx = pi.position.x - pj.position.x;
                     let dy = pi.position.y - pj.position.y;
@@ -1207,7 +1240,8 @@ impl SphSolver {
 
                 if st > 0.0 {
                     let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                    if cn_mag > 1e-6 / kc.h {
+                    let threshold = (1e-6 / kc.h).max(1e-10);
+                    if cn_mag > threshold {
                         let kappa = -laplacian_color / cn_mag;
                         let st_scale = st * kappa / (rho * cn_mag);
                         ax += st_scale * cn_x;
@@ -1238,7 +1272,9 @@ impl SphSolver {
         let dt = config.dt;
         if self.use_verlet {
             // Velocity Verlet: x += v·dt + 0.5·a·dt², v += 0.5·(a_old + a_new)·dt
-            self.prev_accel.resize(n, DVec3::ZERO);
+            if self.prev_accel.len() != n {
+                self.prev_accel.resize(n, DVec3::ZERO);
+            }
             for (i, p) in particles.iter_mut().enumerate() {
                 let a_old = self.prev_accel[i];
                 p.position += p.velocity * dt + 0.5 * a_old * dt * dt;
@@ -1356,7 +1392,7 @@ impl SphSolver {
             let mut ax = config.gravity.x;
             let mut ay = config.gravity.y;
             let mut az = config.gravity.z;
-            let rho = pi.density.max(1e-10);
+            let rho = pi.density.max(MIN_DENSITY);
 
             let mut cn_x = 0.0;
             let mut cn_y = 0.0;
@@ -1373,7 +1409,7 @@ impl SphSolver {
                     continue;
                 }
                 let r = r2.sqrt();
-                let rho_j = pj.density.max(1e-10);
+                let rho_j = pj.density.max(MIN_DENSITY);
 
                 // Viscosity
                 let lap = kc.visc_laplacian(r);
@@ -1397,7 +1433,8 @@ impl SphSolver {
 
             if st > 0.0 {
                 let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                if cn_mag > 1e-6 / kc.h {
+                let threshold = (1e-6 / kc.h).max(1e-10);
+                if cn_mag > threshold {
                     let kappa = -laplacian_color / cn_mag;
                     let st_scale = st * kappa / (rho * cn_mag);
                     ax += st_scale * cn_x;
@@ -1418,41 +1455,55 @@ impl SphSolver {
 
         // PCISPH pressure correction loop
         // Precompute scaling factor δ from kernel gradient sums (Solenthaler 2009).
-        // Use a representative particle (particle 0) to estimate the scaling.
+        // Average over all particles with neighbors for robustness.
         let delta = {
-            let pi = &self.snapshot[0];
-            let mut sum_grad = [0.0f64; 3];
-            let mut sum_grad_sq = 0.0f64;
-            for &j in self.neighbors(0) {
-                if j == 0 {
+            let mut delta_sum = 0.0f64;
+            let mut delta_count = 0usize;
+            for pi_idx in 0..n {
+                let pi = &self.snapshot[pi_idx];
+                let mut sum_grad = [0.0f64; 3];
+                let mut sum_grad_sq = 0.0f64;
+                let mut has_neighbors = false;
+                for &j in self.neighbors(pi_idx) {
+                    if j == pi_idx {
+                        continue;
+                    }
+                    let pj = &self.snapshot[j];
+                    let r2 = pi.distance_squared_to(pj);
+                    if r2 > kc.h2 || r2 < 1e-20 {
+                        continue;
+                    }
+                    has_neighbors = true;
+                    let r = r2.sqrt();
+                    let grad = kc.spiky_grad(r);
+                    let grad_w = [
+                        grad / r * (pi.position.x - pj.position.x),
+                        grad / r * (pi.position.y - pj.position.y),
+                        grad / r * (pi.position.z - pj.position.z),
+                    ];
+                    sum_grad[0] += grad_w[0];
+                    sum_grad[1] += grad_w[1];
+                    sum_grad[2] += grad_w[2];
+                    sum_grad_sq +=
+                        grad_w[0] * grad_w[0] + grad_w[1] * grad_w[1] + grad_w[2] * grad_w[2];
+                }
+                if !has_neighbors {
                     continue;
                 }
-                let pj = &self.snapshot[j];
-                let r2 = pi.distance_squared_to(pj);
-                if r2 > kc.h2 || r2 < 1e-20 {
-                    continue;
+                let sum_dot = sum_grad[0] * sum_grad[0]
+                    + sum_grad[1] * sum_grad[1]
+                    + sum_grad[2] * sum_grad[2];
+                let beta = 2.0 * (dt * pi.mass / rest_density).powi(2);
+                let denom = beta * (sum_dot + sum_grad_sq);
+                if denom.abs() > 1e-20 {
+                    delta_sum += 1.0 / denom;
+                    delta_count += 1;
                 }
-                let r = r2.sqrt();
-                let grad = kc.spiky_grad(r);
-                let grad_w = [
-                    grad / r * (pi.position.x - pj.position.x),
-                    grad / r * (pi.position.y - pj.position.y),
-                    grad / r * (pi.position.z - pj.position.z),
-                ];
-                sum_grad[0] += grad_w[0];
-                sum_grad[1] += grad_w[1];
-                sum_grad[2] += grad_w[2];
-                sum_grad_sq +=
-                    grad_w[0] * grad_w[0] + grad_w[1] * grad_w[1] + grad_w[2] * grad_w[2];
             }
-            let sum_dot =
-                sum_grad[0] * sum_grad[0] + sum_grad[1] * sum_grad[1] + sum_grad[2] * sum_grad[2];
-            let beta = 2.0 * (dt * self.snapshot[0].mass / rest_density).powi(2);
-            let denom = beta * (sum_dot + sum_grad_sq);
-            if denom.abs() < 1e-20 {
-                0.0 // degenerate (single particle or no neighbors)
+            if delta_count > 0 {
+                delta_sum / delta_count as f64
             } else {
-                1.0 / denom
+                0.0
             }
         };
 
@@ -1470,7 +1521,7 @@ impl SphSolver {
             // Predict position/velocity with current pressure + non-pressure forces
             for i in 0..n {
                 let pi = &self.snapshot[i];
-                let rho = pi.density.max(1e-10);
+                let rho = pi.density.max(MIN_DENSITY);
 
                 // Compute pressure acceleration from current pressures
                 let mut pax = 0.0;
@@ -1487,7 +1538,7 @@ impl SphSolver {
                         continue;
                     }
                     let r = r2.sqrt();
-                    let rho_j = pj.density.max(1e-10);
+                    let rho_j = pj.density.max(MIN_DENSITY);
 
                     let sym = pressures[i] / (rho * rho) + pressures[j] / (rho_j * rho_j);
                     let grad = kc.spiky_grad(r);
@@ -1675,7 +1726,7 @@ impl SphSolver {
             }
             let denom = sum_grad.length_squared() + sum_grad_sq;
             alphas[i] = if denom > 1e-20 {
-                pi.density.max(1e-10) / denom
+                pi.density.max(MIN_DENSITY) / denom
             } else {
                 0.0
             };
@@ -1690,7 +1741,7 @@ impl SphSolver {
         for i in 0..n {
             let pi = &self.snapshot[i];
             let mut accel = config.gravity;
-            let rho = pi.density.max(1e-10);
+            let rho = pi.density.max(MIN_DENSITY);
 
             for &j in self.neighbors(i) {
                 if j == i {
@@ -1702,7 +1753,7 @@ impl SphSolver {
                     continue;
                 }
                 let r = r2.sqrt();
-                let rho_j = pj.density.max(1e-10);
+                let rho_j = pj.density.max(MIN_DENSITY);
                 let lap = kc.visc_laplacian(r);
                 let v_scale = viscosity * pj.mass * lap / rho_j / rho;
                 accel += (pj.velocity - pi.velocity) * v_scale;
@@ -1719,7 +1770,7 @@ impl SphSolver {
 
             for i in 0..n {
                 let pos_i = particles[i].position;
-                let rho_i = particles[i].density.max(1e-10);
+                let rho_i = particles[i].density.max(MIN_DENSITY);
 
                 // Compute velocity divergence
                 let mut div_v = 0.0;
@@ -1754,7 +1805,7 @@ impl SphSolver {
                             continue;
                         }
                         let r = r2.sqrt();
-                        let rho_j = particles[j].density.max(1e-10);
+                        let rho_j = particles[j].density.max(MIN_DENSITY);
                         let grad = kc.spiky_grad(r);
                         vel_correction += diff
                             * (dt
@@ -1802,7 +1853,7 @@ impl SphSolver {
                 if alphas[i] > 0.0 && rho_err.abs() > 1e-10 {
                     let kappa = rho_err * alphas[i] / (dt * dt);
                     let pi_pos = particles[i].position;
-                    let pi_rho = particles[i].density.max(1e-10);
+                    let pi_rho = particles[i].density.max(MIN_DENSITY);
 
                     for &j in self.neighbors(i) {
                         if j == i {
@@ -1814,7 +1865,7 @@ impl SphSolver {
                             continue;
                         }
                         let r = r2.sqrt();
-                        let rho_j = particles[j].density.max(1e-10);
+                        let rho_j = particles[j].density.max(MIN_DENSITY);
                         let grad = kc.spiky_grad(r);
                         let correction = diff
                             * (dt
@@ -1999,7 +2050,7 @@ impl SphSolver {
                 let mut ax = gravity.x;
                 let mut ay = gravity.y;
                 let mut az = gravity.z;
-                let rho = pi.density.max(1e-10);
+                let rho = pi.density.max(MIN_DENSITY);
                 let props_i = phase_config.get(pi.phase);
 
                 let mut cn_x = 0.0;
@@ -2019,7 +2070,7 @@ impl SphSolver {
                         continue;
                     }
                     let r = r2.sqrt();
-                    let rho_j = pj.density.max(1e-10);
+                    let rho_j = pj.density.max(MIN_DENSITY);
 
                     let dx = pi.position.x - pj.position.x;
                     let dy = pi.position.y - pj.position.y;
@@ -2055,12 +2106,12 @@ impl SphSolver {
                 }
 
                 // Apply surface/interface tension
-                let effective_st_total = st + it; // upper bound check
-                if effective_st_total > 0.0 {
+                if st > 0.0 || it > 0.0 {
                     let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                    if cn_mag > 1e-6 / kc.h {
+                    let threshold = (1e-6 / kc.h).max(1e-10);
+                    if cn_mag > threshold {
                         let kappa = -laplacian_color / cn_mag;
-                        let st_scale = effective_st_total * kappa / (rho * cn_mag);
+                        let st_scale = (st + it) * kappa / (rho * cn_mag);
                         ax += st_scale * cn_x;
                         ay += st_scale * cn_y;
                         az += st_scale * cn_z;
@@ -2168,7 +2219,7 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
             let mut ax = config.gravity.x;
             let mut ay = config.gravity.y;
             let mut az = config.gravity.z;
-            let rho = pi.density.max(1e-10);
+            let rho = pi.density.max(MIN_DENSITY);
 
             for (j, pj) in snapshot.iter().enumerate() {
                 if j == i {
@@ -2179,7 +2230,7 @@ pub fn step(particles: &mut [FluidParticle], config: &FluidConfig, viscosity: f6
                     continue;
                 }
                 let r = r2.sqrt();
-                let rho_j = pj.density.max(1e-10);
+                let rho_j = pj.density.max(MIN_DENSITY);
 
                 // Symmetric momentum-conserving pressure: -m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W
                 let sym_pressure = pi.pressure / (rho * rho) + pj.pressure / (rho_j * rho_j);
@@ -2290,7 +2341,7 @@ pub fn compute_gradient_corrections(
                 continue;
             }
             let r = r2.sqrt();
-            let rho_j = pj.density.max(1e-10);
+            let rho_j = pj.density.max(MIN_DENSITY);
             let vol_j = pj.mass / rho_j;
             let grad = kc.spiky_grad(r);
             // ∇W points from j to i
@@ -2376,12 +2427,15 @@ pub fn apply_implicit_viscosity(
 
     let kc = KernelCoeffs::new(h);
 
+    const CONVERGENCE_THRESHOLD: f64 = 1e-8;
+
     for _iter in 0..iterations {
         let snap_vel: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
+        let mut max_change: f64 = 0.0;
 
         for i in 0..n {
             let pi_pos = particles[i].position;
-            let rho = particles[i].density.max(1e-10);
+            let rho = particles[i].density.max(MIN_DENSITY);
             let start = neighbor_offsets[i] as usize;
             let end = neighbor_offsets[i + 1] as usize;
             let mut laplacian = DVec3::ZERO;
@@ -2395,12 +2449,20 @@ pub fn apply_implicit_viscosity(
                     continue;
                 }
                 let r = r2.sqrt();
-                let rho_j = particles[j].density.max(1e-10);
+                let rho_j = particles[j].density.max(MIN_DENSITY);
                 let lap = kc.visc_laplacian(r);
                 laplacian += (snap_vel[j] - snap_vel[i]) * (particles[j].mass * lap / rho_j);
             }
 
-            particles[i].velocity = snap_vel[i] + laplacian * (viscosity * dt / rho);
+            let new_vel = snap_vel[i] + laplacian * (viscosity * dt / rho);
+            let change = (new_vel - snap_vel[i]).length_squared();
+            max_change = max_change.max(change);
+            particles[i].velocity = new_vel;
+        }
+
+        // Early exit if all velocity updates are below convergence threshold
+        if max_change < CONVERGENCE_THRESHOLD * CONVERGENCE_THRESHOLD {
+            break;
         }
     }
 }
@@ -2417,6 +2479,7 @@ pub fn split_particle(
     n_children: usize,
     offset: f64,
 ) -> Vec<FluidParticle> {
+    let _span = trace_span!("sph::split_particle").entered();
     if n_children == 0 {
         return vec![];
     }
@@ -2437,6 +2500,7 @@ pub fn split_particle(
 /// Merge two nearby particles into one, conserving mass and momentum.
 #[must_use]
 pub fn merge_particles(a: &FluidParticle, b: &FluidParticle) -> FluidParticle {
+    let _span = trace_span!("sph::merge_particles").entered();
     let total_mass = a.mass + b.mass;
     let inv_mass = 1.0 / total_mass.max(1e-20);
     FluidParticle {
@@ -2481,6 +2545,7 @@ fn morton_code_2d(x: f64, y: f64, inv_cell: f64) -> u64 {
 /// Call before `SphSolver::step()` for improved cache hit rates during
 /// neighbor traversal. The cell size should match the smoothing radius.
 pub fn sort_by_zorder(particles: &mut [FluidParticle], cell_size: f64) {
+    let _span = trace_span!("sph::sort_by_zorder", n = particles.len()).entered();
     if particles.len() < 2 || cell_size <= 0.0 {
         return;
     }

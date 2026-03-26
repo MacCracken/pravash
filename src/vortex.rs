@@ -18,7 +18,7 @@ pub fn vorticity_2d(dvydx: f64, dvxdy: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn lamb_oseen_velocity(circulation: f64, radius: f64, viscosity: f64, time: f64) -> f64 {
-    if radius <= 0.0 || time <= 0.0 {
+    if radius <= 0.0 || time <= 0.0 || viscosity <= 0.0 {
         return 0.0;
     }
     let r2 = radius * radius;
@@ -59,10 +59,11 @@ pub fn enstrophy(vorticity_field: &[f64], dx: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn kolmogorov_scale(viscosity: f64, dissipation_rate: f64) -> f64 {
-    if dissipation_rate <= 0.0 {
+    if viscosity <= 0.0 || dissipation_rate <= 0.0 {
         return f64::INFINITY;
     }
-    (viscosity.powi(3) / dissipation_rate).powf(0.25)
+    // Use log form for numeric stability: η = exp(0.75·ln(ν) - 0.25·ln(ε))
+    (0.75 * viscosity.ln() - 0.25 * dissipation_rate.ln()).exp()
 }
 
 #[cfg(test)]

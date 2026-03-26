@@ -79,7 +79,7 @@ pub struct ShallowWater {
 impl ShallowWater {
     /// Create a flat water surface at given height.
     pub fn new(nx: usize, ny: usize, dx: f64, water_height: f64) -> Result<Self> {
-        if nx == 0 || ny == 0 {
+        if nx < 3 || ny < 3 {
             return Err(PravashError::InvalidGridResolution { nx, ny });
         }
         let size = nx * ny;
@@ -157,6 +157,9 @@ impl ShallowWater {
 
     /// Add a circular disturbance (drop/splash).
     pub fn add_disturbance(&mut self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
+        if radius <= 0.0 {
+            return;
+        }
         let _span = trace_span!("shallow::disturbance").entered();
         let r2 = radius * radius;
         let inv_radius = 1.0 / radius;
@@ -180,7 +183,7 @@ impl ShallowWater {
     /// Returns (flux_h, flux_hu) at the interface between left and right states.
     #[inline]
     fn hll_flux(h_l: f64, u_l: f64, h_r: f64, u_r: f64, g: f64) -> (f64, f64) {
-        let eps = 1e-10;
+        let eps = 1e-8;
         let c_l = (g * h_l.max(0.0)).sqrt();
         let c_r = (g * h_r.max(0.0)).sqrt();
 
@@ -299,7 +302,7 @@ impl ShallowWater {
                         let h_il = (sh[i] - z_left).max(0.0);
                         let h_jl = (sh[i - 1] - z_left).max(0.0);
                         0.5 * g * (h_jr * h_jr - h_ir * h_ir + h_il * h_il - h_jl * h_jl)
-                            / (2.0 * dx * hi.max(1e-3))
+                            / (2.0 * dx * hi.max(dry_thr))
                     } else {
                         g * (sh[i + 1] - sh[i - 1]) * inv_2dx
                     };
@@ -315,7 +318,7 @@ impl ShallowWater {
                         let h_ib = (sh[i] - z_bot).max(0.0);
                         let h_jb = (sh[i - nx] - z_bot).max(0.0);
                         0.5 * g * (h_jt * h_jt - h_it * h_it + h_ib * h_ib - h_jb * h_jb)
-                            / (2.0 * dx * hi.max(1e-3))
+                            / (2.0 * dx * hi.max(dry_thr))
                     } else {
                         g * (sh[i + nx] - sh[i - nx]) * inv_2dx
                     };
@@ -365,10 +368,11 @@ impl ShallowWater {
                 let n_manning = self.manning_n[i];
                 if n_manning > 0.0 {
                     let depth = (sh[i] - self.ground[i]).max(0.0);
-                    if depth > 1e-6 {
+                    if depth > dry_thr {
                         let speed = (u * u + v * v).sqrt();
                         // h^(4/3) = h · h^(1/3) = h · cbrt(h)
-                        let friction = g * n_manning * n_manning * speed / (depth * depth.cbrt());
+                        let d_safe = depth.max(dry_thr);
+                        let friction = g * n_manning * n_manning * speed / (d_safe * d_safe.cbrt());
                         // Implicit: v_new = v_old / (1 + friction·dt)
                         let decay = 1.0 / (1.0 + friction * dt);
                         self.vx[i] *= decay;
@@ -412,10 +416,10 @@ impl ShallowWater {
                     let d_t = (sh[i + nx] - self.ground[i + nx]).max(0.0);
                     let d_b = (sh[i - nx] - self.ground[i - nx]).max(0.0);
 
-                    let (fh_r, fhu_r) = Self::hll_flux(depth, self.vx[i], d_r, self.vx[i + 1], g);
-                    let (fh_l, fhu_l) = Self::hll_flux(d_l, self.vx[i - 1], depth, self.vx[i], g);
-                    let (fh_t, fhv_t) = Self::hll_flux(depth, self.vy[i], d_t, self.vy[i + nx], g);
-                    let (fh_b, fhv_b) = Self::hll_flux(d_b, self.vy[i - nx], depth, self.vy[i], g);
+                    let (fh_r, fhu_r) = Self::hll_flux(depth, svx[i], d_r, svx[i + 1], g);
+                    let (fh_l, fhu_l) = Self::hll_flux(d_l, svx[i - 1], depth, svx[i], g);
+                    let (fh_t, fhv_t) = Self::hll_flux(depth, svy[i], d_t, svy[i + nx], g);
+                    let (fh_b, fhv_b) = Self::hll_flux(d_b, svy[i - nx], depth, svy[i], g);
 
                     // Update velocity from momentum flux divergence: ∂(hu)/∂t = -∂F_hu/∂x
                     if depth > dry_thr {
@@ -526,7 +530,21 @@ impl ShallowWater {
         if max_wave_speed < 1e-20 {
             return cfl_factor * self.dx; // fallback
         }
-        cfl_factor * self.dx / max_wave_speed
+        let dt_cfl = cfl_factor * self.dx / max_wave_speed;
+
+        // Dispersive stability limit: dt < dx² / (coeff · g · h_max)
+        if self.dispersion_coeff > 0.0 {
+            let h_max = self
+                .height
+                .iter()
+                .zip(self.ground.iter())
+                .map(|(h, g_elev)| (h - g_elev).max(0.0))
+                .fold(0.0f64, f64::max);
+            let dt_disp = self.dx * self.dx / (self.dispersion_coeff * g * h_max.max(1e-6));
+            dt_cfl.min(dt_disp)
+        } else {
+            dt_cfl
+        }
     }
 }
 
@@ -583,7 +601,9 @@ pub fn update_sediment(
     let d = config.grain_diameter;
     let tau_cr = config.shields_critical * (rho_s - rho_w) * g * d;
 
-    debug_assert!(concentration.len() >= nx * sw.ny);
+    if concentration.len() < nx * sw.ny {
+        return;
+    }
 
     for y in 1..sw.ny - 1 {
         for x in 1..nx - 1 {

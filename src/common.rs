@@ -425,7 +425,7 @@ impl ParticleArena {
     #[must_use]
     pub fn active_count(&self) -> usize {
         let free_total: usize = self.free_list.iter().map(|(_, len)| len).sum();
-        self.watermark - free_total
+        self.watermark.saturating_sub(free_total)
     }
 
     /// Allocate a contiguous block of `n` particles. Returns `None` if

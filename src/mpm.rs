@@ -31,6 +31,52 @@ pub enum ConstitutiveModel {
     },
 }
 
+impl ConstitutiveModel {
+    /// Validate material parameters. Returns error for non-physical values.
+    pub fn validate(&self) -> Result<()> {
+        match *self {
+            ConstitutiveModel::Fluid {
+                bulk_modulus,
+                viscosity,
+            } => {
+                if bulk_modulus <= 0.0 || !bulk_modulus.is_finite() {
+                    return Err(PravashError::InvalidParameter {
+                        reason: format!("bulk modulus must be positive: {bulk_modulus}").into(),
+                    });
+                }
+                if viscosity < 0.0 || !viscosity.is_finite() {
+                    return Err(PravashError::InvalidParameter {
+                        reason: format!("viscosity must be non-negative: {viscosity}").into(),
+                    });
+                }
+            }
+            ConstitutiveModel::NeoHookean {
+                youngs_modulus,
+                poisson_ratio,
+            }
+            | ConstitutiveModel::DruckerPrager {
+                youngs_modulus,
+                poisson_ratio,
+                ..
+            } => {
+                if youngs_modulus <= 0.0 || !youngs_modulus.is_finite() {
+                    return Err(PravashError::InvalidParameter {
+                        reason: format!("Young's modulus must be positive: {youngs_modulus}")
+                            .into(),
+                    });
+                }
+                if poisson_ratio <= -1.0 || poisson_ratio >= 0.5 || !poisson_ratio.is_finite() {
+                    return Err(PravashError::InvalidParameter {
+                        reason: format!("Poisson ratio must be in (-1, 0.5): {poisson_ratio}")
+                            .into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-particle MPM state (deformation gradient + material).
 #[derive(Debug, Clone, Copy)]
 pub struct MpmParticle {
@@ -176,12 +222,22 @@ impl MpmSolver {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
         }
+        if particles.len() != mpm_data.len() {
+            return Err(PravashError::InvalidParameter {
+                reason: format!(
+                    "particle/mpm_data count mismatch: {} vs {}",
+                    particles.len(),
+                    mpm_data.len()
+                )
+                .into(),
+            });
+        }
         let nx = self.nx;
         let ny = self.ny;
         let dx = self.dx;
         let inv_dx = 1.0 / dx;
         let n_grid = nx * ny;
-        let n = particles.len().min(mpm_data.len());
+        let n = particles.len();
 
         // Clear grid
         self.mass.fill(0.0);
@@ -293,12 +349,20 @@ impl MpmSolver {
                 * inv_dx;
 
             let [f00, f01, f10, f11] = mpm_data[pi].deformation_grad;
-            mpm_data[pi].deformation_grad = [
+            let new_f = [
                 (1.0 + dt * dvx_dx) * f00 + dt * dvx_dy * f10,
                 (1.0 + dt * dvx_dx) * f01 + dt * dvx_dy * f11,
                 dt * dvy_dx * f00 + (1.0 + dt * dvy_dy) * f10,
                 dt * dvy_dx * f01 + (1.0 + dt * dvy_dy) * f11,
             ];
+            // Clamp det(F) to prevent deformation gradient explosion
+            let det = new_f[0] * new_f[3] - new_f[1] * new_f[2];
+            if !(1e-4..=1e4).contains(&det) || !det.is_finite() {
+                // Deformation too extreme — reset to identity
+                mpm_data[pi].deformation_grad = [1.0, 0.0, 0.0, 1.0];
+            } else {
+                mpm_data[pi].deformation_grad = new_f;
+            }
 
             p.velocity.x = new_vx;
             p.velocity.y = new_vy;

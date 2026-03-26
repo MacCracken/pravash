@@ -393,6 +393,10 @@ pub struct FlipSolver {
     pub use_apic: bool,
     /// Narrow-band mode: only transfer particles within `narrow_band_cells`
     /// of the free surface. Interior particles are frozen. 0 = disabled.
+    ///
+    /// **Reserved for future use** — this field is currently read but has no
+    /// effect on solver behavior. It will be wired into the transfer routines
+    /// in a future release.
     pub narrow_band_cells: usize,
     /// Per-particle affine velocity matrices [c00, c01, c10, c11] for APIC.
     apic_c: Vec<[f64; 4]>,
@@ -616,6 +620,11 @@ impl FlipSolver {
         let nx = self.nx;
         let ny = self.ny;
 
+        // Ensure APIC affine matrix vec matches particle count
+        if self.use_apic && self.apic_c.len() != particles.len() {
+            self.apic_c.resize(particles.len(), [0.0; 4]);
+        }
+
         // 1. P2G
         self.particles_to_grid(particles);
 
@@ -644,7 +653,9 @@ impl FlipSolver {
                 }
             }
             // GS pressure solve (warm start from previous step)
-            for _ in 0..40 {
+            const PRESSURE_ITERATIONS: usize = 40;
+            for _ in 0..PRESSURE_ITERATIONS {
+                let mut max_change = 0.0f64;
                 for y in 1..ny - 1 {
                     for x in 1..nx - 1 {
                         let i = y * nx + x;
@@ -652,8 +663,13 @@ impl FlipSolver {
                             + self.pressure[i + 1]
                             + self.pressure[i - nx]
                             + self.pressure[i + nx];
-                        self.pressure[i] = (self.div[i] + neighbors) * 0.25;
+                        let new_p = (self.div[i] + neighbors) * 0.25;
+                        max_change = max_change.max((new_p - self.pressure[i]).abs());
+                        self.pressure[i] = new_p;
                     }
+                }
+                if max_change < 1e-6 {
+                    break;
                 }
             }
             // Subtract pressure gradient scaled by dt
@@ -665,6 +681,16 @@ impl FlipSolver {
                     self.vy[i] -= (self.pressure[i + nx] - self.pressure[i - nx]) * grad_scale;
                 }
             }
+        }
+
+        // NaN check after pressure solve — catch divergence early
+        let has_nan = self.vx.iter().chain(self.vy.iter()).any(|v| !v.is_finite());
+        if has_nan {
+            return Err(PravashError::Diverged {
+                reason: std::borrow::Cow::Borrowed(
+                    "non-finite velocity detected after pressure solve",
+                ),
+            });
         }
 
         // 4. G2P with FLIP/PIC blend
