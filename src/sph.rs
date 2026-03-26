@@ -25,6 +25,7 @@ use std::f64::consts::PI;
 use hisab::DVec3;
 use hisab::SpatialHash;
 use hisab::Vec3;
+use hisab::num::matrix_inverse;
 use tracing::trace_span;
 
 #[cfg(feature = "parallel")]
@@ -2371,22 +2372,15 @@ pub fn compute_gradient_corrections(
 /// Returns None if singular.
 #[inline]
 fn invert_3x3(m: &[f64; 9]) -> Option<[f64; 9]> {
-    let [a, b, c, d, e, f, g, h, k] = *m;
-    let det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
-    if det.abs() < 1e-20 {
-        return None;
-    }
-    let inv_det = 1.0 / det;
+    let rows = vec![
+        vec![m[0], m[1], m[2]],
+        vec![m[3], m[4], m[5]],
+        vec![m[6], m[7], m[8]],
+    ];
+    let inv = matrix_inverse(&rows).ok()?;
     Some([
-        (e * k - f * h) * inv_det,
-        (c * h - b * k) * inv_det,
-        (b * f - c * e) * inv_det,
-        (f * g - d * k) * inv_det,
-        (a * k - c * g) * inv_det,
-        (c * d - a * f) * inv_det,
-        (d * h - e * g) * inv_det,
-        (b * g - a * h) * inv_det,
-        (a * e - b * d) * inv_det,
+        inv[0][0], inv[0][1], inv[0][2], inv[1][0], inv[1][1], inv[1][2], inv[2][0], inv[2][1],
+        inv[2][2],
     ])
 }
 

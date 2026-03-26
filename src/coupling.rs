@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use hisab::DVec3;
+use hisab::{DVec3, SpatialHash, Vec3};
 
 use crate::common::FluidParticle;
 use crate::error::{PravashError, Result};
@@ -306,6 +306,92 @@ pub fn drag_from_particles(
             let ay = (rel_vy / rel_speed).abs();
             let az = (rel_vz / rel_speed).abs();
             // Each face contributes proportionally to its alignment with velocity
+            4.0 * (ax * half_extents[1] * half_extents[2]
+                + ay * half_extents[0] * half_extents[2]
+                + az * half_extents[0] * half_extents[1])
+        }
+    };
+
+    // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
+    let drag_mag = 0.5 * fluid_density * rel_speed * drag_coefficient * area;
+    DVec3::new(
+        drag_mag * rel_vx / rel_speed,
+        drag_mag * rel_vy / rel_speed,
+        drag_mag * rel_vz / rel_speed,
+    )
+}
+
+/// Compute drag on a rigid body using a pre-built spatial hash for broadphase.
+///
+/// Like [`drag_from_particles`], but queries only nearby particles via
+/// `spatial_hash` instead of iterating all particles (O(k) vs O(n) per body).
+///
+/// The caller must build the [`SpatialHash`] from particle positions and keep
+/// it in sync with the particle slice indices.
+///
+/// Returns the drag force vector (opposing relative motion).
+#[must_use]
+pub fn drag_from_particles_indexed(
+    body: &RigidBody,
+    particles: &[FluidParticle],
+    spatial_hash: &SpatialHash,
+    fluid_density: f64,
+    drag_coefficient: f64,
+    sample_radius: f64,
+) -> DVec3 {
+    let _span = trace_span!("coupling::drag_from_particles_indexed").entered();
+
+    // Convert body position to f32 Vec3 for spatial hash query
+    let body_pos_f32 = Vec3::new(
+        body.position.x as f32,
+        body.position.y as f32,
+        body.position.z as f32,
+    );
+
+    let nearby = spatial_hash.query_radius(body_pos_f32, sample_radius as f32);
+
+    // Average fluid velocity near the body surface
+    let mut avg_vx = 0.0;
+    let mut avg_vy = 0.0;
+    let mut avg_vz = 0.0;
+    let mut count = 0.0;
+
+    for &idx in &nearby {
+        let p = &particles[idx];
+        let sd = body.signed_distance(p.position);
+        if sd.abs() < sample_radius {
+            avg_vx += p.velocity.x;
+            avg_vy += p.velocity.y;
+            avg_vz += p.velocity.z;
+            count += 1.0;
+        }
+    }
+
+    if count < 1.0 {
+        return DVec3::ZERO;
+    }
+
+    avg_vx /= count;
+    avg_vy /= count;
+    avg_vz /= count;
+
+    // Relative velocity (fluid relative to body)
+    let rel_vx = avg_vx - body.velocity.x;
+    let rel_vy = avg_vy - body.velocity.y;
+    let rel_vz = avg_vz - body.velocity.z;
+    let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz).sqrt();
+
+    if rel_speed < 1e-20 {
+        return DVec3::ZERO;
+    }
+
+    // Cross-section area projected onto the velocity-normal plane
+    let area = match body.shape {
+        BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
+        BodyShape::Box { half_extents } => {
+            let ax = (rel_vx / rel_speed).abs();
+            let ay = (rel_vy / rel_speed).abs();
+            let az = (rel_vz / rel_speed).abs();
             4.0 * (ax * half_extents[1] * half_extents[2]
                 + ay * half_extents[0] * half_extents[2]
                 + az * half_extents[0] * half_extents[1])

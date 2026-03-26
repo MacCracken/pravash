@@ -34,8 +34,11 @@
 - grid: `GridConfig` validation — smagorinsky_cs, vorticity_confinement, iteration counts
 - grid: BFECC advection wired up via `use_bfecc` flag
 - vof: `is_surface_with_threshold()`, `is_full_with_threshold()`, `is_empty_with_threshold()` — configurable threshold
+- grid: Conjugate gradient pressure solver via hisab (`GridConfig.use_cg`) — matrix-free, SPD-optimized
+- coupling: `drag_from_particles_indexed()` — spatial-hash-accelerated drag using hisab `SpatialHash`
 
 ### Changed
+- sph: MLS 3×3 matrix inversion now delegates to `hisab::num::matrix_inverse` (LU-based)
 - sph: Density threshold standardized via `MIN_DENSITY` constant across all solvers
 - sph: `MultiPhaseConfig::get()` now logs warning on invalid phase index fallback
 - grid: All pressure solvers now return `Result<()>` consistently

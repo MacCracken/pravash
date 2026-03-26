@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PravashError, Result};
 
-use hisab::num::{dst, idst};
+use hisab::num::{conjugate_gradient, dst, idst};
 use tracing::trace_span;
 
 #[cfg(feature = "parallel")]
@@ -60,6 +60,11 @@ pub struct GridConfig {
     /// Falls back to DST for non-periodic, GS for periodic when disabled.
     /// Default: false.
     pub use_multigrid: bool,
+    /// Use conjugate gradient for pressure solve.
+    /// Matrix-free CG via hisab. Good for large grids where GS converges slowly.
+    /// Takes priority over multigrid/DST/GS when enabled.
+    /// Default: false.
+    pub use_cg: bool,
 }
 
 impl GridConfig {
@@ -79,6 +84,7 @@ impl GridConfig {
             use_bfecc: false,
             smagorinsky_cs: 0.0,
             use_multigrid: false,
+            use_cg: false,
         }
     }
 }
@@ -775,6 +781,49 @@ impl FluidGrid {
         let _ = Self::pressure_solve(p, rhs, nx, ny, nu);
     }
 
+    /// Conjugate gradient Poisson solver: ∇²p = div.
+    ///
+    /// Matrix-free CG using `hisab::num::conjugate_gradient`. Applies the
+    /// discrete Laplacian as the linear operator. Boundary cells are held at
+    /// zero (Dirichlet). Good for large grids where Gauss-Seidel converges
+    /// slowly, with guaranteed convergence for the SPD Laplacian.
+    fn pressure_solve_cg(
+        pressure: &mut [f64],
+        div: &[f64],
+        nx: usize,
+        ny: usize,
+        iterations: usize,
+    ) -> Result<()> {
+        let _span = trace_span!("grid::pressure_solve_cg", nx, ny, iterations).entered();
+
+        let n = nx * ny;
+
+        // The discrete Laplacian operator: for interior cells (x,y) in
+        // 1..nx-1, 1..ny-1 compute p[left]+p[right]+p[up]+p[down]-4*p[center].
+        // Boundary cells are treated as zero (Dirichlet BCs).
+        let a_mul = move |p: &[f64]| -> Vec<f64> {
+            let mut result = vec![0.0; n];
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    result[i] = p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx] - 4.0 * p[i];
+                }
+            }
+            result
+        };
+
+        let x0: Vec<f64> = pressure.to_vec();
+
+        let solution = conjugate_gradient(a_mul, div, &x0, 1e-6, iterations).map_err(|e| {
+            PravashError::Diverged {
+                reason: format!("CG pressure solve failed: {e}").into(),
+            }
+        })?;
+
+        pressure.copy_from_slice(&solution);
+        Ok(())
+    }
+
     /// Subtract pressure gradient from velocity to enforce divergence-free.
     fn project_velocity(
         vx: &mut [f64],
@@ -1144,7 +1193,15 @@ impl FluidGrid {
         {
             sa.fill(0.0);
             Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, inv_2dx);
-            if config.use_multigrid {
+            if config.use_cg {
+                Self::pressure_solve_cg(
+                    &mut self.pressure,
+                    &sa,
+                    nx,
+                    ny,
+                    config.pressure_iterations,
+                )?;
+            } else if config.use_multigrid {
                 let mut mg = std::mem::take(&mut self.mg_levels);
                 Self::pressure_solve_multigrid(&mut self.pressure, &sa, nx, ny, 4, &mut mg)?;
                 self.mg_levels = mg;
