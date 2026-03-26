@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-03-26
+
 ### Added
 - sph: Wendland C2/C4 kernels (`kernel_wendland_c2`, `kernel_wendland_c4`) — no tensile instability
 - sph: Delta-SPH density diffusion (`apply_delta_sph`) — pressure noise reduction
@@ -81,11 +83,6 @@
 - coupling: FLIP solver particle boundary clamping to grid domain
 - coupling: Directional drag cross-section for box shapes (projected onto velocity normal)
 - deny.toml for cargo-deny license and advisory checking
-
-### Changed
-- Cargo.toml: license corrected from deprecated `GPL-3.0` to `GPL-3.0-only`
-- shallow: NaN dt now rejected (consistent with grid.rs)
-- sph: `SpatialHash::new()` error properly propagated (hisab API change)
 
 ## [0.24.3] - 2026-03-24
 

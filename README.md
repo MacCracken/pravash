@@ -9,13 +9,13 @@
 
 Particle-based and grid-based fluid simulation. SPH for real-time effects, Euler/Navier-Stokes for accurate simulation, shallow water for surface waves, multi-phase for immiscible fluids, viscoelastic for honey/lava, heat transfer and combustion for fire effects. Built on [hisab](https://crates.io/crates/hisab) for math foundations.
 
-**Non-linear SWE, Manning friction, wetting/drying, wave breaking, Boussinesq dispersion, terrain-following, multi-phase SPH, phase-field interface tracking, Oldroyd-B viscoelasticity, heat conduction, combustion, Rayon parallelism, GPU-agnostic compute interface** — zero `unsafe`, 230+ tests.
+**Non-linear SWE, HLL Riemann, Green-Naghdi dispersion, sediment transport, multi-phase SPH, DFSPH, MPM, VoF, phase-field, Oldroyd-B viscoelasticity, non-Newtonian viscosity, heat conduction, combustion, foam/spray/bubble, APIC, MAC grid, multigrid, k-epsilon turbulence, autodiff, Rayon parallelism, GPU-agnostic compute interface** — zero `unsafe`, 290+ tests.
 
 ## Installation
 
 ```toml
 [dependencies]
-pravash = "0.24"
+pravash = "1.1"
 ```
 
 Default features: `sph`, `grid`, `shallow`.
@@ -61,15 +61,17 @@ println!("KE: {}", total_kinetic_energy(&particles));
 
 | Module | Description |
 |--------|-------------|
-| `sph` | SPH solver with spatial hash acceleration, PCISPH, surface tension, adaptive timestep, multi-phase (per-phase EOS/viscosity/interface tension), viscoelastic (Oldroyd-B), heat conduction, combustion |
-| `grid` | Navier-Stokes: semi-Lagrangian + MacCormack advection, diffusion, DST + GS pressure projection, vorticity confinement, buoyancy, periodic boundaries. Rayon-parallelized advection and projection |
-| `shallow` | Non-linear SWE with convective terms, flux-form continuity, Manning bed friction, wetting/drying, wave breaking detection + dissipation, Boussinesq dispersion, well-balanced terrain-following |
+| `sph` | SPH solver with spatial hash, PCISPH, DFSPH, Wendland/Delta-SPH kernels, adaptive timestep, multi-phase, viscoelastic (Oldroyd-B), non-Newtonian, implicit viscosity, heat/combustion, particle splitting/merging, foam/spray/bubble, MLS correction |
+| `grid` | Navier-Stokes: MAC grid, semi-Lagrangian + MacCormack + BFECC advection, multigrid/DST/GS pressure, k-epsilon turbulence, Smagorinsky SGS, ghost fluid, periodic BCs. Rayon-parallelized |
+| `shallow` | Non-linear SWE, HLL Riemann, Manning friction, wetting/drying, wave breaking, Green-Naghdi dispersion, Boussinesq, sediment transport, well-balanced terrain-following |
+| `mpm` | Material Point Method — neo-Hookean, fluid, Drucker-Prager constitutive models |
+| `vof` | Volume of Fluid — free surface tracking with donor-acceptor advection |
 | `phase_field` | Allen-Cahn phase-field interface tracking with advection and double-well relaxation |
 | `buoyancy` | Archimedes buoyancy, drag force, terminal velocity, Reynolds number, flow regime classification |
 | `vortex` | Vorticity, Lamb-Oseen/Rankine vortex models, enstrophy, Kolmogorov microscale |
-| `coupling` | RigidBody interaction (sphere/box SDF), FLIP/PIC hybrid, particle-level set, added mass, field drag |
-| `compute` | GPU-agnostic `ComputeBackend` trait, `PackedParticles` f32 buffer packing, kernel parameter structs |
-| `common` | `FluidParticle` (with phase, temperature, fuel, conformation tensor), `FluidMaterial` (water/oil/honey/air/lava), `FluidConfig`, `ParticleSoa` (SOA layout), `ParticleArena` (memory pool) |
+| `coupling` | RigidBody interaction (sphere/box SDF), FLIP/PIC/APIC hybrid, narrow-band FLIP, particle-level set, added mass, field drag |
+| `compute` | GPU-agnostic `ComputeBackend` trait, `NeuralCorrector`, `KernelDerivatives` with autodiff, `PackedParticles` f32 buffers |
+| `common` | `FluidParticle` (phase, temperature, fuel, conformation tensor), `FluidMaterial`, `FluidConfig`, `ParticleSoa` (SOA), `ParticleArena` (memory pool) |
 
 ## Examples
 

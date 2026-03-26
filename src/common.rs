@@ -523,7 +523,7 @@ impl ParticleArena {
     }
 
     /// All particles from index 0 to watermark (includes freed gaps).
-    /// For gap-free iteration, use [`compact`] first then [`active_particles`].
+    /// For gap-free iteration, use `compact()` first then `active_particles()`.
     #[inline]
     #[must_use]
     pub fn raw_slice(&self) -> &[FluidParticle] {
@@ -562,7 +562,7 @@ impl ParticleArena {
     }
 
     /// Contiguous slice of all active particles after compaction.
-    /// Call [`compact`] first to ensure no gaps.
+    /// Call `compact()` first to ensure no gaps.
     #[inline]
     #[must_use]
     pub fn active_particles(&self) -> &[FluidParticle] {

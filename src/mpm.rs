@@ -34,7 +34,7 @@ pub enum ConstitutiveModel {
 /// Per-particle MPM state (deformation gradient + material).
 #[derive(Debug, Clone, Copy)]
 pub struct MpmParticle {
-    /// 2D deformation gradient [F00, F01, F10, F11]. Identity = [1,0,0,1].
+    /// 2D deformation gradient \[F00, F01, F10, F11\]. Identity = \[1,0,0,1\].
     pub deformation_grad: [f64; 4],
     /// Constitutive model for this particle.
     pub model: ConstitutiveModel,
