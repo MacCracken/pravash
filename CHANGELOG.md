@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [1.2.0]
+
+### Added
+- **bridge** — cross-crate primitive-value bridges for pavan (Cp to pressure, dynamic pressure, aero forces, freestream velocity), ushma (temperature to water viscosity, heat to buoyancy forcing, TKE to eddy diffusivity), goonj (velocity to acoustic source strength, TKE to broadband noise, wave height to acoustic pressure)
+
+### Updated
+- hisab 1.1.0 -> 1.3.0, zerocopy 0.8.47 -> 0.8.48, iri-string 0.7.11 -> 0.7.12
+
+## [Unreleased-pre-1.2]
+
 ### Fixed
 - sph: Surface tension div-by-zero in solver step, PCISPH, and multiphase — added threshold floor
 - sph: Phase change energy conservation — added `heat_capacity` to `PhaseChangeConfig`, proper J/kg↔K conversion

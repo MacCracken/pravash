@@ -78,3 +78,12 @@
 ### Engineering Backlog
 
 - No current items
+
+---
+
+## Cross-Crate Bridges
+
+- [ ] `bridge.rs` module — primitive-value conversions for cross-crate fluid dynamics (no deps on sibling crates)
+- [ ] **pavan bridge**: airfoil pressure distribution → surface flow velocity boundary conditions; wind field → free-stream velocity
+- [ ] **ushma bridge**: fluid temperature field → viscosity; heat source positions → thermal buoyancy forcing
+- [ ] **goonj bridge**: fluid velocity field → acoustic source strength (aeroacoustics); turbulent kinetic energy → broadband noise level

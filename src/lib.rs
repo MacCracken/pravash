@@ -16,6 +16,8 @@
 //! - [`common`] — Shared types: FluidParticle, FluidConfig, material properties
 //! - [`error`] — Error types
 
+/// Cross-crate bridges — primitive-value conversions from other AGNOS science crates.
+pub mod bridge;
 pub mod common;
 pub mod error;
 
