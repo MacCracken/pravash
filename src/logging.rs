@@ -30,7 +30,9 @@ pub fn init_with_level(default_level: &str) {
 /// alive for the duration of profiling. When dropped, it flushes and closes
 /// the trace file.
 ///
-/// The trace file is written to the current directory as `trace-{pid}.json`.
+/// The trace file is written to the current directory as
+/// `trace-{unix_micros}.json`. If a global subscriber is already installed,
+/// the chrome layer is not registered and the trace stays empty.
 ///
 /// # Usage
 ///
@@ -39,6 +41,7 @@ pub fn init_with_level(default_level: &str) {
 /// // ... run simulation ...
 /// // guard dropped here, trace file flushed
 /// ```
+#[must_use = "dropping the guard immediately flushes and closes the trace file"]
 pub fn init_profiling() -> tracing_chrome::FlushGuard {
     use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;

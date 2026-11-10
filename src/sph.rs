@@ -127,7 +127,7 @@ impl KernelCoeffs {
 #[inline]
 #[must_use]
 pub fn kernel_poly6(r: f64, h: f64) -> f64 {
-    if r < 0.0 {
+    if r < 0.0 || !gt_zero(h) {
         return 0.0;
     }
     KernelCoeffs::new(h).poly6(r * r)
@@ -139,6 +139,9 @@ pub fn kernel_poly6(r: f64, h: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn kernel_spiky_grad(r: f64, h: f64) -> f64 {
+    if !gt_zero(h) {
+        return 0.0;
+    }
     KernelCoeffs::new(h).spiky_grad(r)
 }
 
@@ -148,6 +151,9 @@ pub fn kernel_spiky_grad(r: f64, h: f64) -> f64 {
 #[inline]
 #[must_use]
 pub fn kernel_viscosity_laplacian(r: f64, h: f64) -> f64 {
+    if !gt_zero(h) {
+        return 0.0;
+    }
     KernelCoeffs::new(h).visc_laplacian(r)
 }
 
@@ -218,6 +224,58 @@ pub fn kernel_wendland_c4_grad(r: f64, h: f64) -> f64 {
     (9.0 / (4.0 * PI * h * h)) * dfdq / h
 }
 
+/// `x` is finite and strictly positive (false for NaN).
+#[inline]
+fn is_positive(x: f64) -> bool {
+    x.is_finite() && x > 0.0
+}
+
+/// `x > 0` (false for NaN) — a single comparison for hot-path kernel guards.
+#[inline(always)]
+fn gt_zero(x: f64) -> bool {
+    x > 0.0
+}
+
+// ── Neighbor list validation ──────────────────────────────────────────────
+
+/// Whether CSR neighbor lists (`offsets.len() == n + 1`, indices `< n`,
+/// monotone offsets within `indices`) are valid for `n` particles.
+///
+/// Free functions that take caller-supplied neighbor lists check this first
+/// and do nothing (with a warning) instead of panicking on a mismatch.
+fn neighbor_lists_valid(offsets: &[u32], indices: &[usize], n: usize) -> bool {
+    let ok = offsets.len() == n + 1
+        && offsets.windows(2).all(|w| w[0] <= w[1])
+        && offsets.last().is_some_and(|&e| e as usize <= indices.len())
+        && indices.iter().all(|&j| j < n);
+    if !ok {
+        tracing::warn!(
+            n,
+            offsets = offsets.len(),
+            indices = indices.len(),
+            "invalid neighbor lists ignored (expected offsets.len() == n + 1, indices < n)"
+        );
+    }
+    ok
+}
+
+// ── Surface tension (CSF) ─────────────────────────────────────────────────
+
+/// Colour-field normal magnitude, in units of `1/h`, below which a particle
+/// is treated as interior (no surface tension).
+const CSF_NORMAL_THRESHOLD: f64 = 0.1;
+
+/// CSF surface-tension acceleration (Müller et al. 2003): `a = −σ·∇²c·n̂/ρ`
+/// with `n = ∇c`, applied only where `|n| > 0.1/h` (near a surface).
+#[inline]
+fn csf_acceleration(normal: DVec3, laplacian: f64, sigma: f64, rho: f64, h: f64) -> DVec3 {
+    let mag = normal.length();
+    if !is_positive(sigma) || mag.is_nan() || mag <= CSF_NORMAL_THRESHOLD / h {
+        return DVec3::ZERO;
+    }
+    normal * (-sigma * laplacian / (rho * mag))
+}
+
 // ── Multi-phase Configuration ──────────────────────────────────────────────
 
 /// Per-phase material properties for multi-phase SPH.
@@ -275,17 +333,21 @@ impl MultiPhaseConfig {
     }
 
     /// Get properties for a particle's phase, falling back to phase 0.
+    ///
+    /// `step_multiphase` rejects an empty `phases` list and warns once per
+    /// step about out-of-range indices, so this hot-path lookup stays silent.
     #[inline]
     #[must_use]
     fn get(&self, phase: u8) -> &PhaseProperties {
-        self.phases.get(phase as usize).unwrap_or_else(|| {
-            tracing::warn!(
-                requested = phase,
-                available = self.phases.len(),
-                "phase index out of bounds, falling back to phase 0"
-            );
-            &self.phases[0]
-        })
+        const FALLBACK: PhaseProperties = PhaseProperties {
+            rest_density: 1000.0,
+            gas_constant: 2000.0,
+            viscosity: 0.0,
+        };
+        self.phases
+            .get(phase as usize)
+            .or_else(|| self.phases.first())
+            .unwrap_or(&FALLBACK)
     }
 }
 
@@ -308,10 +370,24 @@ pub struct ViscoelasticConfig {
     pub relaxation_time: f64,
 }
 
+impl ViscoelasticConfig {
+    /// Create a viscoelastic config (elastic modulus G in Pa, relaxation time λ in s).
+    #[must_use]
+    pub fn new(elastic_modulus: f64, relaxation_time: f64) -> Self {
+        Self {
+            elastic_modulus,
+            relaxation_time,
+        }
+    }
+}
+
 /// Update conformation tensors and apply elastic stress for viscoelastic particles.
 ///
 /// Evolves each particle's conformation tensor using the Oldroyd-B model
 /// and adds the elastic stress divergence to particle accelerations.
+///
+/// Neighbor lists come from [`SphSolver::neighbor_lists`]; invalid lists
+/// are ignored with a warning.
 ///
 /// Call after `SphSolver::step()` (which computes density/pressure/viscous forces),
 /// then re-integrate positions with the updated accelerations.
@@ -325,7 +401,7 @@ pub fn update_viscoelastic(
 ) {
     let _span = trace_span!("sph::viscoelastic", n = particles.len()).entered();
     let n = particles.len();
-    if n == 0 {
+    if n == 0 || !neighbor_lists_valid(neighbor_offsets, neighbor_indices, n) {
         return;
     }
 
@@ -371,16 +447,13 @@ pub fn update_viscoelastic(
             dvdy += dvy * scale * dy;
         }
 
-        // Evolve conformation tensor: DC/Dt = C·∇u + (∇u)ᵀ·C - (C-I)/λ
+        // Evolve conformation tensor (upper-convected Oldroyd-B):
+        // DC/Dt = L·C + C·Lᵀ − (C − I)/λ, with L = ∇u = [[∂u/∂x, ∂u/∂y], [∂v/∂x, ∂v/∂y]].
         let [c_xx, c_xy, c_yy] = pi.conformation;
 
-        let dcxx =
-            (c_xx * dudx + c_xy * dvdx) + (dudx * c_xx + dudy * c_xy) - (c_xx - 1.0) * inv_lambda;
-        let dcxy = 0.5 * ((c_xx * dudy + c_xy * dvdy) + (c_xy * dudx + c_yy * dvdx))
-            + 0.5 * ((dvdx * c_xx + dvdy * c_xy) + (dudx * c_xy + dudy * c_yy))
-            - c_xy * inv_lambda;
-        let dcyy =
-            (c_xy * dudy + c_yy * dvdy) + (dvdx * c_xy + dvdy * c_yy) - (c_yy - 1.0) * inv_lambda;
+        let dcxx = 2.0 * (dudx * c_xx + dudy * c_xy) - (c_xx - 1.0) * inv_lambda;
+        let dcxy = dudx * c_xy + dudy * c_yy + dvdx * c_xx + dvdy * c_xy - c_xy * inv_lambda;
+        let dcyy = 2.0 * (dvdx * c_xy + dvdy * c_yy) - (c_yy - 1.0) * inv_lambda;
 
         particles[i].conformation = [c_xx + dcxx * dt, c_xy + dcxy * dt, c_yy + dcyy * dt];
 
@@ -428,13 +501,22 @@ pub struct HeatConfig {
     pub diffusivity: f64,
 }
 
+impl HeatConfig {
+    /// Create a heat-conduction config with thermal diffusivity κ (m²/s).
+    #[must_use]
+    pub fn new(diffusivity: f64) -> Self {
+        Self { diffusivity }
+    }
+}
+
 /// Update particle temperatures via SPH heat conduction.
 ///
 /// Computes `∂T/∂t = κ·∇²T` using the SPH Laplacian approximation:
 /// `∇²T_i = Σ_j (m_j/ρ_j) · (T_j - T_i) · ∇²W(r_ij, h)`
 ///
 /// Convection is implicit — particles carry temperature as they move.
-/// Call after the SPH step (needs valid density and neighbor cache).
+/// Call after the SPH step (needs valid density and neighbor cache from
+/// [`SphSolver::neighbor_lists`]; invalid lists are ignored with a warning).
 pub fn update_heat(
     particles: &mut [FluidParticle],
     neighbor_offsets: &[u32],
@@ -445,7 +527,10 @@ pub fn update_heat(
 ) {
     let _span = trace_span!("sph::heat", n = particles.len()).entered();
     let n = particles.len();
-    if n == 0 || heat.diffusivity <= 0.0 {
+    if n == 0 || !is_positive(heat.diffusivity) {
+        return;
+    }
+    if !neighbor_lists_valid(neighbor_offsets, neighbor_indices, n) {
         return;
     }
 
@@ -454,9 +539,9 @@ pub fn update_heat(
 
     for i in 0..n {
         let pi = &particles[i];
-        let rho = pi.density.max(MIN_DENSITY);
         let start = neighbor_offsets[i] as usize;
         let end = neighbor_offsets[i + 1] as usize;
+        // Σ_j (m_j/ρ_j)(T_j − T_i)∇²W_ij is already ∇²T (no extra 1/ρ_i).
         let mut dt_temp = 0.0;
 
         for &j in &neighbor_indices[start..end] {
@@ -475,7 +560,7 @@ pub fn update_heat(
             dt_temp += pj.mass / rho_j * (snap[j] - snap[i]) * lap;
         }
 
-        particles[i].temperature += heat.diffusivity * dt_temp / rho * dt;
+        particles[i].temperature += heat.diffusivity * dt_temp * dt;
     }
 }
 
@@ -498,42 +583,96 @@ pub struct PhaseChangeConfig {
     pub phase_above: u8,
 }
 
+impl PhaseChangeConfig {
+    /// Create a phase-change config.
+    #[must_use]
+    pub fn new(
+        transition_temperature: f64,
+        latent_heat: f64,
+        heat_capacity: f64,
+        phase_below: u8,
+        phase_above: u8,
+    ) -> Self {
+        Self {
+            transition_temperature,
+            latent_heat,
+            heat_capacity,
+            phase_below,
+            phase_above,
+        }
+    }
+
+    /// Water ice ⇄ liquid water at 273.15 K (L = 334 kJ/kg, c_p(ice) = 2090 J/(kg·K)).
+    #[must_use]
+    pub fn water_ice(phase_ice: u8, phase_water: u8) -> Self {
+        Self::new(273.15, 334_000.0, 2090.0, phase_ice, phase_water)
+    }
+}
+
 /// Update particle phases based on temperature (Stefan condition).
 ///
 /// Particles at the transition temperature absorb/release latent heat
 /// before changing phase. Temperature is held at the transition point
-/// until all latent heat is consumed.
+/// until all latent heat is consumed, and the energy is accumulated across
+/// steps, so slow heating (or cooling) still completes the transition.
 ///
-/// Uses `fuel` field as a latent heat accumulator (0 = fully below, 1 = fully above).
+/// The `fuel` field is used as the latent-heat accumulator: the fraction
+/// (0–1) of the transition the particle has completed toward the *other*
+/// phase. It is reset to 0 when the phase flips. Do not combine with
+/// combustion, which also uses `fuel`.
 pub fn update_phase_change(particles: &mut [FluidParticle], config: &PhaseChangeConfig, _dt: f64) {
     let _span = trace_span!("sph::phase_change", n = particles.len()).entered();
     let t_trans = config.transition_temperature;
-    let l_heat = config.latent_heat;
+    let l_heat = config.latent_heat.max(1e-20);
     let cp = config.heat_capacity.max(1e-10);
 
     for p in particles.iter_mut() {
-        if p.temperature > t_trans && p.phase == config.phase_below {
-            // Absorb latent heat (melting/evaporation)
-            // Thermal energy available = cp · ΔT (J/kg), need l_heat (J/kg) to transition
-            let excess = p.temperature - t_trans;
-            let thermal_energy = excess * cp;
-            let fraction = (thermal_energy / l_heat).min(1.0);
-            if fraction >= 1.0 {
-                p.phase = config.phase_above;
-                // Remaining temperature above transition after consuming latent heat
-                p.temperature = t_trans + (thermal_energy - l_heat) / cp;
+        let (other, heating) = if p.phase == config.phase_below {
+            (config.phase_above, true)
+        } else if p.phase == config.phase_above {
+            (config.phase_below, false)
+        } else {
+            continue;
+        };
+        // Signed thermal energy (J/kg) toward the other phase: positive when
+        // the particle is past the transition temperature.
+        let toward = if heating {
+            (p.temperature - t_trans) * cp
+        } else {
+            (t_trans - p.temperature) * cp
+        };
+        let progress = p.fuel.clamp(0.0, 1.0);
+        if toward > 0.0 {
+            let needed = (1.0 - progress) * l_heat;
+            if toward >= needed {
+                // Transition completes; leftover energy changes temperature.
+                p.phase = other;
+                p.fuel = 0.0;
+                let extra = (toward - needed) / cp;
+                p.temperature = if heating {
+                    t_trans + extra
+                } else {
+                    t_trans - extra
+                };
             } else {
-                p.temperature = t_trans; // hold at transition
+                p.fuel = progress + toward / l_heat;
+                p.temperature = t_trans;
             }
-        } else if p.temperature < t_trans && p.phase == config.phase_above {
-            // Release latent heat (solidification/condensation)
-            let deficit = t_trans - p.temperature;
-            let thermal_energy = deficit * cp;
-            let fraction = (thermal_energy / l_heat).min(1.0);
-            if fraction >= 1.0 {
-                p.phase = config.phase_below;
-                p.temperature = t_trans - (thermal_energy - l_heat) / cp;
+        } else if progress > 0.0 {
+            // Moving back: a partly transformed particle returns its stored
+            // latent heat before its temperature leaves the transition point.
+            let stored = progress * l_heat;
+            let back = -toward;
+            if back >= stored {
+                p.fuel = 0.0;
+                let extra = (back - stored) / cp;
+                p.temperature = if heating {
+                    t_trans - extra
+                } else {
+                    t_trans + extra
+                };
             } else {
+                p.fuel = progress - back / l_heat;
                 p.temperature = t_trans;
             }
         }
@@ -661,10 +800,12 @@ pub fn update_combustion(particles: &mut [FluidParticle], config: &CombustionCon
 ///
 /// Young's equation: cos(θ) = (γ_SG - γ_SL) / γ_LG
 ///
-/// Particles within `h` of a domain boundary have their color field normal
-/// adjusted to enforce the prescribed contact angle. This affects the surface
-/// tension force direction, creating wetting (θ < 90°) or non-wetting (θ > 90°)
-/// behavior.
+/// Particles within `h` of a domain boundary receive a wall-normal
+/// acceleration `σ·cos(θ)/h`: toward the wall for wetting (θ < 90°),
+/// away from it for non-wetting (θ > 90°), and none at θ = 90°.
+/// `surface_tension` is a per-unit-mass scale (m²/s²); the smoothing radius
+/// `h` is the length scale so the effect is resolution-consistent.
+/// Degenerate axes (`bounds_min == bounds_max`, e.g. z in 2D) have no walls.
 ///
 /// `contact_angle` in radians (π/4 = hydrophilic, π/2 = neutral, 3π/4 = hydrophobic).
 pub fn apply_contact_angle(
@@ -674,49 +815,34 @@ pub fn apply_contact_angle(
     surface_tension: f64,
 ) {
     let _span = trace_span!("sph::contact_angle", n = particles.len()).entered();
-    let cos_theta = contact_angle.cos();
-    let sin_theta = contact_angle.sin();
     let h = config.smoothing_radius;
+    if !is_positive(h) || !surface_tension.is_finite() || !contact_angle.is_finite() {
+        return;
+    }
+    let cos_theta = contact_angle.cos();
     let lo = config.bounds_min;
     let hi = config.bounds_max;
+    let accel = surface_tension * cos_theta / h;
 
     for p in particles.iter_mut() {
-        // Check proximity to each wall
+        // Sum of inward wall normals for every wall within h.
         let mut wall_normal = DVec3::ZERO;
-        if p.position.x - lo.x < h {
-            wall_normal.x += 1.0;
+        for axis in 0..3 {
+            if hi[axis] <= lo[axis] {
+                continue; // degenerate axis: no walls
+            }
+            if p.position[axis] - lo[axis] < h {
+                wall_normal[axis] += 1.0;
+            }
+            if hi[axis] - p.position[axis] < h {
+                wall_normal[axis] -= 1.0;
+            }
         }
-        if hi.x - p.position.x < h && hi.x > lo.x {
-            wall_normal.x -= 1.0;
-        }
-        if p.position.y - lo.y < h {
-            wall_normal.y += 1.0;
-        }
-        if hi.y - p.position.y < h && hi.y > lo.y {
-            wall_normal.y -= 1.0;
-        }
-        if p.position.z - lo.z < h {
-            wall_normal.z += 1.0;
-        }
-        if hi.z - p.position.z < h && hi.z > lo.z {
-            wall_normal.z -= 1.0;
-        }
-
         if wall_normal.length_squared() < 1e-20 {
             continue;
         }
-        let n_wall = wall_normal.normalize();
-
-        // Apply wetting force: push velocity toward the wall (hydrophilic)
-        // or away (hydrophobic) proportional to surface tension.
-        //
-        // Simplified contact angle model: `surface_tension` acts as a
-        // force-per-unit-mass scale (units: m/s²). The smoothing radius `h`
-        // is used as the characteristic length scale so the force magnitude
-        // remains consistent across resolutions.
-        let approach = p.velocity.dot(n_wall);
-        let wetting_force = surface_tension * (cos_theta - approach.signum() * sin_theta) / h;
-        p.acceleration += n_wall * wetting_force / p.mass.max(1e-20);
+        // Inward normal points into the fluid; wetting pulls toward the wall.
+        p.acceleration -= wall_normal.normalize() * accel;
     }
 }
 
@@ -785,7 +911,7 @@ impl NonNewtonianViscosity {
 /// Apply delta-SPH density diffusion to reduce pressure noise.
 ///
 /// Adds a diffusive correction: `δ·h·c₀·Σ Vⱼ·ψᵢⱼ·∇Wᵢⱼ`
-/// where `ψᵢⱼ = 2(ρⱼ-ρᵢ)·rᵢⱼ / (|rᵢⱼ|² + 0.01h²)`.
+/// where `ψᵢⱼ = 2(ρⱼ-ρᵢ)·rⱼᵢ / (|rᵢⱼ|² + 0.01h²)` (Molteni & Colagrossi 2009).
 ///
 /// Call after density computation, before pressure/force evaluation.
 /// Typical `delta` value: 0.05–0.1.
@@ -800,7 +926,8 @@ pub fn apply_delta_sph(
 ) {
     let _span = trace_span!("sph::delta_sph", n = particles.len()).entered();
     let n = particles.len();
-    if n == 0 || delta <= 0.0 {
+    if n == 0 || !is_positive(delta) || !neighbor_lists_valid(neighbor_offsets, neighbor_indices, n)
+    {
         return;
     }
 
@@ -833,11 +960,12 @@ pub fn apply_delta_sph(
             let rho_j_safe = rho_j.max(MIN_DENSITY);
             let vol_j = mass_j / rho_j_safe;
 
-            // ψᵢⱼ · ∇Wᵢⱼ (dot product of psi vector with kernel gradient direction)
+            // ψᵢⱼ·∇ᵢWᵢⱼ with ψᵢⱼ along r_ji = x_j − x_i and ∇ᵢW along r_ij:
+            // r_ji·r̂_ij = −r, so the term is −2(ρⱼ−ρᵢ)·r·W'(r)/(r²+ε).
+            // W' < 0, so ρᵢ moves toward ρⱼ (diffusion, not anti-diffusion).
             let psi_scale = 2.0 * (rho_j - rho_i) / (r2 + eps);
             let grad = kc.spiky_grad(r);
-            let grad_dot_r = grad; // |∇W| already scaled, dot with r̂ gives magnitude
-            correction += vol_j * psi_scale * r * grad_dot_r;
+            correction -= vol_j * psi_scale * r * grad;
         }
 
         particles[i].density += delta * h * speed_of_sound * correction * dt;
@@ -892,8 +1020,14 @@ pub fn equation_of_state_tait(
     speed_of_sound: f64,
     gamma: f64,
 ) -> f64 {
-    let b = rest_density * speed_of_sound * speed_of_sound / gamma;
-    b * ((density / rest_density.max(MIN_DENSITY)).powf(gamma) - 1.0)
+    let rho0 = rest_density.max(MIN_DENSITY);
+    let c2 = speed_of_sound * speed_of_sound;
+    if gamma.abs() < 1e-12 {
+        // γ → 0 limit: B·(x^γ − 1) → ρ₀c²·ln(x)
+        return rest_density * c2 * (density / rho0).ln();
+    }
+    let b = rest_density * c2 / gamma;
+    b * ((density / rho0).powf(gamma) - 1.0)
 }
 
 // ── Forces (standalone, brute-force) ────────────────────────────────────────
@@ -993,9 +1127,16 @@ pub struct SphSolver {
     pcisph_pred_pos: Vec<DVec3>,
     pcisph_pred_vel: Vec<DVec3>,
     /// Use Velocity Verlet integration instead of symplectic Euler.
+    ///
+    /// Keeps per-particle state indexed by position in the slice; call
+    /// [`reset_integrator`](SphSolver::reset_integrator) after reordering,
+    /// splitting or merging particles.
     pub use_verlet: bool,
     /// Previous accelerations for Verlet half-step.
     prev_accel: Vec<DVec3>,
+    // DFSPH scratch buffers (persistent across steps)
+    dfsph_alpha: Vec<f64>,
+    dfsph_kappa: Vec<f64>,
 }
 
 impl SphSolver {
@@ -1023,6 +1164,8 @@ impl SphSolver {
             pcisph_pred_vel: Vec::new(),
             use_verlet: false,
             prev_accel: Vec::new(),
+            dfsph_alpha: Vec::new(),
+            dfsph_kappa: Vec::new(),
         }
     }
 
@@ -1032,6 +1175,25 @@ impl SphSolver {
         let mut s = Self::new();
         s.surface_tension = surface_tension;
         s
+    }
+
+    /// Discard per-particle integrator state (Verlet previous accelerations).
+    ///
+    /// Call after reordering ([`sort_by_zorder`]), splitting or merging
+    /// particles so stale state is not applied to the wrong particle.
+    pub fn reset_integrator(&mut self) {
+        self.prev_accel.clear();
+    }
+
+    /// Neighbor lists from the most recent step, in CSR form:
+    /// particle `i`'s neighbors are `indices[offsets[i]..offsets[i + 1]]`.
+    ///
+    /// Pass these to [`update_heat`], [`update_viscoelastic`],
+    /// [`apply_delta_sph`], [`apply_implicit_viscosity`] and
+    /// [`compute_gradient_corrections`] after a step on the same particles.
+    #[must_use]
+    pub fn neighbor_lists(&self) -> (&[u32], &[usize]) {
+        (&self.neighbor_offsets, &self.neighbor_indices)
     }
 
     /// Build spatial hash and cache neighbor lists for all particles.
@@ -1196,7 +1358,12 @@ impl SphSolver {
                 let mut cn_x = 0.0;
                 let mut cn_y = 0.0;
                 let mut cn_z = 0.0;
-                let mut laplacian_color = 0.0;
+                // Colour-field Laplacian includes the self term m_i/ρ_i·∇²W(0).
+                let mut laplacian_color = if st > 0.0 {
+                    pi.mass / rho * kc.poly6_laplacian(0.0)
+                } else {
+                    0.0
+                };
 
                 let start = offsets[i] as usize;
                 let end = offsets[i + 1] as usize;
@@ -1239,19 +1406,10 @@ impl SphSolver {
                     }
                 }
 
-                if st > 0.0 {
-                    let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                    let threshold = (1e-6 / kc.h).max(1e-10);
-                    if cn_mag > threshold {
-                        let kappa = -laplacian_color / cn_mag;
-                        let st_scale = st * kappa / (rho * cn_mag);
-                        ax += st_scale * cn_x;
-                        ay += st_scale * cn_y;
-                        az += st_scale * cn_z;
-                    }
-                }
+                let a_st =
+                    csf_acceleration(DVec3::new(cn_x, cn_y, cn_z), laplacian_color, st, rho, kc.h);
 
-                DVec3::new(ax, ay, az)
+                DVec3::new(ax, ay, az) + a_st
             };
 
             #[cfg(feature = "parallel")]
@@ -1272,15 +1430,24 @@ impl SphSolver {
         // Integrate
         let dt = config.dt;
         if self.use_verlet {
-            // Velocity Verlet: x += v·dt + 0.5·a·dt², v += 0.5·(a_old + a_new)·dt
-            if self.prev_accel.len() != n {
+            // Velocity Verlet with forces evaluated once per step at xₙ:
+            //   finish the previous step:  vₙ = ṽₙ + ½(aₙ − aₙ₋₁)·dt
+            //   x_{n+1} = xₙ + vₙ·dt + ½aₙ·dt²
+            //   ṽ_{n+1} = vₙ + aₙ·dt   (reported; corrected next step)
+            // Exact for constant acceleration, second order in general.
+            let started = self.prev_accel.len() == n;
+            if !started {
+                self.prev_accel.clear();
                 self.prev_accel.resize(n, DVec3::ZERO);
             }
             for (i, p) in particles.iter_mut().enumerate() {
-                let a_old = self.prev_accel[i];
-                p.position += p.velocity * dt + 0.5 * a_old * dt * dt;
-                p.velocity += 0.5 * (a_old + p.acceleration) * dt;
-                self.prev_accel[i] = p.acceleration;
+                let a = p.acceleration;
+                if started {
+                    p.velocity += 0.5 * (a - self.prev_accel[i]) * dt;
+                }
+                p.position += p.velocity * dt + 0.5 * a * dt * dt;
+                p.velocity += a * dt;
+                self.prev_accel[i] = a;
             }
         } else {
             // Symplectic Euler
@@ -1321,11 +1488,47 @@ impl SphSolver {
         Ok(())
     }
 
+    /// Predict velocities/positions from the non-pressure accelerations plus
+    /// the symmetric pressure force of `pressures` (PCISPH prediction step).
+    #[allow(clippy::too_many_arguments)]
+    fn pcisph_predict(
+        &self,
+        kc: &KernelCoeffs,
+        dt: f64,
+        pressures: &[f64],
+        non_pressure_accel: &[DVec3],
+        predicted_pos: &mut [DVec3],
+        predicted_vel: &mut [DVec3],
+    ) {
+        for i in 0..self.snapshot.len() {
+            let pi = &self.snapshot[i];
+            let rho = pi.density.max(MIN_DENSITY);
+            let mut pa = DVec3::ZERO;
+            for &j in self.neighbors(i) {
+                if j == i {
+                    continue;
+                }
+                let pj = &self.snapshot[j];
+                let diff = pi.position - pj.position;
+                let r2 = diff.length_squared();
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let rho_j = pj.density.max(MIN_DENSITY);
+                let sym = pressures[i] / (rho * rho) + pressures[j] / (rho_j * rho_j);
+                pa += diff * (-pj.mass * sym * kc.spiky_grad(r) / r);
+            }
+            predicted_vel[i] = pi.velocity + (non_pressure_accel[i] + pa) * dt;
+            predicted_pos[i] = pi.position + predicted_vel[i] * dt;
+        }
+    }
     /// Perform one PCISPH step (Predictive-Corrective Incompressible SPH).
     ///
     /// Iteratively corrects pressure to enforce near-constant density.
-    /// `max_iterations` controls convergence (typically 3-10).
-    /// `max_density_error` is the convergence threshold (e.g., 0.01 = 1%).
+    /// `max_iterations` controls convergence (typically 3-10; at least one
+    /// iteration always runs). `max_density_error` is the convergence
+    /// threshold on the maximum relative *compression* (e.g., 0.01 = 1%).
     pub fn step_pcisph(
         &mut self,
         particles: &mut [FluidParticle],
@@ -1398,7 +1601,11 @@ impl SphSolver {
             let mut cn_x = 0.0;
             let mut cn_y = 0.0;
             let mut cn_z = 0.0;
-            let mut laplacian_color = 0.0;
+            let mut laplacian_color = if st > 0.0 {
+                pi.mass / rho * kc.poly6_laplacian(0.0)
+            } else {
+                0.0
+            };
 
             for &j in self.neighbors(i) {
                 if j == i {
@@ -1432,17 +1639,11 @@ impl SphSolver {
                 }
             }
 
-            if st > 0.0 {
-                let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                let threshold = (1e-6 / kc.h).max(1e-10);
-                if cn_mag > threshold {
-                    let kappa = -laplacian_color / cn_mag;
-                    let st_scale = st * kappa / (rho * cn_mag);
-                    ax += st_scale * cn_x;
-                    ay += st_scale * cn_y;
-                    az += st_scale * cn_z;
-                }
-            }
+            let a_st =
+                csf_acceleration(DVec3::new(cn_x, cn_y, cn_z), laplacian_color, st, rho, kc.h);
+            ax += a_st.x;
+            ay += a_st.y;
+            az += a_st.z;
 
             if !ax.is_finite() || !ay.is_finite() || !az.is_finite() {
                 self.pcisph_accel = non_pressure_accel;
@@ -1455,16 +1656,16 @@ impl SphSolver {
         }
 
         // PCISPH pressure correction loop
-        // Precompute scaling factor δ from kernel gradient sums (Solenthaler 2009).
-        // Average over all particles with neighbors for robustness.
+        // Precompute scaling factor δ from kernel gradient sums (Solenthaler 2009)
+        // for a prototype particle: the one with the fullest neighborhood.
+        // (Averaging 1/denom lets sparse splash particles dominate δ.)
         let delta = {
-            let mut delta_sum = 0.0f64;
-            let mut delta_count = 0usize;
+            let mut best: Option<(usize, f64)> = None; // (neighbor count, denom)
             for pi_idx in 0..n {
                 let pi = &self.snapshot[pi_idx];
                 let mut sum_grad = [0.0f64; 3];
                 let mut sum_grad_sq = 0.0f64;
-                let mut has_neighbors = false;
+                let mut count = 0usize;
                 for &j in self.neighbors(pi_idx) {
                     if j == pi_idx {
                         continue;
@@ -1474,7 +1675,7 @@ impl SphSolver {
                     if r2 > kc.h2 || r2 < 1e-20 {
                         continue;
                     }
-                    has_neighbors = true;
+                    count += 1;
                     let r = r2.sqrt();
                     let grad = kc.spiky_grad(r);
                     let grad_w = [
@@ -1488,7 +1689,7 @@ impl SphSolver {
                     sum_grad_sq +=
                         grad_w[0] * grad_w[0] + grad_w[1] * grad_w[1] + grad_w[2] * grad_w[2];
                 }
-                if !has_neighbors {
+                if count == 0 {
                     continue;
                 }
                 let sum_dot = sum_grad[0] * sum_grad[0]
@@ -1496,16 +1697,13 @@ impl SphSolver {
                     + sum_grad[2] * sum_grad[2];
                 let beta = 2.0 * (dt * pi.mass / rest_density).powi(2);
                 let denom = beta * (sum_dot + sum_grad_sq);
-                if denom.abs() > 1e-20 {
-                    delta_sum += 1.0 / denom;
-                    delta_count += 1;
+                if denom.abs() > 1e-20
+                    && best.is_none_or(|(c, d)| count > c || (count == c && denom > d))
+                {
+                    best = Some((count, denom));
                 }
             }
-            if delta_count > 0 {
-                delta_sum / delta_count as f64
-            } else {
-                0.0
-            }
+            best.map_or(0.0, |(_, denom)| 1.0 / denom)
         };
 
         let mut pressures = std::mem::take(&mut self.pcisph_pressures);
@@ -1516,81 +1714,62 @@ impl SphSolver {
         let mut predicted_vel = std::mem::take(&mut self.pcisph_pred_vel);
         predicted_vel.resize(n, DVec3::ZERO);
 
-        for iter in 0..max_iterations {
+        let mut density_err = std::mem::take(&mut self.densities);
+        density_err.resize(n, 0.0);
+        let iterations = max_iterations.max(1);
+        let mut converged = false;
+        for iter in 0..iterations {
             let _span = trace_span!("sph::pcisph_iter", iter).entered();
 
             // Predict position/velocity with current pressure + non-pressure forces
-            for i in 0..n {
-                let pi = &self.snapshot[i];
-                let rho = pi.density.max(MIN_DENSITY);
+            self.pcisph_predict(
+                &kc,
+                dt,
+                &pressures,
+                &non_pressure_accel,
+                &mut predicted_pos,
+                &mut predicted_vel,
+            );
 
-                // Compute pressure acceleration from current pressures
-                let mut pax = 0.0;
-                let mut pay = 0.0;
-                let mut paz = 0.0;
-
-                for &j in self.neighbors(i) {
-                    if j == i {
-                        continue;
-                    }
-                    let pj = &self.snapshot[j];
-                    let r2 = pi.distance_squared_to(pj);
-                    if r2 > kc.h2 || r2 < 1e-20 {
-                        continue;
-                    }
-                    let r = r2.sqrt();
-                    let rho_j = pj.density.max(MIN_DENSITY);
-
-                    let sym = pressures[i] / (rho * rho) + pressures[j] / (rho_j * rho_j);
-                    let grad = kc.spiky_grad(r);
-                    let s = -pj.mass * sym * grad / r;
-
-                    pax += s * (pi.position.x - pj.position.x);
-                    pay += s * (pi.position.y - pj.position.y);
-                    paz += s * (pi.position.z - pj.position.z);
-                }
-
-                let total_ax = non_pressure_accel[i].x + pax;
-                let total_ay = non_pressure_accel[i].y + pay;
-                let total_az = non_pressure_accel[i].z + paz;
-
-                predicted_vel[i] = DVec3::new(
-                    pi.velocity.x + total_ax * dt,
-                    pi.velocity.y + total_ay * dt,
-                    pi.velocity.z + total_az * dt,
-                );
-                predicted_pos[i] = DVec3::new(
-                    pi.position.x + predicted_vel[i].x * dt,
-                    pi.position.y + predicted_vel[i].y * dt,
-                    pi.position.z + predicted_vel[i].z * dt,
-                );
-            }
-
-            // Compute predicted density and density error
+            // Compute predicted density error. Only compression counts toward
+            // convergence: free-surface particles are always under-dense and
+            // their pressure is clamped to 0 anyway.
             let mut max_error = 0.0f64;
             for i in 0..n {
                 let mut pred_density = 0.0;
                 for &j in self.neighbors(i) {
-                    let dx = predicted_pos[i].x - predicted_pos[j].x;
-                    let dy = predicted_pos[i].y - predicted_pos[j].y;
-                    let dz = predicted_pos[i].z - predicted_pos[j].z;
-                    let r2 = dx * dx + dy * dy + dz * dz;
+                    let r2 = predicted_pos[i].distance_squared(predicted_pos[j]);
                     if r2 <= kc.h2 {
                         pred_density += self.snapshot[j].mass * kc.poly6(r2);
                     }
                 }
-
-                let density_error = pred_density - rest_density;
-                max_error = max_error.max(density_error.abs() / rest_density);
-
-                // Update pressure: p = max(0, p + δ * density_error)
-                pressures[i] = (pressures[i] + density_error * delta).max(0.0);
+                let err = pred_density - rest_density;
+                density_err[i] = err;
+                max_error = max_error.max(err.max(0.0) / rest_density);
             }
 
             if max_error < max_density_error {
+                converged = true;
                 break;
             }
+
+            // Update pressure: p = max(0, p + δ·density_error)
+            for i in 0..n {
+                pressures[i] = (pressures[i] + density_err[i] * delta).max(0.0);
+            }
         }
+        if !converged {
+            // Integrate with the final pressures, not the previous iteration's.
+            self.pcisph_predict(
+                &kc,
+                dt,
+                &pressures,
+                &non_pressure_accel,
+                &mut predicted_pos,
+                &mut predicted_vel,
+            );
+        }
+        self.densities = density_err;
 
         // Apply final velocities and positions (with divergence check)
         for i in 0..n {
@@ -1646,15 +1825,109 @@ impl SphSolver {
         Ok(())
     }
 
+    /// DFSPH helper: recompute densities and the stiffness factors
+    /// `αᵢ = ρᵢ / (|Σⱼ mⱼ∇Wᵢⱼ|² + Σⱼ |mⱼ∇Wᵢⱼ|²)` at the current positions.
+    fn dfsph_density_alpha(
+        &self,
+        particles: &mut [FluidParticle],
+        kc: &KernelCoeffs,
+        alphas: &mut [f64],
+    ) {
+        for i in 0..particles.len() {
+            let pos_i = particles[i].position;
+            let mut d = 0.0;
+            let mut sum_grad = DVec3::ZERO;
+            let mut sum_grad_sq = 0.0f64;
+            for &j in self.neighbors(i) {
+                let diff = pos_i - particles[j].position;
+                let r2 = diff.length_squared();
+                if r2 > kc.h2 {
+                    continue;
+                }
+                d += particles[j].mass * kc.poly6(r2);
+                if j == i || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let grad_w = diff * (particles[j].mass * kc.spiky_grad(r) / r);
+                sum_grad += grad_w;
+                sum_grad_sq += grad_w.length_squared();
+            }
+            particles[i].density = d;
+            let denom = sum_grad.length_squared() + sum_grad_sq;
+            alphas[i] = if denom > 1e-20 {
+                d.max(MIN_DENSITY) / denom
+            } else {
+                0.0
+            };
+        }
+    }
+
+    /// DFSPH helper: density change rate `Dρᵢ/Dt = Σⱼ mⱼ(vᵢ − vⱼ)·∇Wᵢⱼ`.
+    #[inline]
+    fn dfsph_density_rate(&self, particles: &[FluidParticle], kc: &KernelCoeffs, i: usize) -> f64 {
+        let pi = &particles[i];
+        let mut rate = 0.0;
+        for &j in self.neighbors(i) {
+            if j == i {
+                continue;
+            }
+            let pj = &particles[j];
+            let diff = pi.position - pj.position;
+            let r2 = diff.length_squared();
+            if r2 > kc.h2 || r2 < 1e-20 {
+                continue;
+            }
+            let r = r2.sqrt();
+            let grad_w = diff * (kc.spiky_grad(r) / r);
+            rate += pj.mass * (pi.velocity - pj.velocity).dot(grad_w);
+        }
+        rate
+    }
+
+    /// DFSPH helper: `vᵢ −= dt·Σⱼ mⱼ(κᵢ/ρᵢ + κⱼ/ρⱼ)∇Wᵢⱼ` for all particles
+    /// (κ computed for every particle first, so the update is order-independent).
+    fn dfsph_apply_kappa(
+        &self,
+        particles: &mut [FluidParticle],
+        kc: &KernelCoeffs,
+        kappa: &[f64],
+        dt: f64,
+    ) {
+        for i in 0..particles.len() {
+            let pos_i = particles[i].position;
+            let ki = kappa[i] / particles[i].density.max(MIN_DENSITY);
+            let mut dv = DVec3::ZERO;
+            for &j in self.neighbors(i) {
+                if j == i {
+                    continue;
+                }
+                let pj = &particles[j];
+                let diff = pos_i - pj.position;
+                let r2 = diff.length_squared();
+                if r2 > kc.h2 || r2 < 1e-20 {
+                    continue;
+                }
+                let r = r2.sqrt();
+                let kj = kappa[j] / pj.density.max(MIN_DENSITY);
+                dv += diff * (pj.mass * (ki + kj) * kc.spiky_grad(r) / r);
+            }
+            particles[i].velocity -= dv * dt;
+        }
+    }
+
     /// Perform one DFSPH step (Divergence-Free SPH, Bender & Koschier 2015).
     ///
-    /// Two-stage correction:
-    /// 1. Correct velocity divergence: enforce ∇·v = 0
-    /// 2. Correct density error: enforce ρ = ρ₀
+    /// Pipeline (paper order): non-pressure forces → **density solver**
+    /// (correct predicted velocities so the advected density reaches ρ₀) →
+    /// advect positions → rebuild neighbors → **divergence solver**
+    /// (make the velocity field divergence-free at the new positions).
     ///
-    /// Converges in 1–2 iterations per stage (vs 5–10 for PCISPH).
-    /// `max_iterations` applies to each stage independently.
-    /// `max_error` is the relative convergence threshold (e.g., 0.001 = 0.1%).
+    /// Only compression is corrected (under-dense free-surface particles are
+    /// left alone, which prevents surface clumping). `max_iterations` applies
+    /// to each solver independently; `max_error` is the relative threshold on
+    /// the average density error (and on the average `dt·Dρ/Dt / ρ₀` for the
+    /// divergence solver), e.g. 0.001 = 0.1%.
     pub fn step_dfsph(
         &mut self,
         particles: &mut [FluidParticle],
@@ -1680,70 +1953,27 @@ impl SphSolver {
         let dt = config.dt;
         let rest_density = config.rest_density;
 
-        // Build neighbors
+        let mut alphas = std::mem::take(&mut self.dfsph_alpha);
+        alphas.resize(n, 0.0);
+        let mut kappa = std::mem::take(&mut self.dfsph_kappa);
+        kappa.resize(n, 0.0);
+
+        // Neighbors, densities and α at xₙ
         {
             let _span = trace_span!("sph::build_neighbors", n).entered();
             self.build_neighbors(particles, h, h_f32)?;
         }
+        self.dfsph_density_alpha(particles, &kc, &mut alphas);
 
-        // Compute densities
-        self.densities.resize(n, 0.0);
-        for i in 0..n {
-            let pi = &particles[i];
-            let mut d = 0.0;
-            for &j in self.neighbors(i) {
-                let r2 = pi.position.distance_squared(particles[j].position);
-                if r2 <= kc.h2 {
-                    d += particles[j].mass * kc.poly6(r2);
-                }
-            }
-            self.densities[i] = d;
-        }
-        for (i, p) in particles.iter_mut().enumerate() {
-            p.density = self.densities[i];
-        }
-
-        // Compute alpha factors: α_i = ρ_i / (|Σ m_j ∇W_ij|² + Σ |m_j ∇W_ij|²)
-        let mut alphas = vec![0.0f64; n];
-        for i in 0..n {
-            let pi = &particles[i];
-            let mut sum_grad = DVec3::ZERO;
-            let mut sum_grad_sq = 0.0f64;
-            for &j in self.neighbors(i) {
-                if j == i {
-                    continue;
-                }
-                let pj = &particles[j];
-                let diff = pi.position - pj.position;
-                let r2 = diff.length_squared();
-                if r2 > kc.h2 || r2 < 1e-20 {
-                    continue;
-                }
-                let r = r2.sqrt();
-                let grad = kc.spiky_grad(r);
-                let grad_w = diff * (pj.mass * grad / r);
-                sum_grad += grad_w;
-                sum_grad_sq += grad_w.length_squared();
-            }
-            let denom = sum_grad.length_squared() + sum_grad_sq;
-            alphas[i] = if denom > 1e-20 {
-                pi.density.max(MIN_DENSITY) / denom
-            } else {
-                0.0
-            };
-        }
-
-        // Compute non-pressure accelerations (gravity + viscosity)
+        // Non-pressure accelerations (gravity + viscosity) → predicted velocity v*
         self.snapshot
             .resize(n, FluidParticle::new(DVec3::ZERO, 0.0));
         self.snapshot.copy_from_slice(particles);
-
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let pi = &self.snapshot[i];
             let mut accel = config.gravity;
             let rho = pi.density.max(MIN_DENSITY);
-
             for &j in self.neighbors(i) {
                 if j == i {
                     continue;
@@ -1755,138 +1985,68 @@ impl SphSolver {
                 }
                 let r = r2.sqrt();
                 let rho_j = pj.density.max(MIN_DENSITY);
-                let lap = kc.visc_laplacian(r);
-                let v_scale = viscosity * pj.mass * lap / rho_j / rho;
+                let v_scale = viscosity * pj.mass * kc.visc_laplacian(r) / rho_j / rho;
                 accel += (pj.velocity - pi.velocity) * v_scale;
             }
-
             particles[i].velocity += accel * dt;
         }
 
-        // Stage 1: Correct velocity divergence (∇·v = 0)
+        // Density solver: κᵢ = max(ρ*ᵢ − ρ₀, 0)/dt² · αᵢ, ρ* = ρ + dt·Dρ/Dt
         for _iter in 0..max_iterations {
-            let _span = trace_span!("sph::dfsph_div").entered();
-            let snap_vel: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
-            let mut max_div = 0.0f64;
-
+            let _span = trace_span!("sph::dfsph_density").entered();
+            let mut err_sum = 0.0f64;
             for i in 0..n {
-                let pos_i = particles[i].position;
-                let rho_i = particles[i].density.max(MIN_DENSITY);
-
-                // Compute velocity divergence
-                let mut div_v = 0.0;
-                for &j in self.neighbors(i) {
-                    if j == i {
-                        continue;
-                    }
-                    let diff = pos_i - particles[j].position;
-                    let r2 = diff.length_squared();
-                    if r2 > kc.h2 || r2 < 1e-20 {
-                        continue;
-                    }
-                    let r = r2.sqrt();
-                    let grad = kc.spiky_grad(r);
-                    let grad_w = diff * (grad / r);
-                    div_v += particles[j].mass * (snap_vel[j] - snap_vel[i]).dot(grad_w);
-                }
-
-                max_div = max_div.max(div_v.abs());
-
-                // Correct velocity: κ_v = (1/dt) · div_v · α_i
-                if alphas[i] > 0.0 {
-                    let kappa = div_v * alphas[i] / dt;
-                    let mut vel_correction = DVec3::ZERO;
-                    for &j in self.neighbors(i) {
-                        if j == i {
-                            continue;
-                        }
-                        let diff = pos_i - particles[j].position;
-                        let r2 = diff.length_squared();
-                        if r2 > kc.h2 || r2 < 1e-20 {
-                            continue;
-                        }
-                        let r = r2.sqrt();
-                        let rho_j = particles[j].density.max(MIN_DENSITY);
-                        let grad = kc.spiky_grad(r);
-                        vel_correction += diff
-                            * (dt
-                                * particles[j].mass
-                                * (kappa / (rho_i * rho_i) + kappa / (rho_j * rho_j))
-                                * grad
-                                / r);
-                    }
-                    particles[i].velocity -= vel_correction;
-                }
+                let rho_star =
+                    particles[i].density + dt * self.dfsph_density_rate(particles, &kc, i);
+                let err = (rho_star - rest_density).max(0.0);
+                err_sum += err;
+                kappa[i] = err / (dt * dt) * alphas[i];
             }
-
-            if max_div < max_error * rest_density {
+            if err_sum / (n as f64 * rest_density) < max_error {
                 break;
             }
+            self.dfsph_apply_kappa(particles, &kc, &kappa, dt);
         }
 
-        // Integrate positions
+        // Advect positions with the corrected velocities
         for p in particles.iter_mut() {
             p.position += p.velocity * dt;
         }
 
-        // Recompute density at new positions
-        for i in 0..n {
-            let pi = &particles[i];
-            let mut d = 0.0;
-            for &j in self.neighbors(i) {
-                let r2 = pi.position.distance_squared(particles[j].position);
-                if r2 <= kc.h2 {
-                    d += particles[j].mass * kc.poly6(r2);
-                }
-            }
-            particles[i].density = d;
-        }
+        // Neighbors, densities and α at x_{n+1}
+        self.build_neighbors(particles, h, h_f32)?;
+        self.dfsph_density_alpha(particles, &kc, &mut alphas);
 
-        // Stage 2: Correct density error (ρ = ρ₀)
+        // Divergence solver: κᵛᵢ = max(Dρᵢ/Dt, 0)/dt · αᵢ
         for _iter in 0..max_iterations {
-            let _span = trace_span!("sph::dfsph_density").entered();
-            let mut max_rho_err = 0.0f64;
-
+            let _span = trace_span!("sph::dfsph_div").entered();
+            let mut err_sum = 0.0f64;
             for i in 0..n {
-                let rho_err = particles[i].density - rest_density;
-                max_rho_err = max_rho_err.max(rho_err.abs() / rest_density);
-
-                if alphas[i] > 0.0 && rho_err.abs() > 1e-10 {
-                    let kappa = rho_err * alphas[i] / (dt * dt);
-                    let pi_pos = particles[i].position;
-                    let pi_rho = particles[i].density.max(MIN_DENSITY);
-
-                    for &j in self.neighbors(i) {
-                        if j == i {
-                            continue;
-                        }
-                        let diff = pi_pos - particles[j].position;
-                        let r2 = diff.length_squared();
-                        if r2 > kc.h2 || r2 < 1e-20 {
-                            continue;
-                        }
-                        let r = r2.sqrt();
-                        let rho_j = particles[j].density.max(MIN_DENSITY);
-                        let grad = kc.spiky_grad(r);
-                        let correction = diff
-                            * (dt
-                                * particles[j].mass
-                                * (kappa / (pi_rho * pi_rho) + kappa / (rho_j * rho_j))
-                                * grad
-                                / r);
-                        particles[i].velocity -= correction;
-                    }
-                }
+                let rate = self.dfsph_density_rate(particles, &kc, i).max(0.0);
+                err_sum += rate;
+                kappa[i] = rate / dt * alphas[i];
             }
-
-            if max_rho_err < max_error {
+            if err_sum * dt / (n as f64 * rest_density) < max_error {
                 break;
             }
+            self.dfsph_apply_kappa(particles, &kc, &kappa, dt);
         }
 
-        // Store pressure as density error for diagnostics
+        self.dfsph_alpha = alphas;
+        self.dfsph_kappa = kappa;
+
+        // Diagnostic pressure from the (linear) equation of state
         for p in particles.iter_mut() {
             p.pressure = equation_of_state(p.density, rest_density, config.gas_constant);
+        }
+
+        if particles
+            .iter()
+            .any(|p| !p.position.is_finite() || !p.velocity.is_finite())
+        {
+            return Err(PravashError::Diverged {
+                reason: "NaN/Inf in DFSPH particle state".into(),
+            });
         }
 
         // Boundary enforcement
@@ -1924,7 +2084,7 @@ impl SphSolver {
     ///
     /// dt = cfl · min(h/v_max, sqrt(h/a_max), h²/(6·ν))
     ///
-    /// Returns the computed dt clamped to `[dt_min, dt_max]`.
+    /// Returns the computed dt clamped to `[dt_min, dt_max]` (swapped if inverted).
     #[must_use]
     pub fn adaptive_dt(
         particles: &[FluidParticle],
@@ -1970,14 +2130,24 @@ impl SphSolver {
             dt_cfl = dt_cfl.min(h * h / (6.0 * viscosity));
         }
 
-        (cfl_factor * dt_cfl).clamp(dt_min, dt_max)
+        // Inverted bounds are swapped rather than panicking in f64::clamp.
+        let (lo, hi) = if dt_min <= dt_max {
+            (dt_min, dt_max)
+        } else {
+            (dt_max, dt_min)
+        };
+        (cfl_factor * dt_cfl).clamp(lo, hi)
     }
 
     /// Multi-phase SPH step with per-particle material properties.
     ///
     /// Each particle uses its `phase` index to look up rest density,
-    /// gas constant, and viscosity from `phase_config`. Interface tension
-    /// is applied between particles of different phases.
+    /// gas constant, and viscosity from `phase_config`. Free-surface tension
+    /// (`surface_tension`) uses the colour field of all neighbors; interface
+    /// tension acts only where particles of different phases meet.
+    ///
+    /// Returns an error if `phase_config.phases` is empty. Out-of-range phase
+    /// indices fall back to phase 0 (one warning per step).
     pub fn step_multiphase(
         &mut self,
         particles: &mut [FluidParticle],
@@ -1991,6 +2161,22 @@ impl SphSolver {
 
         if n == 0 {
             return Ok(());
+        }
+        if phase_config.phases.is_empty() {
+            return Err(PravashError::InvalidParameter {
+                reason: "multiphase config must define at least one phase".into(),
+            });
+        }
+        let bad_phase = particles
+            .iter()
+            .filter(|p| p.phase as usize >= phase_config.phases.len())
+            .count();
+        if bad_phase > 0 {
+            tracing::warn!(
+                particles = bad_phase,
+                available = phase_config.phases.len(),
+                "phase index out of bounds, falling back to phase 0"
+            );
         }
 
         let h_f32 = h as f32;
@@ -2054,10 +2240,16 @@ impl SphSolver {
                 let rho = pi.density.max(MIN_DENSITY);
                 let props_i = phase_config.get(pi.phase);
 
-                let mut cn_x = 0.0;
-                let mut cn_y = 0.0;
-                let mut cn_z = 0.0;
-                let mut laplacian_color = 0.0;
+                // Free-surface colour field (all neighbors, with self term)
+                let mut cn_s = DVec3::ZERO;
+                let mut lap_s = if st > 0.0 {
+                    pi.mass / rho * kc.poly6_laplacian(0.0)
+                } else {
+                    0.0
+                };
+                // Interface colour field (other-phase neighbors only)
+                let mut cn_i = DVec3::ZERO;
+                let mut lap_i = 0.0;
 
                 let start = offsets[i] as usize;
                 let end = offsets[i + 1] as usize;
@@ -2094,32 +2286,27 @@ impl SphSolver {
                     ay += v_scale * (pj.velocity.y - pi.velocity.y);
                     az += v_scale * (pj.velocity.z - pi.velocity.z);
 
-                    // Surface tension (CSF) + interface tension between different phases
-                    let effective_st = if pi.phase != pj.phase { st + it } else { st };
-                    if effective_st > 0.0 {
+                    // Surface tension (CSF) and interface tension (CSF on the
+                    // phase-indicator field, Hu & Adams 2006)
+                    if st > 0.0 || (it > 0.0 && pi.phase != pj.phase) {
                         let mass_over_rho = pj.mass / rho_j;
-                        let pg = kc.poly6_grad_scalar(r2);
-                        cn_x += mass_over_rho * pg * dx;
-                        cn_y += mass_over_rho * pg * dy;
-                        cn_z += mass_over_rho * pg * dz;
-                        laplacian_color += mass_over_rho * kc.poly6_laplacian(r2);
-                    }
-                }
-
-                // Apply surface/interface tension
-                if st > 0.0 || it > 0.0 {
-                    let cn_mag = (cn_x * cn_x + cn_y * cn_y + cn_z * cn_z).sqrt();
-                    let threshold = (1e-6 / kc.h).max(1e-10);
-                    if cn_mag > threshold {
-                        let kappa = -laplacian_color / cn_mag;
-                        let st_scale = (st + it) * kappa / (rho * cn_mag);
-                        ax += st_scale * cn_x;
-                        ay += st_scale * cn_y;
-                        az += st_scale * cn_z;
+                        let grad_c =
+                            DVec3::new(dx, dy, dz) * (mass_over_rho * kc.poly6_grad_scalar(r2));
+                        let lap_c = mass_over_rho * kc.poly6_laplacian(r2);
+                        if st > 0.0 {
+                            cn_s += grad_c;
+                            lap_s += lap_c;
+                        }
+                        if it > 0.0 && pi.phase != pj.phase {
+                            cn_i += grad_c;
+                            lap_i += lap_c;
+                        }
                     }
                 }
 
                 DVec3::new(ax, ay, az)
+                    + csf_acceleration(cn_s, lap_s, st, rho, kc.h)
+                    + csf_acceleration(cn_i, lap_i, it, rho, kc.h)
             };
 
             #[cfg(feature = "parallel")]
@@ -2318,10 +2505,13 @@ pub fn compute_gradient_corrections(
 ) -> Vec<[f64; 9]> {
     let _span = trace_span!("sph::mls_correction", n = particles.len()).entered();
     let n = particles.len();
-    let kc = KernelCoeffs::new(h);
     // Identity 3x3: [1,0,0, 0,1,0, 0,0,1]
     let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
     let mut corrections = vec![identity; n];
+    if !is_positive(h) || !neighbor_lists_valid(neighbor_offsets, neighbor_indices, n) {
+        return corrections;
+    }
+    let kc = KernelCoeffs::new(h);
 
     for i in 0..n {
         let pi = &particles[i];
@@ -2401,9 +2591,11 @@ pub fn apply_gradient_correction(correction: &[f64; 9], gw: DVec3) -> DVec3 {
 
 /// Apply implicit viscosity using an iterative solver.
 ///
-/// Treats viscosity implicitly: `v_new = v_old + dt·ν·∇²v_new`.
-/// Uses Jacobi iteration to solve the implicit system.
-/// Removes the viscous CFL restriction (dt < h²/6ν).
+/// Solves the backward-Euler system `v_new = v_old + dt·ν·∇²v_new` with
+/// Gauss-Seidel sweeps: `vᵢ = (v_oldᵢ + dtν·Σ aᵢⱼ vⱼ) / (1 + dtν·Σ aᵢⱼ)`,
+/// `aᵢⱼ = mⱼ∇²Wᵢⱼ/(ρᵢρⱼ)`. The system is diagonally dominant, so the sweep
+/// converges for any `dt` — this removes the viscous CFL restriction
+/// (dt < h²/6ν). Invalid neighbor lists are ignored with a warning.
 pub fn apply_implicit_viscosity(
     particles: &mut [FluidParticle],
     neighbor_offsets: &[u32],
@@ -2415,16 +2607,21 @@ pub fn apply_implicit_viscosity(
 ) {
     let _span = trace_span!("sph::implicit_visc", n = particles.len()).entered();
     let n = particles.len();
-    if n == 0 || viscosity <= 0.0 {
+    if n == 0 || !is_positive(viscosity) || !is_positive(h) || !is_positive(dt) {
+        return;
+    }
+    if !neighbor_lists_valid(neighbor_offsets, neighbor_indices, n) {
         return;
     }
 
     let kc = KernelCoeffs::new(h);
+    let c = viscosity * dt;
 
     const CONVERGENCE_THRESHOLD: f64 = 1e-8;
 
+    let v_old: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
+
     for _iter in 0..iterations {
-        let snap_vel: Vec<DVec3> = particles.iter().map(|p| p.velocity).collect();
         let mut max_change: f64 = 0.0;
 
         for i in 0..n {
@@ -2432,7 +2629,8 @@ pub fn apply_implicit_viscosity(
             let rho = particles[i].density.max(MIN_DENSITY);
             let start = neighbor_offsets[i] as usize;
             let end = neighbor_offsets[i + 1] as usize;
-            let mut laplacian = DVec3::ZERO;
+            let mut weighted = DVec3::ZERO;
+            let mut diag = 0.0;
 
             for &j in &neighbor_indices[start..end] {
                 if j == i {
@@ -2444,17 +2642,18 @@ pub fn apply_implicit_viscosity(
                 }
                 let r = r2.sqrt();
                 let rho_j = particles[j].density.max(MIN_DENSITY);
-                let lap = kc.visc_laplacian(r);
-                laplacian += (snap_vel[j] - snap_vel[i]) * (particles[j].mass * lap / rho_j);
+                let a_ij = particles[j].mass * kc.visc_laplacian(r) / (rho_j * rho);
+                weighted += particles[j].velocity * a_ij;
+                diag += a_ij;
             }
 
-            let new_vel = snap_vel[i] + laplacian * (viscosity * dt / rho);
-            let change = (new_vel - snap_vel[i]).length_squared();
+            let new_vel = (v_old[i] + weighted * c) / (1.0 + c * diag);
+            let change = (new_vel - particles[i].velocity).length_squared();
             max_change = max_change.max(change);
             particles[i].velocity = new_vel;
         }
 
-        // Early exit if all velocity updates are below convergence threshold
+        // Early exit once a sweep no longer changes the velocities
         if max_change < CONVERGENCE_THRESHOLD * CONVERGENCE_THRESHOLD {
             break;
         }
@@ -2476,6 +2675,10 @@ pub fn split_particle(
     let _span = trace_span!("sph::split_particle").entered();
     if n_children == 0 {
         return vec![];
+    }
+    if n_children == 1 {
+        // A single child must sit at the parent's position to conserve the centre of mass.
+        return vec![*parent];
     }
     let child_mass = parent.mass / n_children as f64;
     let mut children = Vec::with_capacity(n_children);
@@ -2538,13 +2741,23 @@ fn morton_code_2d(x: f64, y: f64, inv_cell: f64) -> u64 {
 ///
 /// Call before `SphSolver::step()` for improved cache hit rates during
 /// neighbor traversal. The cell size should match the smoothing radius.
+/// Uses a 2D (x, y) Morton code relative to the particles' bounding-box
+/// minimum, so negative coordinates sort correctly.
+///
+/// Reordering invalidates per-index solver state: call
+/// [`SphSolver::reset_integrator`] afterwards when `use_verlet` is enabled.
 pub fn sort_by_zorder(particles: &mut [FluidParticle], cell_size: f64) {
     let _span = trace_span!("sph::sort_by_zorder", n = particles.len()).entered();
-    if particles.len() < 2 || cell_size <= 0.0 {
+    if particles.len() < 2 || !is_positive(cell_size) {
         return;
     }
     let inv_cell = 1.0 / cell_size;
-    particles.sort_unstable_by_key(|p| morton_code_2d(p.position[0], p.position[1], inv_cell));
+    let (min_x, min_y) = particles.iter().fold((f64::MAX, f64::MAX), |(mx, my), p| {
+        (mx.min(p.position.x), my.min(p.position.y))
+    });
+    particles.sort_unstable_by_key(|p| {
+        morton_code_2d(p.position.x - min_x, p.position.y - min_y, inv_cell)
+    });
 }
 
 // ── Foam / Spray / Bubble Generation ──────────────────────────────────────
@@ -2672,6 +2885,8 @@ pub fn max_speed(particles: &[FluidParticle]) -> f64 {
 }
 
 /// Create a block of particles in a grid pattern.
+///
+/// Returns an empty vector for a non-positive or non-finite `spacing`.
 #[must_use]
 pub fn create_particle_block(
     origin: [f64; 2],
@@ -2679,9 +2894,15 @@ pub fn create_particle_block(
     spacing: f64,
     particle_mass: f64,
 ) -> Vec<FluidParticle> {
+    if !is_positive(spacing) || !size[0].is_finite() || !size[1].is_finite() {
+        return Vec::new();
+    }
     let nx = (size[0] / spacing).ceil() as usize;
     let ny = (size[1] / spacing).ceil() as usize;
-    let mut particles = Vec::with_capacity(nx * ny);
+    let Some(count) = nx.checked_mul(ny) else {
+        return Vec::new();
+    };
+    let mut particles = Vec::with_capacity(count);
     for iy in 0..ny {
         for ix in 0..nx {
             let x = origin[0] + ix as f64 * spacing;
@@ -3250,23 +3471,30 @@ mod tests {
         let mut solver = SphSolver::new();
         solver.step(&mut particles, &config, 0.001).unwrap();
 
-        let heat = HeatConfig { diffusivity: 1.0 };
+        // Physically scaled diffusivity (stable: dt·κ·ΣVⱼ∇²W ≪ 1). With the old
+        // extra 1/ρ factor this produced almost no conduction.
+        let heat = HeatConfig { diffusivity: 0.01 };
         let t_hot_before = particles[mid].temperature;
+        let (offsets, indices) = solver.neighbor_lists();
         for _ in 0..50 {
             update_heat(
                 &mut particles,
-                &solver.neighbor_offsets,
-                &solver.neighbor_indices,
+                offsets,
+                indices,
                 config.smoothing_radius,
                 &heat,
                 0.001,
             );
         }
+        let excess_before = t_hot_before - 293.15;
+        let excess_after = particles[mid].temperature - 293.15;
         assert!(
-            particles[mid].temperature < t_hot_before,
-            "hot particle should cool: before={t_hot_before}, after={}",
+            excess_after < 0.9 * excess_before && excess_after > 0.0,
+            "hot particle should cool noticeably: before={t_hot_before}, after={}",
             particles[mid].temperature
         );
+        // Maximum principle: no particle gets hotter than the initial maximum.
+        assert!(particles.iter().all(|p| p.temperature <= 500.0 + 1e-9));
     }
 
     // ── Viscoelastic tests ────────────────────────────────────────────────
@@ -3617,5 +3845,295 @@ mod tests {
         assert!((result.x - 2.0).abs() < 1e-10);
         assert!((result.y - 3.0).abs() < 1e-10);
         assert!((result.z - 4.0).abs() < 1e-10);
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    /// Brute-force CSR neighbor lists (all pairs within h, including self).
+    fn brute_neighbors(particles: &[FluidParticle], h: f64) -> (Vec<u32>, Vec<usize>) {
+        let mut offsets = vec![0u32];
+        let mut indices = Vec::new();
+        for pi in particles {
+            for (j, pj) in particles.iter().enumerate() {
+                if pi.distance_to(pj) <= h {
+                    indices.push(j);
+                }
+            }
+            offsets.push(indices.len() as u32);
+        }
+        (offsets, indices)
+    }
+
+    #[test]
+    fn test_delta_sph_diffuses_toward_neighbor() {
+        let mut ps = vec![
+            FluidParticle::new_2d(0.0, 0.0, 1.0),
+            FluidParticle::new_2d(0.02, 0.0, 1.0),
+        ];
+        ps[0].density = 1000.0;
+        ps[1].density = 1100.0;
+        let (o, idx) = brute_neighbors(&ps, 0.05);
+        apply_delta_sph(&mut ps, &o, &idx, 0.05, 10.0, 0.1, 1e-3);
+        assert!(
+            ps[0].density > 1000.0,
+            "low density must rise: {}",
+            ps[0].density
+        );
+        assert!(
+            ps[1].density < 1100.0,
+            "high density must fall: {}",
+            ps[1].density
+        );
+    }
+
+    #[test]
+    fn test_viscoelastic_simple_shear_upper_convected() {
+        // u = γ·y: only ∂u/∂y = γ is non-zero. Oldroyd-B (no relaxation over one
+        // step from C = I): dC_xx = 2γC_xy = 0, dC_xy = γC_yy = γ, dC_yy = 0.
+        let gamma = 1.0;
+        let mut ps = create_particle_block([0.0, 0.0], [0.2, 0.2], 0.02, 0.001);
+        for p in ps.iter_mut() {
+            p.density = 1000.0;
+            p.velocity.x = gamma * p.position.y;
+        }
+        let (o, idx) = brute_neighbors(&ps, 0.05);
+        let ve = ViscoelasticConfig {
+            elastic_modulus: 0.0,
+            relaxation_time: 1e12,
+        };
+        update_viscoelastic(&mut ps, &o, &idx, 0.05, &ve, 0.01);
+        // Interior particle (full neighborhood)
+        let mid = ps
+            .iter()
+            .position(|p| (p.position.x - 0.1).abs() < 1e-9 && (p.position.y - 0.1).abs() < 1e-9)
+            .unwrap();
+        let [cxx, cxy, cyy] = ps[mid].conformation;
+        assert!(
+            (cyy - 1.0).abs() < 1e-9,
+            "C_yy must stay 1 in simple shear: {cyy}"
+        );
+        assert!((cxx - 1.0).abs() < 1e-9, "C_xx: {cxx}");
+        assert!(cxy > 0.0, "C_xy grows with shear: {cxy}");
+    }
+
+    #[test]
+    fn test_phase_change_accumulates_latent_heat() {
+        let cfg = PhaseChangeConfig {
+            transition_temperature: 273.15,
+            latent_heat: 334_000.0,
+            heat_capacity: 2090.0,
+            phase_below: 0,
+            phase_above: 1,
+        };
+        let mut ps = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        ps[0].temperature = 273.15;
+        // Heat by 1 K worth of energy per step: L/cp ≈ 160 steps to melt.
+        let mut steps: usize = 0;
+        while ps[0].phase == 0 && steps < 1000 {
+            ps[0].temperature += 1.0;
+            update_phase_change(&mut ps, &cfg, 0.01);
+            steps += 1;
+        }
+        assert_eq!(ps[0].phase, 1, "slow heating must eventually melt");
+        let expected = (334_000.0_f64 / 2090.0).ceil() as usize;
+        assert!(steps.abs_diff(expected) <= 1, "{steps} vs {expected}");
+        assert_eq!(ps[0].fuel, 0.0);
+    }
+
+    #[test]
+    fn test_contact_angle_2d_and_neutral() {
+        let config = FluidConfig::water_2d();
+        // Near the bottom wall in a 2D (z-degenerate) domain.
+        let mut ps = vec![FluidParticle::new_2d(0.5, 0.01, 0.001)];
+        apply_contact_angle(&mut ps, &config, std::f64::consts::FRAC_PI_4, 0.07);
+        assert_eq!(ps[0].acceleration.z, 0.0, "no out-of-plane force in 2D");
+        assert!(ps[0].acceleration.y < 0.0, "wetting pulls toward the wall");
+        let mut ps = vec![FluidParticle::new_2d(0.5, 0.01, 0.001)];
+        apply_contact_angle(&mut ps, &config, std::f64::consts::FRAC_PI_2, 0.07);
+        assert!(
+            ps[0].acceleration.length() < 1e-12,
+            "neutral angle: no force"
+        );
+        let mut ps = vec![FluidParticle::new_2d(0.5, 0.01, 0.001)];
+        apply_contact_angle(&mut ps, &config, 3.0 * std::f64::consts::FRAC_PI_4, 0.07);
+        assert!(ps[0].acceleration.y > 0.0, "non-wetting pushes away");
+    }
+
+    #[test]
+    fn test_pcisph_zero_and_one_iteration() {
+        let config = FluidConfig::water_2d();
+        let block = create_particle_block([0.3, 0.3], [0.1, 0.1], 0.02, 0.001);
+        for iters in [0, 1] {
+            let mut ps = block.clone();
+            let mut solver = SphSolver::new();
+            solver
+                .step_pcisph(&mut ps, &config, 0.001, iters, 0.01)
+                .unwrap();
+            for (p, p0) in ps.iter().zip(&block) {
+                assert!(
+                    p.position.distance(p0.position) < 0.01,
+                    "iters={iters}: particle teleported {:?} -> {:?}",
+                    p0.position,
+                    p.position
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dfsph_reduces_compression() {
+        // A pre-compressed block with no gravity must expand, not collapse.
+        let mut config = FluidConfig::water_2d();
+        config.gravity = DVec3::ZERO;
+        config.dt = 1e-3;
+        let mut ps = create_particle_block([0.4, 0.4], [0.12, 0.12], 0.012, 0.001);
+        let mut solver = SphSolver::new();
+        // Reference: rest density from a lattice at spacing 0.02.
+        let rest = {
+            let lattice = create_particle_block([0.4, 0.4], [0.2, 0.2], 0.02, 0.001);
+            let mid = lattice.len() / 2 + 5;
+            compute_density(mid, &lattice, config.smoothing_radius)
+        };
+        config.rest_density = rest;
+        let max_rho = |ps: &[FluidParticle], h: f64| {
+            (0..ps.len())
+                .map(|i| compute_density(i, ps, h))
+                .fold(0.0f64, f64::max)
+        };
+        let before = max_rho(&ps, config.smoothing_radius);
+        assert!(before > rest, "block starts compressed");
+        for _ in 0..5 {
+            solver.step_dfsph(&mut ps, &config, 0.0, 20, 1e-3).unwrap();
+        }
+        let after = max_rho(&ps, config.smoothing_radius);
+        assert!(
+            after < before,
+            "DFSPH must relieve compression: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn test_implicit_viscosity_large_dt_is_stable() {
+        let mut ps = create_particle_block([0.0, 0.0], [0.1, 0.1], 0.02, 0.001);
+        for (k, p) in ps.iter_mut().enumerate() {
+            p.density = 100.0;
+            p.velocity.x = if k % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let (o, idx) = brute_neighbors(&ps, 0.05);
+        // ν·dt far beyond the explicit limit h²/6.
+        apply_implicit_viscosity(&mut ps, &o, &idx, 0.05, 10.0, 1.0, 200);
+        assert!(
+            ps.iter().all(|p| p.velocity.is_finite()),
+            "implicit solve diverged"
+        );
+        let vmax = ps.iter().map(|p| p.velocity.x.abs()).fold(0.0f64, f64::max);
+        assert!(
+            vmax <= 1.0 + 1e-9,
+            "implicit solve must not overshoot: {vmax}"
+        );
+        let spread = ps.iter().map(|p| p.velocity.x).fold(f64::MIN, f64::max)
+            - ps.iter().map(|p| p.velocity.x).fold(f64::MAX, f64::min);
+        assert!(
+            spread < 0.5,
+            "strong viscosity must smooth velocities: {spread}"
+        );
+    }
+
+    #[test]
+    fn test_verlet_exact_under_constant_gravity() {
+        let mut config = FluidConfig::water_2d();
+        config.bounds_min = DVec3::new(-100.0, -100.0, 0.0);
+        config.bounds_max = DVec3::new(100.0, 100.0, 0.0);
+        let mut ps = vec![FluidParticle::new_2d(0.0, 0.0, 0.001)];
+        let mut solver = SphSolver::new();
+        solver.use_verlet = true;
+        let steps = 20;
+        for _ in 0..steps {
+            solver.step(&mut ps, &config, 0.0).unwrap();
+        }
+        let t = steps as f64 * config.dt;
+        let exact = 0.5 * config.gravity.y * t * t;
+        assert!(
+            (ps[0].position.y - exact).abs() < 1e-12,
+            "Verlet: y = {} vs exact {exact}",
+            ps[0].position.y
+        );
+        assert!((ps[0].velocity.y - config.gravity.y * t).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_adaptive_dt_inverted_bounds_no_panic() {
+        let ps = vec![FluidParticle::new_2d(0.0, 0.0, 1.0)];
+        let dt = SphSolver::adaptive_dt(&ps, 0.05, 0.001, 0.5, 0.1, 0.01);
+        assert!((0.01..=0.1).contains(&dt));
+    }
+
+    #[test]
+    fn test_multiphase_empty_phases_is_error() {
+        let config = FluidConfig::water_2d();
+        let mut ps = create_particle_block([0.3, 0.3], [0.05, 0.05], 0.02, 0.001);
+        let mut solver = SphSolver::new();
+        let mut mp = MultiPhaseConfig::single(1000.0, 2000.0, 0.001);
+        mp.phases.clear();
+        assert!(solver.step_multiphase(&mut ps, &config, &mp).is_err());
+    }
+
+    #[test]
+    fn test_surface_tension_zero_for_interior_particle() {
+        // A particle deep inside a uniform lattice must feel no surface tension.
+        let mut config = FluidConfig::water_2d();
+        config.gravity = DVec3::ZERO;
+        let block = create_particle_block([0.2, 0.2], [0.4, 0.4], 0.02, 0.001);
+        let mid = block
+            .iter()
+            .position(|p| (p.position.x - 0.4).abs() < 1e-9 && (p.position.y - 0.4).abs() < 1e-9)
+            .unwrap();
+        let mut a = block.clone();
+        let mut b = block.clone();
+        SphSolver::new().step(&mut a, &config, 0.0).unwrap();
+        SphSolver::with_surface_tension(0.5)
+            .step(&mut b, &config, 0.0)
+            .unwrap();
+        let d = (a[mid].acceleration - b[mid].acceleration).length();
+        assert!(d < 1e-9, "interior surface-tension acceleration {d}");
+    }
+
+    #[test]
+    fn test_degenerate_inputs_no_panic() {
+        assert!(create_particle_block([0.0, 0.0], [1.0, 1.0], 0.0, 1.0).is_empty());
+        assert!(create_particle_block([0.0, 0.0], [1.0, 1.0], f64::NAN, 1.0).is_empty());
+        let parent = FluidParticle::new_2d(1.0, 2.0, 3.0);
+        let one = split_particle(&parent, 1, 0.5);
+        assert_eq!(one[0].position, parent.position);
+        assert!(equation_of_state_tait(1010.0, 1000.0, 10.0, 0.0).is_finite());
+        assert_eq!(kernel_poly6(0.0, 0.0), 0.0);
+        assert_eq!(kernel_spiky_grad(0.0, -1.0), 0.0);
+        assert_eq!(kernel_viscosity_laplacian(0.0, 0.0), 0.0);
+        // Invalid neighbor lists are ignored, not indexed.
+        let mut ps = vec![FluidParticle::new_2d(0.0, 0.0, 1.0); 3];
+        update_heat(
+            &mut ps,
+            &[0, 1],
+            &[5],
+            0.05,
+            &HeatConfig { diffusivity: 1.0 },
+            0.01,
+        );
+        apply_delta_sph(&mut ps, &[0], &[], 0.05, 10.0, 0.1, 0.01);
+        apply_implicit_viscosity(&mut ps, &[0, 1, 2, 9], &[0], 0.05, 1.0, 0.01, 5);
+        let c = compute_gradient_corrections(&ps, &[], &[], 0.05);
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn test_zorder_negative_coordinates() {
+        let mut ps = vec![
+            FluidParticle::new_2d(-1.0, -1.0, 1.0),
+            FluidParticle::new_2d(-3.0, -3.0, 1.0),
+            FluidParticle::new_2d(-2.0, -2.0, 1.0),
+        ];
+        sort_by_zorder(&mut ps, 0.5);
+        let xs: Vec<f64> = ps.iter().map(|p| p.position.x).collect();
+        assert_eq!(xs, vec![-3.0, -2.0, -1.0]);
     }
 }

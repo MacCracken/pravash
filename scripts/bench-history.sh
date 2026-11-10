@@ -24,20 +24,20 @@ BENCH_OUTPUT=$(cargo bench --manifest-path "$PROJECT_DIR/Cargo.toml" \
     exit 1
 }
 
-# Use awk to parse criterion output: track "Benchmarking X" lines (no colon),
-# then extract the middle estimate from "time: [lo est hi]" lines.
+# Use awk to parse criterion output. Criterion prints the benchmark name and
+# the "time: [lo est hi]" estimate on one line for short names, or the name
+# alone on its own line followed by an indented "time:" line for long names.
+# Units may be ps, ns, µs/us, ms or s.
 ENTRIES=$(echo "$BENCH_OUTPUT" | awk -v ts="$TIMESTAMP" -v label="$LABEL" -v outfile="$HISTORY_FILE" '
-/^Benchmarking [a-zA-Z]/ && !/:/ {
-    name = $2
+/^[A-Za-z0-9_]+\/[^[:space:]]+[[:space:]]*$/ {
+    name = $1
     next
 }
 /time:/ {
-    # Some lines have the name before "time:": "sph_step/9_particles   time: ..."
-    if ($0 ~ /^[a-zA-Z].*time:/) {
+    if ($0 ~ /^[A-Za-z0-9_]/) {
         name = $1
     }
-    match($0, /\[([0-9.]+) ([a-z]+) ([0-9.]+) ([a-z]+)/, arr)
-    if (arr[3] != "" && arr[4] != "" && name != "") {
+    if (match($0, /\[([0-9.]+) ([^ ]+) ([0-9.]+) ([^ ]+)/, arr) && name != "") {
         val = arr[3]
         unit = arr[4]
         if (unit == "ps") val = val * 0.001
@@ -45,8 +45,10 @@ ENTRIES=$(echo "$BENCH_OUTPUT" | awk -v ts="$TIMESTAMP" -v label="$LABEL" -v out
         else if (unit == "us" || unit == "µs") val = val * 1000
         else if (unit == "ms") val = val * 1000000
         else if (unit == "s") val = val * 1000000000
+        else next
         printf "%s,%s,%s,%.4f\n", ts, label, name, val >> outfile
         count++
+        name = ""
     }
 }
 END { print count+0 }

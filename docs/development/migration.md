@@ -1,5 +1,37 @@
 # Migration Guide
 
+## From 1.2.x to 1.3.0
+
+No public signatures changed, but the 1.3.0 audit fixed many numerical
+bugs, so results differ. See CHANGELOG 1.3.0 → *Behavior changes* for the
+full list. The ones most likely to need re-tuning:
+
+- **MSRV is now 1.99.**
+- **Grid with dx ≠ 1**: the projection now removes divergence instead of
+  amplifying it. Forces or buoyancy tuned to the old behaviour will look
+  different.
+- **SPH surface tension**: the force is now `−σ·∇²c·n̂/ρ`. Old coefficients
+  were effectively scaled by ~h, so reduce `surface_tension` accordingly.
+- **SPH heat**: `HeatConfig::diffusivity` is now a true thermal diffusivity
+  (m²/s). Values tuned around the old extra 1/ρ factor are ~ρ× too large
+  and can be unstable.
+- **Shallow water**: waves now travel at √(gh); `breaking_threshold` is a
+  dimensionless slope (default 0.5 unchanged); `dispersion_coeff` is
+  implicit and stable at any dt — the theoretical 1/3 is now usable.
+- **Coupling drag** is quadratic in speed; **added mass** no longer adds the
+  entrained fluid's weight.
+- **MPM**: `Fluid` pressure sign fixed; `DruckerPrager::friction_angle` is
+  in degrees and now matters; invalid materials make `step()` return `Err`.
+- **Arena**: handles from before `compact()` are stale — `get` returns an
+  empty slice and `free` ignores them.
+- **Neighbour lists** for `update_heat`, `update_viscoelastic`,
+  `apply_delta_sph`, `apply_implicit_viscosity` and
+  `compute_gradient_corrections` come from `SphSolver::neighbor_lists()`.
+- **Config structs** `HeatConfig`, `ViscoelasticConfig` and
+  `PhaseChangeConfig` now have `new` constructors (they could not be built
+  outside the crate before).
+
+
 ## From 0.24.x
 
 ### Breaking Changes

@@ -1,6 +1,31 @@
 # Pravash Roadmap
 
-> Last updated: 2026-03-26
+> Last updated: 2026-11-09
+
+### 1.3.0
+
+- [x] Toolchain: MSRV 1.99 (latest stable, edition 2024); deps to latest (hisab 1.4, criterion 0.8); unused `ai` network deps removed; CI actions bumped
+- [x] Full module audit (sph, grid/vof/phase_field, shallow/coupling, common/mpm/compute/bridge/buoyancy/vortex) — see CHANGELOG 1.3.0 for every fix
+- [x] Regression test per fix, mutation-checked for the projection, solver-sign, delta-SPH, DFSPH, implicit-viscosity, MPM-stress and wave-speed fixes
+- [x] `bench-history.sh` records all benchmarks (µs results were dropped)
+
+#### Deferred from the 1.3.0 audit (larger design changes)
+
+- [ ] **grid**: Neumann (∂p/∂n = 0) pressure walls for `FluidGrid` — all solvers use homogeneous Dirichlet; needs DCT (hisab `dct`) or ghost updates + mean removal. `MacGrid` already uses Neumann.
+- [ ] **grid**: periodic pressure solve (wrapped indices / FFT) — `BoundaryCondition::Periodic` uses Dirichlet pressure; `sample_periodic` wraps with period `nx` while ghosts imply `nx − 2`
+- [ ] **grid**: collocated compact Laplacian vs. wide divergence stencil leaves residual divergence after projection — `MacGrid` is exact; consider making MAC the default path
+- [ ] **grid**: `apply_ghost_fluid` sign/units (`σκφ/|∇φ|` is pressure × length); should add σκ to the Poisson RHS with θ-weighting
+- [ ] **grid**: local (per-cell) Smagorinsky ν_t instead of a domain average; k-ε advection/diffusion terms (only sources today)
+- [ ] **grid**: DST pressure solve is O(N²) per line with `sin()` per element — cache a sine table / FFT-based DST (perf)
+- [ ] **sph**: 2D kernel normalisation — 3D poly6/spiky/viscosity constants are used on z = 0 particles (Wendland kernels are 2D); needs a dimension on the solver/config
+- [ ] **sph**: `step()` overwrites `acceleration`, so external forces (viscoelastic, contact angle) must be applied after and re-integrated — add an external-force input
+- [ ] **sph**: neighbour lists keep all 27 cells unfiltered (≈6× true neighbours in 3D); filter by h, drop empty z-layers in 2D; parallelise PCISPH/DFSPH/multiphase loops; remove per-step `accels` allocations
+- [ ] **sph**: MLS gradient correction is a no-op in 2D (singular 3×3 moment matrix) — use a 2×2 path
+- [ ] **sph**: f32 spatial hash loses precision at large coordinates (≈0.05h at 1e4 with h = 0.01)
+- [ ] **mpm**: quadratic B-spline weights + APIC/MLS-MPM transfers (linear hat + PIC is dissipative); fluid viscosity in stress
+- [ ] **coupling**: FLIP cell marking (fluid/air/solid), Neumann solid walls, MAC layout; `particle_level_set` is brute force O(cells·N)
+- [ ] **bridge**: calibrated aeroacoustic noise model (Proudman) for `tke_to_broadband_noise_db`; current scaling is a relative cue
+- [ ] **shallow**: fully nonlinear Green-Naghdi (current option is a depth-weighted Peregrine operator)
 
 ### 1.1.0
 
@@ -83,7 +108,7 @@
 
 ## Cross-Crate Bridges
 
-- [ ] `bridge.rs` module — primitive-value conversions for cross-crate fluid dynamics (no deps on sibling crates)
-- [ ] **pavan bridge**: airfoil pressure distribution → surface flow velocity boundary conditions; wind field → free-stream velocity
-- [ ] **ushma bridge**: fluid temperature field → viscosity; heat source positions → thermal buoyancy forcing
-- [ ] **goonj bridge**: fluid velocity field → acoustic source strength (aeroacoustics); turbulent kinetic energy → broadband noise level
+- [x] `bridge.rs` module — primitive-value conversions for cross-crate fluid dynamics (no deps on sibling crates)
+- [x] **pavan bridge**: airfoil pressure distribution → surface flow velocity boundary conditions; wind field → free-stream velocity
+- [x] **ushma bridge**: fluid temperature field → viscosity; heat source positions → thermal buoyancy forcing
+- [x] **goonj bridge**: fluid velocity field → acoustic source strength (aeroacoustics); turbulent kinetic energy → broadband noise level

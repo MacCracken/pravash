@@ -18,6 +18,9 @@ pub struct VofField {
     pub dx: f64,
     /// Volume fraction per cell: 0 = empty, 1 = full fluid.
     pub alpha: Vec<f64>,
+    /// Previous-step α (reused across steps to avoid allocation).
+    #[serde(skip)]
+    scratch: Vec<f64>,
 }
 
 impl VofField {
@@ -36,6 +39,7 @@ impl VofField {
             ny,
             dx,
             alpha: vec![0.0; nx * ny],
+            scratch: vec![0.0; nx * ny],
         })
     }
 
@@ -126,10 +130,17 @@ impl VofField {
         self.alpha.iter().map(|&a| a * cell_area).sum()
     }
 
-    /// Advect the volume fraction field using donor-acceptor method.
+    /// Advect the volume fraction field using an upwind (donor-cell) flux method.
     ///
-    /// `vx` and `vy` are velocity fields on the same grid.
-    /// Uses a flux-limiting approach to maintain α ∈ [0, 1].
+    /// `vx` and `vy` are cell-centred velocity fields on the same grid.
+    /// Face fluxes are shared by both neighbouring cells, faces on the
+    /// boundary ring are closed (no flux through the walls), and the step is
+    /// sub-cycled so the per-substep Courant number stays ≤ 0.5. Together
+    /// these conserve volume except where a converging flow overfills a cell
+    /// (α is clamped to [0, 1]).
+    ///
+    /// Returns an error if `dt` is invalid, the velocity slices do not match
+    /// the grid, or the velocity is non-finite.
     pub fn advect(&mut self, vx: &[f64], vy: &[f64], dt: f64) -> Result<()> {
         let _span = trace_span!("vof::advect", nx = self.nx, ny = self.ny).entered();
         if !dt.is_finite() || dt <= 0.0 {
@@ -139,17 +150,54 @@ impl VofField {
         let nx = self.nx;
         let ny = self.ny;
         let dx = self.dx;
-        let inv_dx = 1.0 / dx;
+        let n = nx * ny;
+        if nx < 4 || ny < 4 || self.alpha.len() != n || vx.len() != n || vy.len() != n {
+            return Err(PravashError::InvalidParameter {
+                reason: format!(
+                    "VOF advect: velocity/alpha lengths ({}, {}, {}) must equal nx*ny = {n}",
+                    vx.len(),
+                    vy.len(),
+                    self.alpha.len()
+                )
+                .into(),
+            });
+        }
+        if vx.iter().chain(vy).any(|v| !v.is_finite()) {
+            return Err(PravashError::Diverged {
+                reason: "VOF advect: non-finite velocity".into(),
+            });
+        }
+        let max_v = vx.iter().chain(vy).fold(0.0f64, |m, v| m.max(v.abs()));
+        // Two flux directions per cell: keep (|u|+|v|)·dt/dx ≤ 0.5 per substep.
+        let courant = 2.0 * max_v * dt / dx;
+        let substeps = (courant / 0.5).ceil().clamp(1.0, 1024.0) as usize;
+        let sub_dt = dt / substeps as f64;
+        for _ in 0..substeps {
+            self.advect_substep(vx, vy, sub_dt);
+        }
+        Ok(())
+    }
 
-        let old_alpha = self.alpha.clone();
+    /// One conservative donor-cell substep with closed walls.
+    fn advect_substep(&mut self, vx: &[f64], vy: &[f64], dt: f64) {
+        let nx = self.nx;
+        let ny = self.ny;
+        let inv_dx = 1.0 / self.dx;
+
+        let mut old_alpha = std::mem::take(&mut self.scratch);
+        old_alpha.resize(nx * ny, 0.0);
+        old_alpha.copy_from_slice(&self.alpha);
 
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
 
-                // Donor-acceptor fluxes at each face
+                // Donor-cell fluxes at each face; faces touching the boundary
+                // ring are walls (zero flux).
                 // x-direction
-                let flux_right = {
+                let flux_right = if x + 1 == nx - 1 {
+                    0.0
+                } else {
                     let u = 0.5 * (vx[i] + vx[i + 1]);
                     let donor = if u > 0.0 {
                         old_alpha[i]
@@ -158,7 +206,9 @@ impl VofField {
                     };
                     u * donor * dt * inv_dx
                 };
-                let flux_left = {
+                let flux_left = if x == 1 {
+                    0.0
+                } else {
                     let u = 0.5 * (vx[i - 1] + vx[i]);
                     let donor = if u > 0.0 {
                         old_alpha[i - 1]
@@ -168,7 +218,9 @@ impl VofField {
                     u * donor * dt * inv_dx
                 };
                 // y-direction
-                let flux_top = {
+                let flux_top = if y + 1 == ny - 1 {
+                    0.0
+                } else {
                     let v = 0.5 * (vy[i] + vy[i + nx]);
                     let donor = if v > 0.0 {
                         old_alpha[i]
@@ -177,7 +229,9 @@ impl VofField {
                     };
                     v * donor * dt * inv_dx
                 };
-                let flux_bottom = {
+                let flux_bottom = if y == 1 {
+                    0.0
+                } else {
                     let v = 0.5 * (vy[i - nx] + vy[i]);
                     let donor = if v > 0.0 {
                         old_alpha[i - nx]
@@ -187,12 +241,11 @@ impl VofField {
                     v * donor * dt * inv_dx
                 };
 
-                self.alpha[i] -= flux_right - flux_left + flux_top - flux_bottom;
-                self.alpha[i] = self.alpha[i].clamp(0.0, 1.0);
+                let a = old_alpha[i] - (flux_right - flux_left + flux_top - flux_bottom);
+                self.alpha[i] = a.clamp(0.0, 1.0);
             }
         }
-
-        Ok(())
+        self.scratch = old_alpha;
     }
 
     /// Compute approximate interface normal at a surface cell using gradient of α.
@@ -273,5 +326,41 @@ mod tests {
         let (nx, _ny) = vof.interface_normal(10, 10);
         // Gradient of α points from high→low, so -x at the interface
         assert!(nx.abs() > 0.5, "should have strong x-component: nx={nx}");
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    #[test]
+    fn test_vof_conserves_volume_cellular_flow() {
+        // Divergence-free cellular flow, tangential at the walls of [0, L]².
+        let (nx, ny, dx) = (34, 34, 0.1);
+        let l = (nx - 2) as f64 * dx;
+        let mut vof = VofField::new(nx, ny, dx).unwrap();
+        vof.fill_rect(0.1, 0.1, 0.5 * l, l + 0.05);
+        let v0 = vof.total_volume();
+        let n = nx * ny;
+        let mut vx = vec![0.0; n];
+        let mut vy = vec![0.0; n];
+        let pi = std::f64::consts::PI;
+        for y in 0..ny {
+            for x in 0..nx {
+                let (px, py) = ((x as f64 - 0.5) * dx, (y as f64 - 0.5) * dx);
+                vx[y * nx + x] = (pi * px / l).sin() * (pi * py / l).cos();
+                vy[y * nx + x] = -(pi * px / l).cos() * (pi * py / l).sin();
+            }
+        }
+        for _ in 0..40 {
+            vof.advect(&vx, &vy, 0.05).unwrap();
+        }
+        let v1 = vof.total_volume();
+        assert!((v1 - v0).abs() < 0.01 * v0, "volume {v0} -> {v1}");
+        assert!(vof.alpha.iter().all(|&a| (0.0..=1.0).contains(&a)));
+    }
+
+    #[test]
+    fn test_vof_rejects_short_velocity() {
+        let mut vof = VofField::new(8, 8, 0.1).unwrap();
+        assert!(vof.advect(&[0.0; 10], &[0.0; 64], 0.01).is_err());
+        assert!(vof.advect(&[f64::NAN; 64], &[0.0; 64], 0.01).is_err());
     }
 }

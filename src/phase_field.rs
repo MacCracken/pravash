@@ -109,21 +109,42 @@ impl PhaseField {
     /// Step the phase field using Allen-Cahn with velocity advection.
     ///
     /// `vx` and `vy` are the velocity fields (same grid dimensions).
-    /// Pass empty slices if no advection is needed.
+    /// Pass empty slices if no advection is needed; slices of any other
+    /// length are an error. Advection is first-order upwind (stable for
+    /// `|u|·dt/dx ≤ 1`).
     pub fn step(&mut self, vx: &[f64], vy: &[f64], dt: f64) -> Result<()> {
         let _span = trace_span!("phase_field::step", nx = self.nx, ny = self.ny).entered();
         if !dt.is_finite() || dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
         }
+        let n = self.nx * self.ny;
+        if self.phi.len() != n || self.nx < 3 || self.ny < 3 {
+            return Err(PravashError::InvalidGridResolution {
+                nx: self.nx,
+                ny: self.ny,
+            });
+        }
+        let no_velocity = vx.is_empty() && vy.is_empty();
+        if !no_velocity && (vx.len() != n || vy.len() != n) {
+            return Err(PravashError::InvalidParameter {
+                reason: format!(
+                    "phase field velocity lengths ({}, {}) must be 0 or nx*ny = {n}",
+                    vx.len(),
+                    vy.len()
+                )
+                .into(),
+            });
+        }
 
         let nx = self.nx;
         let ny = self.ny;
         let dx = self.dx;
-        let inv_2dx = 0.5 / dx;
-        let inv_dx2 = 1.0 / (dx * dx);
+        let inv_dx = 1.0 / dx;
+        let inv_dx2 = inv_dx * inv_dx;
         let m = self.mobility;
         let eps2 = self.epsilon * self.epsilon;
-        let has_velocity = vx.len() == nx * ny && vy.len() == nx * ny;
+        let has_velocity = !no_velocity;
+        let mut diverging = 0usize;
 
         // Ensure scratch buffer
         let size = nx * ny;
@@ -145,25 +166,42 @@ impl PhaseField {
                 // Allen-Cahn: M · (ε²·∇²φ - f'(φ))
                 let reaction = m * (eps2 * lap - f_prime);
 
-                // Advection: -u·∇φ (upwind would be better but central is simpler)
+                // Advection: -u·∇φ, first-order upwind (central differencing
+                // with forward Euler is unconditionally unstable).
                 let advection = if has_velocity {
-                    let dpdx = (ph[i + 1] - ph[i - 1]) * inv_2dx;
-                    let dpdy = (ph[i + nx] - ph[i - nx]) * inv_2dx;
-                    -(vx[i] * dpdx + vy[i] * dpdy)
+                    let (u, v) = (vx[i], vy[i]);
+                    let dpdx = if u > 0.0 {
+                        p - ph[i - 1]
+                    } else {
+                        ph[i + 1] - p
+                    } * inv_dx;
+                    let dpdy = if v > 0.0 {
+                        p - ph[i - nx]
+                    } else {
+                        ph[i + nx] - p
+                    } * inv_dx;
+                    -(u * dpdx + v * dpdy)
                 } else {
                     0.0
                 };
 
                 let new_phi = self.phi[i] + (advection + reaction) * dt;
 
-                // Warn if the phase field is diverging significantly
                 if new_phi.abs() > 1.5 {
-                    tracing::warn!(x, y, new_phi, "phase field divergence detected (|φ| > 1.5)");
+                    diverging += 1;
                 }
 
                 // Clamp to [-1, 1] for stability
                 self.phi[i] = new_phi.clamp(-1.0, 1.0);
             }
+        }
+
+        // One warning per step (not per cell) if the field is diverging.
+        if diverging > 0 {
+            tracing::warn!(
+                cells = diverging,
+                "phase field divergence detected (|φ| > 1.5)"
+            );
         }
 
         // Neumann boundary (zero gradient)
@@ -299,5 +337,36 @@ mod tests {
         pf.phi[i] = 0.1;
         assert!(pf.is_interface(5, 5, 0.5));
         assert!(!pf.is_interface(0, 0, 0.5)); // φ = -1, not near interface
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    #[test]
+    fn test_phase_field_rejects_wrong_velocity_length() {
+        let mut pf = PhaseField::new(8, 8, 0.1).unwrap();
+        assert!(pf.step(&[0.0; 10], &[0.0; 10], 0.001).is_err());
+        assert!(pf.step(&[], &[], 0.001).is_ok());
+    }
+
+    #[test]
+    fn test_phase_field_upwind_advection_bounded() {
+        // High cell Péclet number (central differencing would oscillate).
+        let mut pf = PhaseField::new(32, 8, 0.1).unwrap();
+        pf.mobility = 0.0;
+        for y in 0..8 {
+            for x in 0..32 {
+                pf.phi[y * 32 + x] = if x < 10 { 1.0 } else { -1.0 };
+            }
+        }
+        let n = 32 * 8;
+        let vx = vec![1.0; n];
+        let vy = vec![0.0; n];
+        for _ in 0..20 {
+            pf.step(&vx, &vy, 0.05).unwrap();
+        }
+        // Upwind is monotone: no new extrema were created (clamp never needed).
+        assert!(pf.phi.iter().all(|&p| (-1.0..=1.0).contains(&p)));
+        // The front moved downstream.
+        assert!(pf.phi[4 * 32 + 12] > -1.0);
     }
 }

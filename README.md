@@ -22,7 +22,7 @@ Default features: `sph`, `grid`, `shallow`.
 
 Optional: `buoyancy`, `vortex`, `coupling`, `compute`, `parallel`, `ai`, `logging`.
 
-MSRV: **1.89** (Rust edition 2024).
+MSRV: **1.99** (Rust edition 2024).
 
 ## Features
 
@@ -36,7 +36,7 @@ MSRV: **1.89** (Rust edition 2024).
 | `coupling` | no | Fluid-body interaction, FLIP/PIC hybrid, level set, added mass |
 | `compute` | no | GPU-agnostic `ComputeBackend` trait, packed f32 buffers |
 | `parallel` | no | Rayon parallelism for SPH and grid operations |
-| `ai` | no | Daimon/hoosh integration (network deps) |
+| `ai` | no | Daimon/hoosh endpoint config types (no network deps) |
 | `logging` | no | Structured logging + chrome://tracing profiling via `PRAVASH_LOG` |
 | `full` | -- | Enables all features |
 

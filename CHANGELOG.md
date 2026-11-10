@@ -2,6 +2,93 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-09
+
+Toolchain/dependency refresh plus a full correctness audit of every module.
+Most fixes change numerical results — read **Behavior changes** before
+upgrading. No public signatures were removed or changed.
+
+### Behavior changes (migration)
+- **grid**: pressure projection now actually removes divergence for any `dx` (it amplified divergence ~1/dx² for dx < 1). Simulations at dx ≠ 1 behave very differently — re-tune forces tuned against the old behaviour.
+- **grid**: `FreeSlip` ghost cells now reflect the normal velocity (`ghost = −interior`, zero at the wall face) like `NoSlip`, instead of setting the ghost to 0.
+- **sph**: surface tension is now Müller's `−σ·∇²c·n̂/ρ` (was divided by an extra `|n|`) and only acts where `|∇c| > 0.1/h`; coefficients tuned for 1.2 are ~1/h too strong now.
+- **sph**: `update_heat` no longer divides by ρ a second time — conduction is ~ρ× faster; use a physical diffusivity (water ≈ 1.4e-7 m²/s).
+- **sph**: `update_phase_change` now accumulates latent heat across steps in `fuel` (progress toward the other phase, reset on transition) — don't combine with combustion.
+- **sph**: `apply_contact_angle` applies `σ·cos θ/h` toward the wall for wetting (θ < 90°), none at 90°, away for θ > 90°; no longer divides by mass and never acts on degenerate (2D) axes.
+- **sph**: PCISPH always runs ≥ 1 iteration and converges on *compression* only.
+- **shallow**: continuity flux was halved (waves ran at √(gh/2)); waves now travel at √(gh).
+- **shallow**: `breaking_threshold` is now a dimensionless surface slope `|∇η|` (was `|∇η|/depth`, units 1/m).
+- **shallow**: `dispersion_coeff` now drives an implicit Peregrine-form filter (`ω² = ghk²/(1+c·h²k²)`, stable for any dt) instead of an explicit 4th-order term that grew exponentially; `use_green_naghdi` selects the depth-weighted operator.
+- **shallow**: domain edges are closed walls (no mass leaks into ghost cells).
+- **coupling**: drag is quadratic (`½ρ|v|²CdA`, was linear in |v|); added-mass integration applies gravity to the body mass only; FLIP projection is dx-correct; P2G is mass-weighted.
+- **mpm**: the `Fluid` stress sign is fixed (compression now pushes back); `DruckerPrager` now has real plasticity with `friction_angle` in **degrees**; `step()` validates every particle's material and volume and returns `Err` instead of producing NaN; grid walls are separating and particles stay in the domain.
+- **vortex**: `lamb_oseen_velocity` with `ν·t = 0` returns the point-vortex speed Γ/(2πr) (was 0); `kolmogorov_scale(0, ε)` returns 0 (was ∞).
+- **buoyancy**: `reynolds_number` uses |v| and rejects NaN viscosity; `classify_flow` uses |Re|; `terminal_velocity` rejects non-positive ρ, Cd or A individually.
+
+### Changed
+- **toolchain**: MSRV 1.89 → 1.99 (edition 2024, latest stable); CI MSRV job, README and CLAUDE.md updated.
+- **deps**: hisab 1.1 → 1.4, serde 1.0.229, thiserror 2.0.21, tracing 0.1.44, tracing-subscriber 0.3.23, tracing-chrome 0.7.2, rayon 1.12, serde_json 1.0.154 (dev), criterion 0.5 → 0.8 (dev; benches use `std::hint::black_box`).
+- **ai**: the feature no longer pulls `reqwest`, `tokio` (`full`) or `serde_json` — none were used. Lockfile: 214 → 93 packages, no OpenSSL/native-tls.
+- **compute**: feature now enables `sph` (it calls the SPH kernels; `--no-default-features --features compute` failed to build).
+- **ci**: actions/checkout v4 → v7, codecov-action v4 → v7, action-gh-release v2 → v3.
+- **scripts**: `bench-history.sh` now records µs-scale results and names printed on their own line (it silently dropped them — 19 of 57 benchmarks were recorded).
+- **deny**: dropped the unused BSD-3-Clause allowance.
+- **docs**: docs.rs builds with all features; crate-level module list completed; stale doc claims fixed (Periodic "FFT solve", MacCormack "fallback", k-ε "transport", MPM fluid viscosity).
+
+### Fixed
+#### grid
+- Projection RHS is now `−dx²·∇·u` for the unit-stencil Poisson system (all four solvers).
+- DST and CG solved the opposite-sign system to Gauss-Seidel; all solvers now solve `4p − Σp = rhs` (CG on the SPD operator, relative tolerance).
+- Multigrid: residual sign, missing ×4 coarse RHS, and one-sided prolongation fixed; V-cycles now converge, and `pressure_iterations/10` cycles are run.
+- MacCormack/BFECC limiter clamped to the destination cell's neighbours (erased features moving > 1 cell/step); now clamps to the backtraced stencil. "BFECC" was MacCormack — it now advects the error-compensated field forward.
+- `MacGrid::step`: closed walls, buoyancy only on interior faces (no accumulation on wall faces), Neumann pressure over every cell, density advection (was documented but missing), sizes validated; `cfl_dt` returns `f64::MAX` without flow instead of a length.
+- `FluidGrid::step` re-validates sizes (Deserialize/pub fields), rejects NaN `smagorinsky_cs`/`vorticity_confinement`/buoyancy, and errors on non-finite velocity after projection; `cfl_dt` saturates instead of returning ∞.
+- `diffuse`, `KEpsilon::step`, `apply_ghost_fluid` ignore mismatched sizes (warning) instead of panicking.
+- VOF: closed walls (no leak into the ring), sub-cycled to Courant ≤ 0.5, persistent scratch buffer, slice lengths and non-finite velocity checked.
+- Phase field: upwind advection (central + forward Euler is unconditionally unstable), one divergence warning per step (was per cell), wrong-length velocity slices are an error.
+#### sph
+- DFSPH rewritten in Bender & Koschier order (density solver → advect → divergence solver) with the correct sign of Dρ/Dt, `κ/ρ` scaling, κ computed for all particles first, compression-only correction, and persistent buffers.
+- Delta-SPH diffusion had the wrong sign (amplified density noise).
+- PCISPH: `max_iterations = 0` teleported particles to the origin; the final integration used one-iteration-old pressures; δ came from an average dominated by sparse particles (now a full-neighbourhood prototype).
+- `apply_implicit_viscosity` was K explicit steps; it is now a backward-Euler Gauss-Seidel solve.
+- Viscoelastic Oldroyd-B used ∇uᵀ in one term (C_yy drifted in simple shear).
+- `use_verlet` was first-order (lagged acceleration, zero first step); it is now velocity Verlet (exact under constant acceleration). New `SphSolver::reset_integrator()` for after reordering.
+- Colour-field Laplacian includes the self term; multiphase interface tension uses its own colour field and only acts between phases; out-of-range phases warn once per step; empty `phases` is an error (was a panic).
+- `adaptive_dt` with inverted bounds panicked in `f64::clamp`.
+- Public kernels return 0 for `h <= 0` (NaN in release); `equation_of_state_tait` handles γ → 0; `create_particle_block` with spacing ≤ 0 returned an endless allocation; `split_particle(.., 1, ..)` moved the centre of mass; `sort_by_zorder` mis-sorted negative coordinates.
+- Free functions taking neighbour lists validate them (warning) instead of panicking.
+#### shallow
+- Riemann path is a proper finite-volume HLL update of (h, hu, hv) with Audusse hydrostatic reconstruction (well-balanced) and mirrored-wall states; it no longer double-counts the pressure gradient and advection. HLL uses dry-bed wave speeds.
+- Convective terms are upwinded (centred + forward Euler was unconditionally unstable).
+- Breaking detection ignores dry neighbours.
+- Sediment: suspended volume `C·h` is conserved through erosion/deposition (bed can no longer rise above the surface); uses `dry_threshold`; validates `dt`/lengths.
+- `new()` validates `dx` and height; `step()` validates sizes/gravity/dispersion and errors on non-finite state.
+#### coupling
+- FLIP pressure solve missing `dx²` (over-corrected ~100× at dx = 0.1).
+- `drag_from_particles_indexed` queried only `sample_radius` around the centre and missed bodies larger than the radius; stale hash indices are skipped instead of panicking.
+- P2G weights could go negative for particles outside the grid.
+- APIC `C` used the quadratic-B-spline factor with bilinear weights; it is now `Σ vᵢ∇wᵢᵀ` (exact for linear fields).
+- `flip_ratio` NaN is an error; `particle_level_set` ignores a mismatched buffer.
+#### common / compute / misc
+- `ParticleArena`: watermark allocations returned stale particles; double free and stale (post-`compact`) handles corrupted the free list or aliased blocks; foreign handles panicked; `alloc(usize::MAX)` overflowed. Handles now carry a generation.
+- `ParticleSoa::to_aos`/`write_to_aos` and `PackedParticles::from_soa`/`unpack_*` panicked on mismatched lengths.
+- `FluidMaterial::custom`, `FluidConfig::validate`, `check_cfl` accepted NaN/Inf (and negative velocities).
+- `KernelDerivatives::dtait_drho` NaN at γ = 0; `dpoly6_dr2(0, 0)` NaN.
+- `bridge::heat_to_buoyancy_forcing` NaN at density 0 (ρ cancels).
+
+### Added
+- `SphSolver::neighbor_lists()` (the free neighbour-list functions were unusable without it), `SphSolver::reset_integrator()`.
+- Constructors for `#[non_exhaustive]` configs that external crates could not build: `HeatConfig::new`, `ViscoelasticConfig::new`, `PhaseChangeConfig::new` / `water_ice`, and `Default` for `SphKernelParams`/`GridKernelParams`/`ShallowKernelParams`.
+- `ShallowWater::interior_volume()` (the conserved quantity), `ParticleSoa::is_consistent`/`consistent_len`, `BodyShape::bounding_radius`/`projected_area`.
+
+### Security
+- `DaimonConfig`'s `Debug` redacts `api_key`.
+
+### Performance
+- No speedups are claimed. The full suite (`bench-history.sh`, labels `baseline-1.2.0` → `post-audit-1.3.0`, 57/57 benchmarks) ran on a shared, loaded host and moved ±100% even on unchanged code (`shallow_disturbance`), so it is not used as evidence.
+- Pinned A/B (`taskset -c 15`, old/new interleaved, 2 runs each, 2 s measurement) shows parity within run-to-run noise (±20%): `grid_step/63x63` 10.8/13.2 → 13.3/10.5 ms, `grid_step_maccormack/63x63` 12.3/12.9 → 13.8/10.7 ms, `pcisph_step/64` 64.3/68.0 → 80.1/61.5 µs, `solver_step/256` 344/363 → 365/287 µs, `solver_step_st/169` 206/204 → 194/197 µs, `shallow_step/128x128` 546/543 → 567/519 µs, `flip_step/225` 25.0/19.8 → 22.8/28.3 µs.
+- Standalone kernels: the new `h > 0` guard first cost ~0.4 ns (+15–30%); reduced to a single comparison, now at parity — `sph_kernels/poly6` 2.35/2.10 → 2.00/2.21 ns, `spiky_grad` 2.11/1.85 → 1.57/1.65 ns, `viscosity_laplacian` 1.53/1.72 → 1.48/1.61 ns.
+
 ## [1.2.0]
 
 ### Added

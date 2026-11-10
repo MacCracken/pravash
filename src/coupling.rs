@@ -61,6 +61,34 @@ impl BodyShape {
             }
         }
     }
+
+    /// Radius of the smallest sphere around the body centre containing the shape.
+    #[inline]
+    #[must_use]
+    pub fn bounding_radius(&self) -> f64 {
+        match *self {
+            BodyShape::Sphere { radius } => radius.abs(),
+            BodyShape::Box { half_extents } => (half_extents[0] * half_extents[0]
+                + half_extents[1] * half_extents[1]
+                + half_extents[2] * half_extents[2])
+                .sqrt(),
+        }
+    }
+
+    /// Cross-section area projected onto the plane normal to unit direction `dir`.
+    #[inline]
+    #[must_use]
+    pub fn projected_area(&self, dir: DVec3) -> f64 {
+        match *self {
+            BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
+            BodyShape::Box { half_extents } => {
+                // Each face pair contributes proportionally to its alignment.
+                4.0 * (dir.x.abs() * half_extents[1] * half_extents[2]
+                    + dir.y.abs() * half_extents[0] * half_extents[2]
+                    + dir.z.abs() * half_extents[0] * half_extents[1])
+            }
+        }
+    }
 }
 
 /// A rigid body that interacts with fluid particles.
@@ -96,6 +124,7 @@ impl RigidBody {
     }
 
     /// Surface normal at a point (central-difference gradient of signed distance).
+    #[inline]
     #[must_use]
     pub fn surface_normal(&self, point: DVec3) -> DVec3 {
         let eps = 1e-6;
@@ -229,6 +258,10 @@ pub fn effective_mass(body_mass: f64, fluid_density: f64, body_volume: f64, ca: 
 /// The added mass increases the effective inertia of the body, reducing
 /// acceleration for a given force. `ca` is the added mass coefficient
 /// (shape-dependent, 0.5 for sphere).
+///
+/// `a = (F + m·g) / (m + C_a·ρ·V)`: gravity acts on the body's own mass
+/// only — the entrained fluid adds inertia, not weight. Include buoyancy
+/// in `body.force`.
 pub fn integrate_bodies_with_added_mass(
     bodies: &mut [RigidBody],
     gravity: DVec3,
@@ -240,12 +273,33 @@ pub fn integrate_bodies_with_added_mass(
         let vol = body.shape.volume();
         let m_eff = effective_mass(body.mass, fluid_density, vol, ca);
         let inv_m = 1.0 / m_eff.max(1e-20);
-        body.velocity += (body.force * inv_m + gravity) * dt;
+        body.velocity += (body.force + gravity * body.mass) * inv_m * dt;
         body.position += body.velocity * dt;
     }
 }
 
 // ── Drag from Velocity Fields ───────────────────────────────────────────────
+
+/// Quadratic drag on `body` from the mean fluid velocity of the sampled particles:
+/// `F = ½·ρ·|v_rel|·v_rel·Cd·A(v̂_rel)` (magnitude ½ρ|v_rel|²CdA along v_rel).
+fn drag_from_mean_velocity(
+    body: &RigidBody,
+    velocity_sum: DVec3,
+    count: usize,
+    fluid_density: f64,
+    drag_coefficient: f64,
+) -> DVec3 {
+    if count == 0 {
+        return DVec3::ZERO;
+    }
+    let rel_v = velocity_sum / count as f64 - body.velocity;
+    let rel_speed = rel_v.length();
+    if rel_speed <= 1e-20 || !rel_speed.is_finite() {
+        return DVec3::ZERO;
+    }
+    let area = body.shape.projected_area(rel_v / rel_speed);
+    rel_v * (0.5 * fluid_density * rel_speed * drag_coefficient * area)
+}
 
 /// Compute drag on a rigid body from nearby SPH particle velocities.
 ///
@@ -253,7 +307,8 @@ pub fn integrate_bodies_with_added_mass(
 /// within `sample_radius`, then applies the standard drag formula using
 /// the relative velocity.
 ///
-/// Returns the drag force vector (opposing relative motion).
+/// Returns the drag force vector (along the fluid-relative velocity), with
+/// magnitude `½·ρ·|v_rel|²·Cd·A`.
 #[must_use]
 pub fn drag_from_particles(
     body: &RigidBody,
@@ -263,62 +318,15 @@ pub fn drag_from_particles(
     sample_radius: f64,
 ) -> DVec3 {
     let _span = trace_span!("coupling::drag_from_particles").entered();
-    // Average fluid velocity near the body surface
-    let mut avg_vx = 0.0;
-    let mut avg_vy = 0.0;
-    let mut avg_vz = 0.0;
-    let mut count = 0.0;
-
+    let mut sum = DVec3::ZERO;
+    let mut count = 0usize;
     for p in particles {
-        let sd = body.signed_distance(p.position);
-        if sd.abs() < sample_radius {
-            avg_vx += p.velocity.x;
-            avg_vy += p.velocity.y;
-            avg_vz += p.velocity.z;
-            count += 1.0;
+        if body.signed_distance(p.position).abs() < sample_radius {
+            sum += p.velocity;
+            count += 1;
         }
     }
-
-    if count < 1.0 {
-        return DVec3::ZERO;
-    }
-
-    avg_vx /= count;
-    avg_vy /= count;
-    avg_vz /= count;
-
-    // Relative velocity (fluid relative to body)
-    let rel_vx = avg_vx - body.velocity.x;
-    let rel_vy = avg_vy - body.velocity.y;
-    let rel_vz = avg_vz - body.velocity.z;
-    let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz).sqrt();
-
-    if rel_speed < 1e-20 {
-        return DVec3::ZERO;
-    }
-
-    // Cross-section area projected onto the velocity-normal plane
-    let area = match body.shape {
-        BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
-        BodyShape::Box { half_extents } => {
-            // Project box area onto the plane perpendicular to relative velocity
-            let ax = (rel_vx / rel_speed).abs();
-            let ay = (rel_vy / rel_speed).abs();
-            let az = (rel_vz / rel_speed).abs();
-            // Each face contributes proportionally to its alignment with velocity
-            4.0 * (ax * half_extents[1] * half_extents[2]
-                + ay * half_extents[0] * half_extents[2]
-                + az * half_extents[0] * half_extents[1])
-        }
-    };
-
-    // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
-    let drag_mag = 0.5 * fluid_density * rel_speed * drag_coefficient * area;
-    DVec3::new(
-        drag_mag * rel_vx / rel_speed,
-        drag_mag * rel_vy / rel_speed,
-        drag_mag * rel_vz / rel_speed,
-    )
+    drag_from_mean_velocity(body, sum, count, fluid_density, drag_coefficient)
 }
 
 /// Compute drag on a rigid body using a pre-built spatial hash for broadphase.
@@ -327,9 +335,11 @@ pub fn drag_from_particles(
 /// `spatial_hash` instead of iterating all particles (O(k) vs O(n) per body).
 ///
 /// The caller must build the [`SpatialHash`] from particle positions and keep
-/// it in sync with the particle slice indices.
+/// it in sync with the particle slice indices; indices outside `particles`
+/// are skipped.
 ///
-/// Returns the drag force vector (opposing relative motion).
+/// Returns the drag force vector (along the fluid-relative velocity), with
+/// magnitude `½·ρ·|v_rel|²·Cd·A`.
 #[must_use]
 pub fn drag_from_particles_indexed(
     body: &RigidBody,
@@ -348,63 +358,20 @@ pub fn drag_from_particles_indexed(
         body.position.z as f32,
     );
 
-    let nearby = spatial_hash.query_radius(body_pos_f32, sample_radius as f32);
+    // Sampled particles lie within `sample_radius` of the *surface*, so the
+    // broadphase sphere around the centre must also cover the body itself.
+    let query_radius = (sample_radius + body.shape.bounding_radius()) as f32;
+    let nearby = spatial_hash.query_radius(body_pos_f32, query_radius);
 
-    // Average fluid velocity near the body surface
-    let mut avg_vx = 0.0;
-    let mut avg_vy = 0.0;
-    let mut avg_vz = 0.0;
-    let mut count = 0.0;
-
-    for &idx in &nearby {
-        let p = &particles[idx];
-        let sd = body.signed_distance(p.position);
-        if sd.abs() < sample_radius {
-            avg_vx += p.velocity.x;
-            avg_vy += p.velocity.y;
-            avg_vz += p.velocity.z;
-            count += 1.0;
+    let mut sum = DVec3::ZERO;
+    let mut count = 0usize;
+    for p in nearby.iter().filter_map(|&idx| particles.get(idx)) {
+        if body.signed_distance(p.position).abs() < sample_radius {
+            sum += p.velocity;
+            count += 1;
         }
     }
-
-    if count < 1.0 {
-        return DVec3::ZERO;
-    }
-
-    avg_vx /= count;
-    avg_vy /= count;
-    avg_vz /= count;
-
-    // Relative velocity (fluid relative to body)
-    let rel_vx = avg_vx - body.velocity.x;
-    let rel_vy = avg_vy - body.velocity.y;
-    let rel_vz = avg_vz - body.velocity.z;
-    let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz).sqrt();
-
-    if rel_speed < 1e-20 {
-        return DVec3::ZERO;
-    }
-
-    // Cross-section area projected onto the velocity-normal plane
-    let area = match body.shape {
-        BodyShape::Sphere { radius } => std::f64::consts::PI * radius * radius,
-        BodyShape::Box { half_extents } => {
-            let ax = (rel_vx / rel_speed).abs();
-            let ay = (rel_vy / rel_speed).abs();
-            let az = (rel_vz / rel_speed).abs();
-            4.0 * (ax * half_extents[1] * half_extents[2]
-                + ay * half_extents[0] * half_extents[2]
-                + az * half_extents[0] * half_extents[1])
-        }
-    };
-
-    // F_drag = 0.5 · ρ · |v_rel|² · Cd · A · v̂_rel
-    let drag_mag = 0.5 * fluid_density * rel_speed * drag_coefficient * area;
-    DVec3::new(
-        drag_mag * rel_vx / rel_speed,
-        drag_mag * rel_vy / rel_speed,
-        drag_mag * rel_vz / rel_speed,
-    )
+    drag_from_mean_velocity(body, sum, count, fluid_density, drag_coefficient)
 }
 
 // ── Particle-Level Set Surface Tracking ─────────────────────────────────────
@@ -424,6 +391,15 @@ pub fn particle_level_set(
     particle_radius: f64,
 ) {
     let _span = trace_span!("coupling::particle_level_set", nx, ny, n = particles.len()).entered();
+    if nx.checked_mul(ny) != Some(level_set.len()) {
+        tracing::warn!(
+            nx,
+            ny,
+            len = level_set.len(),
+            "particle_level_set: size mismatch ignored"
+        );
+        return;
+    }
 
     // Initialize to large positive (outside)
     let far = (nx as f64 + ny as f64) * dx;
@@ -499,12 +475,18 @@ impl FlipSolver {
                 reason: format!("cell size must be positive: {dx}").into(),
             });
         }
-        let n = nx * ny;
+        let n = nx
+            .checked_mul(ny)
+            .ok_or(PravashError::InvalidGridResolution { nx, ny })?;
         Ok(Self {
             nx,
             ny,
             dx,
-            flip_ratio: flip_ratio.clamp(0.0, 1.0),
+            flip_ratio: if flip_ratio.is_finite() {
+                flip_ratio.clamp(0.0, 1.0)
+            } else {
+                0.95
+            },
             vx: vec![0.0; n],
             vy: vec![0.0; n],
             vx_old: vec![0.0; n],
@@ -556,8 +538,10 @@ impl FlipSolver {
             let x0 = gx.floor().max(0.0).min((nx - 2) as f64) as usize;
             let y0 = gy.floor().max(0.0).min((self.ny - 2) as f64) as usize;
 
-            let sx = gx - x0 as f64;
-            let sy = gy - y0 as f64;
+            // Clamp so particles outside the grid never get negative weights
+            // (same as G2P's sampling).
+            let sx = (gx - x0 as f64).clamp(0.0, 1.0);
+            let sy = (gy - y0 as f64).clamp(0.0, 1.0);
 
             let weights = [
                 (1.0 - sx) * (1.0 - sy),
@@ -581,8 +565,14 @@ impl FlipSolver {
                 [0.0; 4]
             };
 
+            // Mass-weighted transfer conserves momentum with mixed particle masses.
+            let mass = if p.mass > 0.0 && p.mass.is_finite() {
+                p.mass
+            } else {
+                0.0
+            };
             for k in 0..4 {
-                let w = weights[k];
+                let w = weights[k] * mass;
                 let idx = indices[k];
                 let dxi = grid_x[k] as f64 * dx - p.position.x;
                 let dyi = grid_y[k] as f64 * dx - p.position.y;
@@ -593,7 +583,7 @@ impl FlipSolver {
             }
         }
 
-        // Normalize by weights
+        // Normalize by (mass) weights
         for i in 0..self.vx.len() {
             if self.weight[i] > 1e-20 {
                 self.vx[i] /= self.weight[i];
@@ -611,9 +601,10 @@ impl FlipSolver {
         let inv_dx = 1.0 / dx;
 
         if self.use_apic {
-            // APIC G2P: v_p = Σ v_i w_ip, C_p = (4/dx²) Σ v_i (x_i - x_p)^T w_ip
+            // APIC G2P: v_p = Σ v_i w_ip, C_p = Σ v_i ∇w_ipᵀ. For multilinear
+            // weights this reproduces a linear velocity field exactly (the
+            // 4/dx² form is specific to quadratic B-splines).
             self.apic_c.resize(particles.len(), [0.0; 4]);
-            let scale = 4.0 / (dx * dx);
             for (pi, p) in particles.iter_mut().enumerate() {
                 let gx = p.position.x * inv_dx;
                 let gy = p.position.y * inv_dx;
@@ -629,32 +620,32 @@ impl FlipSolver {
                 let mut c10 = 0.0;
                 let mut c11 = 0.0;
 
-                let weights = [
-                    ((x0, y0), (1.0 - sx) * (1.0 - sy)),
-                    ((x0 + 1, y0), sx * (1.0 - sy)),
-                    ((x0, y0 + 1), (1.0 - sx) * sy),
-                    ((x0 + 1, y0 + 1), sx * sy),
+                // (node, weight, ∂w/∂x, ∂w/∂y)
+                let stencil = [
+                    ((x0, y0), (1.0 - sx) * (1.0 - sy), -(1.0 - sy), -(1.0 - sx)),
+                    ((x0 + 1, y0), sx * (1.0 - sy), 1.0 - sy, -sx),
+                    ((x0, y0 + 1), (1.0 - sx) * sy, -sy, 1.0 - sx),
+                    ((x0 + 1, y0 + 1), sx * sy, sy, sx),
                 ];
-                for &((ix, iy), w) in &weights {
+                for &((ix, iy), w, gwx, gwy) in &stencil {
                     let idx = iy * nx + ix;
                     let grid_vx = self.vx[idx];
                     let grid_vy = self.vy[idx];
                     vx_new += w * grid_vx;
                     vy_new += w * grid_vy;
-                    let dxi = ix as f64 * dx - p.position.x;
-                    let dyi = iy as f64 * dx - p.position.y;
-                    c00 += w * grid_vx * dxi * scale;
-                    c01 += w * grid_vx * dyi * scale;
-                    c10 += w * grid_vy * dxi * scale;
-                    c11 += w * grid_vy * dyi * scale;
+                    let (gwx, gwy) = (gwx * inv_dx, gwy * inv_dx);
+                    c00 += grid_vx * gwx;
+                    c01 += grid_vx * gwy;
+                    c10 += grid_vy * gwx;
+                    c11 += grid_vy * gwy;
                 }
                 p.velocity.x = vx_new;
                 p.velocity.y = vy_new;
                 self.apic_c[pi] = [c00, c01, c10, c11];
             }
         } else {
-            // Standard FLIP/PIC blend
-            let flip = self.flip_ratio;
+            // Standard FLIP/PIC blend (pub field: re-clamp at use)
+            let flip = self.flip_ratio.clamp(0.0, 1.0);
             let pic = 1.0 - flip;
             for p in particles.iter_mut() {
                 let gx = p.position.x * inv_dx;
@@ -702,6 +693,11 @@ impl FlipSolver {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt });
         }
+        if !self.flip_ratio.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("flip_ratio must be finite: {}", self.flip_ratio).into(),
+            });
+        }
 
         let nx = self.nx;
         let ny = self.ny;
@@ -738,8 +734,10 @@ impl FlipSolver {
                         * div_scale;
                 }
             }
-            // GS pressure solve (warm start from previous step)
+            // GS pressure solve (warm start from previous step) for the
+            // unit-stencil system 4p − Σp = dx²·div, i.e. ∇²p = ∇·u*/dt.
             const PRESSURE_ITERATIONS: usize = 40;
+            let dx2 = self.dx * self.dx;
             for _ in 0..PRESSURE_ITERATIONS {
                 let mut max_change = 0.0f64;
                 for y in 1..ny - 1 {
@@ -749,7 +747,7 @@ impl FlipSolver {
                             + self.pressure[i + 1]
                             + self.pressure[i - nx]
                             + self.pressure[i + nx];
-                        let new_p = (self.div[i] + neighbors) * 0.25;
+                        let new_p = (self.div[i] * dx2 + neighbors) * 0.25;
                         max_change = max_change.max((new_p - self.pressure[i]).abs());
                         self.pressure[i] = new_p;
                     }
@@ -1153,5 +1151,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    #[test]
+    fn test_drag_is_quadratic_in_speed() {
+        let body = RigidBody::new(DVec3::ZERO, 1.0, BodyShape::Sphere { radius: 0.1 });
+        let mut ps = vec![FluidParticle::new(DVec3::new(0.12, 0.0, 0.0), 0.001)];
+        ps[0].velocity = DVec3::new(2.0, 0.0, 0.0);
+        let f = drag_from_particles(&body, &ps, 1000.0, 0.47, 0.05);
+        let area = std::f64::consts::PI * 0.01;
+        let expected = 0.5 * 1000.0 * 4.0 * 0.47 * area;
+        assert!(
+            (f.x - expected).abs() < 1e-9 * expected,
+            "{} vs {expected}",
+            f.x
+        );
+        ps[0].velocity.x = 0.5;
+        let f2 = drag_from_particles(&body, &ps, 1000.0, 0.47, 0.05);
+        assert!((f.x / f2.x - 16.0).abs() < 1e-9, "F ∝ v²");
+    }
+
+    #[test]
+    fn test_indexed_drag_matches_bruteforce_for_large_body() {
+        let body = RigidBody::new(DVec3::ZERO, 1.0, BodyShape::Sphere { radius: 1.0 });
+        let mut ps = Vec::new();
+        for k in 0..16 {
+            let a = k as f64 * std::f64::consts::TAU / 16.0;
+            let mut p = FluidParticle::new(DVec3::new(1.05 * a.cos(), 1.05 * a.sin(), 0.0), 0.001);
+            p.velocity = DVec3::new(1.0, 0.0, 0.0);
+            ps.push(p);
+        }
+        let mut hash = SpatialHash::new(0.25).unwrap();
+        for (i, p) in ps.iter().enumerate() {
+            hash.insert(Vec3::new(p.position.x as f32, p.position.y as f32, 0.0), i);
+        }
+        let brute = drag_from_particles(&body, &ps, 1000.0, 0.47, 0.2);
+        let indexed = drag_from_particles_indexed(&body, &ps, &hash, 1000.0, 0.47, 0.2);
+        assert!(brute.length() > 0.0);
+        assert!((brute - indexed).length() < 1e-9 * brute.length());
+        // A hash with stale indices must not panic.
+        let short = &ps[..4];
+        let _ = drag_from_particles_indexed(&body, short, &hash, 1000.0, 0.47, 0.2);
+    }
+
+    #[test]
+    fn test_added_mass_free_fall() {
+        // Neutral body (m = ρV) with C_a = 0.5 and no fluid force: a = g / 1.5.
+        let shape = BodyShape::Sphere { radius: 0.1 };
+        let rho = 1000.0;
+        let m = rho * shape.volume();
+        let mut bodies = vec![RigidBody::new(DVec3::ZERO, m, shape)];
+        let g = DVec3::new(0.0, -9.81, 0.0);
+        integrate_bodies_with_added_mass(&mut bodies, g, 0.01, rho, 0.5);
+        let a = bodies[0].velocity.y / 0.01;
+        assert!((a + 9.81 / 1.5).abs() < 1e-9, "a = {a}");
+    }
+
+    #[test]
+    fn test_flip_projection_reduces_divergence_small_dx() {
+        let dx = 0.1;
+        let mut solver = FlipSolver::new(16, 16, dx, 0.0).unwrap();
+        // Radially divergent particle velocities.
+        let mut ps = Vec::new();
+        for j in 2..14 {
+            for i in 2..14 {
+                for (ox, oy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                    let x = (i as f64 + ox) * dx;
+                    let y = (j as f64 + oy) * dx;
+                    let mut p = FluidParticle::new_2d(x, y, 0.001);
+                    p.velocity = DVec3::new(x - 0.8, y - 0.8, 0.0);
+                    ps.push(p);
+                }
+            }
+        }
+        solver.step(&mut ps, DVec3::ZERO, 1e-3).unwrap();
+        let div_norm = |vx: &[f64], vy: &[f64]| {
+            let mut s = 0.0;
+            for y in 3..13 {
+                for x in 3..13 {
+                    let i = y * 16 + x;
+                    let d = (vx[i + 1] - vx[i - 1] + vy[i + 16] - vy[i - 16]) / (2.0 * dx);
+                    s += d * d;
+                }
+            }
+            s.sqrt()
+        };
+        let before = div_norm(&solver.vx_old, &solver.vy_old);
+        let after = div_norm(&solver.vx, &solver.vy);
+        assert!(after < 0.5 * before, "FLIP divergence {before} -> {after}");
+    }
+
+    #[test]
+    fn test_p2g_weights_non_negative_outside_grid() {
+        let mut solver = FlipSolver::new(8, 8, 0.1, 0.95).unwrap();
+        let ps = vec![
+            FluidParticle::new_2d(-0.05, 0.3, 0.001),
+            FluidParticle::new_2d(0.3, 0.9, 0.001),
+        ];
+        solver.particles_to_grid(&ps);
+        assert!(solver.weight.iter().all(|&w| w >= 0.0));
+    }
+
+    #[test]
+    fn test_apic_c_exact_for_rigid_rotation() {
+        let (nx, dx, omega) = (8, 0.1, 2.0);
+        let mut solver = FlipSolver::new(nx, nx, dx, 0.0).unwrap();
+        solver.use_apic = true;
+        for y in 0..nx {
+            for x in 0..nx {
+                let i = y * nx + x;
+                solver.vx[i] = -omega * y as f64 * dx;
+                solver.vy[i] = omega * x as f64 * dx;
+            }
+        }
+        let mut ps = vec![FluidParticle::new_2d(0.33, 0.41, 0.001)];
+        solver.grid_to_particles(&mut ps);
+        let c = solver.apic_c[0];
+        assert!(c[0].abs() < 1e-12 && c[3].abs() < 1e-12, "{c:?}");
+        assert!(
+            (c[1] + omega).abs() < 1e-12 && (c[2] - omega).abs() < 1e-12,
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn test_flip_rejects_nan_ratio() {
+        let mut solver = FlipSolver::new(8, 8, 0.1, 0.95).unwrap();
+        solver.flip_ratio = f64::NAN;
+        let mut ps = vec![FluidParticle::new_2d(0.3, 0.3, 0.001)];
+        assert!(solver.step(&mut ps, DVec3::ZERO, 0.01).is_err());
+    }
+
+    #[test]
+    fn test_level_set_size_mismatch_no_panic() {
+        let mut ls = vec![0.0; 10];
+        particle_level_set(&mut ls, 8, 8, 0.1, &[], 0.05);
     }
 }

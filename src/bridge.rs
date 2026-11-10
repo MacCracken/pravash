@@ -64,15 +64,15 @@ pub fn wind_to_freestream(wind_velocity_ms: f64) -> f64 {
 // ── Ushma bridges (thermodynamics) ─────────────────────────────────────────
 
 /// Convert fluid temperature (K) to dynamic viscosity (Pa·s) for water
-/// using the Andrade equation approximation.
+/// using the Vogel(-Fulcher-Tammann) correlation.
 ///
-/// μ(T) = A × exp(B / T), with water constants.
-/// Valid range: 273–373 K.
+/// μ(T) = A × 10^(B / (T − C)), A = 2.414e-5 Pa·s, B = 247.8 K, C = 140 K.
+/// Valid range: 273–373 K (input is clamped).
 #[must_use]
 #[inline]
 pub fn temperature_to_water_viscosity(temperature_k: f64) -> f64 {
     let t = temperature_k.clamp(273.0, 373.0);
-    // Andrade coefficients for water
+    // Vogel coefficients for water
     let a = 2.414e-5;
     let b = 247.8;
     let c = 140.0;
@@ -83,7 +83,9 @@ pub fn temperature_to_water_viscosity(temperature_k: f64) -> f64 {
 /// thermal buoyancy forcing (N/m³).
 ///
 /// Buoyancy force per unit volume: f_b = ρ × g × β × ΔT
-/// where ΔT = Q / (ρ × c_p × V) for a single timestep.
+/// where ΔT = Q·dt / (ρ × c_p × V) is the temperature rise over one timestep.
+/// Density cancels, so f_b = g × β × Q × dt / (c_p × V); `density_kg_m3` is
+/// accepted for API compatibility and only needs to be positive.
 ///
 /// `heat_power_w`: heat source power in watts.
 /// `fluid_volume_m3`: volume of affected fluid.
@@ -100,12 +102,12 @@ pub fn heat_to_buoyancy_forcing(
     expansion_coeff_per_k: f64,
     dt_s: f64,
 ) -> f64 {
-    if fluid_volume_m3 <= 0.0 || specific_heat_j_per_kg_k <= 0.0 {
+    if !(fluid_volume_m3 > 0.0 && specific_heat_j_per_kg_k > 0.0 && density_kg_m3 > 0.0) {
         return 0.0;
     }
-    let delta_t =
-        heat_power_w * dt_s / (density_kg_m3 * specific_heat_j_per_kg_k * fluid_volume_m3);
-    density_kg_m3 * 9.81 * expansion_coeff_per_k * delta_t
+    // ρ·g·β·ΔT with ΔT = Q·dt/(ρ·c_p·V) — ρ cancels.
+    9.81 * expansion_coeff_per_k * heat_power_w * dt_s
+        / (specific_heat_j_per_kg_k * fluid_volume_m3)
 }
 
 /// Convert turbulent kinetic energy (m²/s²) to eddy thermal diffusivity (m²/s)
@@ -147,10 +149,13 @@ pub fn velocity_to_acoustic_source_strength(velocity_ms: f64, speed_of_sound: f6
 /// Convert turbulent kinetic energy (m²/s²) to estimated broadband noise
 /// level in dB SPL.
 ///
-/// Empirical: SPL ≈ 10 × log10(ρ × k × V / (p_ref² / (ρ × c)))
-/// Simplified scaling: SPL ≈ 20 × log10(sqrt(2/3 × k) / v_ref) + offset.
+/// Rough scaling: SPL ≈ 20 × log10(u_rms / v_ref), with u_rms = sqrt(2/3 × k)
+/// and v_ref = 5e-8 m/s (the acoustic particle velocity of 20 μPa in air).
+///
+/// This treats the turbulent velocity fluctuation as an acoustic particle
+/// velocity, which overestimates radiated sound; use it only as a relative
+/// loudness cue, not a calibrated SPL.
 /// `tke`: turbulent kinetic energy (m²/s²).
-/// Returns approximate dB SPL (reference: 20 μPa).
 #[must_use]
 #[inline]
 pub fn tke_to_broadband_noise_db(tke: f64) -> f64 {
@@ -170,8 +175,9 @@ pub fn tke_to_broadband_noise_db(tke: f64) -> f64 {
 /// Convert fluid surface wave height (m) and frequency (Hz) to estimated
 /// acoustic pressure contribution (Pa) at the surface.
 ///
-/// Simplified dipole radiation model: p ≈ ρ × g × h × (k × a)
-/// where k = 2πf/c, a is a characteristic length.
+/// Simplified dipole radiation model: p ≈ ρ_air × g × h × (k × a)
+/// where k = 2πf/c and the characteristic length a is taken as the wave
+/// height h (so p ∝ h²).
 #[must_use]
 #[inline]
 pub fn wave_height_to_acoustic_pressure(
@@ -296,5 +302,14 @@ mod tests {
     #[test]
     fn wave_acoustic_pressure_zero_freq() {
         assert_eq!(wave_height_to_acoustic_pressure(0.1, 0.0, 343.0), 0.0);
+    }
+
+    #[test]
+    fn heat_buoyancy_zero_density_no_nan() {
+        let f = heat_to_buoyancy_forcing(1000.0, 1.0, 0.0, 4186.0, 2.1e-4, 0.01);
+        assert_eq!(f, 0.0);
+        let f = heat_to_buoyancy_forcing(1000.0, 1.0, 1000.0, 4186.0, 2.1e-4, 0.01);
+        let expected = 9.81 * 2.1e-4 * 1000.0 * 0.01 / (4186.0 * 1.0);
+        assert!((f - expected).abs() < 1e-15);
     }
 }

@@ -48,17 +48,11 @@ pub struct PackedParticles {
 impl PackedParticles {
     /// Pack from SOA data into GPU-friendly f32 buffers.
     #[must_use]
+    ///
+    /// If the SOA arrays have mismatched lengths, only the complete particles
+    /// ([`ParticleSoa::consistent_len`]) are packed.
     pub fn from_soa(soa: &ParticleSoa) -> Self {
-        let n = soa.len();
-        debug_assert_eq!(soa.pos_x.len(), n, "pos_x length mismatch");
-        debug_assert_eq!(soa.pos_y.len(), n, "pos_y length mismatch");
-        debug_assert_eq!(soa.pos_z.len(), n, "pos_z length mismatch");
-        debug_assert_eq!(soa.vel_x.len(), n, "vel_x length mismatch");
-        debug_assert_eq!(soa.vel_y.len(), n, "vel_y length mismatch");
-        debug_assert_eq!(soa.vel_z.len(), n, "vel_z length mismatch");
-        debug_assert_eq!(soa.mass.len(), n, "mass length mismatch");
-        debug_assert_eq!(soa.density.len(), n, "density length mismatch");
-        debug_assert_eq!(soa.pressure.len(), n, "pressure length mismatch");
+        let n = soa.consistent_len().min(u32::MAX as usize);
         let mut position_mass = Vec::with_capacity(n * 4);
         let mut velocity = Vec::with_capacity(n * 4);
         let mut density_pressure = Vec::with_capacity(n * 2);
@@ -79,7 +73,7 @@ impl PackedParticles {
         }
 
         Self {
-            count: n as u32,
+            count: n as u32, // n <= u32::MAX
             position_mass,
             velocity,
             density_pressure,
@@ -87,31 +81,63 @@ impl PackedParticles {
     }
 
     /// Unpack density and pressure results back into SOA.
+    ///
+    /// Writes at most `count` particles, bounded by the buffer and SOA lengths.
     pub fn unpack_density_pressure(&self, soa: &mut ParticleSoa) {
         let n = self.count as usize;
-        for i in 0..n.min(soa.len()) {
-            soa.density[i] = f64::from(self.density_pressure[i * 2]);
-            soa.pressure[i] = f64::from(self.density_pressure[i * 2 + 1]);
+        for ((dp, rho), p) in self
+            .density_pressure
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(n)
+            .zip(soa.density.iter_mut())
+            .zip(soa.pressure.iter_mut())
+        {
+            *rho = f64::from(dp[0]);
+            *p = f64::from(dp[1]);
         }
     }
 
     /// Unpack velocity results back into SOA.
+    ///
+    /// Writes at most `count` particles, bounded by the buffer and SOA lengths.
     pub fn unpack_velocity(&self, soa: &mut ParticleSoa) {
         let n = self.count as usize;
-        for i in 0..n.min(soa.len()) {
-            soa.vel_x[i] = f64::from(self.velocity[i * 4]);
-            soa.vel_y[i] = f64::from(self.velocity[i * 4 + 1]);
-            soa.vel_z[i] = f64::from(self.velocity[i * 4 + 2]);
+        for (((v, vx), vy), vz) in self
+            .velocity
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(n)
+            .zip(soa.vel_x.iter_mut())
+            .zip(soa.vel_y.iter_mut())
+            .zip(soa.vel_z.iter_mut())
+        {
+            *vx = f64::from(v[0]);
+            *vy = f64::from(v[1]);
+            *vz = f64::from(v[2]);
         }
     }
 
     /// Unpack position results back into SOA.
+    ///
+    /// Writes at most `count` particles, bounded by the buffer and SOA lengths.
     pub fn unpack_positions(&self, soa: &mut ParticleSoa) {
         let n = self.count as usize;
-        for i in 0..n.min(soa.len()) {
-            soa.pos_x[i] = f64::from(self.position_mass[i * 4]);
-            soa.pos_y[i] = f64::from(self.position_mass[i * 4 + 1]);
-            soa.pos_z[i] = f64::from(self.position_mass[i * 4 + 2]);
+        for (((pm, x), y), z) in self
+            .position_mass
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(n)
+            .zip(soa.pos_x.iter_mut())
+            .zip(soa.pos_y.iter_mut())
+            .zip(soa.pos_z.iter_mut())
+        {
+            *x = f64::from(pm[0]);
+            *y = f64::from(pm[1]);
+            *z = f64::from(pm[2]);
         }
     }
 }
@@ -119,7 +145,9 @@ impl PackedParticles {
 // ── Kernel Parameters ──────────────────────────────────────────────────────
 
 /// Parameters for SPH density/force computation.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// Construct with `SphKernelParams::default()` and set the public fields.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SphKernelParams {
     pub smoothing_radius: f32,
@@ -132,7 +160,9 @@ pub struct SphKernelParams {
 }
 
 /// Parameters for grid-based Navier-Stokes step.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// Construct with `GridKernelParams::default()` and set the public fields.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GridKernelParams {
     pub nx: u32,
@@ -145,7 +175,9 @@ pub struct GridKernelParams {
 }
 
 /// Parameters for shallow water step.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// Construct with `ShallowKernelParams::default()` and set the public fields.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ShallowKernelParams {
     pub nx: u32,
@@ -176,8 +208,9 @@ pub enum ComputeOp {
 /// Backend-agnostic compute acceleration interface.
 ///
 /// Implementors provide GPU or distributed acceleration for simulation
-/// kernels. Pravash calls these methods with packed buffers and parameters;
-/// the backend executes the computation and writes results back.
+/// kernels. The consumer calls these methods with packed buffers and
+/// parameters (pravash's CPU solvers do not dispatch to a backend); the
+/// backend executes the computation and writes results back.
 ///
 /// # Example (pseudocode)
 ///
@@ -286,7 +319,7 @@ impl KernelDerivatives {
     #[must_use]
     pub fn dpoly6_dr2(r2: f64, h: f64) -> f64 {
         let h2 = h * h;
-        if r2 > h2 {
+        if h <= 0.0 || r2 > h2 {
             return 0.0;
         }
         let h3 = h2 * h;
@@ -307,13 +340,12 @@ impl KernelDerivatives {
 
     /// d(Tait EOS)/dρ — derivative of Tait equation of state.
     ///
-    /// P = B((ρ/ρ₀)^γ - 1) → dP/dρ = B·γ·(ρ/ρ₀)^(γ-1) / ρ₀
+    /// P = B((ρ/ρ₀)^γ - 1), B = ρ₀c²/γ → dP/dρ = c²·(ρ/ρ₀)^(γ-1)
     #[inline]
     #[must_use]
     pub fn dtait_drho(density: f64, rest_density: f64, speed_of_sound: f64, gamma: f64) -> f64 {
         let rho0 = rest_density.max(1e-10);
-        let b = rho0 * speed_of_sound * speed_of_sound / gamma;
-        b * gamma * (density / rho0).powf(gamma - 1.0) / rho0
+        speed_of_sound * speed_of_sound * (density / rho0).powf(gamma - 1.0)
     }
 
     /// d(Wendland C2)/dr — analytical derivative for gradient computation.
@@ -436,5 +468,54 @@ mod tests {
         // Ensure all variants are distinct
         assert_ne!(ComputeOp::SphDensity, ComputeOp::SphStep);
         assert_ne!(ComputeOp::GridAdvect, ComputeOp::ShallowStep);
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    #[test]
+    fn test_unpack_short_buffers_no_panic() {
+        let particles = vec![FluidParticle::new(DVec3::ZERO, 1.0); 4];
+        let mut soa = ParticleSoa::from_aos(&particles);
+        let mut packed = PackedParticles::from_soa(&soa);
+        packed.density_pressure.truncate(3);
+        packed.velocity.truncate(5);
+        packed.position_mass.clear();
+        packed.unpack_density_pressure(&mut soa);
+        packed.unpack_velocity(&mut soa);
+        packed.unpack_positions(&mut soa);
+    }
+
+    #[test]
+    fn test_from_soa_mismatched_lengths() {
+        let particles = vec![FluidParticle::new(DVec3::ZERO, 1.0); 4];
+        let mut soa = ParticleSoa::from_aos(&particles);
+        soa.pressure.truncate(1);
+        let packed = PackedParticles::from_soa(&soa);
+        assert_eq!(packed.count, 1);
+    }
+
+    #[test]
+    fn test_kernel_params_default_constructible() {
+        let p = SphKernelParams {
+            smoothing_radius: 0.05,
+            ..SphKernelParams::default()
+        };
+        assert!((p.smoothing_radius - 0.05).abs() < f32::EPSILON);
+        let _ = GridKernelParams::default();
+        let _ = ShallowKernelParams::default();
+    }
+
+    #[test]
+    fn test_dtait_drho_gamma_zero_finite() {
+        let d = KernelDerivatives::dtait_drho(1000.0, 1000.0, 10.0, 0.0);
+        assert!(d.is_finite());
+        // γ = 7 at rest density: dP/dρ = c²
+        let d7 = KernelDerivatives::dtait_drho(1000.0, 1000.0, 10.0, 7.0);
+        assert!((d7 - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_dpoly6_zero_radius() {
+        assert_eq!(KernelDerivatives::dpoly6_dr2(0.0, 0.0), 0.0);
     }
 }

@@ -22,7 +22,9 @@ pub enum BoundaryCondition {
     NoSlip,
     /// Normal velocity = 0, tangential velocity free (inviscid wall).
     FreeSlip,
-    /// Opposite edges connected (wrapping). Enables FFT pressure solve.
+    /// Opposite edges connected (wrapping) for advection and velocity ghosts.
+    /// The pressure solve still uses Gauss-Seidel with zero (Dirichlet)
+    /// boundary pressure — a true periodic solve is on the roadmap.
     Periodic,
 }
 
@@ -46,8 +48,8 @@ pub struct GridConfig {
     pub buoyancy_alpha: f64,
     /// Ambient density for buoyancy reference.
     pub ambient_density: f64,
-    /// Use MacCormack advection (higher-order, less diffusive).
-    /// Falls back to semi-Lagrangian at grid boundaries.
+    /// Use MacCormack advection (higher-order, less diffusive), limited to
+    /// the bilinear stencil of the backtraced point. Ignored for `Periodic`.
     pub use_maccormack: bool,
     /// Use BFECC advection (Back and Forth Error Compensation and Correction).
     /// Better feature preservation than MacCormack. Overrides MacCormack if both set.
@@ -56,9 +58,10 @@ pub struct GridConfig {
     /// Smagorinsky SGS turbulence model coefficient (0.0 to disable).
     /// ν_t = (Cs·dx)²·|S|. Typical Cs: 0.1–0.2. Default: 0.0.
     pub smagorinsky_cs: f64,
-    /// Use multigrid V-cycle for pressure solve (O(N) vs O(N²) for GS).
-    /// Falls back to DST for non-periodic, GS for periodic when disabled.
-    /// Default: false.
+    /// Use multigrid V-cycles for the pressure solve (O(N) per cycle).
+    /// Runs `pressure_iterations / 10` (at least 1) V-cycles, about the work
+    /// of `pressure_iterations` Gauss-Seidel sweeps. When disabled, DST is
+    /// used for walls and GS for periodic. Default: false.
     pub use_multigrid: bool,
     /// Use conjugate gradient for pressure solve.
     /// Matrix-free CG via hisab. Good for large grids where GS converges slowly.
@@ -166,6 +169,7 @@ impl FluidGrid {
     }
 
     #[inline]
+    #[must_use]
     pub fn idx(&self, x: usize, y: usize) -> usize {
         debug_assert!(x < self.nx && y < self.ny, "grid index out of bounds");
         y * self.nx + x
@@ -208,7 +212,7 @@ impl FluidGrid {
         if viscosity > 1e-20 {
             dt = dt.min(self.dx * self.dx / (4.0 * viscosity));
         }
-        cfl_factor * dt
+        (cfl_factor * dt).min(f64::MAX)
     }
 
     #[must_use]
@@ -247,6 +251,42 @@ impl FluidGrid {
             + v10 * sx * (1.0 - sy)
             + v01 * (1.0 - sx) * sy
             + v11 * sx * sy
+    }
+
+    /// Min/max of the four bilinear stencil values used by [`sample`](Self::sample)
+    /// at `(fx, fy)` — the limiter bounds for MacCormack/BFECC (Selle et al. 2008).
+    #[inline]
+    fn sample_bounds(field: &[f64], nx: usize, ny: usize, fx: f64, fy: f64) -> (f64, f64) {
+        if !fx.is_finite() || !fy.is_finite() {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        let x0 = fx.floor().max(0.0).min((nx - 2) as f64) as usize;
+        let y0 = fy.floor().max(0.0).min((ny - 2) as f64) as usize;
+        let v00 = field[y0 * nx + x0];
+        let v10 = field[y0 * nx + x0 + 1];
+        let v01 = field[(y0 + 1) * nx + x0];
+        let v11 = field[(y0 + 1) * nx + x0 + 1];
+        (
+            v00.min(v10).min(v01).min(v11),
+            v00.max(v10).max(v01).max(v11),
+        )
+    }
+
+    /// Clamp that never panics: returns `v` unchanged if the bounds are NaN or inverted.
+    #[inline]
+    fn clamp_safe(v: f64, lo: f64, hi: f64) -> f64 {
+        if lo <= hi { v.clamp(lo, hi) } else { v }
+    }
+
+    /// Copy the boundary ring of `src` into `dst`.
+    fn copy_ring(dst: &mut [f64], src: &[f64], nx: usize, ny: usize) {
+        dst[..nx].copy_from_slice(&src[..nx]);
+        let top = (ny - 1) * nx;
+        dst[top..top + nx].copy_from_slice(&src[top..top + nx]);
+        for y in 1..ny - 1 {
+            dst[y * nx] = src[y * nx];
+            dst[y * nx + nx - 1] = src[y * nx + nx - 1];
+        }
     }
 
     /// Semi-Lagrangian advection: trace back through velocity field, sample.
@@ -365,6 +405,9 @@ impl FluidGrid {
 
     /// MacCormack advection: forward step, backward correction, clamp.
     /// Reduces numerical diffusion compared to basic semi-Lagrangian.
+    ///
+    /// The corrected value is clamped to the bilinear stencil of the
+    /// backtraced point, so the scheme never creates new extrema.
     #[allow(clippy::too_many_arguments)]
     fn advect_maccormack(
         dst: &mut [f64],
@@ -390,6 +433,10 @@ impl FluidGrid {
             }
         }
 
+        // The backward pass samples the forward result near the walls too:
+        // give it the source's boundary ring instead of stale scratch data.
+        Self::copy_ring(dst, src, nx, ny);
+
         // Backward step from the forward result
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
@@ -400,33 +447,25 @@ impl FluidGrid {
             }
         }
 
-        // Corrected result with clamping to neighbor min/max
+        // Corrected result, clamped to the stencil of the backtraced point
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
                 let corrected = dst[i] + 0.5 * (src[i] - temp[i]);
-
-                // Clamp to min/max of original neighbors (loop bounds guarantee in-range)
-                let s = src[i];
-                let mut lo = s;
-                let mut hi = s;
-                lo = lo.min(src[i - 1]);
-                hi = hi.max(src[i - 1]);
-                lo = lo.min(src[i + 1]);
-                hi = hi.max(src[i + 1]);
-                lo = lo.min(src[i - nx]);
-                hi = hi.max(src[i - nx]);
-                lo = lo.min(src[i + nx]);
-                hi = hi.max(src[i + nx]);
-
-                dst[i] = corrected.clamp(lo, hi);
+                let fx = x as f64 - dt_inv_dx * vx[i];
+                let fy = y as f64 - dt_inv_dx * vy[i];
+                let (lo, hi) = Self::sample_bounds(src, nx, ny, fx, fy);
+                dst[i] = Self::clamp_safe(corrected, lo, hi);
             }
         }
     }
 
     /// BFECC advection: forward, backward, error estimate, corrected forward.
     /// Better feature preservation than MacCormack.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    ///
+    /// φ̂ = B(F(φⁿ)), φ̃ = φⁿ + ½(φⁿ − φ̂), φⁿ⁺¹ = F(φ̃), clamped to the stencil
+    /// of the backtraced point in φⁿ.
+    #[allow(clippy::too_many_arguments)]
     fn advect_bfecc(
         dst: &mut [f64],
         src: &[f64],
@@ -453,6 +492,7 @@ impl FluidGrid {
         }
 
         // Step 2: Backward from temp1 → temp2
+        Self::copy_ring(temp1, src, nx, ny);
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
@@ -462,31 +502,24 @@ impl FluidGrid {
             }
         }
 
-        // Step 3: Corrected result with clamping
+        // Step 3: Error-compensated source φ̃ = φ + ½(φ − φ̂) → temp2
+        Self::copy_ring(temp2, src, nx, ny);
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
-                let s = src[i];
-                let mut lo = s;
-                let mut hi = s;
-                if x > 0 {
-                    lo = lo.min(src[i - 1]);
-                    hi = hi.max(src[i - 1]);
-                }
-                if x < nx - 1 {
-                    lo = lo.min(src[i + 1]);
-                    hi = hi.max(src[i + 1]);
-                }
-                if y > 0 {
-                    lo = lo.min(src[i - nx]);
-                    hi = hi.max(src[i - nx]);
-                }
-                if y < ny - 1 {
-                    lo = lo.min(src[i + nx]);
-                    hi = hi.max(src[i + nx]);
-                }
-                let corrected = temp1[i] + 0.5 * (src[i] - temp2[i]);
-                dst[i] = corrected.clamp(lo, hi);
+                temp2[i] = src[i] + 0.5 * (src[i] - temp2[i]);
+            }
+        }
+
+        // Step 4: Forward advect the compensated source, clamp to original stencil
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let i = y * nx + x;
+                let fx = x as f64 - dt_inv_dx * vx[i];
+                let fy = y as f64 - dt_inv_dx * vy[i];
+                let v = Self::sample(temp2, nx, ny, fx, fy);
+                let (lo, hi) = Self::sample_bounds(src, nx, ny, fx, fy);
+                dst[i] = Self::clamp_safe(v, lo, hi);
             }
         }
     }
@@ -497,6 +530,9 @@ impl FluidGrid {
     ///
     /// Solves the implicit equation `(I - a·∇²)·x_new = x_old` where
     /// `a = dt · diff_rate / dx²`. The original field is preserved as the RHS.
+    ///
+    /// Does nothing (with a warning) if `field.len() != nx·ny` or the grid is
+    /// smaller than 3×3.
     pub fn diffuse(
         field: &mut [f64],
         nx: usize,
@@ -507,6 +543,15 @@ impl FluidGrid {
         iterations: usize,
     ) {
         let _span = trace_span!("grid::diffuse", nx, ny).entered();
+        if nx < 3 || ny < 3 || nx.checked_mul(ny) != Some(field.len()) {
+            tracing::warn!(
+                nx,
+                ny,
+                len = field.len(),
+                "grid::diffuse: size mismatch ignored"
+            );
+            return;
+        }
         let mut rhs = vec![0.0f64; nx * ny];
         Self::diffuse_with_buf(field, nx, ny, diff_rate, dt, dx, iterations, &mut rhs);
     }
@@ -544,18 +589,27 @@ impl FluidGrid {
 
     // ── Pressure Projection ─────────────────────────────────────────────────
 
-    /// Compute velocity divergence with correct dx scaling.
-    fn divergence(div: &mut [f64], vx: &[f64], vy: &[f64], nx: usize, ny: usize, inv_2dx: f64) {
+    /// Compute `-(central difference sum) · scale` at interior cells.
+    ///
+    /// With `scale = 1/(2dx)` this is the negated physical divergence `-∇·u`.
+    /// The projection passes `scale = dx/2`, i.e. `-dx²·∇·u`, which is the
+    /// right-hand side of the unit-stencil pressure Poisson equation.
+    fn divergence(div: &mut [f64], vx: &[f64], vy: &[f64], nx: usize, ny: usize, scale: f64) {
         let _span = trace_span!("grid::divergence", nx, ny).entered();
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
-                div[i] = -((vx[i + 1] - vx[i - 1]) + (vy[i + nx] - vy[i - nx])) * inv_2dx;
+                div[i] = -((vx[i + 1] - vx[i - 1]) + (vy[i + nx] - vy[i - nx])) * scale;
             }
         }
     }
 
-    /// Gauss-Seidel Poisson solver: ∇²p = div.
+    /// Gauss-Seidel Poisson solver for the unit-stencil system
+    /// `4·p[i] − Σ p[neighbors] = rhs[i]`, i.e. `−dx²·∇²p = rhs`.
+    ///
+    /// All pressure solvers (GS, DST, multigrid, CG) solve this same system
+    /// with homogeneous Dirichlet boundaries. With `rhs = −dx²·∇·u` the
+    /// subsequent `u −= ∇p` makes `u` divergence-free.
     /// Uses the existing pressure field as initial guess (warm start).
     fn pressure_solve(
         pressure: &mut [f64],
@@ -580,7 +634,7 @@ impl FluidGrid {
 
     /// DST-based Poisson solver for Dirichlet (wall) boundary conditions.
     ///
-    /// Solves ∇²p = div on interior cells using 2D Discrete Sine Transform.
+    /// Solves `4p − Σn = rhs` on interior cells using a 2D Discrete Sine Transform.
     /// Exact solve (no iterations needed). Works for any grid size.
     fn pressure_solve_dst(pressure: &mut [f64], div: &[f64], nx: usize, ny: usize) -> Result<()> {
         let _span = trace_span!("grid::pressure_solve_dst", nx, ny).entered();
@@ -621,14 +675,14 @@ impl FluidGrid {
             }
         }
 
-        // Divide by eigenvalues of the discrete Laplacian (DST-I)
-        // λ(kx,ky) = 2cos(π(kx+1)/(inx+1)) + 2cos(π(ky+1)/(iny+1)) - 4
+        // Divide by eigenvalues of the unit-stencil operator 4p − Σn (DST-I):
+        // μ(kx,ky) = 4 − 2cos(π(kx+1)/(inx+1)) − 2cos(π(ky+1)/(iny+1)) > 0
         let pi = std::f64::consts::PI;
         for ky in 0..iny {
             for kx in 0..inx {
                 let lx = 2.0 * (pi * (kx + 1) as f64 / (inx + 1) as f64).cos() - 2.0;
                 let ly = 2.0 * (pi * (ky + 1) as f64 / (iny + 1) as f64).cos() - 2.0;
-                let eigenvalue = lx + ly;
+                let eigenvalue = -(lx + ly);
                 if eigenvalue.abs() > 1e-12 {
                     rhs[ky * inx + kx] /= eigenvalue;
                 }
@@ -668,16 +722,20 @@ impl FluidGrid {
     /// Recursively restricts the residual to coarser grids, solves, and
     /// prolongates the correction. Uses Gauss-Seidel smoothing.
     /// `levels` provides persistent scratch buffers (residual, coarse_rhs, coarse_p) per level.
+    /// Runs `cycles` V-cycles with `nu_smooth` Gauss-Seidel sweeps per level.
     fn pressure_solve_multigrid(
         pressure: &mut [f64],
         div: &[f64],
         nx: usize,
         ny: usize,
         nu_smooth: usize,
+        cycles: usize,
         levels: &mut Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>,
     ) -> Result<()> {
-        let _span = trace_span!("grid::multigrid", nx, ny).entered();
-        Self::mg_vcycle(pressure, div, nx, ny, nu_smooth, levels, 0);
+        let _span = trace_span!("grid::multigrid", nx, ny, cycles).entered();
+        for _ in 0..cycles.max(1) {
+            Self::mg_vcycle(pressure, div, nx, ny, nu_smooth, levels, 0);
+        }
         Ok(())
     }
 
@@ -699,8 +757,9 @@ impl FluidGrid {
         let _ = Self::pressure_solve(p, rhs, nx, ny, nu);
 
         let n = nx * ny;
-        let cnx = nx / 2;
-        let cny = ny / 2;
+        // Vertex-centred coarsening: coarse (cx, cy) ↔ fine (2cx, 2cy).
+        let cnx = nx.div_ceil(2);
+        let cny = ny.div_ceil(2);
         if cnx < 4 || cny < 4 {
             let _ = Self::pressure_solve(p, rhs, nx, ny, nu * 4);
             return;
@@ -719,17 +778,18 @@ impl FluidGrid {
         c_p.resize(cn, 0.0);
         c_p.fill(0.0);
 
-        // Compute residual
+        // Residual of the smoother's system: r = rhs − (4p − Σn)
         residual.fill(0.0);
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = y * nx + x;
-                let lap = p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx] - 4.0 * p[i];
-                residual[i] = rhs[i] - lap;
+                let a_p = 4.0 * p[i] - (p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx]);
+                residual[i] = rhs[i] - a_p;
             }
         }
 
-        // Restrict (full weighting)
+        // Restrict (full weighting). The unit stencil hides h², so the coarse
+        // (2h) system's right-hand side is 4× the restricted residual.
         c_rhs.fill(0.0);
         for cy in 1..cny - 1 {
             for cx in 1..cnx - 1 {
@@ -746,31 +806,40 @@ impl FluidGrid {
                     + residual[fi - nx + 1]
                     + residual[fi + nx - 1]
                     + residual[fi + nx + 1])
-                    / 16.0;
+                    * 0.25;
             }
         }
 
         // Recurse
         Self::mg_vcycle(&mut c_p, &c_rhs, cnx, cny, nu, levels, depth + 1);
 
-        // Prolongate
-        for cy in 0..cny {
-            for cx in 0..cnx {
-                let val = c_p[cy * cnx + cx];
-                let fx = cx * 2;
-                let fy = cy * 2;
-                if fx < nx && fy < ny {
-                    p[fy * nx + fx] += val;
-                }
-                if fx + 1 < nx && fy < ny {
-                    p[fy * nx + fx + 1] += val * 0.5;
-                }
-                if fx < nx && fy + 1 < ny {
-                    p[(fy + 1) * nx + fx] += val * 0.5;
-                }
-                if fx + 1 < nx && fy + 1 < ny {
-                    p[(fy + 1) * nx + fx + 1] += val * 0.25;
-                }
+        // Prolongate (bilinear): even fine points take the coarse value, odd
+        // points average their 2 or 4 coarse parents. Boundary ring stays 0.
+        let c_at = |cx: usize, cy: usize| -> f64 {
+            if cx < cnx && cy < cny {
+                c_p[cy * cnx + cx]
+            } else {
+                0.0
+            }
+        };
+        for y in 1..ny - 1 {
+            let cy = y / 2;
+            let odd_y = y % 2 == 1;
+            for x in 1..nx - 1 {
+                let cx = x / 2;
+                let odd_x = x % 2 == 1;
+                let corr = match (odd_x, odd_y) {
+                    (false, false) => c_at(cx, cy),
+                    (true, false) => 0.5 * (c_at(cx, cy) + c_at(cx + 1, cy)),
+                    (false, true) => 0.5 * (c_at(cx, cy) + c_at(cx, cy + 1)),
+                    (true, true) => {
+                        0.25 * (c_at(cx, cy)
+                            + c_at(cx + 1, cy)
+                            + c_at(cx, cy + 1)
+                            + c_at(cx + 1, cy + 1))
+                    }
+                };
+                p[y * nx + x] += corr;
             }
         }
 
@@ -781,12 +850,12 @@ impl FluidGrid {
         let _ = Self::pressure_solve(p, rhs, nx, ny, nu);
     }
 
-    /// Conjugate gradient Poisson solver: ∇²p = div.
+    /// Conjugate gradient Poisson solver for `4p − Σn = rhs`.
     ///
-    /// Matrix-free CG using `hisab::num::conjugate_gradient`. Applies the
-    /// discrete Laplacian as the linear operator. Boundary cells are held at
-    /// zero (Dirichlet). Good for large grids where Gauss-Seidel converges
-    /// slowly, with guaranteed convergence for the SPD Laplacian.
+    /// Matrix-free CG using `hisab::num::conjugate_gradient`. The unit-stencil
+    /// operator `4p − Σn` is symmetric positive definite on the interior with
+    /// Dirichlet boundaries, as CG requires. Converges to a relative residual
+    /// of 1e-6 or stops after `iterations`.
     fn pressure_solve_cg(
         pressure: &mut [f64],
         div: &[f64],
@@ -798,23 +867,23 @@ impl FluidGrid {
 
         let n = nx * ny;
 
-        // The discrete Laplacian operator: for interior cells (x,y) in
-        // 1..nx-1, 1..ny-1 compute p[left]+p[right]+p[up]+p[down]-4*p[center].
-        // Boundary cells are treated as zero (Dirichlet BCs).
+        // SPD operator 4·p[center] − (p[left]+p[right]+p[up]+p[down]) on
+        // interior cells; boundary rows are zero (Dirichlet BCs).
         let a_mul = move |p: &[f64]| -> Vec<f64> {
             let mut result = vec![0.0; n];
             for y in 1..ny - 1 {
                 for x in 1..nx - 1 {
                     let i = y * nx + x;
-                    result[i] = p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx] - 4.0 * p[i];
+                    result[i] = 4.0 * p[i] - (p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx]);
                 }
             }
             result
         };
 
-        let x0: Vec<f64> = pressure.to_vec();
+        let b_norm = div.iter().map(|d| d * d).sum::<f64>().sqrt();
+        let tol = (1e-6 * b_norm).max(1e-14);
 
-        let solution = conjugate_gradient(a_mul, div, &x0, 1e-6, iterations).map_err(|e| {
+        let solution = conjugate_gradient(a_mul, div, pressure, tol, iterations).map_err(|e| {
             PravashError::Diverged {
                 reason: format!("CG pressure solve failed: {e}").into(),
             }
@@ -837,28 +906,18 @@ impl FluidGrid {
 
         #[cfg(feature = "parallel")]
         {
-            // Compute corrections, then apply (avoids split-borrow issues)
-            let corrections: Vec<(f64, f64)> = (1..ny - 1)
-                .into_par_iter()
-                .flat_map(|y| {
-                    (1..nx - 1).into_par_iter().map(move |x| {
+            // Rows are independent: update vx/vy row slices in parallel.
+            vx.par_chunks_mut(nx)
+                .zip(vy.par_chunks_mut(nx))
+                .enumerate()
+                .filter(|(y, _)| *y >= 1 && *y < ny - 1)
+                .for_each(|(y, (row_x, row_y))| {
+                    for x in 1..nx - 1 {
                         let i = y * nx + x;
-                        (
-                            (pressure[i + 1] - pressure[i - 1]) * inv_2dx,
-                            (pressure[i + nx] - pressure[i - nx]) * inv_2dx,
-                        )
-                    })
-                })
-                .collect();
-            let mut idx = 0;
-            for y in 1..ny - 1 {
-                for x in 1..nx - 1 {
-                    let i = y * nx + x;
-                    vx[i] -= corrections[idx].0;
-                    vy[i] -= corrections[idx].1;
-                    idx += 1;
-                }
-            }
+                        row_x[x] -= (pressure[i + 1] - pressure[i - 1]) * inv_2dx;
+                        row_y[x] -= (pressure[i + nx] - pressure[i - nx]) * inv_2dx;
+                    }
+                });
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -951,20 +1010,23 @@ impl FluidGrid {
                 }
             }
             BoundaryCondition::FreeSlip => {
+                // Wall sits on the face between ghost and first interior cell
+                // (as for NoSlip): normal component reflected (zero at the
+                // face), tangential component copied (zero gradient).
                 for x in 0..nx {
                     vx[x] = vx[nx + x];
-                    vy[x] = 0.0;
+                    vy[x] = -vy[nx + x];
                     let top = (ny - 1) * nx + x;
                     let below = (ny - 2) * nx + x;
                     vx[top] = vx[below];
-                    vy[top] = 0.0;
+                    vy[top] = -vy[below];
                 }
                 for y in 0..ny {
                     let l = y * nx;
-                    vx[l] = 0.0;
+                    vx[l] = -vx[l + 1];
                     vy[l] = vy[l + 1];
                     let r = y * nx + nx - 1;
-                    vx[r] = 0.0;
+                    vx[r] = -vx[r - 1];
                     vy[r] = vy[r - 1];
                 }
             }
@@ -1023,14 +1085,19 @@ impl FluidGrid {
                 viscosity: config.viscosity,
             });
         }
-        if config.smagorinsky_cs < 0.0 {
+        if !config.smagorinsky_cs.is_finite() || config.smagorinsky_cs < 0.0 {
             return Err(PravashError::InvalidParameter {
-                reason: "smagorinsky_cs must be >= 0".into(),
+                reason: "smagorinsky_cs must be finite and >= 0".into(),
             });
         }
-        if config.vorticity_confinement < 0.0 {
+        if !config.vorticity_confinement.is_finite() || config.vorticity_confinement < 0.0 {
             return Err(PravashError::InvalidParameter {
-                reason: "vorticity_confinement must be >= 0".into(),
+                reason: "vorticity_confinement must be finite and >= 0".into(),
+            });
+        }
+        if !config.buoyancy_alpha.is_finite() || !config.ambient_density.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: "buoyancy_alpha and ambient_density must be finite".into(),
             });
         }
         if config.pressure_iterations == 0 {
@@ -1048,7 +1115,25 @@ impl FluidGrid {
         let ny = self.ny;
         let dx = self.dx;
         let dt = config.dt;
-        let n = nx * ny;
+        // Public fields / Deserialize can bypass `new()`: re-check invariants.
+        let n = match nx.checked_mul(ny) {
+            Some(n)
+                if nx >= Self::MIN_SIZE
+                    && ny >= Self::MIN_SIZE
+                    && self.vx.len() == n
+                    && self.vy.len() == n
+                    && self.pressure.len() == n
+                    && self.density.len() == n =>
+            {
+                n
+            }
+            _ => return Err(PravashError::InvalidGridResolution { nx, ny }),
+        };
+        if !dx.is_finite() || dx <= 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("cell size must be positive: {dx}").into(),
+            });
+        }
         let inv_dx = 1.0 / dx;
         let inv_2dx = 0.5 * inv_dx;
 
@@ -1192,7 +1277,8 @@ impl FluidGrid {
         // 4. Pressure projection
         {
             sa.fill(0.0);
-            Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, inv_2dx);
+            // RHS = −dx²·∇·u for the unit-stencil Poisson system (see pressure_solve).
+            Self::divergence(&mut sa, &self.vx, &self.vy, nx, ny, 0.5 * dx);
             if config.use_cg {
                 Self::pressure_solve_cg(
                     &mut self.pressure,
@@ -1202,9 +1288,20 @@ impl FluidGrid {
                     config.pressure_iterations,
                 )?;
             } else if config.use_multigrid {
+                // ~10 GS sweeps of work per V-cycle: match pressure_iterations' budget.
+                let cycles = config.pressure_iterations.div_ceil(10);
                 let mut mg = std::mem::take(&mut self.mg_levels);
-                Self::pressure_solve_multigrid(&mut self.pressure, &sa, nx, ny, 4, &mut mg)?;
+                let res = Self::pressure_solve_multigrid(
+                    &mut self.pressure,
+                    &sa,
+                    nx,
+                    ny,
+                    4,
+                    cycles,
+                    &mut mg,
+                );
                 self.mg_levels = mg;
+                res?;
             } else if config.boundary == BoundaryCondition::Periodic {
                 Self::pressure_solve(&mut self.pressure, &sa, nx, ny, config.pressure_iterations)?;
             } else {
@@ -1213,6 +1310,16 @@ impl FluidGrid {
             Self::project_velocity(&mut self.vx, &mut self.vy, &self.pressure, nx, ny, inv_2dx);
         }
         Self::enforce_boundary(&mut self.vx, &mut self.vy, nx, ny, config.boundary);
+
+        if self.vx.iter().chain(&self.vy).any(|v| !v.is_finite()) {
+            self.scratch_a = sa;
+            self.scratch_b = sb;
+            self.scratch_c = sc;
+            self.diffuse_rhs = drhs;
+            return Err(PravashError::Diverged {
+                reason: "non-finite velocity after pressure projection".into(),
+            });
+        }
 
         // 5. Advect density
         if config.use_bfecc && config.boundary != BoundaryCondition::Periodic {
@@ -1288,9 +1395,12 @@ impl FluidGrid {
 
 /// k-epsilon turbulence state for a 2D grid.
 ///
-/// Two-equation RANS model solving transport equations for:
+/// Two-equation RANS model for:
 /// - k: turbulent kinetic energy
 /// - ε: turbulent dissipation rate
+///
+/// [`step`](KEpsilon::step) integrates the production/dissipation source
+/// terms only; advection and diffusion of k and ε are not modelled yet.
 ///
 /// Effective viscosity: ν_t = C_μ · k² / ε
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1337,11 +1447,37 @@ impl KEpsilon {
         self.c_mu * self.k[i] * self.k[i] / self.epsilon[i].max(1e-20)
     }
 
-    /// Step the k-ε transport equations.
+    /// Step the k-ε source terms (production and dissipation).
+    ///
+    /// Does nothing (with a warning) if the slice lengths do not match
+    /// `nx·ny`, the grid is smaller than 3×3, or `dx`/`dt` are invalid.
     pub fn step(&mut self, vx: &[f64], vy: &[f64], nx: usize, ny: usize, dx: f64, dt: f64) {
         let _span = trace_span!("grid::kepsilon", nx, ny).entered();
+        let n = match nx.checked_mul(ny) {
+            Some(n)
+                if nx >= 3
+                    && ny >= 3
+                    && vx.len() == n
+                    && vy.len() == n
+                    && self.k.len() == n
+                    && self.epsilon.len() == n
+                    && dx.is_finite()
+                    && dx > 0.0
+                    && dt.is_finite()
+                    && dt > 0.0 =>
+            {
+                n
+            }
+            _ => {
+                tracing::warn!(
+                    nx,
+                    ny,
+                    "KEpsilon::step: invalid sizes or parameters ignored"
+                );
+                return;
+            }
+        };
         let inv_2dx = 0.5 / dx;
-        let n = nx * ny;
 
         // Swap k/epsilon into scratch buffers to read old values without cloning.
         self.scratch_k.resize(n, 0.0);
@@ -1401,6 +1537,17 @@ pub fn apply_ghost_fluid(
     surface_tension: f64,
 ) {
     let _span = trace_span!("grid::ghost_fluid", nx, ny).entered();
+    let valid = nx >= 3
+        && ny >= 3
+        && nx
+            .checked_mul(ny)
+            .is_some_and(|n| pressure.len() == n && level_set.len() == n)
+        && dx.is_finite()
+        && dx > 0.0;
+    if !valid {
+        tracing::warn!(nx, ny, "apply_ghost_fluid: invalid sizes or dx ignored");
+        return;
+    }
     let inv_dx = 1.0 / dx;
     let inv_dx2 = inv_dx * inv_dx;
 
@@ -1456,6 +1603,11 @@ pub struct MacGrid {
     pub pressure: Vec<f64>,
     /// Density/scalar at cell centers. Size: nx × ny.
     pub density: Vec<f64>,
+    /// Scratch buffers (divergence, advected density) reused across steps.
+    #[serde(skip)]
+    scratch_div: Vec<f64>,
+    #[serde(skip)]
+    scratch_density: Vec<f64>,
 }
 
 impl MacGrid {
@@ -1480,6 +1632,8 @@ impl MacGrid {
             vy: vec![0.0; vy_n],
             pressure: vec![0.0; cell_n],
             density: vec![0.0; cell_n],
+            scratch_div: vec![0.0; cell_n],
+            scratch_density: vec![0.0; cell_n],
         })
     }
 
@@ -1506,6 +1660,7 @@ impl MacGrid {
     }
 
     /// Compute divergence at cell centers (exact on staggered grid).
+    #[inline]
     #[must_use]
     pub fn divergence_at(&self, x: usize, y: usize) -> f64 {
         let inv_dx = 1.0 / self.dx;
@@ -1516,65 +1671,118 @@ impl MacGrid {
 
     /// Perform one Navier-Stokes step on the staggered grid.
     ///
-    /// Simplified pipeline: apply forces → pressure projection → advect density.
-    /// Pressure projection is exact (no checkerboard) on the staggered layout.
+    /// Simplified pipeline: buoyancy → pressure projection → advect density.
+    ///
+    /// The domain is closed by solid walls on all four sides: the normal face
+    /// velocity on the domain boundary is held at zero and pressure uses
+    /// Neumann (zero normal gradient) wall conditions, so the projection is
+    /// exact on the staggered layout. `config.boundary` is not used (there is
+    /// no tangential wall velocity on a MAC grid without viscosity).
     pub fn step(&mut self, config: &GridConfig) -> Result<()> {
         let _span = trace_span!("mac::step", nx = self.nx, ny = self.ny).entered();
 
         if !config.dt.is_finite() || config.dt <= 0.0 {
             return Err(PravashError::InvalidTimestep { dt: config.dt });
         }
+        if config.pressure_iterations == 0 {
+            return Err(PravashError::InvalidParameter {
+                reason: "pressure_iterations must be > 0".into(),
+            });
+        }
+        if !config.buoyancy_alpha.is_finite() || !config.ambient_density.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: "buoyancy_alpha and ambient_density must be finite".into(),
+            });
+        }
 
         let nx = self.nx;
         let ny = self.ny;
         let dx = self.dx;
         let dt = config.dt;
+        let cell_n = match nx.checked_mul(ny) {
+            Some(n)
+                if nx >= 4
+                    && ny >= 4
+                    && self.vx.len() == (nx + 1) * ny
+                    && self.vy.len() == nx * (ny + 1)
+                    && self.pressure.len() == n
+                    && self.density.len() == n =>
+            {
+                n
+            }
+            _ => return Err(PravashError::InvalidGridResolution { nx, ny }),
+        };
+        if !dx.is_finite() || dx <= 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("cell size must be positive: {dx}").into(),
+            });
+        }
         let inv_dx = 1.0 / dx;
 
-        // 1. Apply body forces (gravity/buoyancy) to face velocities
+        // 0. Solid walls: zero normal velocity on the domain boundary faces.
+        for y in 0..ny {
+            self.vx[y * (nx + 1)] = 0.0;
+            self.vx[y * (nx + 1) + nx] = 0.0;
+        }
+        for x in 0..nx {
+            self.vy[x] = 0.0;
+            self.vy[ny * nx + x] = 0.0;
+        }
+
+        // 1. Buoyancy on interior y-faces (density averaged to the face)
         if config.buoyancy_alpha != 0.0 {
-            for y in 0..ny + 1 {
+            for y in 1..ny {
                 for x in 0..nx {
-                    let idx = y * nx + x;
-                    // Average density to y-face
-                    let rho = if y > 0 && y < ny {
-                        0.5 * (self.density[(y - 1) * nx + x] + self.density[y * nx + x])
-                    } else if y == 0 {
-                        self.density[x]
-                    } else {
-                        self.density[(ny - 1) * nx + x]
-                    };
-                    self.vy[idx] += config.buoyancy_alpha * (rho - config.ambient_density) * dt;
+                    let rho = 0.5 * (self.density[(y - 1) * nx + x] + self.density[y * nx + x]);
+                    self.vy[y * nx + x] +=
+                        config.buoyancy_alpha * (rho - config.ambient_density) * dt;
                 }
             }
         }
 
-        // 2. Pressure projection (exact divergence-free on staggered grid)
-        let cell_n = nx * ny;
-        let mut div = vec![0.0f64; cell_n];
+        // 2. Pressure projection: Σ_nbr (p_i − p_j) = −dx·(flux sum) = −dx²·∇·u,
+        //    neighbours across a wall are omitted (Neumann).
+        let mut rhs = std::mem::take(&mut self.scratch_div);
+        rhs.resize(cell_n, 0.0);
         for y in 0..ny {
             for x in 0..nx {
-                div[y * nx + x] = -((self.vx[y * (nx + 1) + x + 1] - self.vx[y * (nx + 1) + x])
+                rhs[y * nx + x] = -((self.vx[y * (nx + 1) + x + 1] - self.vx[y * (nx + 1) + x])
                     + (self.vy[(y + 1) * nx + x] - self.vy[y * nx + x]))
-                    * inv_dx;
+                    * dx;
             }
         }
-
-        // GS pressure solve on cell centers
         for _ in 0..config.pressure_iterations {
-            for y in 1..ny - 1 {
-                for x in 1..nx - 1 {
+            for y in 0..ny {
+                for x in 0..nx {
                     let i = y * nx + x;
-                    let neighbors = self.pressure[i - 1]
-                        + self.pressure[i + 1]
-                        + self.pressure[i - nx]
-                        + self.pressure[i + nx];
-                    self.pressure[i] = (div[i] + neighbors) * 0.25;
+                    let mut sum = 0.0;
+                    let mut count = 0.0;
+                    if x > 0 {
+                        sum += self.pressure[i - 1];
+                        count += 1.0;
+                    }
+                    if x + 1 < nx {
+                        sum += self.pressure[i + 1];
+                        count += 1.0;
+                    }
+                    if y > 0 {
+                        sum += self.pressure[i - nx];
+                        count += 1.0;
+                    }
+                    if y + 1 < ny {
+                        sum += self.pressure[i + nx];
+                        count += 1.0;
+                    }
+                    self.pressure[i] = (rhs[i] + sum) / count;
                 }
             }
         }
+        // Pure-Neumann pressure is defined up to a constant: pin the mean to 0.
+        let mean = self.pressure.iter().sum::<f64>() / cell_n as f64;
+        self.pressure.iter_mut().for_each(|p| *p -= mean);
+        self.scratch_div = rhs;
 
-        // Subtract pressure gradient at faces
+        // Subtract pressure gradient at interior faces (wall faces stay 0)
         for y in 0..ny {
             for x in 1..nx {
                 self.vx[y * (nx + 1) + x] -=
@@ -1588,6 +1796,32 @@ impl MacGrid {
             }
         }
 
+        // 3. Advect density (semi-Lagrangian from cell centres)
+        let mut advected = std::mem::take(&mut self.scratch_density);
+        advected.resize(cell_n, 0.0);
+        let dt_inv_dx = dt * inv_dx;
+        for y in 0..ny {
+            for x in 0..nx {
+                let (u, v) = self.velocity_at(x, y);
+                let fx = x as f64 - dt_inv_dx * u;
+                let fy = y as f64 - dt_inv_dx * v;
+                advected[y * nx + x] = FluidGrid::sample(&self.density, nx, ny, fx, fy);
+            }
+        }
+        std::mem::swap(&mut self.density, &mut advected);
+        self.scratch_density = advected;
+
+        if self
+            .vx
+            .iter()
+            .chain(&self.vy)
+            .chain(&self.density)
+            .any(|v| !v.is_finite())
+        {
+            return Err(PravashError::Diverged {
+                reason: "non-finite value in MAC grid step".into(),
+            });
+        }
         Ok(())
     }
 
@@ -1596,7 +1830,8 @@ impl MacGrid {
     pub fn cfl_dt(&self, cfl_factor: f64) -> f64 {
         let max_v = self.max_speed();
         if max_v < 1e-20 {
-            return cfl_factor * self.dx;
+            // No flow: no advective limit (consistent with FluidGrid::cfl_dt).
+            return f64::MAX;
         }
         cfl_factor * self.dx / max_v
     }
@@ -1841,8 +2076,13 @@ mod tests {
         let mut vx = vec![1.0; n];
         let mut vy = vec![2.0; n];
         FluidGrid::enforce_boundary(&mut vx, &mut vy, nx, ny, BoundaryCondition::FreeSlip);
-        assert!(vx[0].abs() < f64::EPSILON); // left wall: normal vx = 0
-        assert!(vy[1].abs() < f64::EPSILON); // bottom wall: normal vy = 0
+        // Wall on the ghost/interior face: normal velocity averages to zero there.
+        let l = 3 * nx; // left ghost, row 3
+        assert!((vx[l] + vx[l + 1]).abs() < f64::EPSILON); // left wall: normal vx
+        assert!((vy[1] + vy[nx + 1]).abs() < f64::EPSILON); // bottom wall: normal vy
+        // Tangential components are copied (zero gradient).
+        assert!((vy[l] - vy[l + 1]).abs() < f64::EPSILON);
+        assert!((vx[1] - vx[nx + 1]).abs() < f64::EPSILON);
     }
 
     // ── Full step tests ─────────────────────────────────────────────────────
@@ -2095,5 +2335,296 @@ mod tests {
             "free-slip: tangential vy should be preserved: {}",
             g.vy[l]
         );
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    /// Smooth potential-flow field u = ∇φ (φ a Gaussian bump), zero near walls.
+    fn potential_flow(nx: usize, ny: usize, dx: f64) -> (Vec<f64>, Vec<f64>) {
+        let n = nx * ny;
+        let mut vx = vec![0.0; n];
+        let mut vy = vec![0.0; n];
+        let (cx, cy) = (nx as f64 / 2.0, ny as f64 / 2.0);
+        let sigma = nx as f64 / 8.0;
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let (rx, ry) = (x as f64 - cx, y as f64 - cy);
+                let phi = (-(rx * rx + ry * ry) / (sigma * sigma)).exp();
+                // ∂φ/∂x in physical units
+                vx[y * nx + x] = -2.0 * rx / (sigma * sigma) * phi / dx;
+                vy[y * nx + x] = -2.0 * ry / (sigma * sigma) * phi / dx;
+            }
+        }
+        (vx, vy)
+    }
+
+    fn div_norm(vx: &[f64], vy: &[f64], nx: usize, ny: usize, dx: f64) -> f64 {
+        let mut div = vec![0.0; nx * ny];
+        FluidGrid::divergence(&mut div, vx, vy, nx, ny, 0.5 / dx);
+        div.iter().map(|d| d * d).sum::<f64>().sqrt()
+    }
+
+    /// Project with each solver at dx ≠ 1; every one must cut divergence.
+    #[test]
+    fn test_projection_all_solvers_dx_scaled() {
+        let (nx, ny, dx) = (33, 33, 0.1);
+        for solver in ["gs", "dst", "mg", "cg"] {
+            let (mut vx, mut vy) = potential_flow(nx, ny, dx);
+            let before = div_norm(&vx, &vy, nx, ny, dx);
+            let mut rhs = vec![0.0; nx * ny];
+            FluidGrid::divergence(&mut rhs, &vx, &vy, nx, ny, 0.5 * dx);
+            let mut p = vec![0.0; nx * ny];
+            let mut levels = Vec::new();
+            match solver {
+                "gs" => FluidGrid::pressure_solve(&mut p, &rhs, nx, ny, 2000).unwrap(),
+                "dst" => FluidGrid::pressure_solve_dst(&mut p, &rhs, nx, ny).unwrap(),
+                "mg" => {
+                    FluidGrid::pressure_solve_multigrid(&mut p, &rhs, nx, ny, 4, 10, &mut levels)
+                        .unwrap()
+                }
+                _ => FluidGrid::pressure_solve_cg(&mut p, &rhs, nx, ny, 500).unwrap(),
+            }
+            FluidGrid::project_velocity(&mut vx, &mut vy, &p, nx, ny, 0.5 / dx);
+            let after = div_norm(&vx, &vy, nx, ny, dx);
+            assert!(
+                after < 0.5 * before,
+                "{solver}: divergence {before} -> {after} (must shrink)"
+            );
+        }
+    }
+
+    /// All solvers solve the same system: their pressures must agree.
+    #[test]
+    fn test_pressure_solvers_agree() {
+        let (nx, ny, dx) = (17, 17, 0.25);
+        let (vx, vy) = potential_flow(nx, ny, dx);
+        let mut rhs = vec![0.0; nx * ny];
+        FluidGrid::divergence(&mut rhs, &vx, &vy, nx, ny, 0.5 * dx);
+        let mut p_dst = vec![0.0; nx * ny];
+        FluidGrid::pressure_solve_dst(&mut p_dst, &rhs, nx, ny).unwrap();
+        let mut p_gs = vec![0.0; nx * ny];
+        FluidGrid::pressure_solve(&mut p_gs, &rhs, nx, ny, 5000).unwrap();
+        let mut p_cg = vec![0.0; nx * ny];
+        FluidGrid::pressure_solve_cg(&mut p_cg, &rhs, nx, ny, 1000).unwrap();
+        let mut p_mg = vec![0.0; nx * ny];
+        let mut levels = Vec::new();
+        FluidGrid::pressure_solve_multigrid(&mut p_mg, &rhs, nx, ny, 4, 30, &mut levels).unwrap();
+        let scale = p_dst.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(scale > 0.0);
+        for (name, p) in [("gs", &p_gs), ("cg", &p_cg), ("mg", &p_mg)] {
+            let err = p
+                .iter()
+                .zip(&p_dst)
+                .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                err < 1e-3 * scale,
+                "{name} disagrees with DST: {err} vs {scale}"
+            );
+        }
+    }
+
+    /// Repeated V-cycles must drive the residual down monotonically.
+    #[test]
+    fn test_multigrid_converges() {
+        let (nx, ny) = (33, 33);
+        let mut rhs = vec![0.0; nx * ny];
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                rhs[y * nx + x] = ((x * 7 + y * 3) % 5) as f64 - 2.0;
+            }
+        }
+        let residual = |p: &[f64]| -> f64 {
+            let mut r = 0.0;
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = y * nx + x;
+                    let a = 4.0 * p[i] - (p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx]);
+                    r += (rhs[i] - a).powi(2);
+                }
+            }
+            r.sqrt()
+        };
+        let mut p = vec![0.0; nx * ny];
+        let mut levels = Vec::new();
+        let mut last = residual(&p);
+        for _ in 0..6 {
+            FluidGrid::pressure_solve_multigrid(&mut p, &rhs, nx, ny, 4, 1, &mut levels).unwrap();
+            let r = residual(&p);
+            assert!(r < 0.5 * last, "V-cycle residual {last} -> {r}");
+            last = r;
+        }
+    }
+
+    /// A blob advected more than one cell per step must survive the limiter.
+    #[test]
+    fn test_maccormack_bfecc_preserve_moving_blob() {
+        let (nx, ny) = (40, 9);
+        let n = nx * ny;
+        let mut src = vec![0.0; n];
+        for x in 8..12 {
+            src[4 * nx + x] = 1.0;
+        }
+        let vx = vec![2.0; n]; // CFL = 2 with dt = dx = 1
+        let vy = vec![0.0; n];
+        let mass0: f64 = src.iter().sum();
+        for which in ["maccormack", "bfecc"] {
+            let mut dst = vec![0.0; n];
+            let mut t1 = vec![0.0; n];
+            let mut t2 = vec![0.0; n];
+            if which == "maccormack" {
+                FluidGrid::advect_maccormack(&mut dst, &src, &vx, &vy, nx, ny, 1.0, 1.0, &mut t1);
+            } else {
+                FluidGrid::advect_bfecc(
+                    &mut dst, &src, &vx, &vy, nx, ny, 1.0, 1.0, &mut t1, &mut t2,
+                );
+            }
+            let mass: f64 = dst.iter().sum();
+            assert!(
+                (mass - mass0).abs() < 1e-9,
+                "{which}: blob mass {mass0} -> {mass}"
+            );
+            assert!(
+                (dst[4 * nx + 12] - 1.0).abs() < 1e-9,
+                "{which}: blob moved by 2"
+            );
+            assert!(dst.iter().all(|&v| (-1e-12..=1.0 + 1e-12).contains(&v)));
+        }
+    }
+
+    #[test]
+    fn test_step_rejects_nan_config() {
+        let mut g = FluidGrid::new(8, 8, 0.1).unwrap();
+        let mut c = GridConfig::smoke();
+        c.smagorinsky_cs = f64::NAN;
+        assert!(g.step(&c).is_err());
+        let mut c = GridConfig::smoke();
+        c.buoyancy_alpha = f64::NAN;
+        assert!(g.step(&c).is_err());
+    }
+
+    #[test]
+    fn test_step_rejects_inconsistent_grid() {
+        let mut g = FluidGrid::new(8, 8, 0.1).unwrap();
+        g.vx.truncate(10);
+        assert!(g.step(&GridConfig::smoke()).is_err());
+        let mut g = FluidGrid::new(8, 8, 0.1).unwrap();
+        g.nx = 1;
+        assert!(g.step(&GridConfig::smoke()).is_err());
+    }
+
+    #[test]
+    fn test_diffuse_size_mismatch_no_panic() {
+        let mut f = vec![1.0; 10];
+        FluidGrid::diffuse(&mut f, 8, 8, 0.1, 0.1, 0.1, 5);
+        FluidGrid::diffuse(&mut f, 10, 0, 0.1, 0.1, 0.1, 5);
+        assert!(f.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn test_kepsilon_size_mismatch_no_panic() {
+        let mut ke = KEpsilon::new(8, 8);
+        ke.step(&[0.0; 10], &[0.0; 10], 8, 8, 0.1, 0.01);
+        ke.step(&[0.0; 64], &[0.0; 64], 16, 4, 0.1, 0.01);
+    }
+
+    #[test]
+    fn test_cfl_dt_finite_without_flow() {
+        let g = FluidGrid::new(8, 8, 0.1).unwrap();
+        assert!(g.cfl_dt(0.0, 2.0).is_finite());
+        let m = MacGrid::new(8, 8, 0.1).unwrap();
+        assert!(m.cfl_dt(0.5) > 1e300);
+    }
+
+    #[test]
+    fn test_mac_projection_divergence_free() {
+        let mut m = MacGrid::new(16, 16, 0.1).unwrap();
+        // Arbitrary interior face velocities.
+        for (k, v) in m.vx.iter_mut().enumerate() {
+            *v = ((k * 13) % 7) as f64 - 3.0;
+        }
+        for (k, v) in m.vy.iter_mut().enumerate() {
+            *v = ((k * 5) % 11) as f64 - 5.0;
+        }
+        let mut c = GridConfig::smoke();
+        c.buoyancy_alpha = 0.0;
+        c.pressure_iterations = 3000;
+        m.step(&c).unwrap();
+        let mut max_div = 0.0f64;
+        for y in 0..16 {
+            for x in 0..16 {
+                max_div = max_div.max(m.divergence_at(x, y).abs());
+            }
+        }
+        assert!(
+            max_div < 1e-3,
+            "MAC projection residual divergence {max_div}"
+        );
+        // Walls are closed.
+        assert!(m.vy[..16].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_mac_buoyancy_does_not_accumulate_on_walls() {
+        let mut m = MacGrid::new(8, 8, 0.1).unwrap();
+        m.density.fill(1.0);
+        let c = GridConfig::smoke();
+        for _ in 0..10 {
+            m.step(&c).unwrap();
+        }
+        assert!(m.vy[..8].iter().all(|&v| v == 0.0));
+        assert!(m.vy[8 * 8..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_mac_advects_density() {
+        let mut m = MacGrid::new(16, 16, 0.1).unwrap();
+        m.density[8 * 16 + 4] = 1.0;
+        for y in 0..16 {
+            for x in 1..16 {
+                m.vx[y * 17 + x] = 0.5;
+            }
+        }
+        let mut c = GridConfig::smoke();
+        c.buoyancy_alpha = 0.0;
+        let before = m.density[8 * 16 + 4];
+        m.step(&c).unwrap();
+        assert!(
+            m.density[8 * 16 + 4] < before,
+            "density must move with the flow"
+        );
+    }
+
+    #[test]
+    fn test_ghost_fluid_size_mismatch_no_panic() {
+        let mut p = vec![0.0; 10];
+        apply_ghost_fluid(&mut p, &[0.0; 64], 8, 8, 0.1, 0.07);
+    }
+
+    /// Full `step()` at dx = 0.1 must remove divergence for every solver path
+    /// (the unscaled RHS used to amplify it by ~1/dx²).
+    #[test]
+    fn test_step_reduces_divergence_small_dx() {
+        let (nx, ny, dx) = (33, 33, 0.1);
+        for (cg, mg) in [(false, false), (false, true), (true, false)] {
+            let mut g = FluidGrid::new(nx, ny, dx).unwrap();
+            let (vx, vy) = potential_flow(nx, ny, dx);
+            g.vx = vx;
+            g.vy = vy;
+            let before = div_norm(&g.vx, &g.vy, nx, ny, dx);
+            let mut c = GridConfig::smoke();
+            c.dt = 1e-4;
+            c.viscosity = 0.0;
+            c.buoyancy_alpha = 0.0;
+            c.vorticity_confinement = 0.0;
+            c.pressure_iterations = 200;
+            c.use_cg = cg;
+            c.use_multigrid = mg;
+            g.step(&c).unwrap();
+            let after = div_norm(&g.vx, &g.vy, nx, ny, dx);
+            assert!(
+                after < 0.5 * before,
+                "cg={cg} mg={mg}: divergence {before} -> {after}"
+            );
+        }
     }
 }

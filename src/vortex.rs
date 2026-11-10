@@ -15,15 +15,20 @@ pub fn vorticity_2d(dvydx: f64, dvxdy: f64) -> f64 {
 ///
 /// Returns tangential velocity at radius r from center.
 /// Γ = circulation, ν = kinematic viscosity, t = time since creation.
+///
+/// With `ν·t <= 0` (inviscid or t = 0) this is the point-vortex limit Γ/(2πr).
 #[inline]
 #[must_use]
 pub fn lamb_oseen_velocity(circulation: f64, radius: f64, viscosity: f64, time: f64) -> f64 {
-    if radius <= 0.0 || time <= 0.0 || viscosity <= 0.0 {
+    if radius <= 0.0 {
         return 0.0;
     }
-    let r2 = radius * radius;
+    let point_vortex = circulation / (2.0 * PI * radius);
     let core = 4.0 * viscosity * time;
-    (circulation / (2.0 * PI * radius)) * (1.0 - (-r2 / core).exp())
+    if core <= 0.0 {
+        return point_vortex;
+    }
+    point_vortex * (1.0 - (-(radius * radius) / core).exp())
 }
 
 /// Rankine vortex — solid body rotation inside core, irrotational outside.
@@ -56,11 +61,16 @@ pub fn enstrophy(vorticity_field: &[f64], dx: f64) -> f64 {
 ///
 /// η = (ν³/ε)^(1/4)
 /// where ε = turbulent dissipation rate.
+///
+/// Returns ∞ for `ε <= 0` (no dissipation) and 0 for `ν <= 0` (inviscid limit).
 #[inline]
 #[must_use]
 pub fn kolmogorov_scale(viscosity: f64, dissipation_rate: f64) -> f64 {
-    if viscosity <= 0.0 || dissipation_rate <= 0.0 {
+    if dissipation_rate <= 0.0 {
         return f64::INFINITY;
+    }
+    if viscosity <= 0.0 {
+        return 0.0;
     }
     // Use log form for numeric stability: η = exp(0.75·ln(ν) - 0.25·ln(ε))
     (0.75 * viscosity.ln() - 0.25 * dissipation_rate.ln()).exp()
@@ -93,8 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lamb_oseen_zero_time() {
-        assert!(lamb_oseen_velocity(1.0, 1.0, 0.001, 0.0).abs() < EPS);
+    fn test_lamb_oseen_zero_time_is_point_vortex() {
+        // At t = 0 (or ν = 0) the core has zero size: v = Γ/(2πr).
+        let expected = 1.0 / (2.0 * PI);
+        assert!((lamb_oseen_velocity(1.0, 1.0, 0.001, 0.0) - expected).abs() < EPS);
+        assert!((lamb_oseen_velocity(1.0, 1.0, 0.0, 1.0) - expected).abs() < EPS);
     }
 
     #[test]
@@ -142,5 +155,10 @@ mod tests {
     #[test]
     fn test_kolmogorov_zero_dissipation() {
         assert!(kolmogorov_scale(1e-6, 0.0).is_infinite());
+    }
+
+    #[test]
+    fn test_kolmogorov_inviscid_limit() {
+        assert!(kolmogorov_scale(0.0, 0.01).abs() < EPS);
     }
 }

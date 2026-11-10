@@ -9,7 +9,7 @@ pravash
   └── hisab (math: DVec3, spatial hash, FFT/DST, PDE solvers, autodiff)
 ```
 
-External: `serde`, `thiserror`, `tracing` (required); `rayon`, `reqwest`, `tokio`, `serde_json`, `tracing-subscriber`, `tracing-chrome` (optional, feature-gated).
+External: `serde`, `thiserror`, `tracing` (required); `rayon`, `tracing-subscriber`, `tracing-chrome` (optional, feature-gated).
 
 ## Module Map
 

@@ -66,13 +66,18 @@ impl FluidMaterial {
         surface_tension: f64,
         speed_of_sound: f64,
     ) -> Result<Self> {
-        if density <= 0.0 {
+        if !density.is_finite() || density <= 0.0 {
             return Err(PravashError::InvalidDensity { density });
         }
-        if viscosity < 0.0 {
+        if !viscosity.is_finite() || viscosity < 0.0 {
             return Err(PravashError::InvalidViscosity { viscosity });
         }
-        if speed_of_sound <= 0.0 {
+        if !surface_tension.is_finite() || surface_tension < 0.0 {
+            return Err(PravashError::InvalidParameter {
+                reason: format!("surface tension must be non-negative: {surface_tension}").into(),
+            });
+        }
+        if !speed_of_sound.is_finite() || speed_of_sound <= 0.0 {
             return Err(PravashError::InvalidParameter {
                 reason: format!("speed of sound must be positive: {speed_of_sound}").into(),
             });
@@ -251,7 +256,10 @@ impl ParticleSoa {
         }
     }
 
-    /// Number of particles.
+    /// Number of particles (length of `pos_x`).
+    ///
+    /// All field arrays are public; if they are resized independently, use
+    /// [`is_consistent`](ParticleSoa::is_consistent) to check them.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
@@ -263,6 +271,43 @@ impl ParticleSoa {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pos_x.is_empty()
+    }
+
+    /// Lengths of every field array.
+    fn field_lens(&self) -> [usize; 18] {
+        [
+            self.pos_x.len(),
+            self.pos_y.len(),
+            self.pos_z.len(),
+            self.vel_x.len(),
+            self.vel_y.len(),
+            self.vel_z.len(),
+            self.accel_x.len(),
+            self.accel_y.len(),
+            self.accel_z.len(),
+            self.density.len(),
+            self.pressure.len(),
+            self.mass.len(),
+            self.phase.len(),
+            self.conf_xx.len(),
+            self.conf_xy.len(),
+            self.conf_yy.len(),
+            self.temperature.len(),
+            self.fuel.len(),
+        ]
+    }
+
+    /// Whether every field array has the same length.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        let n = self.len();
+        self.field_lens().iter().all(|&l| l == n)
+    }
+
+    /// Length of the shortest field array — the number of complete particles.
+    #[must_use]
+    pub fn consistent_len(&self) -> usize {
+        self.field_lens().into_iter().min().unwrap_or(0)
     }
 
     /// Convert from a slice of AOS particles.
@@ -294,9 +339,12 @@ impl ParticleSoa {
     }
 
     /// Convert back to AOS particles.
+    ///
+    /// If the field arrays have mismatched lengths, only the
+    /// [`consistent_len`](ParticleSoa::consistent_len) complete particles are converted.
     #[must_use]
     pub fn to_aos(&self) -> Vec<FluidParticle> {
-        let n = self.len();
+        let n = self.consistent_len();
         let mut particles = Vec::with_capacity(n);
         for i in 0..n {
             particles.push(FluidParticle {
@@ -317,7 +365,7 @@ impl ParticleSoa {
 
     /// Write SOA data back into an existing AOS slice (avoids allocation).
     pub fn write_to_aos(&self, particles: &mut [FluidParticle]) {
-        let n = self.len().min(particles.len());
+        let n = self.consistent_len().min(particles.len());
         for (i, p) in particles.iter_mut().enumerate().take(n) {
             p.position = DVec3::new(self.pos_x[i], self.pos_y[i], self.pos_z[i]);
             p.velocity = DVec3::new(self.vel_x[i], self.vel_y[i], self.vel_z[i]);
@@ -356,6 +404,8 @@ impl Default for ParticleSoa {
 pub struct ArenaHandle {
     start: usize,
     len: usize,
+    /// Arena generation at allocation time; bumped by `compact()`.
+    generation: u64,
 }
 
 impl ArenaHandle {
@@ -398,6 +448,8 @@ pub struct ParticleArena {
     watermark: usize,
     /// Free list: (start, len) sorted by start index.
     free_list: Vec<(usize, usize)>,
+    /// Incremented by `compact()`; handles from older generations are stale.
+    generation: u64,
 }
 
 impl ParticleArena {
@@ -410,6 +462,7 @@ impl ParticleArena {
             capacity,
             watermark: 0,
             free_list: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -430,56 +483,95 @@ impl ParticleArena {
 
     /// Allocate a contiguous block of `n` particles. Returns `None` if
     /// there isn't enough space.
+    ///
+    /// Allocated particles are always reset to the default (zero-mass,
+    /// at-rest) state.
+    #[must_use = "dropping the handle leaks the allocated block"]
     pub fn alloc(&mut self, n: usize) -> Option<ArenaHandle> {
         if n == 0 {
-            return Some(ArenaHandle { start: 0, len: 0 });
+            return Some(ArenaHandle {
+                start: 0,
+                len: 0,
+                generation: self.generation,
+            });
         }
 
-        // Try to find a free block that fits
-        for i in 0..self.free_list.len() {
+        // First fit from the free list, else bump the watermark.
+        let start = if let Some(i) = self.free_list.iter().position(|&(_, l)| l >= n) {
             let (start, free_len) = self.free_list[i];
-            if free_len >= n {
-                let handle = ArenaHandle { start, len: n };
-                if free_len == n {
-                    self.free_list.remove(i);
-                } else {
-                    self.free_list[i] = (start + n, free_len - n);
-                }
-                // Zero the allocated particles
-                let default = FluidParticle::new(DVec3::ZERO, 0.0);
-                for p in &mut self.particles[start..start + n] {
-                    *p = default;
-                }
-                return Some(handle);
+            if free_len == n {
+                self.free_list.remove(i);
+            } else {
+                self.free_list[i] = (start + n, free_len - n);
             }
-        }
-
-        // Allocate from the watermark
-        if self.watermark + n <= self.capacity {
-            let handle = ArenaHandle {
-                start: self.watermark,
-                len: n,
-            };
+            start
+        } else if n <= self.capacity - self.watermark {
+            let start = self.watermark;
             self.watermark += n;
-            return Some(handle);
-        }
+            start
+        } else {
+            return None; // out of space
+        };
 
-        None // out of space
+        // Zero the block: watermark slots may hold stale data from an earlier
+        // free or compaction.
+        let default = FluidParticle::new(DVec3::ZERO, 0.0);
+        self.particles[start..start + n].fill(default);
+        Some(ArenaHandle {
+            start,
+            len: n,
+            generation: self.generation,
+        })
+    }
+
+    /// Whether a handle refers to a live block of this arena's current
+    /// generation and lies within the allocated range.
+    #[inline]
+    fn handle_in_range(&self, handle: ArenaHandle) -> bool {
+        handle.generation == self.generation
+            && handle
+                .start
+                .checked_add(handle.len)
+                .is_some_and(|end| end <= self.watermark)
     }
 
     /// Free a previously allocated block, returning its slots to the pool.
+    ///
+    /// Stale handles (from before a [`compact`](ParticleArena::compact)),
+    /// out-of-range handles, and double frees are ignored with a warning.
     pub fn free(&mut self, handle: ArenaHandle) {
         if handle.len == 0 {
             return;
         }
+        if !self.handle_in_range(handle) {
+            tracing::warn!(
+                start = handle.start,
+                len = handle.len,
+                "ParticleArena::free: stale or out-of-range handle ignored"
+            );
+            return;
+        }
 
         // Insert into free list sorted by start, then merge adjacent
-        let entry = (handle.start, handle.len);
+        let end = handle.start + handle.len;
         let pos = self
             .free_list
             .binary_search_by_key(&handle.start, |&(s, _)| s)
             .unwrap_or_else(|p| p);
-        self.free_list.insert(pos, entry);
+        let overlaps_prev = pos > 0 && {
+            let (s0, l0) = self.free_list[pos - 1];
+            s0 + l0 > handle.start
+        };
+        let overlaps_next = self.free_list.get(pos).is_some_and(|&(s1, _)| s1 < end);
+        if overlaps_prev || overlaps_next {
+            tracing::warn!(
+                start = handle.start,
+                len = handle.len,
+                "ParticleArena::free: block already free (double free) ignored"
+            );
+            return;
+        }
+        self.free_list.insert(pos, (handle.start, handle.len));
 
         // Merge with next block
         if pos + 1 < self.free_list.len() {
@@ -510,15 +602,25 @@ impl ParticleArena {
     }
 
     /// Get a slice of particles for a given handle.
+    ///
+    /// Returns an empty slice for a stale (pre-`compact`) or out-of-range handle.
     #[inline]
     #[must_use]
     pub fn get(&self, handle: ArenaHandle) -> &[FluidParticle] {
+        if !self.handle_in_range(handle) {
+            return &[];
+        }
         &self.particles[handle.start..handle.start + handle.len]
     }
 
     /// Get a mutable slice of particles for a given handle.
+    ///
+    /// Returns an empty slice for a stale (pre-`compact`) or out-of-range handle.
     #[inline]
     pub fn get_mut(&mut self, handle: ArenaHandle) -> &mut [FluidParticle] {
+        if !self.handle_in_range(handle) {
+            return &mut [];
+        }
         &mut self.particles[handle.start..handle.start + handle.len]
     }
 
@@ -558,6 +660,7 @@ impl ParticleArena {
 
         self.watermark = write;
         self.free_list.clear();
+        self.generation = self.generation.wrapping_add(1);
         write
     }
 
@@ -634,7 +737,7 @@ impl FluidConfig {
                 reason: format!("gas constant must be positive: {}", self.gas_constant).into(),
             });
         }
-        if self.boundary_damping < 0.0 || self.boundary_damping > 1.0 {
+        if !(0.0..=1.0).contains(&self.boundary_damping) {
             return Err(PravashError::InvalidParameter {
                 reason: format!(
                     "boundary damping must be in [0, 1]: {}",
@@ -643,9 +746,19 @@ impl FluidConfig {
                 .into(),
             });
         }
+        if !self.gravity.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: "gravity must be finite".into(),
+            });
+        }
         // Check bounds ordering: min must be <= max for each axis
         let lo = self.bounds_min;
         let hi = self.bounds_max;
+        if !lo.is_finite() || !hi.is_finite() {
+            return Err(PravashError::InvalidParameter {
+                reason: "bounds must be finite".into(),
+            });
+        }
         if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
             return Err(PravashError::InvalidParameter {
                 reason: format!(
@@ -662,8 +775,8 @@ impl FluidConfig {
     #[inline]
     pub fn check_cfl(&self, max_velocity: f64) -> Result<()> {
         let dx = self.smoothing_radius;
-        let cfl = max_velocity * self.dt / dx;
-        if cfl > 1.0 {
+        let cfl = max_velocity.abs() * self.dt / dx;
+        if !cfl.is_finite() || cfl > 1.0 {
             return Err(PravashError::CflViolation {
                 velocity: max_velocity,
                 dx,
@@ -1032,5 +1145,105 @@ mod tests {
             assert!(m.viscosity >= 0.0);
             assert!(m.speed_of_sound > 0.0);
         }
+    }
+
+    // ── Audit regressions (1.3.0) ──────────────────────────────────────
+
+    #[test]
+    fn test_arena_watermark_alloc_is_zeroed() {
+        let mut arena = ParticleArena::new(10);
+        let h = arena.alloc(5).unwrap();
+        arena.get_mut(h)[0].mass = 7.0;
+        arena.free(h);
+        let h2 = arena.alloc(5).unwrap();
+        assert!(arena.get(h2).iter().all(|p| p.mass == 0.0));
+    }
+
+    #[test]
+    fn test_arena_double_free_ignored() {
+        let mut arena = ParticleArena::new(20);
+        let h1 = arena.alloc(5).unwrap();
+        let _h2 = arena.alloc(5).unwrap();
+        arena.free(h1);
+        arena.free(h1); // double free must not duplicate the free block
+        assert_eq!(arena.active_count(), 5);
+        let a = arena.alloc(5).unwrap();
+        let b = arena.alloc(5).unwrap();
+        assert_ne!(a.start(), b.start(), "two live handles must not alias");
+    }
+
+    #[test]
+    fn test_arena_stale_handle_after_compact() {
+        let mut arena = ParticleArena::new(20);
+        let h1 = arena.alloc(5).unwrap();
+        let h2 = arena.alloc(5).unwrap();
+        arena.free(h1);
+        arena.compact();
+        assert!(arena.get(h2).is_empty(), "pre-compact handle is stale");
+        arena.free(h2); // ignored
+        assert_eq!(arena.active_count(), 5);
+    }
+
+    #[test]
+    fn test_arena_foreign_handle_no_panic() {
+        let mut big = ParticleArena::new(100);
+        let _ = big.alloc(50).unwrap();
+        let h = big.alloc(10).unwrap();
+        let mut small = ParticleArena::new(10);
+        assert!(small.get(h).is_empty());
+        assert!(small.get_mut(h).is_empty());
+        small.free(h);
+        assert_eq!(small.active_count(), 0);
+    }
+
+    #[test]
+    fn test_arena_alloc_overflow() {
+        let mut arena = ParticleArena::new(10);
+        let _ = arena.alloc(3).unwrap();
+        assert!(arena.alloc(usize::MAX).is_none());
+        assert_eq!(arena.active_count(), 3);
+    }
+
+    #[test]
+    fn test_soa_mismatched_lengths_no_panic() {
+        let particles = vec![FluidParticle::new_2d(0.0, 0.0, 1.0); 4];
+        let mut soa = ParticleSoa::from_aos(&particles);
+        assert!(soa.is_consistent());
+        soa.mass.truncate(2);
+        assert!(!soa.is_consistent());
+        assert_eq!(soa.consistent_len(), 2);
+        assert_eq!(soa.to_aos().len(), 2);
+        let mut out = particles.clone();
+        soa.write_to_aos(&mut out);
+    }
+
+    #[test]
+    fn test_custom_material_rejects_non_finite() {
+        assert!(FluidMaterial::custom(f64::NAN, 0.01, 0.05, 1400.0).is_err());
+        assert!(FluidMaterial::custom(1000.0, f64::INFINITY, 0.05, 1400.0).is_err());
+        assert!(FluidMaterial::custom(1000.0, 0.01, f64::NAN, 1400.0).is_err());
+        assert!(FluidMaterial::custom(1000.0, 0.01, -0.1, 1400.0).is_err());
+        assert!(FluidMaterial::custom(1000.0, 0.01, 0.05, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_nan_fields() {
+        let mut c = FluidConfig::water_2d();
+        c.boundary_damping = f64::NAN;
+        assert!(c.validate().is_err());
+        let mut c = FluidConfig::water_2d();
+        c.gravity = DVec3::new(0.0, f64::NAN, 0.0);
+        assert!(c.validate().is_err());
+        let mut c = FluidConfig::water_2d();
+        c.bounds_max = DVec3::new(f64::NAN, 1.0, 0.0);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_check_cfl_negative_and_nan_velocity() {
+        let c = FluidConfig::water_2d();
+        assert!(c.check_cfl(-1e6).is_err());
+        assert!(c.check_cfl(f64::NAN).is_err());
+        assert!(c.check_cfl(-0.1).is_ok());
     }
 }

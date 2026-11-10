@@ -57,17 +57,18 @@ pub fn terminal_velocity(
     drag_coefficient: f64,
     area: f64,
 ) -> Result<f64> {
-    if !gravity.is_finite() {
+    if !gravity.is_finite() || !mass.is_finite() {
         return Err(PravashError::InvalidParameter {
-            reason: "terminal_velocity: gravity must be finite".into(),
+            reason: "terminal_velocity: mass and gravity must be finite".into(),
+        });
+    }
+    let positive = |x: f64| x.is_finite() && x > 0.0;
+    if !positive(fluid_density) || !positive(drag_coefficient) || !positive(area) {
+        return Err(PravashError::InvalidParameter {
+            reason: "terminal_velocity: ρ, Cd and A must each be positive and finite".into(),
         });
     }
     let denom = fluid_density * drag_coefficient * area;
-    if denom <= 0.0 {
-        return Err(PravashError::InvalidParameter {
-            reason: "terminal_velocity denominator (ρ·Cd·A) must be positive".into(),
-        });
-    }
     let arg = 2.0 * mass * gravity / denom;
     if arg < 0.0 {
         return Err(PravashError::InvalidParameter {
@@ -79,9 +80,11 @@ pub fn terminal_velocity(
 
 /// Reynolds number — determines flow regime (laminar vs turbulent).
 ///
-/// Re = ρ·v·L / μ
+/// Re = ρ·|v|·L / μ
 ///
-/// Returns an error if viscosity is zero (inviscid limit).
+/// Uses the speed `|v|`, so the result is non-negative for valid inputs.
+/// Returns an error if viscosity is zero (inviscid limit), or any input is
+/// non-finite, or density/length is negative.
 #[inline]
 pub fn reynolds_number(
     fluid_density: f64,
@@ -89,7 +92,7 @@ pub fn reynolds_number(
     length: f64,
     viscosity: f64,
 ) -> Result<f64> {
-    if viscosity <= 0.0 {
+    if !viscosity.is_finite() || viscosity <= 0.0 {
         return Err(PravashError::InvalidViscosity { viscosity });
     }
     if !fluid_density.is_finite() {
@@ -107,7 +110,12 @@ pub fn reynolds_number(
             reason: "reynolds_number: length must be finite".into(),
         });
     }
-    Ok(fluid_density * velocity * length / viscosity)
+    if fluid_density < 0.0 || length < 0.0 {
+        return Err(PravashError::InvalidParameter {
+            reason: "reynolds_number: density and length must be non-negative".into(),
+        });
+    }
+    Ok(fluid_density * velocity.abs() * length / viscosity)
 }
 
 /// Flow regime classification.
@@ -119,10 +127,13 @@ pub enum FlowRegime {
     Turbulent,
 }
 
-/// Classify flow regime from Reynolds number.
+/// Classify flow regime from Reynolds number (pipe-flow thresholds).
+///
+/// Uses `|Re|`, so the sign of the velocity does not matter.
 #[inline]
 #[must_use]
 pub fn classify_flow(re: f64) -> FlowRegime {
+    let re = re.abs();
     if re < 2300.0 {
         FlowRegime::Laminar
     } else if re < 4000.0 {
@@ -186,6 +197,25 @@ mod tests {
     #[test]
     fn test_reynolds_number_zero_viscosity() {
         assert!(reynolds_number(1000.0, 1.0, 0.1, 0.0).is_err());
+    }
+
+    #[test]
+    fn test_reynolds_number_nan_viscosity() {
+        assert!(reynolds_number(1000.0, 1.0, 0.1, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_reynolds_number_negative_velocity() {
+        let re = reynolds_number(1000.0, -1.0, 0.1, 0.001).unwrap();
+        assert!((re - 100000.0).abs() < 1.0);
+        assert_eq!(classify_flow(-1e7), FlowRegime::Turbulent);
+    }
+
+    #[test]
+    fn test_terminal_velocity_two_negative_terms_rejected() {
+        // ρ·Cd > 0 but both factors are non-physical.
+        assert!(terminal_velocity(1.0, 9.81, -1.225, -0.47, 0.01).is_err());
+        assert!(terminal_velocity(f64::NAN, 9.81, 1.225, 0.47, 0.01).is_err());
     }
 
     #[test]

@@ -13,6 +13,10 @@
 //! - [`shallow`] — Shallow water equations (2D surface waves)
 //! - [`buoyancy`] — Buoyancy and drag forces
 //! - [`vortex`] — Vortex dynamics and turbulence
+//! - [`vof`] / [`phase_field`] — Interface tracking on grids (with `grid`)
+//! - [`coupling`] / [`mpm`] — Fluid-body coupling, FLIP/APIC, Material Point Method
+//! - [`compute`] — GPU-agnostic compute backend interface
+//! - [`bridge`] — Cross-crate primitive-value conversions
 //! - [`common`] — Shared types: FluidParticle, FluidConfig, material properties
 //! - [`error`] — Error types
 

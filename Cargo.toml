@@ -1,8 +1,8 @@
 [package]
 name = "pravash"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99"
 license = "GPL-3.0-only"
 description = "Fluid dynamics simulation — SPH, Euler/Navier-Stokes, shallow water, buoyancy, drag, vortex dynamics"
 homepage = "https://github.com/MacCracken/pravash"
@@ -13,6 +13,9 @@ keywords = ["fluid", "simulation", "physics", "sph", "navier-stokes"]
 categories = ["science", "simulation"]
 exclude = [".claude/", ".github/", "docs/", "scripts/"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["sph", "grid", "shallow"]
 sph = []
@@ -21,29 +24,26 @@ shallow = []
 buoyancy = []
 vortex = []
 coupling = []
-compute = []
+compute = ["sph"]
 parallel = ["dep:rayon"]
-ai = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+ai = []
 logging = ["dep:tracing-subscriber", "dep:tracing-chrome"]
 full = ["sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute", "parallel", "ai", "logging"]
 
 [dependencies]
-hisab = { version = "1.1", features = ["num", "geo", "autodiff"] }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-tracing = "0.1"
+hisab = { version = "1.4", features = ["num", "geo", "autodiff"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
 
 # Optional
-reqwest = { version = "0.12", features = ["json"], optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
-serde_json = { version = "1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
-tracing-chrome = { version = "0.7", optional = true }
-rayon = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], optional = true }
+tracing-chrome = { version = "0.7.2", optional = true }
+rayon = { version = "1.12", optional = true }
 
 [dev-dependencies]
-serde_json = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1.0.154"
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "benchmarks"
