@@ -715,6 +715,208 @@ fn _par_json(fp, fl): i64 {
     return 0;
 }
 
+# ── shallow (M2) ────────────────────────────────────────────────────────────────────
+# A state is 11 scalars and 5 `v:<n>` fields (scripts/oracle/src/m_shallow.rs).
+
+# A column of `n` f64 words from the input tokens at k into *c (empty first): 1, or 0 for no memory.
+fn _par_col_in(k, n, c: *PvColumn): i64 {
+    c.data = 0;
+    c.len = 0;
+    c.cap = 0;
+    if (c.resize(n, 0) == 0) { return 0; }
+    for (var j = 0; j < n; j = j + 1) { store64(c.data + j * 8, _par_in(k + j)); }
+    return 1;
+}
+
+# Appends a column as `v:<n>` and its f64s.
+fn _par_col_out(c: *PvColumn) {
+    _par_got_seq(c.len);
+    for (var j = 0; j < c.len; j = j + 1) { _par_got_f(load64(c.data + j * 8)); }
+    return 0;
+}
+
+# The state whose tokens start at input k into *sw (scratch empty): the index after it, or -1 for no memory.
+fn _par_sw_in(k, sw: *PvShallowWater): i64 {
+    sw.nx = _par_in(k);
+    sw.ny = _par_in(k + 1);
+    sw.dx = _par_in(k + 2);
+    sw.gravity = _par_in(k + 3);
+    sw.damping = _par_in(k + 4);
+    sw.dry_threshold = _par_in(k + 5);
+    sw.breaking_threshold = _par_in(k + 6);
+    sw.breaking_dissipation = _par_in(k + 7);
+    sw.dispersion_coeff = _par_in(k + 8);
+    sw.use_green_naghdi = _par_in(k + 9);
+    sw.use_riemann = _par_in(k + 10);
+    for (var z = 5; z < _PV_SW_COLUMNS; z = z + 1) {
+        var s: *PvColumn = _pv_sw_col(sw, z);
+        s.data = 0;
+        s.len = 0;
+        s.cap = 0;
+    }
+    var at = k + 11;
+    for (var c = 0; c < 5; c = c + 1) {
+        var n = _par_in(at);
+        if (_par_col_in(at + 1, n, _pv_sw_col(sw, c)) == 0) { return 0 - 1; }
+        at = at + 1 + n;
+    }
+    return at;
+}
+
+# Appends a state's 11 scalars and 5 fields.
+fn _par_sw_out(sw: *PvShallowWater) {
+    _par_got_i(sw.nx);
+    _par_got_i(sw.ny);
+    _par_got_f(_pv_bits(sw.dx));
+    _par_got_f(_pv_bits(sw.gravity));
+    _par_got_f(_pv_bits(sw.damping));
+    _par_got_f(_pv_bits(sw.dry_threshold));
+    _par_got_f(_pv_bits(sw.breaking_threshold));
+    _par_got_f(_pv_bits(sw.breaking_dissipation));
+    _par_got_f(_pv_bits(sw.dispersion_coeff));
+    _par_got_i(sw.use_green_naghdi);
+    _par_got_i(sw.use_riemann);
+    for (var c = 0; c < 5; c = c + 1) { _par_col_out(_pv_sw_col(sw, c)); }
+    return 0;
+}
+
+fn _par_shallow(fp, fl): i64 {
+    var sw: PvShallowWater;
+    if (_par_eq(fp, fl, "ShallowWater::new") == 1) {
+        var t, v = PvShallowWater_new(_par_in(0), _par_in(1), _par_in(2), _par_in(3), &sw);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_i(sw.nx);
+        _par_got_i(sw.ny);
+        _par_got_f(_pv_bits(sw.dx));
+        _par_got_f(_pv_bits(sw.gravity));
+        _par_got_f(_pv_bits(sw.damping));
+        _par_got_f(_pv_bits(sw.dry_threshold));
+        _par_got_f(_pv_bits(sw.breaking_threshold));
+        _par_got_f(_pv_bits(sw.breaking_dissipation));
+        _par_got_f(_pv_bits(sw.dispersion_coeff));
+        _par_got_i(sw.use_green_naghdi);
+        _par_got_i(sw.use_riemann);
+        for (var c = 0; c < 5; c = c + 1) {
+            var col: *PvColumn = _pv_sw_col(&sw, c);
+            _par_got_i(col.len);
+            _par_got_f(load64(col.data));
+        }
+        for (var s = 5; s < _PV_SW_COLUMNS; s = s + 1) {
+            var sc: *PvColumn = _pv_sw_col(&sw, s);
+            _par_got_i(sc.len);
+        }
+        PvShallowWater_drop(&sw);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "SedimentConfig::default") == 1) {
+        var d: PvSedimentConfig = PvSedimentConfig_default();
+        _par_got_f(_pv_bits(d.shields_critical));
+        _par_got_f(_pv_bits(d.grain_diameter));
+        _par_got_f(_pv_bits(d.sediment_density));
+        _par_got_f(_pv_bits(d.water_density));
+        _par_got_f(_pv_bits(d.erosion_rate));
+        _par_got_f(_pv_bits(d.deposition_rate));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ShallowWater::from_json") == 1) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var tj, vj = PvShallowWater_from_json(doc, strlen(doc), &sw);
+        if (is_err_result(tj) == 1) { _par_got_err(vj); return 1; }
+        _par_sw_out(&sw);
+        # The round trip: write it, read it back, compare every scalar and field.
+        var sb = str_builder_new();
+        if (sw.to_json(sb) != 0) { return 0 - 1; }
+        var d2, n2 = _par_sb_text(sb);
+        var sw2: PvShallowWater;
+        var t2, v2 = PvShallowWater_from_json(d2, n2, &sw2);
+        if (is_err_result(t2) == 1) { return 0 - 1; }
+        if (memeq(&sw, &sw2, 24) != 1) { return 0 - 1; }
+        for (var c2 = 0; c2 < 5; c2 = c2 + 1) {
+            var a: *PvColumn = _pv_sw_col(&sw, c2);
+            var b: *PvColumn = _pv_sw_col(&sw2, c2);
+            if (a.len != b.len) { return 0 - 1; }
+            if (a.len > 0 && memeq(a.data, b.data, a.len * 8) != 1) { return 0 - 1; }
+        }
+        PvShallowWater_drop(&sw);
+        PvShallowWater_drop(&sw2);
+        return 1;
+    }
+    # Every other row starts with a state.
+    var k = _par_sw_in(0, &sw);
+    if (k < 0) { return 0 - 1; }
+    var n = sw.nx * sw.ny;
+    var handled = 1;
+    if (_par_eq(fp, fl, "ShallowWater::depth_at") == 1) {
+        _par_got_seq(n);
+        for (var i = 0; i < n; i = i + 1) {
+            var dd: f64 = sw.depth_at(i % sw.nx, i / sw.nx);
+            _par_got_f(_pv_bits(dd));
+        }
+    } elif (_par_eq(fp, fl, "ShallowWater::surface_at") == 1) {
+        _par_got_seq(n);
+        for (var i = 0; i < n; i = i + 1) {
+            var ss: f64 = sw.surface_at(i % sw.nx, i / sw.nx);
+            _par_got_f(_pv_bits(ss));
+        }
+    } elif (_par_eq(fp, fl, "ShallowWater::is_wet") == 1) {
+        _par_got_seq(n);
+        for (var i = 0; i < n; i = i + 1) { _par_got_i(sw.is_wet(i % sw.nx, i / sw.nx)); }
+    } elif (_par_eq(fp, fl, "ShallowWater::is_breaking") == 1) {
+        _par_got_seq(n);
+        for (var i = 0; i < n; i = i + 1) { _par_got_i(sw.is_breaking(i % sw.nx, i / sw.nx)); }
+    } elif (_par_eq(fp, fl, "ShallowWater::total_volume") == 1) {
+        var tv: f64 = sw.total_volume();
+        _par_got_f(_pv_bits(tv));
+    } elif (_par_eq(fp, fl, "ShallowWater::interior_volume") == 1) {
+        var iv: f64 = sw.interior_volume();
+        _par_got_f(_pv_bits(iv));
+    } elif (_par_eq(fp, fl, "ShallowWater::max_wave_height") == 1) {
+        var mw: f64 = sw.max_wave_height(_par_in(k));
+        _par_got_f(_pv_bits(mw));
+    } elif (_par_eq(fp, fl, "ShallowWater::cfl_dt") == 1) {
+        var cf: f64 = sw.cfl_dt(_par_in(k));
+        _par_got_f(_pv_bits(cf));
+    } elif (_par_eq(fp, fl, "ShallowWater::add_disturbance") == 1) {
+        sw.add_disturbance(_par_in(k), _par_in(k + 1), _par_in(k + 2), _par_in(k + 3));
+        _par_col_out(_pv_sw_col(&sw, 0));
+    } elif (_par_eq(fp, fl, "ShallowWater::step") == 1) {
+        # The state stepped nsteps times; the first failure's code if one fails.
+        var dt: f64 = _par_in(k);
+        var steps = _par_in(k + 1);
+        var failed = 0;
+        for (var s = 0; s < steps; s = s + 1) {
+            var ts, vs = sw.step(dt);
+            if (is_err_result(ts) == 1) {
+                _par_got_err(vs);
+                failed = 1;
+                break;
+            }
+        }
+        if (failed == 0) { _par_sw_out(&sw); }
+    } elif (_par_eq(fp, fl, "update_sediment") == 1) {
+        var nc = _par_in(k);
+        var conc = alloc(nc * 8 + 8);
+        for (var j = 0; j < nc; j = j + 1) { store64(conc + j * 8, _par_in(k + 1 + j)); }
+        var ck = k + 1 + nc;
+        var cfg: PvSedimentConfig;
+        cfg.shields_critical = _par_in(ck);
+        cfg.grain_diameter = _par_in(ck + 1);
+        cfg.sediment_density = _par_in(ck + 2);
+        cfg.water_density = _par_in(ck + 3);
+        cfg.erosion_rate = _par_in(ck + 4);
+        cfg.deposition_rate = _par_in(ck + 5);
+        update_sediment(&sw, conc, nc, &cfg, _par_in(ck + 6));
+        _par_col_out(_pv_sw_col(&sw, 3));
+        _par_got_seq(nc);
+        for (var j2 = 0; j2 < nc; j2 = j2 + 1) { _par_got_f(load64(conc + j2 * 8)); }
+    } else {
+        handled = 0;
+    }
+    PvShallowWater_drop(&sw);
+    return handled;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
@@ -723,6 +925,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "vortex") == 1) { return _par_vortex(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
+    if (_par_eq(mp, ml, "shallow") == 1) { return _par_shallow(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;
 }
@@ -841,6 +1044,11 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "kolmogorov_scale") == 1) { return 0; }
     if (_par_eq(fp, fl, "temperature_to_water_viscosity") == 1) { return 0; }
     if (_par_eq(fp, fl, "tke_to_broadband_noise_db") == 1) { return 0; }
+    # M2: sediment's cbrt is correctly rounded on both sides (port-parity §3).
+    if (_par_eq(fp, fl, "update_sediment") == 1) { return 0; }
+    # The shallow-water step (class S): Rust's operations on the correctly rounded damping powf and cbrt, so every
+    # field of every step row is bit for bit the oracle's (the corrected oracle's where glibc's pow misrounds).
+    if (_par_eq(fp, fl, "ShallowWater::step") == 1) { return 0; }
     return 0 - 1;
 }
 

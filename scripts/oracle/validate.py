@@ -127,7 +127,7 @@ def read_module(path):
             fail(f"{where}: {len(cols)} fields, not 5")
             continue
         func, cls, ins, outs, note = cols
-        if cls not in "ABCD" or len(cls) != 1:
+        if cls not in "ABCDS" or len(cls) != 1:
             fail(f"{where}: class {cls!r}")
         rows.append((func, cls, parse_tokens(ins, where), parse_tokens(outs, where), where))
     if not m:
@@ -964,6 +964,506 @@ def check_json(rows):
     return counts
 
 
+# ── shallow (M2) ───────────────────────────────────────────────────────────────────────────
+# rust-old/src/shallow.rs transcribed, in Rust's order, on a state dict (scripts/oracle/src/m_shallow.rs's token
+# layout). cbrt is MPFR's correctly rounded one, which the oracle's compiler_builtins cbrt equals (port-parity §3).
+
+SW_FIELDS = ["height", "vx", "vy", "ground", "manning_n"]
+SW_SCALARS = ["nx", "ny", "dx", "gravity", "damping", "dry_threshold", "breaking_threshold",
+              "breaking_dissipation", "dispersion_coeff", "use_green_naghdi", "use_riemann"]
+
+
+def sw_read(x, k=0):
+    """(state dict, the index after it) from the token values at k."""
+    sw = dict(zip(SW_SCALARS, x[k:k + 11]))
+    at = k + 11
+    for name in SW_FIELDS:
+        n = x[at][1]
+        sw[name] = list(x[at + 1:at + 1 + n])
+        at += 1 + n
+    return sw, at
+
+
+def sw_tokens(sw):
+    out = [sw[s] for s in SW_SCALARS]
+    for name in SW_FIELDS:
+        out += [("v", len(sw[name]))] + list(sw[name])
+    return out
+
+
+def r_max(x, y):
+    """Rust's f64::max (a NaN operand ignored)."""
+    if x != x:
+        return y
+    if y != y:
+        return x
+    return x if x > y else y
+
+
+def r_minf(x, y):
+    if x != x:
+        return y
+    if y != y:
+        return x
+    return x if x < y else y
+
+
+def sw_new(nx, ny, dx, h):
+    if nx < 3 or ny < 3 or nx >= 1 << 63 or ny >= 1 << 63:
+        return ["E:InvalidGridResolution"]
+    if not fin(dx) or dx <= 0.0:
+        return ["E:InvalidParameter"]
+    if not fin(h):
+        return ["E:InvalidParameter"]
+    if nx * ny >= 1 << 64:
+        return ["E:InvalidGridResolution"]
+    n = nx * ny
+    out = [nx, ny, dx, 9.81, 0.999, 1e-4, 0.5, 5.0, 0.0, 0, 0]
+    for v in (h, 0.0, 0.0, 0.0, 0.0):
+        out += [n, v]
+    return out + [n, n, n, n, 0]
+
+
+def sw_depth(sw, i):
+    return r_max(sw["height"][i] - sw["ground"][i], 0.0)
+
+
+def sw_e(sw, k, own):
+    return sw["height"][k] if sw["height"][k] - sw["ground"][k] >= sw["dry_threshold"] else own
+
+
+def sw_breaking(sw, x, y):
+    nx, ny = sw["nx"], sw["ny"]
+    if x == 0 or x + 1 >= nx or y == 0 or y + 1 >= ny:
+        return 0
+    i = y * nx + x
+    if sw["breaking_threshold"] <= 0.0 or i + nx >= len(sw["height"]):
+        return 0
+    eta, g = sw["height"], sw["ground"]
+    if eta[i] - g[i] < sw["dry_threshold"]:
+        return 0
+    inv_2dx = 0.5 / sw["dx"]
+    own = eta[i]
+    sx = (sw_e(sw, i + 1, own) - sw_e(sw, i - 1, own)) * inv_2dx
+    sy = (sw_e(sw, i + nx, own) - sw_e(sw, i - nx, own)) * inv_2dx
+    return int(r_sqrt((sx * sx) + (sy * sy)) > sw["breaking_threshold"])
+
+
+def sw_total_volume(sw):
+    area = sw["dx"] * sw["dx"]
+    s = -0.0
+    for h, g in zip(sw["height"], sw["ground"]):
+        s = s + r_max(h - g, 0.0) * area
+    return s
+
+
+def sw_interior_volume(sw):
+    area = sw["dx"] * sw["dx"]
+    nx, ny = sw["nx"], sw["ny"]
+    if nx < 3 or ny < 3 or len(sw["height"]) < nx * ny or len(sw["ground"]) < nx * ny:
+        return 0.0
+    s = 0.0
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            s += r_max(sw["height"][i] - sw["ground"][i], 0.0)
+    return s * area
+
+
+def sw_max_wave(sw, rest):
+    m = 0.0
+    for h in sw["height"]:
+        m = r_max(m, abs(h - rest))
+    return m
+
+
+def sw_cfl(sw, cfl):
+    g = sw["gravity"]
+    m = 0.0
+    for i in range(len(sw["height"])):
+        d = r_max(sw["height"][i] - sw["ground"][i], 0.0)
+        u, v = sw["vx"][i], sw["vy"][i]
+        m = r_max(m, r_sqrt((u * u) + (v * v)) + r_sqrt(g * d))
+    if m < 1e-20:
+        return sys.float_info.max
+    return fdiv(cfl * sw["dx"], m)
+
+
+def sw_disturb(sw, cx, cy, r, a):
+    h = list(sw["height"])
+    if r <= 0.0:
+        return h
+    r2 = r * r
+    inv = 1.0 / r
+    for y in range(sw["ny"]):
+        for x in range(sw["nx"]):
+            px = float(x) * sw["dx"]
+            py = float(y) * sw["dx"]
+            ddx, ddy = px - cx, py - cy
+            d2 = (ddx * ddx) + (ddy * ddy)
+            if d2 < r2:
+                fac = 1.0 - (r_sqrt(d2) * inv)
+                i = y * sw["nx"] + x
+                h[i] = h[i] + ((a * fac) * fac)
+    return h
+
+
+def sw_sediment(sw, conc, cfg, dt):
+    nx, ny = sw["nx"], sw["ny"]
+    ground = list(sw["ground"])
+    conc = list(conc)
+    n = nx * ny
+    if (not fin(dt) or dt <= 0.0 or nx < 3 or ny < 3 or len(conc) < n
+            or any(len(sw[f]) < n for f in SW_FIELDS)):
+        return ground, conc
+    shields, d, rho_s, rho_w, er, dr = cfg
+    g = sw["gravity"]
+    tau_cr = ((shields * (rho_s - rho_w)) * g) * d
+    dry = r_max(sw["dry_threshold"], 1e-9)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            depth = r_max(sw["height"][i] - ground[i], 0.0)
+            if depth < dry:
+                continue
+            susp = r_max(conc[i], 0.0) * depth
+            u, v = sw["vx"][i], sw["vy"][i]
+            nm = r_max(sw["manning_n"][i], 0.01)
+            tau_b = fdiv(((((rho_w * g) * nm) * nm) * ((u * u) + (v * v))), MPFR.cr("cbrt", depth))
+            if tau_b > tau_cr:
+                ero = (er * (tau_b - tau_cr)) * dt
+                ground[i] -= ero
+                depth += ero
+                susp += ero
+            if susp > 0.0:
+                c = fdiv(susp, depth)
+                depo = r_minf((dr * c) * dt, susp)
+                ground[i] += depo
+                depth -= depo
+                susp -= depo
+            conc[i] = r_max(fdiv(susp, depth), 0.0) if depth > 0.0 else 0.0
+    return ground, conc
+
+
+def sw_hll(h_l, u_l, h_r, u_r, g):
+    h_l, h_r = r_max(h_l, 0.0), r_max(h_r, 0.0)
+    if h_l <= 0.0 and h_r <= 0.0:
+        return 0.0, 0.0
+    c_l, c_r = r_sqrt(g * h_l), r_sqrt(g * h_r)
+    if h_l <= 0.0:
+        s_l, s_r = u_r - 2.0 * c_r, u_r + c_r
+    elif h_r <= 0.0:
+        s_l, s_r = u_l - c_l, u_l + 2.0 * c_l
+    else:
+        s_l, s_r = r_minf(u_l - c_l, u_r - c_r), r_max(u_l + c_l, u_r + c_r)
+    f_h_l = h_l * u_l
+    f_hu_l = ((h_l * u_l) * u_l) + (((0.5 * g) * h_l) * h_l)
+    f_h_r = h_r * u_r
+    f_hu_r = ((h_r * u_r) * u_r) + (((0.5 * g) * h_r) * h_r)
+    if s_l >= 0.0:
+        return f_h_l, f_hu_l
+    if s_r <= 0.0:
+        return f_h_r, f_hu_r
+    den = fdiv(1.0, r_max(s_r - s_l, 1e-8))
+    f_h = (((s_r * f_h_l) - (s_l * f_h_r)) + ((s_l * s_r) * (h_r - h_l))) * den
+    f_hu = (((s_r * f_hu_l) - (s_l * f_hu_r)) + ((s_l * s_r) * ((h_r * u_r) - (h_l * u_l)))) * den
+    return f_h, f_hu
+
+
+def sw_face(left, right, g):
+    eta_l, z_l, un_l, ut_l = left
+    eta_r, z_r, un_r, ut_r = right
+    h_l, h_r = r_max(eta_l - z_l, 0.0), r_max(eta_r - z_r, 0.0)
+    z_f = r_max(z_l, z_r)
+    hs_l = r_minf(r_max(eta_l - z_f, 0.0), h_l)
+    hs_r = r_minf(r_max(eta_r - z_f, 0.0), h_r)
+    f_h, f_hn = sw_hll(hs_l, un_l, hs_r, un_r, g)
+    f_ht = f_h * (ut_l if f_h >= 0.0 else ut_r)
+    return (f_h, f_hn + (0.5 * g) * ((h_l * h_l) - (hs_l * hs_l)),
+            f_hn + (0.5 * g) * ((h_r * h_r) - (hs_r * hs_r)), f_ht)
+
+
+def sw_slope(eta, ground, nx, i, dry, inv_2dx):
+    if eta[i] - ground[i] < dry:
+        return None
+    e = lambda k: eta[k] if eta[k] - ground[k] >= dry else eta[i]
+    sx = (e(i + 1) - e(i - 1)) * inv_2dx
+    sy = (e(i + nx) - e(i - nx)) * inv_2dx
+    return r_sqrt((sx * sx) + (sy * sy))
+
+
+def sw_validate(sw):
+    nx, ny = sw["nx"], sw["ny"]
+    n = nx * ny
+    if nx < 3 or ny < 3 or n >= 1 << 64 or any(len(sw[f]) != n for f in SW_FIELDS):
+        return "E:InvalidGridResolution"
+    for key, strict in (("dx", True), ("gravity", True), ("dispersion_coeff", False)):
+        v = sw[key]
+        if not fin(v) or (v <= 0.0 if strict else v < 0.0):
+            return "E:InvalidParameter"
+    return None
+
+
+def sw_step(sw, dt, P, scratch):
+    """One step of rust-old/src/shallow.rs in place on the state dict; None, or the error token."""
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    bad = sw_validate(sw)
+    if bad:
+        return bad
+    nx, ny, g, dx = sw["nx"], sw["ny"], sw["gravity"], sw["dx"]
+    inv_dx = fdiv(1.0, dx)
+    inv_2dx = 0.5 * inv_dx
+    damp = P["pow"](sw["damping"], dt / 0.001)
+    dry = sw["dry_threshold"]
+    H, U, V, G, M = sw["height"], sw["vx"], sw["vy"], sw["ground"], sw["manning_n"]
+    size = nx * ny
+    for i in range(size):
+        if H[i] - G[i] < dry:
+            U[i] = 0.0
+            V[i] = 0.0
+    svx, svy, sh = list(U), list(V), list(H)
+    scratch["vx"], scratch["vy"], scratch["h"] = svx, svy, sh
+    riemann = sw["use_riemann"] != 0
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            u, v = svx[i], svy[i]
+            hi = r_max(sh[i] - G[i], 0.0)
+            if not riemann:
+                if hi < dry:
+                    dhdx = dhdy = 0.0
+                else:
+                    gx = G[i]
+                    def press(j_hi, j_lo):
+                        g_hi, g_lo = G[j_hi], G[j_lo]
+                        if abs(g_hi - gx) > 1e-12 or abs(g_lo - gx) > 1e-12:
+                            z_hi, z_lo = r_max(gx, g_hi), r_max(gx, g_lo)
+                            h_ih, h_jh = r_max(sh[i] - z_hi, 0.0), r_max(sh[j_hi] - z_hi, 0.0)
+                            h_il, h_jl = r_max(sh[i] - z_lo, 0.0), r_max(sh[j_lo] - z_lo, 0.0)
+                            sq = (((h_jh * h_jh) - (h_ih * h_ih)) + (h_il * h_il)) - (h_jl * h_jl)
+                            return fdiv((0.5 * g) * sq, (2.0 * dx) * r_max(hi, dry))
+                        return (g * (sh[j_hi] - sh[j_lo])) * inv_2dx
+                    dhdx = press(i + 1, i - 1)
+                    dhdy = press(i + nx, i - nx)
+                def up(f, vel, s):
+                    return (f[i] - f[i - s]) * inv_dx if vel > 0.0 else (f[i + s] - f[i]) * inv_dx
+                dudx, dudy = up(svx, u, 1), up(svx, v, nx)
+                dvdx, dvdy = up(svy, u, 1), up(svy, v, nx)
+                U[i] = U[i] - (((dhdx + (u * dudx)) + (v * dudy)) * dt)
+                V[i] = V[i] - (((dhdy + (u * dvdx)) + (v * dvdy)) * dt)
+            nm = M[i]
+            if nm > 0.0 and hi > dry:
+                speed = r_sqrt((u * u) + (v * v))
+                ds = r_max(hi, dry)
+                fr = fdiv(((g * nm) * nm) * speed, ds * MPFR.cr("cbrt", ds))
+                decay = fdiv(1.0, 1.0 + (fr * dt))
+                U[i] *= decay
+                V[i] *= decay
+            bt, bd = sw["breaking_threshold"], sw["breaking_dissipation"]
+            if bt > 0.0 and bd > 0.0:
+                sl = sw_slope(sh, G, nx, i, dry, inv_2dx)
+                if sl is not None and sl > bt:
+                    decay = fdiv(1.0, 1.0 + (bd * dt))
+                    U[i] *= decay
+                    V[i] *= decay
+            U[i] *= damp
+            V[i] *= damp
+    disp = sw["dispersion_coeff"]
+    if riemann:
+        sw_riemann(sw, dt, svx, svy, sh)
+        if disp > 0.0:
+            sw_dispersion(sw, svx, svy, sh)
+    else:
+        if disp > 0.0:
+            sw_dispersion(sw, svx, svy, sh)
+        depth = lambda k: r_max(sh[k] - G[k], 0.0)
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                d_i = depth(i)
+                hr = 0.0 if x + 2 == nx else 0.5 * ((d_i * U[i]) + (depth(i + 1) * U[i + 1]))
+                hl = 0.0 if x == 1 else 0.5 * ((d_i * U[i]) + (depth(i - 1) * U[i - 1]))
+                ht = 0.0 if y + 2 == ny else 0.5 * ((d_i * V[i]) + (depth(i + nx) * V[i + nx]))
+                hb = 0.0 if y == 1 else 0.5 * ((d_i * V[i]) + (depth(i - nx) * V[i - nx]))
+                fd = (((hr - hl) + ht) - hb) * inv_dx
+                H[i] = r_max(H[i] - (fd * dt), G[i])
+    for x in range(nx):
+        top, below = (ny - 1) * nx + x, (ny - 2) * nx + x
+        H[x], U[x], V[x] = H[nx + x], U[nx + x], 0.0
+        H[top], U[top], V[top] = H[below], U[below], 0.0
+    for y in range(ny):
+        l, r = y * nx, y * nx + nx - 1
+        H[l], U[l], V[l] = H[l + 1], 0.0, V[l + 1]
+        H[r], U[r], V[r] = H[r - 1], 0.0, V[r - 1]
+    if not all(fin(a) for a in H + U + V):
+        return "E:Diverged"
+    return None
+
+
+def sw_riemann(sw, dt, svx, svy, sh):
+    nx, ny, g, dry = sw["nx"], sw["ny"], sw["gravity"], sw["dry_threshold"]
+    inv_dx = fdiv(1.0, sw["dx"])
+    H, U, V, G = sw["height"], sw["vx"], sw["vy"], sw["ground"]
+    st = lambda k: (sh[k], G[k], svx[k], svy[k])
+    k_ = dt * inv_dx
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            eta, z, u, v = st(i)
+            h_i = r_max(eta - z, 0.0)
+            own_x, mir_x = (eta, z, u, v), (eta, z, -u, v)
+            right = mir_x if x + 2 == nx else st(i + 1)
+            left = mir_x if x == 1 else st(i - 1)
+            fr, fl = sw_face(own_x, right, g), sw_face(left, own_x, g)
+            own_y, mir_y = (eta, z, v, u), (eta, z, -v, u)
+            def swap(s):
+                return (s[0], s[1], s[3], s[2])
+            top = mir_y if y + 2 == ny else swap(st(i + nx))
+            bot = mir_y if y == 1 else swap(st(i - nx))
+            gt, gb = sw_face(own_y, top, g), sw_face(bot, own_y, g)
+            new_h = r_max(h_i - (k_ * (((fr[0] - fl[0]) + gt[0]) - gb[0])), 0.0)
+            hu = (h_i * U[i]) - (k_ * (((fr[1] - fl[2]) + gt[3]) - gb[3]))
+            hv = (h_i * V[i]) - (k_ * (((fr[3] - fl[3]) + gt[1]) - gb[2]))
+            H[i] = z + new_h
+            if new_h > dry:
+                U[i], V[i] = fdiv(hu, new_h), fdiv(hv, new_h)
+            else:
+                U[i], V[i] = 0.0, 0.0
+
+
+def sw_dispersion(sw, svx, svy, sh):
+    nx, ny, c = sw["nx"], sw["ny"], sw["dispersion_coeff"]
+    inv_dx2 = fdiv(1.0, sw["dx"] * sw["dx"])
+    dry, dw, G = sw["dry_threshold"], sw["use_green_naghdi"] != 0, sw["ground"]
+    m = max(nx, ny)
+    def depth(k):
+        d = sh[k] - G[k]
+        return d if d >= dry else 0.0
+    def beta(a, b):
+        h = 0.5 * (depth(a) + depth(b)) if dw else depth(a)
+        return ((c * h) * h) * inv_dx2
+    for field, old in ((sw["vx"], svx), (sw["vy"], svy)):
+        delta = [0.0] * (nx * ny)
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                delta[i] = field[i] - old[i]
+        for outer, inner, so, si in ((ny, nx, nx, 1), (nx, ny, 1, nx)):
+            ln = inner - 2
+            cp, dp = [0.0] * m, [0.0] * m
+            for o in range(1, outer - 1):
+                base = o * so
+                for k in range(ln):
+                    i = base + (k + 1) * si
+                    b_lo, b_hi = beta(i, i - si), beta(i, i + si)
+                    a_k, b_k, c_k = -b_lo, (1.0 + b_lo) + b_hi, -b_hi
+                    cpp, dpp = (cp[k - 1], dp[k - 1]) if k > 0 else (0.0, 0.0)
+                    den = b_k - (a_k * cpp)
+                    cp[k] = fdiv(c_k, den)
+                    dp[k] = fdiv(delta[i] - (a_k * dpp), den)
+                nxt = 0.0
+                for k in range(ln - 1, -1, -1):
+                    i = base + (k + 1) * si
+                    val = dp[k] - (cp[k] * nxt)
+                    delta[i] = val
+                    nxt = val
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                field[i] = old[i] + delta[i]
+
+
+def sw_run(x, P):
+    """A step row's outputs: the state after its nsteps steps, or the first failure."""
+    sw, k = sw_read(x)
+    dt, steps = x[k], x[k + 1]
+    for _ in range(steps):
+        bad = sw_step(sw, dt, P, {})
+        if bad:
+            return [bad]
+    return sw_tokens(sw)
+
+
+def sw_json(doc):
+    """serde_json's reading of a ShallowWater document (16 fields; the scratch buffers skipped)."""
+    names = ["nx", "ny", "dx", "height", "vx", "vy", "ground", "gravity", "damping", "manning_n",
+             "dry_threshold", "breaking_threshold", "breaking_dissipation", "dispersion_coeff",
+             "use_green_naghdi", "use_riemann"]
+    try:
+        f = j_struct(j_load(doc), names)
+        def us(v):
+            if not (isinstance(v, tuple) and v[0] == "int") or int(v[1]) < 0:
+                raise JsonRefused("not a usize")
+            return int(v[1])
+        def bl(v):
+            if not isinstance(v, bool):
+                raise JsonRefused("not a bool")
+            return int(v)
+        sw = {"nx": us(f[0]), "ny": us(f[1]), "dx": j_f64(f[2]), "gravity": j_f64(f[7]),
+              "damping": j_f64(f[8]), "dry_threshold": j_f64(f[10]), "breaking_threshold": j_f64(f[11]),
+              "breaking_dissipation": j_f64(f[12]), "dispersion_coeff": j_f64(f[13]),
+              "use_green_naghdi": bl(f[14]), "use_riemann": bl(f[15])}
+        for name, k in zip(SW_FIELDS, (3, 4, 5, 6, 9)):
+            sw[name] = [j_f64(e) for e in j_arr(f[k])]
+        return sw_tokens(sw)
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def check_shallow(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        short = func.split("::")[-1]
+        if func == "ShallowWater::new":
+            nx, ny = (v % (1 << 64) for v in x[:2])
+            want = sw_new(nx, ny, x[2], x[3])
+        elif func == "SedimentConfig::default":
+            want = [0.047, 0.001, 2650.0, 1000.0, 0.01, 0.02]
+        elif func == "ShallowWater::from_json":
+            want = sw_json(unpct(ins[0][2:]))
+        else:
+            sw, k = sw_read(x)
+            n = sw["nx"] * sw["ny"]
+            cells = [(i % sw["nx"], i // sw["nx"]) for i in range(n)]
+            if short == "depth_at":
+                want = [("v", n)] + [sw_depth(sw, i) for i in range(n)]
+            elif short == "surface_at":
+                want = [("v", n)] + [sw["height"][i] for i in range(n)]
+            elif short == "is_wet":
+                want = [("v", n)] + [int(sw_depth(sw, i) >= sw["dry_threshold"]) for i in range(n)]
+            elif short == "is_breaking":
+                want = [("v", n)] + [sw_breaking(sw, cx, cy) for cx, cy in cells]
+            elif short == "total_volume":
+                want = [sw_total_volume(sw)]
+            elif short == "interior_volume":
+                want = [sw_interior_volume(sw)]
+            elif short == "max_wave_height":
+                want = [sw_max_wave(sw, x[k])]
+            elif short == "cfl_dt":
+                want = [sw_cfl(sw, x[k])]
+            elif short == "add_disturbance":
+                h = sw_disturb(sw, *x[k:k + 4])
+                want = [("v", len(h))] + h
+            elif short == "step":
+                want = sw_run(x, GLIBC)
+            elif func == "update_sediment":
+                nc = x[k][1]
+                conc = x[k + 1:k + 1 + nc]
+                cfg = x[k + 1 + nc:k + 7 + nc]
+                g, c = sw_sediment(sw, conc, cfg, x[k + 7 + nc])
+                want = [("v", len(g))] + g + [("v", len(c))] + c
+            else:
+                fail(f"{where}: no check for {func}")
+                continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 # ── the correctly rounded math (ADR 0004) ─────────────────────────────────────────────────────
 # The corrected oracle: the oracle's own operations with every exp, ln, log10, sin, cos, hypot, pow and
 # atan2 result correctly rounded (MPFR). Where glibc rounded every call correctly the row is unchanged
@@ -1002,6 +1502,17 @@ def corrections(module, rows):
     out = []
     for fn, cls, ins, outs, where in rows:
         log = []
+        if module == "shallow" and fn == "ShallowWater::step":
+            x = [tok_val(t) for t in ins]
+            want = sw_run(x, mpfr_logged(log))
+            got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            new = " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
+                           else (w if isinstance(w, str) else f"i:{w}")) for w in want)
+            seen = list(dict.fromkeys(log))
+            out.append((fn, " ".join(ins), new, "oracle (state); " + "; ".join(seen)))
+            continue
         if module in ("vortex", "bridge") and fn in M1B_C:
             x = [tok_val(t) for t in ins]
             want = M1B_C[fn](x, mpfr_logged(log))
@@ -1179,6 +1690,11 @@ def main():
             counts = check_json(rows)
             summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
             print(f"json: {len(rows)} documents decoded again ({summary})")
+        elif path.stem == "shallow":
+            counts = check_shallow(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"shallow: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "shallow", path, rows)
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

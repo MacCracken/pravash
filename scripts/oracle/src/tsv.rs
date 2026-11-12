@@ -23,6 +23,9 @@ pub enum Class {
     C,
     /// Iterative: relative ≤ 1e-12.
     D,
+    /// A single solver step from a state (port plan §5): per field, the bound of the path that produced it; the
+    /// harness's `_par_c_bound` gives it per function (0 for the shallow-water step).
+    S,
 }
 
 impl Class {
@@ -32,6 +35,7 @@ impl Class {
             Self::B => 'B',
             Self::C => 'C',
             Self::D => 'D',
+            Self::S => 'S',
         }
     }
 }
@@ -175,6 +179,14 @@ impl Module {
     }
 
     fn push(&mut self, func: &str, class: Class, ins: &[Tok], outs: &[Tok], note: &str) {
+        // A long note (a solver state, a scenario) is cut at 240 characters: the harness ignores it, and the
+        // tokens hold the row.
+        let note = if note.chars().count() > 240 {
+            let cut: String = note.chars().take(240).collect();
+            format!("{cut} …")
+        } else {
+            note.to_string()
+        };
         self.rows.push(format!(
             "{func}\t{}\t{}\t{}\t{note}",
             class.letter(),

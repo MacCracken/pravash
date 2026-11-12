@@ -73,8 +73,9 @@ fn <TAB> class <TAB> inputs <TAB> outputs <TAB> note
   - `E:<Variant>`: `Err(PravashError::<Variant>)`, with the payload not compared;
   - `v:<len>`: a sequence, whose element tokens follow.
 - **Classes** (port plan §5): A exact (NaN matches any NaN), B ≤ 2 ulp, C an ulp bound per function set by the
-  step 8 baselines, D relative ≤ 1e-12 or a bound set before the first comparison. Single-step (S) and reference (R)
-  rows arrive with the solvers.
+  step 8 baselines, D relative ≤ 1e-12 or a bound set before the first comparison, S a solver step from a state
+  (per field the bound of its path: the harness's `_par_c_bound` gives it per function, 0 for the shallow-water
+  step). Reference (R) checks are the ported tests' own tolerances, not golden rows.
 - **The note** is a human rendering of the same call, for review only; the harness ignores it.
 
 ## The corrected oracle (ADR 0004)

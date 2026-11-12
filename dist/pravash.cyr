@@ -27,8 +27,9 @@ include "lib/fnptr.cyr"
 # caller passed in, so the caller already has it. `pv_error_message(code)` gives thiserror's message up to its
 # first field, the part that doesn't depend on the payload.
 #
-# PV_ERR_DESERIALIZE is Cyrius-only (ADR 0002 #10): a JSON reader's refusal, where Rust's serde_json returns its own
-# error type rather than a PravashError.
+# Two codes are Cyrius-only: PV_ERR_DESERIALIZE (ADR 0002 #10), a JSON reader's refusal, where Rust's serde_json
+# returns its own error type rather than a PravashError; and PV_ERR_OUT_OF_MEMORY (ADR 0002 #8), an allocation failure
+# a constructor reports, where Rust aborts.
 
 enum PvError {
     PV_ERR_NONE = 0;
@@ -42,6 +43,7 @@ enum PvError {
     PV_ERR_DIVERGED = 8;
     PV_ERR_INVALID_PARAMETER = 9;
     PV_ERR_DESERIALIZE = 10;
+    PV_ERR_OUT_OF_MEMORY = 11;
 }
 
 # The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, "Deserialize" for the
@@ -60,6 +62,7 @@ fn pv_error_name(code): i64 {
         PV_ERR_DIVERGED => { return "Diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "InvalidParameter"; }
         PV_ERR_DESERIALIZE => { return "Deserialize"; }
+        PV_ERR_OUT_OF_MEMORY => { return "OutOfMemory"; }
         _ => { return "Unknown"; }
     }
     return "Unknown";
@@ -81,6 +84,7 @@ fn pv_error_message(code): i64 {
         PV_ERR_DIVERGED => { return "simulation diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "invalid parameter"; }
         PV_ERR_DESERIALIZE => { return "deserialization error"; }
+        PV_ERR_OUT_OF_MEMORY => { return "out of memory"; }
         _ => { return "unknown error"; }
     }
     return "unknown error";
@@ -4246,6 +4250,13 @@ impl PvColumn {
         return self.push(_pv_bits(x));
     }
 
+    # Slot i as an f64, unchecked: for loops that have checked the length (hot paths read this, not get_f).
+    #must_use
+    fn at(self, i): f64 {
+        var x: f64 = load64(self.data + i * 8);
+        return x;
+    }
+
     # Slot i as a word, or 0 out of range. Mirrors `v[i]` on a `Vec<u8>`.
     #must_use
     fn get(self, i): i64 {
@@ -4274,6 +4285,35 @@ impl PvColumn {
     # Sets slot i to x: 1, or 0 out of range. Mirrors `v[i] = x`.
     fn set_f(self, i, x: f64): i64 {
         return self.set(i, _pv_bits(x));
+    }
+
+    # Grows the column to `n` slots, each new one the word w, or shortens it to `n`: 1, or 0 when it can't grow
+    # (unchanged). Mirrors `Vec::resize`.
+    #must_use
+    fn resize(self, n, w): i64 {
+        if (n < 0) { return 0; }
+        if (n <= self.len) {
+            self.len = n;
+            return 1;
+        }
+        if (self.reserve(n) == 0) { return 0; }
+        for (var i = self.len; i < n; i = i + 1) { store64(self.data + i * 8, w); }
+        self.len = n;
+        return 1;
+    }
+
+    # Every slot set to the word w. Mirrors `slice::fill`.
+    fn fill(self, w) {
+        for (var i = 0; i < self.len; i = i + 1) { store64(self.data + i * 8, w); }
+        return 0;
+    }
+
+    # Copies `src`'s slots over this column's, which must be as long (0 and nothing copied otherwise). Mirrors
+    # `slice::copy_from_slice` (which panics on a length mismatch).
+    fn copy_from(self, src: *PvColumn): i64 {
+        if (src.len != self.len) { return 0; }
+        for (var i = 0; i < self.len; i = i + 1) { store64(self.data + i * 8, load64(src.data + i * 8)); }
+        return 1;
     }
 
     # Shortens the column to `n` slots (no effect when it is not longer). Mirrors `Vec::truncate`.
@@ -5315,6 +5355,1031 @@ fn wave_height_to_acoustic_pressure(wave_height_m: f64, frequency_hz: f64, speed
     return r;
 }
 
+# --- shallow.cyr ---
+
+# shallow.cyr — the shallow water equations on a 2D grid (port of rust-old/src/shallow.rs).
+#
+# `PvShallowWater` mirrors `ShallowWater`: the grid (nx × ny cells of size dx, row-major, index y·nx + x), the
+# public fields `height` (the surface η), `vx`, `vy`, `ground` (the bed z) and `manning_n` as columns
+# (src/column.cyr) that a caller may resize, as Rust's public Vecs, and the scalar parameters. The scratch buffers
+# are private, persistent across steps, so a step allocates nothing once the sizes are set. Create with
+# `PvShallowWater_new`, release with `PvShallowWater_drop`.
+#
+# Every formula is Rust's in Rust's operation order; `cbrt` (Manning friction, sediment) is ganita's, correctly
+# rounded as the oracle's compiler_builtins cbrt is, and the damping `powf` the correctly rounded one (ADR 0004). An
+# index outside a field, where Rust panics, reads NaN or false and writes nothing (ADR 0002 #8). Rust's
+# `trace_span!`s arrive with M7's logging.
+
+struct PvShallowWater {
+    nx;
+    ny;
+    dx: f64;
+    height: PvColumn;
+    vx: PvColumn;
+    vy: PvColumn;
+    ground: PvColumn;
+    gravity: f64;
+    damping: f64;
+    manning_n: PvColumn;
+    dry_threshold: f64;
+    breaking_threshold: f64;
+    breaking_dissipation: f64;
+    dispersion_coeff: f64;
+    use_green_naghdi;
+    use_riemann;
+    scratch_vx: PvColumn;
+    scratch_vy: PvColumn;
+    scratch_h: PvColumn;
+    scratch_lap: PvColumn;
+    scratch_line: PvColumn;
+}
+
+# The number of columns in a `PvShallowWater` (5 public, 5 scratch), for drop and clone.
+const _PV_SW_COLUMNS = 10;
+
+# Column k of the shallow water state: 0 height, 1 vx, 2 vy, 3 ground, 4 manning_n, 5 … 9 the scratch buffers, by
+# its byte offset in the record (a field's address can't be taken; tests/shallow.tcyr pins the layout: nx, ny, dx,
+# four columns, gravity, damping, manning_n, four f64 parameters, two flags, five scratch columns; 328 bytes).
+#must_use
+fn _pv_sw_col(sw, k): *PvColumn {
+    var off = 304;
+    if (k == 0) { off = 24; }
+    if (k == 1) { off = 48; }
+    if (k == 2) { off = 72; }
+    if (k == 3) { off = 96; }
+    if (k == 4) { off = 136; }
+    if (k == 5) { off = 208; }
+    if (k == 6) { off = 232; }
+    if (k == 7) { off = 256; }
+    if (k == 8) { off = 280; }
+    return _pv_as_columns(_pv_addr(sw) + off);
+}
+
+# Releases every field's storage; the state holds no storage after. Mirrors dropping the `ShallowWater`.
+fn PvShallowWater_drop(sw: *PvShallowWater) {
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_sw_col(sw, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# A flat surface at `water_height` over flat ground (z = 0), at rest, into *out: Ok(0), or the first failure in
+# Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx or ny below 3 (or nx·ny overflowing), PV_ERR_INVALID_PARAMETER
+# for a cell size not finite and > 0 or a height not finite; PV_ERR_OUT_OF_MEMORY when the fields can't be allocated
+# (Rust aborts). On an error *out holds no storage. The defaults: g 9.81, damping 0.999, Manning n 0, dry threshold
+# 1e-4, breaking threshold 0.5 and dissipation 5, no dispersion, the default (non-Riemann) scheme. Mirrors
+# `ShallowWater::new`.
+#must_use
+fn PvShallowWater_new(nx, ny, dx: f64, water_height: f64, out: *PvShallowWater): Result {
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_sw_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    if (nx < 3 || ny < 3) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_is_finite(water_height) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    var size = nx * ny;
+    var zero: f64 = 0.0;
+    var ok = out.height.resize(size, _pv_bits(water_height));
+    ok = ok & out.vx.resize(size, _pv_bits(zero));
+    ok = ok & out.vy.resize(size, _pv_bits(zero));
+    ok = ok & out.ground.resize(size, _pv_bits(zero));
+    ok = ok & out.manning_n.resize(size, _pv_bits(zero));
+    ok = ok & out.scratch_vx.resize(size, _pv_bits(zero));
+    ok = ok & out.scratch_vy.resize(size, _pv_bits(zero));
+    ok = ok & out.scratch_h.resize(size, _pv_bits(zero));
+    ok = ok & out.scratch_lap.resize(size, _pv_bits(zero));
+    if (ok == 0) {
+        PvShallowWater_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    out.gravity = 9.81;
+    out.damping = 0.999;
+    var dry: f64 = 0x3F1A36E2EB1C432D;   # 1e-4
+    out.dry_threshold = dry;
+    out.breaking_threshold = 0.5;
+    out.breaking_dissipation = 5.0;
+    out.dispersion_coeff = 0.0;
+    out.use_green_naghdi = 0;
+    out.use_riemann = 0;
+    return Ok(0);
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `ShallowWater::clone`.
+#must_use
+fn PvShallowWater_clone(out: *PvShallowWater, src: *PvShallowWater): i64 {
+    out.nx = src.nx;
+    out.ny = src.ny;
+    out.dx = src.dx;
+    out.gravity = src.gravity;
+    out.damping = src.damping;
+    out.dry_threshold = src.dry_threshold;
+    out.breaking_threshold = src.breaking_threshold;
+    out.breaking_dissipation = src.breaking_dissipation;
+    out.dispersion_coeff = src.dispersion_coeff;
+    out.use_green_naghdi = src.use_green_naghdi;
+    out.use_riemann = src.use_riemann;
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_sw_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var s: *PvColumn = _pv_sw_col(src, k);
+        var d: *PvColumn = _pv_sw_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvShallowWater_drop(out);
+            return 0;
+        }
+        var ok = d.copy_from(s);
+    }
+    return 1;
+}
+
+impl PvShallowWater {
+    # The water depth at (x, y), max(η − z, 0) (Rust's NaN-ignoring max: a NaN depth is 0). NaN when the index
+    # y·nx + x lies outside height or ground (Rust panics). Mirrors `depth_at`.
+    #must_use
+    fn depth_at(self, x, y): f64 {
+        var i = y * self.nx + x;
+        if (i < 0 || i >= self.height.len || i >= self.ground.len) {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+        var d: f64 = self.height.at(i) - self.ground.at(i);
+        var r: f64 = _pv_max(d, 0.0);
+        return r;
+    }
+
+    # The surface elevation η at (x, y), or NaN outside the field. Mirrors `surface_at`.
+    #must_use
+    fn surface_at(self, x, y): f64 {
+        var r: f64 = self.height.get_f(y * self.nx + x);
+        return r;
+    }
+
+    # 1 when the depth at (x, y) is at least the dry threshold (0 outside the field). Mirrors `is_wet`.
+    #must_use
+    fn is_wet(self, x, y): i64 {
+        var d: f64 = self.depth_at(x, y);
+        if (d >= self.dry_threshold) { return 1; }
+        return 0;
+    }
+
+    # 1 when the wet interior cell (x, y) is at a breaking front: its free-surface slope |∇η| exceeds the breaking
+    # threshold (dry neighbours contribute the cell's own η). 0 on the boundary ring, for a dry cell, or with the
+    # threshold ≤ 0. Mirrors `is_breaking`.
+    #must_use
+    fn is_breaking(self, x, y): i64 {
+        if (x <= 0 || x + 1 >= self.nx || y <= 0 || y + 1 >= self.ny) { return 0; }
+        var i = y * self.nx + x;
+        var thr: f64 = self.breaking_threshold;
+        if (thr <= 0.0 || i + self.nx >= self.height.len) { return 0; }
+        if (i + self.nx >= self.ground.len) { return 0; }   # Rust panics
+        var inv_2dx: f64 = 0.5 / self.dx;
+        var slope: f64 = 0.0;
+        if (_pv_sw_slope(self.height.data, self.ground.data, self.nx, i, self.dry_threshold, inv_2dx, &slope) == 0) {
+            return 0;
+        }
+        if (slope > thr) { return 1; }
+        return 0;
+    }
+}
+
+# The free-surface slope |∇η| at interior cell i into *out: √(∂x² + ∂y²) of the central differences, a dry
+# neighbour (depth below `dry_thr`) taking the cell's own η. 1, or 0 (nothing written) when the cell itself is dry.
+# `eta` and `ground` are the fields' raw storage. Mirrors the private `surface_slope`.
+fn _pv_sw_slope(eta, ground, nx, i, dry_thr: f64, inv_2dx: f64, out): i64 {
+    var ei: f64 = load64(eta + i * 8);
+    var gi: f64 = load64(ground + i * 8);
+    if (ei - gi < dry_thr) { return 0; }
+    var er: f64 = _pv_sw_e(eta, ground, i + 1, ei, dry_thr);
+    var el: f64 = _pv_sw_e(eta, ground, i - 1, ei, dry_thr);
+    var et: f64 = _pv_sw_e(eta, ground, i + nx, ei, dry_thr);
+    var eb: f64 = _pv_sw_e(eta, ground, i - nx, ei, dry_thr);
+    var sx: f64 = (er - el) * inv_2dx;
+    var sy: f64 = (et - eb) * inv_2dx;
+    var s: f64 = f64_sqrt((sx * sx) + (sy * sy));
+    store64(out, _pv_bits(s));
+    return 1;
+}
+
+# η at k when cell k is wet, else `own` (the slope's dry-neighbour rule).
+#must_use
+fn _pv_sw_e(eta, ground, k, own: f64, dry_thr: f64): f64 {
+    var ek: f64 = load64(eta + k * 8);
+    var gk: f64 = load64(ground + k * 8);
+    if (ek - gk >= dry_thr) { return ek; }
+    return own;
+}
+
+impl PvShallowWater {
+    # Adds a circular drop at (cx, cy) (world coordinates, cell (x, y) at (x·dx, y·dx)): each cell within `radius`
+    # rises by amplitude·(1 − d/radius)². Nothing for radius ≤ 0. Mirrors `add_disturbance`.
+    fn add_disturbance(self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
+        if (radius <= 0.0) { return 0; }
+        var r2: f64 = radius * radius;
+        var inv_radius: f64 = 1.0 / radius;
+        var dx: f64 = self.dx;
+        for (var y = 0; y < self.ny; y = y + 1) {
+            for (var x = 0; x < self.nx; x = x + 1) {
+                var px: f64 = f64_from(x) * dx;
+                var py: f64 = f64_from(y) * dx;
+                var ddx: f64 = px - cx;
+                var ddy: f64 = py - cy;
+                var dist2: f64 = (ddx * ddx) + (ddy * ddy);
+                if (dist2 < r2) {
+                    var factor: f64 = 1.0 - (f64_sqrt(dist2) * inv_radius);
+                    var i = y * self.nx + x;
+                    var h: f64 = self.height.get_f(i);
+                    var s = self.height.set_f(i, h + ((amplitude * factor) * factor));
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Σ max(η − z, 0)·dx² over every cell the two fields share, the boundary ring included (its cells are ghost
+    # copies; `interior_volume` is the conserved quantity). Rust's `Sum`, from −0. Mirrors `total_volume`.
+    #must_use
+    fn total_volume(self): f64 {
+        var cell_area: f64 = self.dx * self.dx;
+        var n = self.height.len;
+        if (self.ground.len < n) { n = self.ground.len; }
+        var s: f64 = 0x8000000000000000;   # −0
+        var hp = self.height.data;
+        var gp = self.ground.data;
+        for (var i = 0; i < n; i = i + 1) {
+            var h: f64 = load64(hp + i * 8);
+            var g: f64 = load64(gp + i * 8);
+            var d: f64 = h - g;
+            # max(d, 0) as Rust's: d when d > 0, else +0 (a NaN, ±0 and negatives alike).
+            var dd: f64 = 0.0;
+            if (d > 0.0) { dd = d; }
+            s = s + (dd * cell_area);
+        }
+        return s;
+    }
+
+    # (Σ max(η − z, 0) over the interior cells)·dx², the volume the closed walls conserve; 0 for a grid under 3 × 3
+    # or short fields. Mirrors `interior_volume`.
+    #must_use
+    fn interior_volume(self): f64 {
+        var cell_area: f64 = self.dx * self.dx;
+        var nx = self.nx;
+        var ny = self.ny;
+        if (nx < 3 || ny < 3 || self.height.len < nx * ny || self.ground.len < nx * ny) { return 0.0; }
+        var sum: f64 = 0.0;
+        var hp = self.height.data;
+        var gp = self.ground.data;
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var h: f64 = load64(hp + i * 8);
+                var g: f64 = load64(gp + i * 8);
+                var d: f64 = h - g;
+                if (d > 0.0) { sum = sum + d; } else { sum = sum + 0.0; }
+            }
+        }
+        var r: f64 = sum * cell_area;
+        return r;
+    }
+
+    # The largest |η − rest| over the cells, folded from 0 with Rust's NaN-ignoring max. Mirrors `max_wave_height`.
+    #must_use
+    fn max_wave_height(self, rest_height: f64): f64 {
+        var m: f64 = 0.0;
+        for (var i = 0; i < self.height.len; i = i + 1) {
+            var d: f64 = self.height.at(i) - rest_height;
+            var ad: f64 = f64_abs(d);
+            m = _pv_max(m, ad);
+        }
+        return m;
+    }
+
+    # The CFL timestep, cfl·dx / max(|u| + √(g·h)) over the cells; f64::MAX when the largest wave speed is below
+    # 1e-20 (dry and at rest). NaN when a field is shorter than height (Rust panics). Mirrors `cfl_dt`.
+    #must_use
+    fn cfl_dt(self, cfl_factor: f64): f64 {
+        var n = self.height.len;
+        if (self.ground.len < n || self.vx.len < n || self.vy.len < n) {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+        var g: f64 = self.gravity;
+        var mws: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var d: f64 = self.height.at(i) - self.ground.at(i);
+            var depth: f64 = _pv_max(d, 0.0);
+            var u: f64 = self.vx.at(i);
+            var v: f64 = self.vy.at(i);
+            var speed: f64 = f64_sqrt((u * u) + (v * v));
+            var ws: f64 = speed + f64_sqrt(g * depth);
+            mws = _pv_max(mws, ws);
+        }
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        if (mws < tiny) {
+            var big: f64 = PV_F64_MAX;
+            return big;
+        }
+        var r: f64 = (cfl_factor * self.dx) / mws;
+        return r;
+    }
+}
+
+# ── Sediment transport ──────────────────────────────────────────────────────────────
+
+# Sediment transport parameters: the critical Shields parameter, the grain diameter (m), the sediment and water
+# densities (kg/m³), and the erosion and deposition rate coefficients. Mirrors `SedimentConfig`.
+struct PvSedimentConfig {
+    shields_critical: f64;
+    grain_diameter: f64;
+    sediment_density: f64;
+    water_density: f64;
+    erosion_rate: f64;
+    deposition_rate: f64;
+}
+
+# The default: Shields 0.047, 1 mm quartz sand (2650 kg/m³) in water (1000 kg/m³), erosion 0.01, deposition 0.02.
+# Mirrors `Default for SedimentConfig`.
+#must_use
+fn PvSedimentConfig_default(): PvSedimentConfig {
+    var c: PvSedimentConfig;
+    c.shields_critical = 0.047;
+    c.grain_diameter = 0.001;
+    c.sediment_density = 2650.0;
+    c.water_density = 1000.0;
+    c.erosion_rate = 0.01;
+    c.deposition_rate = 0.02;
+    return c;
+}
+
+# One step of erosion and deposition with η held fixed: the bed `ground` and the `n` concentrations at
+# `concentration` change. Per wet interior cell, the bed shear τ_b = ρ_w·g·n²·|u|²/∛h (n at least 0.01) beyond the
+# Shields critical stress erodes the bed into suspension; suspended sediment settles at the deposition rate, never
+# more than is suspended. Nothing happens for a non-finite or non-positive dt, a grid under 3 × 3, or a field or
+# concentration slice shorter than nx·ny. Mirrors `update_sediment` (Rust's `&mut [f64]` is the pointer and count).
+fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedimentConfig, dt: f64) {
+    var nx = sw.nx;
+    var ny = sw.ny;
+    if (nx < 3 || ny < 3) { return 0; }
+    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+    var n = nx * ny;
+    if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
+    if (conc_len < n || sw.height.len < n || sw.ground.len < n || sw.vx.len < n || sw.vy.len < n) { return 0; }
+    if (sw.manning_n.len < n) { return 0; }
+    var g: f64 = sw.gravity;
+    var rho_s: f64 = config.sediment_density;
+    var rho_w: f64 = config.water_density;
+    var d: f64 = config.grain_diameter;
+    var tau_cr: f64 = ((config.shields_critical * (rho_s - rho_w)) * g) * d;
+    var nano: f64 = 0x3E112E0BE826D695;   # 1e-9
+    var dry_thr: f64 = _pv_max(sw.dry_threshold, nano);
+    var minn: f64 = 0.01;
+    var hd = sw.height.data;
+    var gd = sw.ground.data;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var hi: f64 = load64(hd + i * 8);
+            var gi: f64 = load64(gd + i * 8);
+            var dd: f64 = hi - gi;
+            var depth: f64 = _pv_max(dd, 0.0);
+            if (depth < dry_thr) { continue; }
+            var ci: f64 = load64(concentration + i * 8);
+            var suspended: f64 = _pv_max(ci, 0.0) * depth;
+            var u: f64 = sw.vx.at(i);
+            var v: f64 = sw.vy.at(i);
+            var speed_sq: f64 = (u * u) + (v * v);
+            var mn: f64 = sw.manning_n.at(i);
+            var n_manning: f64 = _pv_max(mn, minn);
+            var cr: f64 = _pv_cbrt(depth);
+            var tau_b: f64 = ((((rho_w * g) * n_manning) * n_manning) * speed_sq) / cr;
+            if (tau_b > tau_cr) {
+                var erosion: f64 = (config.erosion_rate * (tau_b - tau_cr)) * dt;
+                gi = gi - erosion;
+                depth = depth + erosion;
+                suspended = suspended + erosion;
+            }
+            if (suspended > 0.0) {
+                var c: f64 = suspended / depth;
+                var want: f64 = (config.deposition_rate * c) * dt;
+                var depo: f64 = _pv_min(want, suspended);
+                gi = gi + depo;
+                depth = depth - depo;
+                suspended = suspended - depo;
+            }
+            store64(gd + i * 8, _pv_bits(gi));
+            var cn: f64 = 0.0;
+            if (depth > 0.0) {
+                var q: f64 = suspended / depth;
+                cn = _pv_max(q, 0.0);
+            }
+            store64(concentration + i * 8, _pv_bits(cn));
+        }
+    }
+    return 0;
+}
+
+# ── the step (M2 part 2) ────────────────────────────────────────────────────────────
+
+# The HLL flux of the 1D shallow water Riemann problem between (h_l, u_l) and (h_r, u_r): (F_h, F_hu). Davis wave
+# speeds, the dry-bed speeds u ∓ 2c of the wet side when one side is dry, and (0, 0) when both are dry. Mirrors the
+# private `hll_flux`.
+#must_use
+fn _pv_sw_hll(h_l0: f64, u_l: f64, h_r0: f64, u_r: f64, g: f64) {
+    var eps: f64 = 0x3E45798EE2308C3A;   # 1e-8
+    var h_l: f64 = _pv_max(h_l0, 0.0);
+    var h_r: f64 = _pv_max(h_r0, 0.0);
+    if (h_l <= 0.0 && h_r <= 0.0) {
+        var z: f64 = 0.0;
+        return (z, z);
+    }
+    var c_l: f64 = f64_sqrt(g * h_l);
+    var c_r: f64 = f64_sqrt(g * h_r);
+    var s_l: f64 = 0.0;
+    var s_r: f64 = 0.0;
+    if (h_l <= 0.0) {
+        s_l = u_r - (2.0 * c_r);
+        s_r = u_r + c_r;
+    } elif (h_r <= 0.0) {
+        s_l = u_l - c_l;
+        s_r = u_l + (2.0 * c_l);
+    } else {
+        s_l = _pv_min(u_l - c_l, u_r - c_r);
+        s_r = _pv_max(u_l + c_l, u_r + c_r);
+    }
+    var hg: f64 = 0.5 * g;
+    var f_h_l: f64 = h_l * u_l;
+    var f_hu_l: f64 = ((h_l * u_l) * u_l) + ((hg * h_l) * h_l);
+    var f_h_r: f64 = h_r * u_r;
+    var f_hu_r: f64 = ((h_r * u_r) * u_r) + ((hg * h_r) * h_r);
+    if (s_l >= 0.0) { return (f_h_l, f_hu_l); }
+    if (s_r <= 0.0) { return (f_h_r, f_hu_r); }
+    var denom: f64 = 1.0 / _pv_max(s_r - s_l, eps);
+    var slr: f64 = s_l * s_r;
+    var f_h: f64 = (((s_r * f_h_l) - (s_l * f_h_r)) + (slr * (h_r - h_l))) * denom;
+    var f_hu: f64 = (((s_r * f_hu_l) - (s_l * f_hu_r)) + (slr * ((h_r * u_r) - (h_l * u_l)))) * denom;
+    return (f_h, f_hu);
+}
+
+# The well-balanced HLL face flux (Audusse's hydrostatic reconstruction) between the states (η, z, u_n, u_t) on the
+# left and right, into the 4 words at out: F_h, F_hn as the left cell sees it, F_hn as the right cell sees it, F_ht.
+# The per-side normal fluxes carry the ½g(h² − h*²) bed-slope correction, so a lake at rest stays at rest. Mirrors
+# the private `face_flux`.
+fn _pv_sw_face(eta_l: f64, z_l: f64, un_l: f64, ut_l: f64, eta_r: f64, z_r: f64, un_r: f64, ut_r: f64, g: f64,
+  out) {
+    var h_l: f64 = _pv_max(eta_l - z_l, 0.0);
+    var h_r: f64 = _pv_max(eta_r - z_r, 0.0);
+    var z_f: f64 = _pv_max(z_l, z_r);
+    var a_l: f64 = _pv_max(eta_l - z_f, 0.0);
+    var a_r: f64 = _pv_max(eta_r - z_f, 0.0);
+    var hs_l: f64 = _pv_min(a_l, h_l);
+    var hs_r: f64 = _pv_min(a_r, h_r);
+    var fh, fhn = _pv_sw_hll(hs_l, un_l, hs_r, un_r, g);
+    var f_h: f64 = fh;
+    var f_hn: f64 = fhn;
+    var ut: f64 = ut_r;
+    if (f_h >= 0.0) { ut = ut_l; }
+    var hg: f64 = 0.5 * g;
+    var bl: f64 = f_hn + (hg * ((h_l * h_l) - (hs_l * hs_l)));
+    var br: f64 = f_hn + (hg * ((h_r * h_r) - (hs_r * hs_r)));
+    var ft: f64 = f_h * ut;
+    store64(out, _pv_bits(f_h));
+    store64(out + 8, _pv_bits(bl));
+    store64(out + 16, _pv_bits(br));
+    store64(out + 24, _pv_bits(ft));
+    return 0;
+}
+
+impl PvShallowWater {
+    # Ok(nx·ny), or Err: PV_ERR_INVALID_GRID_RESOLUTION when nx or ny is below 3, nx·ny overflows, or a public field
+    # is not nx·ny long; PV_ERR_INVALID_PARAMETER for a cell size or gravity not finite and > 0, or a dispersion
+    # coefficient not finite and ≥ 0. (Public fields and JSON can bypass `new`.) Mirrors the private
+    # `validate_state`.
+    #must_use
+    fn _validate_state(self): Result {
+        var nx = self.nx;
+        var ny = self.ny;
+        if (nx < 3 || ny < 3) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var n = nx * ny;
+        if (self.height.len != n || self.vx.len != n || self.vy.len != n || self.ground.len != n) {
+            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
+        if (self.manning_n.len != n) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var dx: f64 = self.dx;
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var g: f64 = self.gravity;
+        if (_pv_is_finite(g) == 0 || g <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var dc: f64 = self.dispersion_coeff;
+        if (_pv_is_finite(dc) == 0 || dc < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        return Ok(n);
+    }
+
+    # One step of the non-linear shallow water equations (continuity in flux form; momentum with convection and the
+    # well-balanced pressure gradient −g∇η), then Manning friction, breaking dissipation and the timestep-proportional
+    # damping damping^(dt/0.001). The default path is forward-backward (momentum, then continuity with the new
+    # velocity); `use_riemann` is a finite-volume HLL update instead; `dispersion_coeff > 0` adds Peregrine's implicit
+    # dispersion. The edges are closed reflective walls. Ok(0), or Err: PV_ERR_INVALID_TIMESTEP for dt not finite and
+    # > 0, `_validate_state`'s, PV_ERR_OUT_OF_MEMORY when the scratch buffers can't grow (Rust aborts), and
+    # PV_ERR_DIVERGED when a height or velocity comes out non-finite (the state then holds the step). Mirrors `step`.
+    #must_use
+    fn step(self, dt: f64): Result {
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var vt, vv = self._validate_state();
+        if (is_err_result(vt) == 1) { return Err(vv); }
+        var size = vv;
+        var nx = self.nx;
+        var ny = self.ny;
+        var g: f64 = self.gravity;
+        var dx: f64 = self.dx;
+        var inv_dx: f64 = 1.0 / dx;
+        var inv_2dx: f64 = 0.5 * inv_dx;
+        var damp: f64 = _pv_powf(self.damping, dt / 0.001);
+        var use_riemann = self.use_riemann;
+        var dry_thr: f64 = self.dry_threshold;
+
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        var ok = self.scratch_vx.resize(size, zw);
+        ok = ok & self.scratch_vy.resize(size, zw);
+        ok = ok & self.scratch_h.resize(size, zw);
+        ok = ok & self.scratch_lap.resize(size, zw);
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+
+        var hp = self.height.data;
+        var up = self.vx.data;
+        var vp = self.vy.data;
+        var gp = self.ground.data;
+        var mp = self.manning_n.data;
+        var svx = self.scratch_vx.data;
+        var svy = self.scratch_vy.data;
+        var sh = self.scratch_h.data;
+
+        # Zero the velocity in dry cells, then snapshot the state.
+        for (var i = 0; i < size; i = i + 1) {
+            var h0: f64 = load64(hp + i * 8);
+            var g0: f64 = load64(gp + i * 8);
+            if ((h0 - g0) < dry_thr) {
+                store64(up + i * 8, zw);
+                store64(vp + i * 8, zw);
+            }
+        }
+        for (var i = 0; i < size; i = i + 1) {
+            store64(svx + i * 8, load64(up + i * 8));
+            store64(svy + i * 8, load64(vp + i * 8));
+            store64(sh + i * 8, load64(hp + i * 8));
+        }
+
+        # 1. Momentum: pressure gradient and convection (the default path only), then friction, breaking and
+        #    damping (both paths).
+        var tiny: f64 = 0x3D719799812DEA11;   # 1e-12
+        var brk_thr: f64 = self.breaking_threshold;
+        var brk_diss: f64 = self.breaking_dissipation;
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var u: f64 = load64(svx + i * 8);
+                var v: f64 = load64(svy + i * 8);
+                var shi: f64 = load64(sh + i * 8);
+                var gi: f64 = load64(gp + i * 8);
+                var hi: f64 = _pv_max(shi - gi, 0.0);
+                var nvx: f64 = load64(up + i * 8);
+                var nvy: f64 = load64(vp + i * 8);
+
+                if (use_riemann == 0) {
+                    var dhdx: f64 = 0.0;
+                    var dhdy: f64 = 0.0;
+                    if (hi >= dry_thr) {
+                        var hmax: f64 = _pv_max(hi, dry_thr);
+                        var den: f64 = (2.0 * dx) * hmax;
+                        var hg: f64 = 0.5 * g;
+                        # x: well-balanced where the ground varies, simple where it is flat.
+                        var gxr: f64 = load64(gp + (i + 1) * 8);
+                        var gxl: f64 = load64(gp + (i - 1) * 8);
+                        var shr: f64 = load64(sh + (i + 1) * 8);
+                        var shl: f64 = load64(sh + (i - 1) * 8);
+                        var dgr: f64 = f64_abs(gxr - gi);
+                        var dgl: f64 = f64_abs(gxl - gi);
+                        if (dgr > tiny || dgl > tiny) {
+                            var z_right: f64 = _pv_max(gi, gxr);
+                            var z_left: f64 = _pv_max(gi, gxl);
+                            var h_ir: f64 = _pv_max(shi - z_right, 0.0);
+                            var h_jr: f64 = _pv_max(shr - z_right, 0.0);
+                            var h_il: f64 = _pv_max(shi - z_left, 0.0);
+                            var h_jl: f64 = _pv_max(shl - z_left, 0.0);
+                            var sq: f64 = (((h_jr * h_jr) - (h_ir * h_ir)) + (h_il * h_il)) - (h_jl * h_jl);
+                            dhdx = (hg * sq) / den;
+                        } else {
+                            dhdx = (g * (shr - shl)) * inv_2dx;
+                        }
+                        # y, the same with stride nx.
+                        var gyt: f64 = load64(gp + (i + nx) * 8);
+                        var gyb: f64 = load64(gp + (i - nx) * 8);
+                        var sht: f64 = load64(sh + (i + nx) * 8);
+                        var shb: f64 = load64(sh + (i - nx) * 8);
+                        var dgt: f64 = f64_abs(gyt - gi);
+                        var dgb: f64 = f64_abs(gyb - gi);
+                        if (dgt > tiny || dgb > tiny) {
+                            var z_top: f64 = _pv_max(gi, gyt);
+                            var z_bot: f64 = _pv_max(gi, gyb);
+                            var h_it: f64 = _pv_max(shi - z_top, 0.0);
+                            var h_jt: f64 = _pv_max(sht - z_top, 0.0);
+                            var h_ib: f64 = _pv_max(shi - z_bot, 0.0);
+                            var h_jb: f64 = _pv_max(shb - z_bot, 0.0);
+                            var sq2: f64 = (((h_jt * h_jt) - (h_it * h_it)) + (h_ib * h_ib)) - (h_jb * h_jb);
+                            dhdy = (hg * sq2) / den;
+                        } else {
+                            dhdy = (g * (sht - shb)) * inv_2dx;
+                        }
+                    }
+                    # Convection, first-order upwind.
+                    var dudx: f64 = _pv_sw_up(svx, i, u, 1, inv_dx);
+                    var dudy: f64 = _pv_sw_up(svx, i, v, nx, inv_dx);
+                    var dvdx: f64 = _pv_sw_up(svy, i, u, 1, inv_dx);
+                    var dvdy: f64 = _pv_sw_up(svy, i, v, nx, inv_dx);
+                    nvx = nvx - (((dhdx + (u * dudx)) + (v * dudy)) * dt);
+                    nvy = nvy - (((dhdy + (u * dvdx)) + (v * dvdy)) * dt);
+                }
+
+                # Manning's bed friction, implicit: u ← u / (1 + g·n²·|u| / (h·∛h)·dt).
+                var n_m: f64 = load64(mp + i * 8);
+                if (n_m > 0.0 && hi > dry_thr) {
+                    var speed: f64 = f64_sqrt((u * u) + (v * v));
+                    var d_safe: f64 = _pv_max(hi, dry_thr);
+                    var cb: f64 = _pv_cbrt(d_safe);
+                    var friction: f64 = (((g * n_m) * n_m) * speed) / (d_safe * cb);
+                    var decay: f64 = 1.0 / (1.0 + (friction * dt));
+                    nvx = nvx * decay;
+                    nvy = nvy * decay;
+                }
+
+                # Breaking: extra damping where the free-surface slope exceeds the threshold.
+                if (brk_thr > 0.0 && brk_diss > 0.0) {
+                    var slope: f64 = 0.0;
+                    if (_pv_sw_slope(sh, gp, nx, i, dry_thr, inv_2dx, &slope) == 1) {
+                        if (slope > brk_thr) {
+                            var bdecay: f64 = 1.0 / (1.0 + (brk_diss * dt));
+                            nvx = nvx * bdecay;
+                            nvy = nvy * bdecay;
+                        }
+                    }
+                }
+
+                nvx = nvx * damp;
+                nvy = nvy * damp;
+                store64(up + i * 8, _pv_bits(nvx));
+                store64(vp + i * 8, _pv_bits(nvy));
+            }
+        }
+
+        var disp: f64 = self.dispersion_coeff;
+        if (use_riemann != 0) {
+            # 2a. The finite-volume update; 3a. dispersion on this step's velocity increment.
+            self._riemann_update(dt);
+            if (disp > 0.0) {
+                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+            }
+        } else {
+            # 2b. Dispersion first, so the filtered velocity drives the mass flux; 3b. continuity with
+            #     face-averaged fluxes, walls (zero flux) on the boundary ring's faces.
+            if (disp > 0.0) {
+                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+            }
+            for (var y = 1; y < ny - 1; y = y + 1) {
+                for (var x = 1; x < nx - 1; x = x + 1) {
+                    var i = y * nx + x;
+                    var d_i: f64 = _pv_sw_depth(sh, gp, i);
+                    var vxi: f64 = load64(up + i * 8);
+                    var vyi: f64 = load64(vp + i * 8);
+                    var hu_right: f64 = 0.0;
+                    if (x + 2 != nx) {
+                        var dr: f64 = _pv_sw_depth(sh, gp, i + 1);
+                        var vr: f64 = load64(up + (i + 1) * 8);
+                        hu_right = 0.5 * ((d_i * vxi) + (dr * vr));
+                    }
+                    var hu_left: f64 = 0.0;
+                    if (x != 1) {
+                        var dl: f64 = _pv_sw_depth(sh, gp, i - 1);
+                        var vl: f64 = load64(up + (i - 1) * 8);
+                        hu_left = 0.5 * ((d_i * vxi) + (dl * vl));
+                    }
+                    var hv_top: f64 = 0.0;
+                    if (y + 2 != ny) {
+                        var dt2: f64 = _pv_sw_depth(sh, gp, i + nx);
+                        var vtt: f64 = load64(vp + (i + nx) * 8);
+                        hv_top = 0.5 * ((d_i * vyi) + (dt2 * vtt));
+                    }
+                    var hv_bottom: f64 = 0.0;
+                    if (y != 1) {
+                        var db: f64 = _pv_sw_depth(sh, gp, i - nx);
+                        var vb: f64 = load64(vp + (i - nx) * 8);
+                        hv_bottom = 0.5 * ((d_i * vyi) + (db * vb));
+                    }
+                    var flux_div: f64 = (((hu_right - hu_left) + hv_top) - hv_bottom) * inv_dx;
+                    var hcur: f64 = load64(hp + i * 8);
+                    var gcur: f64 = load64(gp + i * 8);
+                    var nh: f64 = _pv_max(hcur - (flux_div * dt), gcur);
+                    store64(hp + i * 8, _pv_bits(nh));
+                }
+            }
+        }
+
+        self._enforce_boundary();
+
+        for (var i = 0; i < size; i = i + 1) {
+            var a: f64 = load64(hp + i * 8);
+            var b: f64 = load64(up + i * 8);
+            var c: f64 = load64(vp + i * 8);
+            if (_pv_is_finite(a) == 0 || _pv_is_finite(b) == 0 || _pv_is_finite(c) == 0) {
+                return Err(PV_ERR_DIVERGED);
+            }
+        }
+        return Ok(0);
+    }
+
+    # The finite-volume update of (h, hu, hv) from the step's snapshot: well-balanced HLL fluxes on the four faces of
+    # each interior cell, a mirrored ghost state at the walls; the source terms already in vx / vy (friction,
+    # breaking, damping) carried into hu / hv. Mirrors the private `riemann_update`.
+    fn _riemann_update(self, dt: f64) {
+        var nx = self.nx;
+        var ny = self.ny;
+        var g: f64 = self.gravity;
+        var inv_dx: f64 = 1.0 / self.dx;
+        var dry_thr: f64 = self.dry_threshold;
+        var sh = self.scratch_h.data;
+        var svx = self.scratch_vx.data;
+        var svy = self.scratch_vy.data;
+        var gp = self.ground.data;
+        var hp = self.height.data;
+        var up = self.vx.data;
+        var vp = self.vy.data;
+        var fr[32];
+        var fl[32];
+        var gt[32];
+        var gb[32];
+        var k: f64 = dt * inv_dx;
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var eta: f64 = load64(sh + i * 8);
+                var z: f64 = load64(gp + i * 8);
+                var u: f64 = load64(svx + i * 8);
+                var v: f64 = load64(svy + i * 8);
+                var h_i: f64 = _pv_max(eta - z, 0.0);
+                var nu: f64 = -u;
+                var nv: f64 = -v;
+                # x-faces: normal u, tangential v.
+                if (x + 2 == nx) {
+                    _pv_sw_face(eta, z, u, v, eta, z, nu, v, g, &fr);
+                } else {
+                    _pv_sw_face(eta, z, u, v, load64(sh + (i + 1) * 8), load64(gp + (i + 1) * 8),
+                      load64(svx + (i + 1) * 8), load64(svy + (i + 1) * 8), g, &fr);
+                }
+                if (x == 1) {
+                    _pv_sw_face(eta, z, nu, v, eta, z, u, v, g, &fl);
+                } else {
+                    _pv_sw_face(load64(sh + (i - 1) * 8), load64(gp + (i - 1) * 8), load64(svx + (i - 1) * 8),
+                      load64(svy + (i - 1) * 8), eta, z, u, v, g, &fl);
+                }
+                # y-faces: normal v, tangential u.
+                if (y + 2 == ny) {
+                    _pv_sw_face(eta, z, v, u, eta, z, nv, u, g, &gt);
+                } else {
+                    _pv_sw_face(eta, z, v, u, load64(sh + (i + nx) * 8), load64(gp + (i + nx) * 8),
+                      load64(svy + (i + nx) * 8), load64(svx + (i + nx) * 8), g, &gt);
+                }
+                if (y == 1) {
+                    _pv_sw_face(eta, z, nv, u, eta, z, v, u, g, &gb);
+                } else {
+                    _pv_sw_face(load64(sh + (i - nx) * 8), load64(gp + (i - nx) * 8), load64(svy + (i - nx) * 8),
+                      load64(svx + (i - nx) * 8), eta, z, v, u, g, &gb);
+                }
+                var fr0: f64 = load64(&fr);
+                var fr1: f64 = load64(&fr + 8);
+                var fr3: f64 = load64(&fr + 24);
+                var fl0: f64 = load64(&fl);
+                var fl2: f64 = load64(&fl + 16);
+                var fl3: f64 = load64(&fl + 24);
+                var gt0: f64 = load64(&gt);
+                var gt1: f64 = load64(&gt + 8);
+                var gt3: f64 = load64(&gt + 24);
+                var gb0: f64 = load64(&gb);
+                var gb2: f64 = load64(&gb + 16);
+                var gb3: f64 = load64(&gb + 24);
+                var dh: f64 = ((fr0 - fl0) + gt0) - gb0;
+                var new_h: f64 = _pv_max(h_i - (k * dh), 0.0);
+                var vxi: f64 = load64(up + i * 8);
+                var vyi: f64 = load64(vp + i * 8);
+                var hu: f64 = (h_i * vxi) - (k * (((fr1 - fl2) + gt3) - gb3));
+                var hv: f64 = (h_i * vyi) - (k * (((fr3 - fl3) + gt1) - gb2));
+                var hn: f64 = z + new_h;
+                store64(hp + i * 8, _pv_bits(hn));
+                if (new_h > dry_thr) {
+                    var nvx: f64 = hu / new_h;
+                    var nvy: f64 = hv / new_h;
+                    store64(up + i * 8, _pv_bits(nvx));
+                    store64(vp + i * 8, _pv_bits(nvy));
+                } else {
+                    var zz: f64 = 0.0;
+                    store64(up + i * 8, _pv_bits(zz));
+                    store64(vp + i * 8, _pv_bits(zz));
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Peregrine's implicit dispersion on this step's velocity increment: (I − c·h²∂xx)(I − c·h²∂yy)·Δũ = Δu for each
+    # component, by alternating-direction tridiagonal (Thomas) solves with Dirichlet-zero ghosts, then u = u_old + Δũ.
+    # With `use_green_naghdi` the coupling uses the face-averaged depth. 1, or 0 when the line scratch can't grow
+    # (Rust aborts). Mirrors the private `apply_dispersion`.
+    #must_use
+    fn _apply_dispersion(self): i64 {
+        var nx = self.nx;
+        var ny = self.ny;
+        var c: f64 = self.dispersion_coeff;
+        var inv_dx2: f64 = 1.0 / (self.dx * self.dx);
+        var dry_thr: f64 = self.dry_threshold;
+        var dw = self.use_green_naghdi;
+        var m = nx;
+        if (ny > m) { m = ny; }
+        var zero: f64 = 0.0;
+        if (self.scratch_line.resize(2 * m, _pv_bits(zero)) == 0) { return 0; }
+        var cp = self.scratch_line.data;
+        var dp = cp + m * 8;
+        var delta = self.scratch_lap.data;
+        var sh = self.scratch_h.data;
+        var gp = self.ground.data;
+        var size = nx * ny;
+        for (var comp = 0; comp < 2; comp = comp + 1) {
+            var field = self.vx.data;
+            var old = self.scratch_vx.data;
+            if (comp == 1) {
+                field = self.vy.data;
+                old = self.scratch_vy.data;
+            }
+            for (var i = 0; i < size; i = i + 1) { store64(delta + i * 8, _pv_bits(zero)); }
+            for (var y = 1; y < ny - 1; y = y + 1) {
+                for (var x = 1; x < nx - 1; x = x + 1) {
+                    var i = y * nx + x;
+                    var fd: f64 = load64(field + i * 8);
+                    var od: f64 = load64(old + i * 8);
+                    store64(delta + i * 8, _pv_bits(fd - od));
+                }
+            }
+            # x-sweeps (rows), then y-sweeps (columns).
+            for (var pass = 0; pass < 2; pass = pass + 1) {
+                var outer = ny;
+                var inner = nx;
+                var stride_o = nx;
+                var stride_i = 1;
+                if (pass == 1) {
+                    outer = nx;
+                    inner = ny;
+                    stride_o = 1;
+                    stride_i = nx;
+                }
+                var len = inner - 2;
+                for (var o = 1; o < outer - 1; o = o + 1) {
+                    var base = o * stride_o;
+                    for (var k = 0; k < len; k = k + 1) {
+                        var i = base + (k + 1) * stride_i;
+                        var b_lo: f64 = _pv_sw_beta(sh, gp, i, i - stride_i, dw, c, inv_dx2, dry_thr);
+                        var b_hi: f64 = _pv_sw_beta(sh, gp, i, i + stride_i, dw, c, inv_dx2, dry_thr);
+                        var a_k: f64 = -b_lo;
+                        var b_k: f64 = (1.0 + b_lo) + b_hi;
+                        var c_k: f64 = -b_hi;
+                        var cp_prev: f64 = 0.0;
+                        var dp_prev: f64 = 0.0;
+                        if (k > 0) {
+                            cp_prev = load64(cp + (k - 1) * 8);
+                            dp_prev = load64(dp + (k - 1) * 8);
+                        }
+                        var denom: f64 = b_k - (a_k * cp_prev);
+                        var di: f64 = load64(delta + i * 8);
+                        var cpk: f64 = c_k / denom;
+                        var dpk: f64 = (di - (a_k * dp_prev)) / denom;
+                        store64(cp + k * 8, _pv_bits(cpk));
+                        store64(dp + k * 8, _pv_bits(dpk));
+                    }
+                    var next: f64 = 0.0;
+                    var k2 = len - 1;
+                    while (k2 >= 0) {
+                        var i2 = base + (k2 + 1) * stride_i;
+                        var dpv: f64 = load64(dp + k2 * 8);
+                        var cpv: f64 = load64(cp + k2 * 8);
+                        var val: f64 = dpv - (cpv * next);
+                        store64(delta + i2 * 8, _pv_bits(val));
+                        next = val;
+                        k2 = k2 - 1;
+                    }
+                }
+            }
+            for (var y = 1; y < ny - 1; y = y + 1) {
+                for (var x = 1; x < nx - 1; x = x + 1) {
+                    var i = y * nx + x;
+                    var od2: f64 = load64(old + i * 8);
+                    var dd: f64 = load64(delta + i * 8);
+                    store64(field + i * 8, _pv_bits(od2 + dd));
+                }
+            }
+        }
+        return 1;
+    }
+
+    # The closed walls: each boundary cell copies its interior neighbour's height and tangential velocity, and the
+    # normal velocity is 0 (top and bottom rows first, then the left and right columns, which take the corners).
+    # Mirrors the private `enforce_boundary`.
+    fn _enforce_boundary(self) {
+        var nx = self.nx;
+        var ny = self.ny;
+        var hp = self.height.data;
+        var up = self.vx.data;
+        var vp = self.vy.data;
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        for (var x = 0; x < nx; x = x + 1) {
+            store64(hp + x * 8, load64(hp + (nx + x) * 8));
+            store64(up + x * 8, load64(up + (nx + x) * 8));
+            store64(vp + x * 8, zw);
+            var top = (ny - 1) * nx + x;
+            var below = (ny - 2) * nx + x;
+            store64(hp + top * 8, load64(hp + below * 8));
+            store64(up + top * 8, load64(up + below * 8));
+            store64(vp + top * 8, zw);
+        }
+        for (var y = 0; y < ny; y = y + 1) {
+            var l = y * nx;
+            store64(hp + l * 8, load64(hp + (l + 1) * 8));
+            store64(up + l * 8, zw);
+            store64(vp + l * 8, load64(vp + (l + 1) * 8));
+            var r = y * nx + nx - 1;
+            store64(hp + r * 8, load64(hp + (r - 1) * 8));
+            store64(up + r * 8, zw);
+            store64(vp + r * 8, load64(vp + (r - 1) * 8));
+        }
+        return 0;
+    }
+}
+
+# The first-order upwind difference of field f at i along `stride` for the velocity `vel`: backward when vel > 0,
+# else forward, times 1/dx.
+#must_use
+fn _pv_sw_up(f, i, vel: f64, stride, inv_dx: f64): f64 {
+    var fi: f64 = load64(f + i * 8);
+    if (vel > 0.0) {
+        var fb: f64 = load64(f + (i - stride) * 8);
+        var r: f64 = (fi - fb) * inv_dx;
+        return r;
+    }
+    var ff: f64 = load64(f + (i + stride) * 8);
+    var r2: f64 = (ff - fi) * inv_dx;
+    return r2;
+}
+
+# max(η − z, 0) at k on the snapshot.
+#must_use
+fn _pv_sw_depth(sh, gp, k): f64 {
+    var a: f64 = load64(sh + k * 8);
+    var b: f64 = load64(gp + k * 8);
+    var r: f64 = _pv_max(a - b, 0.0);
+    return r;
+}
+
+# The dispersion coupling between cells a and b on a's row: c·h²/dx², h the depth at a (d ≥ dry_thr, else 0), or
+# with `dw` the mean of a's and b's.
+#must_use
+fn _pv_sw_beta(sh, gp, a, b, dw, c: f64, inv_dx2: f64, dry_thr: f64): f64 {
+    var h: f64 = _pv_sw_ddepth(sh, gp, a, dry_thr);
+    if (dw != 0) {
+        var hb: f64 = _pv_sw_ddepth(sh, gp, b, dry_thr);
+        h = 0.5 * (h + hb);
+    }
+    var r: f64 = ((c * h) * h) * inv_dx2;
+    return r;
+}
+
+# The dispersion depth at k: η − z when at least dry_thr, else 0.
+#must_use
+fn _pv_sw_ddepth(sh, gp, k, dry_thr: f64): f64 {
+    var a: f64 = load64(sh + k * 8);
+    var b: f64 = load64(gp + k * 8);
+    var d: f64 = a - b;
+    if (d >= dry_thr) { return d; }
+    return 0.0;
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust
@@ -5788,5 +6853,157 @@ fn drag_coefficient_to_json(sb): i64 {
 fn drag_coefficient_from_json(buf, len): Result {
     var v = _pv_jr_parse(buf, len);
     if (v == 0 || bayan_json_v_tag(v) != JTAG_NULL) { return Err(PV_ERR_DESERIALIZE); }
+    return Ok(0);
+}
+
+# ── ShallowWater (M2) ───────────────────────────────────────────────────────────────
+
+# A JSON integer in 0 … i64::MAX (a usize; bayan refuses larger, S3) into *out: 1, or 0.
+fn _pv_jr_usize(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_INT) { return 0; }
+    var n = bayan_json_v_int(v);
+    if (n < 0) { return 0; }
+    store64(out, n);
+    return 1;
+}
+
+# A JSON boolean into *out (0 / 1): 1, or 0.
+fn _pv_jr_bool(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_BOOL) { return 0; }
+    store64(out, bayan_json_v_bool(v));
+    return 1;
+}
+
+# Appends `true` or `false`.
+#must_use
+fn _pv_jw_bool(sb, x): i64 {
+    if (x != 0) { return _pv_jw(sb, "true"); }
+    return _pv_jw(sb, "false");
+}
+
+# The serialized fields of a `ShallowWater`, in declaration order (the scratch buffers are `#[serde(skip)]`).
+#must_use
+fn _pv_sw_field(k): i64 {
+    match k {
+        0 => { return "nx"; }
+        1 => { return "ny"; }
+        2 => { return "dx"; }
+        3 => { return "height"; }
+        4 => { return "vx"; }
+        5 => { return "vy"; }
+        6 => { return "ground"; }
+        7 => { return "gravity"; }
+        8 => { return "damping"; }
+        9 => { return "manning_n"; }
+        10 => { return "dry_threshold"; }
+        11 => { return "breaking_threshold"; }
+        12 => { return "breaking_dissipation"; }
+        13 => { return "dispersion_coeff"; }
+        14 => { return "use_green_naghdi"; }
+        _ => { return "use_riemann"; }
+    }
+    return "use_riemann";
+}
+
+impl PvShallowWater {
+    # Appends the state as serde_json writes a `ShallowWater` (the scratch buffers skipped): 0, or -1 when the
+    # builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        rc = rc | _pv_jw_key(sb, "height", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 0), 0);
+        rc = rc | _pv_jw_key(sb, "vx", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 1), 0);
+        rc = rc | _pv_jw_key(sb, "vy", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 2), 0);
+        rc = rc | _pv_jw_key(sb, "ground", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 3), 0);
+        rc = rc | _pv_jw_key(sb, "gravity", 0);
+        rc = rc | _pv_jw_f64(sb, self.gravity);
+        rc = rc | _pv_jw_key(sb, "damping", 0);
+        rc = rc | _pv_jw_f64(sb, self.damping);
+        rc = rc | _pv_jw_key(sb, "manning_n", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 4), 0);
+        rc = rc | _pv_jw_key(sb, "dry_threshold", 0);
+        rc = rc | _pv_jw_f64(sb, self.dry_threshold);
+        rc = rc | _pv_jw_key(sb, "breaking_threshold", 0);
+        rc = rc | _pv_jw_f64(sb, self.breaking_threshold);
+        rc = rc | _pv_jw_key(sb, "breaking_dissipation", 0);
+        rc = rc | _pv_jw_f64(sb, self.breaking_dissipation);
+        rc = rc | _pv_jw_key(sb, "dispersion_coeff", 0);
+        rc = rc | _pv_jw_f64(sb, self.dispersion_coeff);
+        rc = rc | _pv_jw_key(sb, "use_green_naghdi", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_green_naghdi);
+        rc = rc | _pv_jw_key(sb, "use_riemann", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_riemann);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `ShallowWater` document into *out, a fresh state with empty scratch buffers (as serde's skipped fields
+# default), released with `PvShallowWater_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The
+# field lengths are the document's (they need not agree with nx·ny: `step` refuses an inconsistent state).
+#must_use
+fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 16);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # The scalars into a word buffer (nx, ny, dx, gravity, damping, the four f64 parameters, the two flags).
+    var w[88];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 7, "gravity"), &w + 24);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 8, "damping"), &w + 32);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 10, "dry_threshold"), &w + 40);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 11, "breaking_threshold"), &w + 48);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 12, "breaking_dissipation"), &w + 56);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 13, "dispersion_coeff"), &w + 64);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 14, "use_green_naghdi"), &w + 72);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 15, "use_riemann"), &w + 80);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_sw_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    # The five public fields: height, vx, vy, ground (fields 3–6), manning_n (field 9).
+    for (var c = 0; c < 5; c = c + 1) {
+        var fi = c + 3;
+        if (c == 4) { fi = 9; }
+        if (_pv_jr_col(_pv_jr_at(v, f, fi, _pv_sw_field(fi)), _pv_sw_col(out, c), 0) == 0) {
+            PvShallowWater_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    var g: f64 = load64(&w + 24);
+    var damp: f64 = load64(&w + 32);
+    var dry: f64 = load64(&w + 40);
+    var bt: f64 = load64(&w + 48);
+    var bd: f64 = load64(&w + 56);
+    var dc: f64 = load64(&w + 64);
+    out.dx = dx;
+    out.gravity = g;
+    out.damping = damp;
+    out.dry_threshold = dry;
+    out.breaking_threshold = bt;
+    out.breaking_dissipation = bd;
+    out.dispersion_coeff = dc;
+    out.use_green_naghdi = load64(&w + 72);
+    out.use_riemann = load64(&w + 80);
     return Ok(0);
 }

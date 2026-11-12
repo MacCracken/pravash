@@ -1,8 +1,8 @@
 # integration.tcyr — the ported tests of rust-old/tests/integration.rs, as their modules land.
 #
-# M1 (part 4): the eleven that use only M1 modules. The rest arrive with their milestones:
-# - serde_roundtrip_all_types (it also needs FluidGrid and ShallowWater): M2 and M3;
-# - the shallow tests: M2;
+# M1 (part 4): the eleven that use only M1 modules. M2: the three shallow water tests (`.unwrap()` on `new` and
+# `step` is an assertion that every call was Ok). The rest arrive with their milestones:
+# - serde_roundtrip_all_types (it also needs FluidGrid): M3;
 # - the grid tests: M3;
 # - the SPH and solver tests: M4–M5;
 # - the coupling and FLIP tests: M6.
@@ -27,8 +27,58 @@ fn custom_err(d: f64, v: f64, s: f64, c: f64): i64 {
     return is_err_result(t);
 }
 
+# n steps of dt: the number that returned Err (each is Rust's `step(dt).unwrap()`).
+fn sw_steps(sw: *PvShallowWater, n, dt: f64): i64 {
+    var bad = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var t, e = sw.step(dt);
+        if (is_err_result(t) == 1) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# The shallow water tests (M2), in Rust's order (before the cross-module ones).
+fn test_shallow() {
+    var sw: PvShallowWater;
+
+    test_group("shallow_wave_propagation");
+    var t1, e1 = PvShallowWater_new(20, 20, 0.1, 1.0, &sw);
+    assert_eq(is_err_result(t1), 0, "new");
+    sw.add_disturbance(1.0, 1.0, 0.3, 0.5);
+    var near_before: f64 = sw.surface_at(5, 5);
+    assert_eq(sw_steps(&sw, 500, 0.001), 0, "500 steps");
+    var near_after: f64 = sw.surface_at(5, 5);
+    var dn: f64 = near_after - near_before;
+    var adn: f64 = f64_abs(dn);
+    assert(adn > 0.00000001, "the wave reaches (5, 5)");
+    PvShallowWater_drop(&sw);
+
+    test_group("shallow_volume_approximately_conserved");
+    var t2, e2 = PvShallowWater_new(30, 30, 0.1, 1.0, &sw);
+    assert_eq(is_err_result(t2), 0, "new");
+    sw.add_disturbance(1.5, 1.5, 0.3, 0.2);
+    var vol_before: f64 = sw.total_volume();
+    assert_eq(sw_steps(&sw, 100, 0.001), 0, "100 steps");
+    var vol_after: f64 = sw.total_volume();
+    var dv: f64 = vol_after - vol_before;
+    var adv: f64 = f64_abs(dv);
+    var relative_change: f64 = adv / vol_before;
+    assert(relative_change < 0.1, "the volume changes by under 10%");
+    PvShallowWater_drop(&sw);
+
+    test_group("shallow_flat_surface_stable");
+    var t3, e3 = PvShallowWater_new(20, 20, 0.1, 1.0, &sw);
+    assert_eq(is_err_result(t3), 0, "new");
+    assert_eq(sw_steps(&sw, 1000, 0.001), 0, "1000 steps");
+    var max_dev: f64 = sw.max_wave_height(1.0);
+    assert(max_dev < 0.0000000001, "a flat surface doesn't drift");
+    PvShallowWater_drop(&sw);
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    test_shallow();
     var pi: f64 = PV_F64_PI;
     var w: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
     var air: PvFluidMaterial = PV_FLUID_MATERIAL_AIR;

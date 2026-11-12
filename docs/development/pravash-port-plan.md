@@ -11,8 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M1 complete** (2026-11-11); M2 (shallow water) is next. M0 is complete (§4). M1 delivered, in four
-> parts:
+> ⏳ **Status: M2 complete** (2026-11-11); M3 (grid) is next. M0 is complete (§4). M2 delivered `src/shallow.cyr`, the
+> first stateful solver: 888 rows bit-exact (142 class S step rows among them), all 44 + 3 Rust tests ported
+> (port-parity §9). M1 delivered, in four parts:
 > - `src/mathx.cyr`, the first `[lib]` and the bundle;
 > - the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`), gated at 0 ulp against the MPFR-corrected
 >   oracle (ADR 0004);
@@ -24,6 +25,7 @@
 > - pending: the M4 cell key's 2,460 and three bayan-policy JSON rows.
 >
 > All 100 Rust unit tests of the M1 modules are ported, plus 11 integration tests, and surface parity is in CI.
+> With M2: 46,120 golden rows in eight modules, 43,585 ok and 72 accepted, identical on three targets.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -781,6 +783,8 @@ in `src/` has a row below, and that every open row has at least one note. It run
 
 **Also filed at M1 part 4, outside the ledger:** `bayan:docs/development/issues/2026-11-11-json-integer-negative-zero-loses-its-sign.md` (the integer `-0` reads as +0, where serde_json reads −0.0; one pending JSON row, with impetus's S3 and S4).
 
+**Also filed at M2, outside the ledger:** `cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md` (`#inline` declines helpers with more than 2 parameters, a body over 32 tokens or a pointer parameter; the shallow-water step's 7.2× is that call overhead).
+
 **Also filed at M1, outside the ledger** (a finding with no stand-in): `cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`. `fl_alloc` maps and unmaps every block over 4 KB, so building and dropping an arena or an SoA store pays an mmap and a page fault per page. Solvers allocate once, so the step path is untouched.
 
 ---
@@ -839,7 +843,16 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 **Next:** M2, shallow water |
 
-| M2 Shallow water | — | — | — | — | |
+| M2 Shallow water | ✅ **done 2026-11-11** | shallow 888: 746 construction / reads / sediment / JSON, 142 class S step rows (300-step trajectories of the non-chaotic scenes; single steps at frames {0, 1, 2, 10, 60, 300} of the rest); all bit-exact, the step rows 38,946 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 | all 44 Rust tests of `shallow.rs` (`tests/shallow.tcyr`, 155 checks) and 3 integration tests | `shallow_step`, `shallow_volume`, `shallow_disturbance` (Rust's criterion benches): 7.2×, 6.1–6.5×, 1.4–1.6× | port-parity §9:
+- `src/shallow.cyr` with the three step paths (default, HLL, Peregrine / Green–Naghdi dispersion);
+- the public fields as `PvColumn`s, `PvShallowWater_clone` and `PV_ERR_OUT_OF_MEMORY` (ADR 0002 #11);
+- the S class added to the format, the harness and `validate.py`;
+- the whole step transcribed in `validate.py`: glibc reproduces every row, and MPFR finds no correction (22 damping powf pairs);
+- the ShallowWater JSON;
+- the `#inline` limits filed at cyrius;
+- surface parity 165.
+
+**Next:** M3, grid |
 | M3 Grid | — | — | — | — | |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |

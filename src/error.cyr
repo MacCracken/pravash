@@ -10,8 +10,9 @@
 # caller passed in, so the caller already has it. `pv_error_message(code)` gives thiserror's message up to its
 # first field, the part that doesn't depend on the payload.
 #
-# PV_ERR_DESERIALIZE is Cyrius-only (ADR 0002 #10): a JSON reader's refusal, where Rust's serde_json returns its own
-# error type rather than a PravashError.
+# Two codes are Cyrius-only: PV_ERR_DESERIALIZE (ADR 0002 #10), a JSON reader's refusal, where Rust's serde_json
+# returns its own error type rather than a PravashError; and PV_ERR_OUT_OF_MEMORY (ADR 0002 #8), an allocation failure
+# a constructor reports, where Rust aborts.
 
 enum PvError {
     PV_ERR_NONE = 0;
@@ -25,6 +26,7 @@ enum PvError {
     PV_ERR_DIVERGED = 8;
     PV_ERR_INVALID_PARAMETER = 9;
     PV_ERR_DESERIALIZE = 10;
+    PV_ERR_OUT_OF_MEMORY = 11;
 }
 
 # The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, "Deserialize" for the
@@ -43,6 +45,7 @@ fn pv_error_name(code): i64 {
         PV_ERR_DIVERGED => { return "Diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "InvalidParameter"; }
         PV_ERR_DESERIALIZE => { return "Deserialize"; }
+        PV_ERR_OUT_OF_MEMORY => { return "OutOfMemory"; }
         _ => { return "Unknown"; }
     }
     return "Unknown";
@@ -64,6 +67,7 @@ fn pv_error_message(code): i64 {
         PV_ERR_DIVERGED => { return "simulation diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "invalid parameter"; }
         PV_ERR_DESERIALIZE => { return "deserialization error"; }
+        PV_ERR_OUT_OF_MEMORY => { return "out of memory"; }
         _ => { return "unknown error"; }
     }
     return "unknown error";

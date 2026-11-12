@@ -66,6 +66,13 @@ impl PvColumn {
         return self.push(_pv_bits(x));
     }
 
+    # Slot i as an f64, unchecked: for loops that have checked the length (hot paths read this, not get_f).
+    #must_use
+    fn at(self, i): f64 {
+        var x: f64 = load64(self.data + i * 8);
+        return x;
+    }
+
     # Slot i as a word, or 0 out of range. Mirrors `v[i]` on a `Vec<u8>`.
     #must_use
     fn get(self, i): i64 {
@@ -94,6 +101,35 @@ impl PvColumn {
     # Sets slot i to x: 1, or 0 out of range. Mirrors `v[i] = x`.
     fn set_f(self, i, x: f64): i64 {
         return self.set(i, _pv_bits(x));
+    }
+
+    # Grows the column to `n` slots, each new one the word w, or shortens it to `n`: 1, or 0 when it can't grow
+    # (unchanged). Mirrors `Vec::resize`.
+    #must_use
+    fn resize(self, n, w): i64 {
+        if (n < 0) { return 0; }
+        if (n <= self.len) {
+            self.len = n;
+            return 1;
+        }
+        if (self.reserve(n) == 0) { return 0; }
+        for (var i = self.len; i < n; i = i + 1) { store64(self.data + i * 8, w); }
+        self.len = n;
+        return 1;
+    }
+
+    # Every slot set to the word w. Mirrors `slice::fill`.
+    fn fill(self, w) {
+        for (var i = 0; i < self.len; i = i + 1) { store64(self.data + i * 8, w); }
+        return 0;
+    }
+
+    # Copies `src`'s slots over this column's, which must be as long (0 and nothing copied otherwise). Mirrors
+    # `slice::copy_from_slice` (which panics on a length mismatch).
+    fn copy_from(self, src: *PvColumn): i64 {
+        if (src.len != self.len) { return 0; }
+        for (var i = 0; i < self.len; i = i + 1) { store64(self.data + i * 8, load64(src.data + i * 8)); }
+        return 1;
     }
 
     # Shortens the column to `n` slots (no effect when it is not longer). Mirrors `Vec::truncate`.

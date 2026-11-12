@@ -578,3 +578,73 @@ Surface parity covers error, common, buoyancy, vortex and bridge: 128 items.
   - the only pending rows are the M4 cell key's 2,460 and the 3 bayan rows.
 - **The Rust tests:** all 100 unit tests of the M1 modules are ported (error 6, common 49, buoyancy 16, vortex
   12, bridge 17), and the 11 integration tests that use only them.
+
+## 9. M2: shallow water (2026-11-11)
+
+`src/shallow.cyr`, the first stateful solver, after `src/bridge.cyr` in `[lib]`. `PvShallowWater` mirrors
+`ShallowWater`:
+- **The record:** 328 bytes, its layout pinned by a test.
+- **Public fields:** the five public Vec fields are `PvColumn`s, resizable as Rust's public Vecs are, and `step`
+  refuses inconsistent lengths as `validate_state` does.
+- **Scratch:** the five scratch buffers persist across steps, so a step allocates nothing once their sizes are set.
+- **Shapes:** ADR 0002 #11 covers the columns, `PvShallowWater_clone` and `PV_ERR_OUT_OF_MEMORY` (appended as 11),
+  where Rust aborts.
+
+The code covers construction and validation, the four cell reads, the disturbance, the volumes, the CFL step,
+sediment transport (`PvSedimentConfig`, `update_sediment`) and JSON (scratch skipped, as serde's `#[serde(skip)]`).
+The step has its three paths:
+- **the default forward-backward scheme:** the well-balanced pressure gradient (Audusse-style reconstruction where
+  the bed varies), first-order upwind convection, then face-averaged continuity;
+- **the finite-volume HLL path** (`use_riemann`), with the hydrostatic reconstruction and mirrored ghost states;
+- **Peregrine's implicit dispersion,** by alternating-direction Thomas solves, with the Green–Naghdi face-averaged
+  variant.
+
+Manning friction, breaking dissipation, the damping `powf` and the closed walls apply on every path. Every formula is
+Rust's in Rust's operation order, with each field's raw storage read into f64 locals in the hot loops.
+
+**The golden module** `shallow.tsv` holds 888 rows:
+- 746 for construction, the reads, the disturbance, the reductions, sediment and JSON;
+- 142 `ShallowWater::step` rows in the new class S (port plan §5).
+
+The step rows come in two kinds:
+- **bit-level trajectories** of the non-chaotic scenes (a flat lake, a lake over a slope and bump on both schemes, a
+  linear wave) from the initial state at 1, 2, 10, 60 and 300 steps;
+- **single steps** from the oracle's own state at frames {0, 1, 2, 10, 60, 300}: 1D dam breaks onto wet and dry
+  beds on both schemes, a 2D dam break on both, a wet/dry beach on both, a drop, a rough bed, a breaking front, the
+  three dispersion variants, 24 random wet-and-dry states, and 14 refusals (dt, field lengths, nx, dx, gravity,
+  dispersion, a divergence).
+
+Grids are 8 × 8 (1D: 24 × 3), and notes are cut at 240 characters (the harness ignores them), so the file is 3.8 MB.
+
+**The S class.** It compares each field under the path's bound, from the harness's `_par_c_bound` hook. For the
+shallow-water step that bound is 0: the damping `powf` is correctly rounded (ADR 0004), and cbrt is exact on both
+sides.
+
+`validate.py` transcribes the whole step: both schemes, dispersion, friction, breaking, the walls, the refusals. On
+glibc's pow it reproduces all 142 step rows bit for bit; on MPFR's it would write `shallow.cr.tsv`. It wrote none:
+glibc's pow is correctly rounded on all 22 (damping, dt) pairs the rows use. The rest of the module is recomputed by
+transcription too.
+
+**Result:** every row passes on the first replay. The 746 part-1 rows are bit-exact, and the 142 step rows hold
+38,946 field values at 0 ulp, the 300-step trajectories included. The replay is **8 modules, 0 failing | rows:
+43,585 ok, 0 failed, 0 measured, 2,463 pending, 72 accepted (ADR 4: 72)**.
+
+**Mutation checks** (each restored and re-verified after):
+- the Riemann x-momentum taking the wrong face side: 23 step rows FAILED;
+- the Green–Naghdi coupling using one cell's depth: 9 FAILED;
+- friction's h·∛h made h·h: 28 FAILED;
+- the transcription's breaking decay dropped: `validate.py` fails 40 rows;
+- the walls' order swapped (columns before rows): no change, and correctly so. Each corner's height, vx and vy come
+  out the same in either order, so it is an equivalent mutation, not a gap.
+
+**Tests ported:**
+- all 44 Rust tests of `shallow.rs`: `tests/shallow.tcyr`, 155 checks, plus a group pinning the record's
+  328-byte layout that `_pv_sw_col`'s offsets rely on;
+- the 3 shallow tests of `integration.rs`, so `tests/integration.tcyr` has 14 tests and 29 checks.
+
+Each Rust `is_err()` became the exact `PV_ERR_*` code, a stronger check. `capacity()` became the scratch
+columns' `cap`, and the data pointers are checked too. Surface parity now covers 165 items with `shallow`.
+
+**Speed** (benchmarks-rust-v-cyrius, M2): the step runs at 7.2× Rust's at every grid size, a per-cell cost of
+calls to small helpers that `#inline` declines (filed). The volume rewrite on raw loads made `total_volume` 3.1×
+faster, with its rows unchanged.

@@ -421,6 +421,107 @@ fn bench_m1b() {
     return 0;
 }
 
+# ── shallow water (M2): Rust's criterion benches shallow_step, shallow_volume, shallow_disturbance ──
+# rust-old/benches/benchmarks.rs: an n × n grid (n = 32, 64, 128) at dx 0.1 and depth 1. The step and disturbance
+# benches time a fresh clone each iteration (criterion's iter_batched excludes the clone; so does this: it clones
+# outside the timed batch, into a pool).
+
+fn _bench_sw_step(n, iters) {
+    var base: PvShallowWater;
+    var t, v = PvShallowWater_new(n, n, 0.1, 1.0, &base);
+    var c: f64 = f64_from(n) * 0.1 / 2.0;
+    base.add_disturbance(c, c, 0.5, 0.3);
+    var pool = fl_alloc(iters * sizeof(PvShallowWater));
+    for (var k = 0; k < iters; k = k + 1) { var ok = PvShallowWater_clone(_bench_sw(pool, k), &base); }
+    var b = bench_new(_bench_name("shallow_step/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var s: *PvShallowWater = _bench_sw(pool, k);
+        var ts, vs = s.step(0.001);
+        g_sink = g_sink ^ ts;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    for (var k = 0; k < iters; k = k + 1) { PvShallowWater_drop(_bench_sw(pool, k)); }
+    fl_free(pool);
+    PvShallowWater_drop(&base);
+    return 0;
+}
+
+fn _bench_sw_volume(n, iters) {
+    var sw: PvShallowWater;
+    var t, v = PvShallowWater_new(n, n, 0.1, 1.0, &sw);
+    var b = bench_new(_bench_name("shallow_volume/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var tv: f64 = sw.total_volume();
+        g_sink = g_sink ^ _pv_bits(tv);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvShallowWater_drop(&sw);
+    return 0;
+}
+
+fn _bench_sw_disturbance(n, iters) {
+    var base: PvShallowWater;
+    var t, v = PvShallowWater_new(n, n, 0.1, 1.0, &base);
+    var c: f64 = f64_from(n) * 0.1 / 2.0;
+    var pool = fl_alloc(iters * sizeof(PvShallowWater));
+    for (var k = 0; k < iters; k = k + 1) { var ok = PvShallowWater_clone(_bench_sw(pool, k), &base); }
+    var b = bench_new(_bench_name("shallow_disturbance/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var s: *PvShallowWater = _bench_sw(pool, k);
+        s.add_disturbance(c, c, 0.3, 0.5);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    for (var k = 0; k < iters; k = k + 1) { PvShallowWater_drop(_bench_sw(pool, k)); }
+    fl_free(pool);
+    PvShallowWater_drop(&base);
+    return 0;
+}
+
+# State k of a pool of states.
+#must_use
+fn _bench_sw(pool, k): *PvShallowWater {
+    var p: *PvShallowWater = _bench_as_sw(pool);
+    return p + k;
+}
+
+#must_use
+fn _bench_as_sw(p): *PvShallowWater {
+    return p;
+}
+
+# `prefix` followed by `n`x`n`, as a fresh C string.
+fn _bench_name(prefix, n): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, "x");
+    str_builder_add_int(sb, n);
+    var s = str_builder_build(sb);
+    var out = alloc(str_len(s) + 1);
+    memcpy(out, str_data(s), str_len(s));
+    store8(out + str_len(s), 0);
+    return out;
+}
+
+fn bench_shallow() {
+    _bench_sw_step(32, 200);
+    _bench_sw_step(64, 100);
+    _bench_sw_step(128, 20);
+    _bench_sw_volume(32, 100000);
+    _bench_sw_volume(64, 20000);
+    _bench_sw_volume(128, 5000);
+    _bench_sw_disturbance(32, 400);
+    _bench_sw_disturbance(64, 200);
+    _bench_sw_disturbance(128, 50);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -440,6 +541,7 @@ fn main(): i64 {
     bench_math();
     bench_common();
     bench_m1b();
+    bench_shallow();
     return 0;
 }
 

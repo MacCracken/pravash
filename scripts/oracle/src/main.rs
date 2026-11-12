@@ -33,6 +33,7 @@ mod m_common;
 mod m_constants;
 mod m_json;
 mod m_math;
+mod m_shallow;
 mod m_vortex;
 mod t_constants;
 mod tsv;
@@ -54,6 +55,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_constants::emit(root)?,
         m_json::emit(),
         m_math::emit(),
+        m_shallow::emit(),
         m_vortex::emit(),
     ])
 }

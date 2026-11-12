@@ -3,6 +3,43 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **shallow** (M2): `src/shallow.cyr`, the port of `rust-old/src/shallow.rs` and the first stateful solver.
+  - **`PvShallowWater`:**
+    - `PvShallowWater_new`, `PvShallowWater_clone` and `PvShallowWater_drop`;
+    - the cell reads `depth_at`, `surface_at`, `is_wet` and `is_breaking`;
+    - `add_disturbance`, `total_volume`, `interior_volume`, `max_wave_height` and `cfl_dt`;
+    - JSON (`to_json`, `PvShallowWater_from_json`).
+  - **`step`:**
+    - the default well-balanced forward-backward scheme;
+    - the HLL finite-volume path (`use_riemann`);
+    - Peregrine's implicit dispersion and its Green–Naghdi variant;
+    - Manning friction, breaking, the damping `powf` and the closed walls.
+
+    Every formula follows Rust's operation order, on the correctly rounded powf and cbrt.
+  - **Sediment:** `PvSedimentConfig` and `update_sediment`.
+  - **Storage:** the public fields are `PvColumn`s (`PvColumn` gains `resize`, `fill`, `copy_from`, `at`). The
+    scratch buffers persist, so a step allocates nothing once sized.
+  - **Errors:** an allocation failure is the Cyrius-only `PV_ERR_OUT_OF_MEMORY` (11; ADR 0002 #11).
+  - **Parity:** `tests/golden/shallow.tsv`, 888 rows, all bit-exact on the first replay on three targets.
+    - 142 of them are `ShallowWater::step` rows in the new **class S** (single solver steps; `_par_c_bound` gives the
+      bound, 0 here).
+    - The non-chaotic scenes are 300-step trajectories, and the rest single steps from the oracle's own state at
+      frames {0, 1, 2, 10, 60, 300}.
+    - `validate.py` transcribes the whole step and reproduces every row on glibc. MPFR finds no correction: glibc's
+      pow is correctly rounded on all 22 damping pairs used.
+  - **Tests:** all 44 Rust tests of `shallow.rs` (`tests/shallow.tcyr`) and the 3 shallow integration tests.
+  - **Surface parity:** 165 items.
+
+### Performance
+- **The shallow-water benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M2),
+  against Rust's own criterion benches, re-run pinned:
+  - `shallow_step` 221 µs (Rust 30.7 µs) at 32 × 32, 7.2× at every size;
+  - `shallow_volume` 4.75 µs (773 ns);
+  - `shallow_disturbance` 8.45 µs (5.17 µs).
+
+  `total_volume` on raw loads with the max written inline went from 14.6 µs to 4.75 µs (pinned A/B), its rows
+  unchanged. The step's remaining cost is calls to small helpers that `#inline` declines (filed at cyrius).
+
 - **buoyancy, vortex, bridge, json** (M1 part 4, which completes M1).
   - **`src/buoyancy.cyr`:**
     - `buoyancy_force` and `drag_force`;

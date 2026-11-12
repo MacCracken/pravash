@@ -63,5 +63,6 @@ modules = [
     "src/buoyancy.cyr",
     "src/vortex.cyr",
     "src/bridge.cyr",
+    "src/shallow.cyr",
     "src/json.cyr",
 ]

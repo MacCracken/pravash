@@ -471,3 +471,155 @@ fn drag_coefficient_from_json(buf, len): Result {
     if (v == 0 || bayan_json_v_tag(v) != JTAG_NULL) { return Err(PV_ERR_DESERIALIZE); }
     return Ok(0);
 }
+
+# ── ShallowWater (M2) ───────────────────────────────────────────────────────────────
+
+# A JSON integer in 0 … i64::MAX (a usize; bayan refuses larger, S3) into *out: 1, or 0.
+fn _pv_jr_usize(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_INT) { return 0; }
+    var n = bayan_json_v_int(v);
+    if (n < 0) { return 0; }
+    store64(out, n);
+    return 1;
+}
+
+# A JSON boolean into *out (0 / 1): 1, or 0.
+fn _pv_jr_bool(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_BOOL) { return 0; }
+    store64(out, bayan_json_v_bool(v));
+    return 1;
+}
+
+# Appends `true` or `false`.
+#must_use
+fn _pv_jw_bool(sb, x): i64 {
+    if (x != 0) { return _pv_jw(sb, "true"); }
+    return _pv_jw(sb, "false");
+}
+
+# The serialized fields of a `ShallowWater`, in declaration order (the scratch buffers are `#[serde(skip)]`).
+#must_use
+fn _pv_sw_field(k): i64 {
+    match k {
+        0 => { return "nx"; }
+        1 => { return "ny"; }
+        2 => { return "dx"; }
+        3 => { return "height"; }
+        4 => { return "vx"; }
+        5 => { return "vy"; }
+        6 => { return "ground"; }
+        7 => { return "gravity"; }
+        8 => { return "damping"; }
+        9 => { return "manning_n"; }
+        10 => { return "dry_threshold"; }
+        11 => { return "breaking_threshold"; }
+        12 => { return "breaking_dissipation"; }
+        13 => { return "dispersion_coeff"; }
+        14 => { return "use_green_naghdi"; }
+        _ => { return "use_riemann"; }
+    }
+    return "use_riemann";
+}
+
+impl PvShallowWater {
+    # Appends the state as serde_json writes a `ShallowWater` (the scratch buffers skipped): 0, or -1 when the
+    # builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        rc = rc | _pv_jw_key(sb, "height", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 0), 0);
+        rc = rc | _pv_jw_key(sb, "vx", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 1), 0);
+        rc = rc | _pv_jw_key(sb, "vy", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 2), 0);
+        rc = rc | _pv_jw_key(sb, "ground", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 3), 0);
+        rc = rc | _pv_jw_key(sb, "gravity", 0);
+        rc = rc | _pv_jw_f64(sb, self.gravity);
+        rc = rc | _pv_jw_key(sb, "damping", 0);
+        rc = rc | _pv_jw_f64(sb, self.damping);
+        rc = rc | _pv_jw_key(sb, "manning_n", 0);
+        rc = rc | _pv_jw_col(sb, _pv_sw_col(self, 4), 0);
+        rc = rc | _pv_jw_key(sb, "dry_threshold", 0);
+        rc = rc | _pv_jw_f64(sb, self.dry_threshold);
+        rc = rc | _pv_jw_key(sb, "breaking_threshold", 0);
+        rc = rc | _pv_jw_f64(sb, self.breaking_threshold);
+        rc = rc | _pv_jw_key(sb, "breaking_dissipation", 0);
+        rc = rc | _pv_jw_f64(sb, self.breaking_dissipation);
+        rc = rc | _pv_jw_key(sb, "dispersion_coeff", 0);
+        rc = rc | _pv_jw_f64(sb, self.dispersion_coeff);
+        rc = rc | _pv_jw_key(sb, "use_green_naghdi", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_green_naghdi);
+        rc = rc | _pv_jw_key(sb, "use_riemann", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_riemann);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `ShallowWater` document into *out, a fresh state with empty scratch buffers (as serde's skipped fields
+# default), released with `PvShallowWater_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The
+# field lengths are the document's (they need not agree with nx·ny: `step` refuses an inconsistent state).
+#must_use
+fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 16);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # The scalars into a word buffer (nx, ny, dx, gravity, damping, the four f64 parameters, the two flags).
+    var w[88];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 7, "gravity"), &w + 24);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 8, "damping"), &w + 32);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 10, "dry_threshold"), &w + 40);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 11, "breaking_threshold"), &w + 48);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 12, "breaking_dissipation"), &w + 56);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 13, "dispersion_coeff"), &w + 64);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 14, "use_green_naghdi"), &w + 72);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 15, "use_riemann"), &w + 80);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_sw_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    # The five public fields: height, vx, vy, ground (fields 3–6), manning_n (field 9).
+    for (var c = 0; c < 5; c = c + 1) {
+        var fi = c + 3;
+        if (c == 4) { fi = 9; }
+        if (_pv_jr_col(_pv_jr_at(v, f, fi, _pv_sw_field(fi)), _pv_sw_col(out, c), 0) == 0) {
+            PvShallowWater_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    var g: f64 = load64(&w + 24);
+    var damp: f64 = load64(&w + 32);
+    var dry: f64 = load64(&w + 40);
+    var bt: f64 = load64(&w + 48);
+    var bd: f64 = load64(&w + 56);
+    var dc: f64 = load64(&w + 64);
+    out.dx = dx;
+    out.gravity = g;
+    out.damping = damp;
+    out.dry_threshold = dry;
+    out.breaking_threshold = bt;
+    out.breaking_dissipation = bd;
+    out.dispersion_coeff = dc;
+    out.use_green_naghdi = load64(&w + 72);
+    out.use_riemann = load64(&w + 80);
+    return Ok(0);
+}

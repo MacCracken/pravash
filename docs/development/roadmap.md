@@ -44,7 +44,9 @@
 - [x] M1 part 3: error, vec3, common (3,683 rows bit-exact, 47 + 6 Rust tests ported, surface parity in CI)
 - [x] M1 part 4: buoyancy, vortex, bridge, the M1 JSON (7,973 + 302 rows, 45 + 2 + 11 Rust tests)
 - [x] **M1 done 2026-11-11.**
-- [ ] M2: shallow water
+- [x] M2: shallow water (888 rows, 142 class S step rows, all bit-exact; 44 + 3 Rust tests)
+- [x] **M2 done 2026-11-11.**
+- [ ] M3: grid (parts a–e)
 
 ### 1.3.0
 

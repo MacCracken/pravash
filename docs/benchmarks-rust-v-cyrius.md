@@ -153,3 +153,36 @@ serde_json 1.0.154 with the generator's `float_roundtrip` parse. One pinned, int
   - **Reading** builds bayan's value tree on a reset arena, then looks each field up by name.
   - Neither is on a step path. A faster writer would batch tokens into a local buffer; that waits for a consumer
     that needs it.
+
+## M2: shallow water (2026-11-11)
+
+Rust's own criterion benches (`rust-old/benches/benchmarks.rs`: `shallow_step`, `shallow_volume`,
+`shallow_disturbance`), re-run pinned on core 15 for this record (criterion's median; the step and disturbance time
+a fresh clone, excluded from the measurement). Most rows agree with the 1.3.0 `bench-history.csv` within the box's
+noise; its 128 × 128 step and disturbance ran 2.1× and 1.7× slower than today's, so the table uses today's run.
+The Cyrius rows are their twins in `tests/pravash.bcyr`: the same grid (n × n, dx 0.1, depth 1), the same drop,
+clones made outside the timed batch.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `shallow_step/32x32` | 30.7 µs | 221 µs | 7.2× |
+| `shallow_step/64x64` | 128.6 µs | 929 µs | 7.2× |
+| `shallow_step/128x128` | 526 µs | 3.82 ms | 7.3× |
+| `shallow_volume/32x32` | 773 ns | 4.75 µs | 6.1× |
+| `shallow_volume/64x64` | 3.12 µs | 20.3 µs | 6.5× |
+| `shallow_volume/128x128` | 12.7 µs | 81.3 µs | 6.4× |
+| `shallow_disturbance/32x32` | 5.17 µs | 8.45 µs | 1.6× |
+| `shallow_disturbance/64x64` | 21.4 µs | 31.5 µs | 1.5× |
+| `shallow_disturbance/128x128` | 83.4 µs | 121 µs | 1.4× |
+
+**The A/B that set the volume rows** (pinned, interleaved, two runs each): `total_volume`'s loop on raw loads, with
+Rust's `max(d, 0)` written as `d > 0 ? d : 0`, took 14.5–14.6 µs → 4.74–4.77 µs at 32 × 32. That rewrite is the same
+value for every d, NaN and ±0 included. The golden rows are unchanged.
+
+**Reading it.**
+- **The step scales linearly and holds 7.2× at every size,** so the cost is per cell, not per step: about 30 calls to
+  small helpers per cell. The heaviest are `_pv_max`, the upwind difference, the depth and the slope.
+- **`#inline` would remove them, but declines each one:** more than 2 parameters, a body over 32 tokens, or a
+  pointer parameter. Filed (`cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md`)
+  with these numbers. Hand-inlining a 300-line kernel in Rust's order is the alternative; it waits for that answer.
+- **The disturbance is 1.4–1.6×:** one sqrt per cell inside the radius and few calls.
