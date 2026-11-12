@@ -4163,6 +4163,129 @@ def r_dfsph_run(c, mu, iters, max_err, steps, ps0, key):
     return [err_] if err_ else [v for p in ps for v in p]
 
 
+# ── sph M5 part d: the multiphase step ──
+
+def r_mp_get(phases, phase):
+    """`MultiPhaseConfig::get`: the phase's (rest, gas, viscosity), phase 0 when out of range, the FALLBACK when
+    empty."""
+    if not phases:
+        return (1000.0, 2000.0, 0.0)
+    return phases[phase] if 0 <= phase < len(phases) else phases[0]
+
+
+def r_multiphase_step(ps, c, sigma, it, phases):
+    """One `SphSolver::step_multiphase` on ps (lists, in place): None or the error token."""
+    e = r_validate(c)
+    if e:
+        return e
+    n = len(ps)
+    if n == 0:
+        return None
+    if not phases:
+        return "E:InvalidParameter"
+    h = c[4]
+    if not (fin(f32(h)) and f32(h) > 0.0):
+        return "E:InvalidSmoothingRadius"
+    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    kc = kc_new(h)
+    dens = []
+    for i in range(n):
+        d = 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            r2 = pd2(ps[i], ps[j])
+            if r2 <= kc[1]:
+                d += ps[j][11] * kc_poly6(kc, r2)
+        dens.append(d)
+    for p, d in zip(ps, dens):
+        p[9] = d
+        rest, gas, _ = r_mp_get(phases, p[12])
+        p[10] = gas * (d - rest)
+    snap = [list(p) for p in ps]
+    free, inter = sigma > 0.0, it > 0.0
+    lap0 = kc_poly6_lap(kc, 0.0)
+    accs = []
+    for i, pi in enumerate(snap):
+        acc = [c[1], c[2], c[3]]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        vi = r_mp_get(phases, pi[12])[2]
+        cs, ci = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        lap_s = fdiv(pi[11], rho) * lap0 if free else 0.0
+        lap_i = 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+            dd = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+            sym = fdiv(pi[10], rho * rho) + fdiv(pj[10], rho_j * rho_j)
+            psc = fdiv(-pj[11] * sym * kc_spiky(kc, r), r)
+            for a in range(3):
+                acc[a] += psc * dd[a]
+            visc = 0.5 * (vi + r_mp_get(phases, pj[12])[2])
+            vs = fdiv(fdiv(visc * pj[11] * kc_visc(kc, r), rho_j), rho)
+            for a in range(3):
+                acc[a] += vs * (pj[3 + a] - pi[3 + a])
+            unlike = inter and pi[12] != pj[12]
+            if free or unlike:
+                mor = fdiv(pj[11], rho_j)
+                s_ = mor * kc_poly6_grad(kc, r2)
+                gc = [dd[a] * s_ for a in range(3)]
+                lc = mor * kc_poly6_lap(kc, r2)
+                if free:
+                    cs = [cs[a] + gc[a] for a in range(3)]
+                    lap_s += lc
+                if unlike:
+                    ci = [ci[a] + gc[a] for a in range(3)]
+                    lap_i += lc
+        a_s = r_csf(cs, lap_s, sigma, rho, kc[0])
+        a_i = r_csf(ci, lap_i, it, rho, kc[0])
+        accs.append([(acc[a] + a_s[a]) + a_i[a] for a in range(3)])
+    for i, a in enumerate(accs):
+        if not all(fin(x) for x in a):
+            return "E:Diverged"
+        ps[i][6:9] = a
+    dt = c[0]
+    for p in ps:
+        for a in range(3):
+            p[3 + a] = p[3 + a] + p[6 + a] * dt
+        for a in range(3):
+            p[a] = p[a] + p[3 + a] * dt
+    lo, hi, damp = c[7:10], c[10:13], c[13]
+    for p in ps:
+        for a in range(3):
+            if p[a] < lo[a]:
+                p[a] = lo[a]
+                p[3 + a] *= -damp
+            elif p[a] > hi[a] and hi[a] > lo[a]:
+                p[a] = hi[a]
+                p[3 + a] *= -damp
+    return None
+
+
+MULTI_CACHE = {}
+
+
+def r_multiphase_run(c, sigma, it, phases, steps, ps0, key):
+    """`steps` multiphase steps of one fresh solver, continuing from the longest cached state of the same scene."""
+    best = None
+    for k, st in MULTI_CACHE.get(key, []):
+        if k <= steps and (best is None or k > best[0]):
+            best = (k, st)
+    if best is None:
+        at, ps, err_ = 0, [list(p) for p in ps0], None
+    else:
+        at, ps, err_ = best[0], [list(p) for p in best[1][0]], best[1][1]
+    while at < steps and err_ is None:
+        err_ = r_multiphase_step(ps, c, sigma, it, phases)
+        at += 1
+    MULTI_CACHE.setdefault(key, []).append((steps, ([list(p) for p in ps], err_)))
+    return [err_] if err_ else [v for p in ps for v in p]
+
+
 def sph_m5_want(func, x, P):
     """An M5 sph row's recomputed outputs, or None for another function."""
     def parts(k):
@@ -4186,6 +4309,12 @@ def sph_m5_want(func, x, P):
         c, mu, iters, max_err, steps = list(x[0:14]), x[14], x[15], x[16], x[17]
         key = (frozen(x[0:17]), frozen(x[18:]))
         return r_dfsph_run(c, mu, iters, max_err, steps, parts(18), key)
+    if func == "SphSolver::step_multiphase":
+        c, sigma, it, k = list(x[0:14]), x[14], x[15], x[16]
+        phases = [tuple(x[17 + 3 * j:20 + 3 * j]) for j in range(k)]
+        steps = x[17 + 3 * k]
+        key = (frozen(x[0:17 + 3 * k]), frozen(x[18 + 3 * k:]))
+        return r_multiphase_run(c, sigma, it, phases, steps, parts(18 + 3 * k), key)
     return None
 
 

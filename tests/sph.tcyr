@@ -223,6 +223,134 @@ fn test_solver_basics() {
     return 0;
 }
 
+# `steps` multiphase steps of the n particles at ps by *s under water_2d with phase config *mp: the number that failed.
+fn multiphase_run(s: *PvSphSolver, ps: *PvFluidParticle, n, steps, mp: *PvMultiPhaseConfig): i64 {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var errs = 0;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = s.step_multiphase(ps, n, &cfg, mp);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+    }
+    return errs;
+}
+
+# A phase's properties.
+fn phase(rest: f64, gas: f64, visc: f64): PvPhaseProperties {
+    var p: PvPhaseProperties;
+    p.rest_density = rest;
+    p.gas_constant = gas;
+    p.viscosity = visc;
+    return p;
+}
+
+# The four multiphase tests after test_solver_large_particle_count, in Rust's order (M5 part d).
+fn test_multiphase() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+
+    test_group("test_multiphase_single_phase_matches_standard");
+    var single: PvMultiPhaseConfig = PvMultiPhaseConfig_single(cfg.rest_density, cfg.gas_constant, 0.001);
+    var ap, an = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var bp, bn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var a: *PvFluidParticle = _pv_as_particles(ap);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var ss: PvSphSolver = PvSphSolver_new();
+    var sm: PvSphSolver = PvSphSolver_new();
+    var st, sv = ss.step(a, an, &cfg, 0.001);
+    assert(is_ok(st) == 1 && multiphase_run(&sm, b, bn, 1, &single) == 0, "Ok");
+    var diff = 0;
+    for (var i = 0; i < an; i = i + 1) {
+        var pa: *PvFluidParticle = a + i;
+        var pb: *PvFluidParticle = b + i;
+        if (near(pa.position.x, pb.position.x, EPS) == 0) { diff = diff + 1; }
+    }
+    assert_eq(diff, 0, "one phase gives the standard step");
+    PvSphSolver_drop(&ss);
+    PvSphSolver_drop(&sm);
+    PvMultiPhaseConfig_drop(&single);
+    fl_free(ap);
+    fl_free(bp);
+
+    test_group("test_multiphase_two_phase_stable");
+    var wa: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(phase(1000.0, 2000.0, 0.001), phase(1.225, 2000.0,
+        0.00001), 0.072);
+    var tp, tn = create_particle_block(0.1, 0.1, 0.3, 0.3, 0.02, 0.001);
+    var t: *PvFluidParticle = _pv_as_particles(tp);
+    for (var j = 0; j < tn; j = j + 1) {
+        var q: *PvFluidParticle = t + j;
+        if (q.position.y > 0.25) {
+            q.phase = 1;
+            q.mass = 0.0001;
+        }
+    }
+    var s2: PvSphSolver = PvSphSolver_new();
+    assert_eq(multiphase_run(&s2, t, tn, 10, &wa), 0, "10 steps, every one Ok");
+    assert_eq(positions_finite(t, tn), 1, "water under air stays finite");
+    PvSphSolver_drop(&s2);
+    PvMultiPhaseConfig_drop(&wa);
+    fl_free(tp);
+
+    test_group("test_multiphase_phases_use_correct_density");
+    var two: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(phase(1000.0, 2000.0, 0.001), phase(500.0, 1000.0, 0.01),
+      0.0);
+    var pr = fl_alloc(2 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(pr);
+    var p0: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    var p1: PvFluidParticle = PvFluidParticle_new_2d(0.52, 0.5, 0.01);
+    p1.phase = 1;
+    *ps = p0;
+    var ps1: *PvFluidParticle = ps + 1;
+    *ps1 = p1;
+    var s3: PvSphSolver = PvSphSolver_new();
+    assert_eq(multiphase_run(&s3, ps, 2, 1, &two), 0, "Ok");
+    assert(ps.density > 0.0 && ps1.density > 0.0, "both densities positive (their self terms)");
+    var dp: f64 = ps.pressure - ps1.pressure;
+    var adp: f64 = f64_abs(dp);
+    assert(adp > 0.000001, "different phases give different pressures");
+    PvSphSolver_drop(&s3);
+    PvMultiPhaseConfig_drop(&two);
+    fl_free(pr);
+
+    test_group("test_multiphase_interface_tension");
+    var no_t: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(phase(1000.0, 2000.0, 0.001), phase(1000.0, 2000.0,
+        0.001), 0.0);
+    var with_t: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(phase(1000.0, 2000.0, 0.001), phase(1000.0, 2000.0,
+        0.001), 0.5);
+    var lp, ln = create_particle_block(0.2, 0.3, 0.2, 0.1, 0.02, 0.001);
+    var up, un = create_particle_block(0.2, 0.4, 0.2, 0.1, 0.02, 0.001);
+    var m = ln + un;
+    var xa = fl_alloc(m * sizeof(PvFluidParticle));
+    var xb = fl_alloc(m * sizeof(PvFluidParticle));
+    var na: *PvFluidParticle = _pv_as_particles(xa);
+    var nb: *PvFluidParticle = _pv_as_particles(xb);
+    var low: *PvFluidParticle = _pv_as_particles(lp);
+    var high: *PvFluidParticle = _pv_as_particles(up);
+    for (var k = 0; k < m; k = k + 1) {
+        var src: *PvFluidParticle = low + k;
+        if (k >= ln) { src = high + (k - ln); }
+        var da: *PvFluidParticle = na + k;
+        var db: *PvFluidParticle = nb + k;
+        *da = *src;
+        *db = *src;
+        if (k >= ln) {
+            da.phase = 1;
+            db.phase = 1;
+        }
+    }
+    var s4: PvSphSolver = PvSphSolver_new();
+    var s5: PvSphSolver = PvSphSolver_with_surface_tension(0.0);
+    assert(multiphase_run(&s4, na, m, 5, &no_t) == 0 && multiphase_run(&s5, nb, m, 5, &with_t) == 0, "Ok");
+    assert(positions_finite(na, m) == 1 && positions_finite(nb, m) == 1, "both stay finite");
+    PvSphSolver_drop(&s4);
+    PvSphSolver_drop(&s5);
+    PvMultiPhaseConfig_drop(&no_t);
+    PvMultiPhaseConfig_drop(&with_t);
+    fl_free(xa);
+    fl_free(xb);
+    fl_free(lp);
+    fl_free(up);
+    return 0;
+}
+
 # test_solver_step_deterministic and test_solver_large_particle_count, after test_poly6_kernels_consistent.
 fn test_solver_more() {
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
@@ -579,6 +707,18 @@ fn test_verlet_dt_and_interior() {
     var dt: f64 = PvSphSolver_adaptive_dt(&one, 1, 0.05, 0.001, 0.5, 0.1, 0.01);
     assert(dt >= 0.01 && dt <= 0.1, "inverted bounds are swapped");
 
+    test_group("test_multiphase_empty_phases_is_error");
+    var mcfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mp, mn = create_particle_block(0.3, 0.3, 0.05, 0.05, 0.02, 0.001);
+    var ms: PvSphSolver = PvSphSolver_new();
+    var mc: PvMultiPhaseConfig = PvMultiPhaseConfig_single(1000.0, 2000.0, 0.001);
+    mc.phases.truncate(0);
+    var mt, mv = ms.step_multiphase(_pv_as_particles(mp), mn, &mcfg, &mc);
+    assert(is_err_result(mt) == 1 && mv == PV_ERR_INVALID_PARAMETER, "no phase is an error");
+    PvMultiPhaseConfig_drop(&mc);
+    PvSphSolver_drop(&ms);
+    fl_free(mp);
+
     test_group("test_surface_tension_zero_for_interior_particle");
     var zg: PvFluidConfig = PvFluidConfig_water_2d();
     zg.gravity = PvVec3_zero();
@@ -730,6 +870,7 @@ fn test_eos_and_totals() {
     assert(tiny(o1) == 1 && tiny(o2) == 1 && tiny(o3) == 1, "all 0 beyond h²");
 
     test_solver_more();
+    test_multiphase();
     return 0;
 }
 

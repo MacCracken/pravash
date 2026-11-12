@@ -1576,3 +1576,61 @@ Surface parity: 349 items ok, 10 pending (part d).
 | the `solver_step` bench's 64-particle block (sparse), to 1% | 1.46× |
 | a dense 625-particle block, to 1% | 3.8× |
 | the dense block, every round (threshold 0) | 5.35× |
+
+## 22. M5 part d: the multiphase step (2026-11-12)
+
+**`src/sph_multiphase.cyr`** holds `PvPhaseProperties`, `PvMultiPhaseConfig` and `step_multiphase`, a fourth
+`impl PvSphSolver` block. The configuration's `Vec<PhaseProperties>` is a column of three words a phase (ADR 0002
+#22). The step is the WCSPH step with a material per particle, in Rust's order:
+- the checks: the config, then n = 0 (Ok), then no phase (`PV_ERR_INVALID_PARAMETER`), then the f32 h;
+- the neighbour lists, the densities, and each pressure by its own phase's rest density and gas constant;
+- the forces from a snapshot:
+  - gravity and the symmetric pressure term;
+  - the viscosity at the mean of the two phases', (μᵢ + μⱼ)·½;
+  - the free-surface colour field for σ > 0, its Laplacian starting from the self term;
+  - the interface colour field over unlike neighbours for an interface tension > 0, with no self term;
+  - the two CSF terms added in that order, `(a + a_s) + a_i`;
+- the divergence check, symplectic Euler (no Verlet), the walls.
+
+A phase outside the list reads phase 0, and an empty list reads Rust's local fallback (1000, 2000, 0), which the step
+never reaches. Rust also warns once a step about an out-of-range phase; that waits for M7's logging.
+
+**The rows** (`m_sph.rs`, M5 part d's seed 0x0_5f5d): 26, class S. The inputs carry the phases as a count and then
+three values each.
+- the plan's two-phase layer: water at its rest density below a lighter phase, at frames 1, 2, 10, 60 and 300;
+- the free-surface tension alone, the interface tension alone, both, and an interface tension of 0, negative and NaN;
+- three phases, with indices outside the list;
+- the Rust tests' shapes: the single phase, water under air, two particles of two phases, and the two stacked blocks
+  with and without interface tension;
+- a random splash of three phases, and n = 0;
+- the errors in Rust's order: the config, no phase (and the empty list with no particles, which is Ok), an h whose
+  `as f32` is ∞ (with and without phases), and a divergence on one axis;
+- masses of 1e-15, so every density sits under the 1e-10 floor (the mutation tests' gap, below).
+
+`validate.py` transcribes the step from the Rust source, each scene's trajectory cached across its frames. Result:
+49,968 rows, 0 failures, in about 65 s.
+
+**Result:**
+- All 25 rows of the first set passed on the first replay. The replay is **12 modules, 0 failing | rows: 49,851 ok,
+  0 failed, 0 measured, 3 pending, 114 accepted (ADR 4: 114)**.
+- **The mutation tests found one gap.** On the first run 18 of 22 port mutations failed rows. Of the four survivors:
+  - dropping the 1e-10 density floor was a gap. No row's density came near it. The faint-mass row closes it (no random
+    numbers drawn), and the mutant then fails it;
+  - running the free-surface sums for σ ≥ 0, or the interface sums for any nonzero tension, is equivalent: the CSF
+    helper returns zero for a σ that isn't positive, NaN included, as Rust's does;
+  - a strict density cutoff (r² < h²) is equivalent: poly6 is exactly 0 at r² = h².
+- **Mutations of the transcription:** 5 of 5 caught.
+
+**Tests** (`tests/sph.tcyr`, 181 checks): the five multiphase Rust tests in Rust's order. Four follow
+`test_solver_large_particle_count`, and the empty-phases test sits among the adaptive-dt tests. That makes all 79 of
+`sph.rs`.
+
+Surface parity: 349 items ok, 0 pending, 0 missing.
+
+**Speed** (benchmarks-rust-v-cyrius, M5 part d; criterion has no multiphase group):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the dense 625-particle block, one phase | 3.4–3.5× |
+| two phases, interface tension 0.05 | 3.5× |
+| two phases, and free-surface tension 0.072 | 3.8–3.9× |

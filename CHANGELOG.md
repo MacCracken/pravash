@@ -3,6 +3,35 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M5 part d): `src/sph_multiphase.cyr`, the solver's multiphase step.
+  - **`PvPhaseProperties`** (rest density, gas constant, viscosity) and **`PvMultiPhaseConfig`**. Its phases are a
+    column of three words a phase, with `phase_count()`, `push_phase(p)` and `PvMultiPhaseConfig_drop`. The
+    constructors `PvMultiPhaseConfig_single` and `_two_phase` return it by value, with no phase when the column can't
+    be allocated (Rust aborts there), which the step then refuses.
+  - **`s.step_multiphase(ps, n, config, phase_config)`** in Rust's order:
+    - the checks (the config, n = 0, no phase, the f32 h);
+    - the densities, each pressure by its own phase's equation of state;
+    - the forces from a snapshot: viscosity at the mean of the two phases', the free-surface CSF term for σ > 0, and
+      a second CSF term on the phase indicator between unlike phases;
+    - the divergence check, symplectic Euler and the walls.
+
+    A phase outside the list reads phase 0. Rust also warns once a step; that waits for M7's logging. ADR 0002 #22.
+  - **Parity:** 26 new class S rows, 1,534 in all. They cover the plan's two-phase layer to 300 steps; each tension
+    alone, both, and 0, negative and NaN; three phases with indices outside the list; Rust's test shapes; a random
+    splash; and the errors, among them the empty list with and without particles.
+    - All 25 rows of the first set passed on the first replay. `validate.py` transcribes the step: 49,968 rows,
+      0 failures.
+    - The mutation tests found one gap, the 1e-10 density floor. The 26th row closes it: masses of 1e-15, so every
+      density sits under the floor. It draws no random numbers.
+  - **Tests:** the five multiphase Rust tests, which makes all 79 of `sph.rs`.
+
+### Performance
+- **Multiphase** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part d; Rust's criterion
+  suite has no multiphase group, so against a twin). On the dense 625-particle block it is 3.4–3.5× with one phase,
+  3.5× with two phases and interface tension, and 3.8–3.9× with free-surface tension added. That is part a's WCSPH
+  step's ratio (3.2–3.6×).
+
+### Added (Cyrius)
 - **sph** (M5 part c): `src/sph_dfsph.cyr`, the solver's DFSPH step.
   - **`s.step_dfsph(ps, n, config, viscosity, max_iterations, max_error)`** in Bender & Koschier's order:
     - the densities and α, the non-pressure velocity, the density solver;

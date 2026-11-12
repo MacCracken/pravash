@@ -12810,6 +12810,308 @@ impl PvSphSolver {
     }
 }
 
+# --- sph_multiphase.cyr ---
+
+# sph_multiphase.cyr — `PhaseProperties`, `MultiPhaseConfig` and `SphSolver::step_multiphase` of rust-old/src/sph.rs
+# (M5 part d), on the solver of src/sph.cyr.
+#
+# The multiphase step is the WCSPH step with per-particle materials: each particle's phase selects its rest density and
+# gas constant for the equation of state, a pair's viscosity is the mean of the two phases', and a second CSF term on
+# the phase-indicator field (Hu & Adams 2006) acts only between particles of different phases. It integrates by
+# symplectic Euler only (no Verlet), in Rust's order.
+
+# One phase's material: its rest density, gas constant (the equation of state's stiffness) and dynamic viscosity.
+# Mirrors `PhaseProperties`.
+struct PvPhaseProperties {
+    rest_density: f64;
+    gas_constant: f64;
+    viscosity: f64;
+}
+
+# A multiphase configuration: the phases (a column of three words a phase: rest density, gas constant, viscosity,
+# indexed by a particle's `phase`) and the interface tension between unlike phases. Mirrors `MultiPhaseConfig`, its
+# `Vec<PhaseProperties>` the column (ADR 0002 #22).
+struct PvMultiPhaseConfig {
+    phases: PvColumn;
+    interface_tension: f64;
+}
+
+impl PvMultiPhaseConfig {
+    # The number of phases.
+    #must_use
+    fn phase_count(self): i64 {
+        var n = self.phases.len / 3;
+        return n;
+    }
+
+    # Appends a phase: 1, or 0 when the column can't grow (unchanged). Rust's `phases.push(..)`.
+    #must_use
+    fn push_phase(self, p: PvPhaseProperties): i64 {
+        if (self.phases.reserve(self.phases.len + 3) == 0) { return 0; }
+        var a = self.phases.push(_pv_bits(p.rest_density));
+        var b = self.phases.push(_pv_bits(p.gas_constant));
+        var c = self.phases.push(_pv_bits(p.viscosity));
+        return a & b & c;
+    }
+}
+
+# An empty configuration with interface tension `it` (nothing allocated).
+#must_use
+fn _pv_mp_empty(it: f64): PvMultiPhaseConfig {
+    var c: PvMultiPhaseConfig;
+    c.phases.data = 0;
+    c.phases.len = 0;
+    c.phases.cap = 0;
+    c.interface_tension = it;
+    return c;
+}
+
+# A single-phase configuration (the standard step's material), no interface tension. Its column is allocated; when it
+# can't be, the configuration has no phase, which `step_multiphase` refuses (Rust aborts). Mirrors
+# `MultiPhaseConfig::single`.
+#must_use
+fn PvMultiPhaseConfig_single(rest_density: f64, gas_constant: f64, viscosity: f64): PvMultiPhaseConfig {
+    var c: PvMultiPhaseConfig = _pv_mp_empty(0.0);
+    var p: PvPhaseProperties;
+    p.rest_density = rest_density;
+    p.gas_constant = gas_constant;
+    p.viscosity = viscosity;
+    if (c.push_phase(p) == 0) { c.phases.truncate(0); }
+    return c;
+}
+
+# A two-phase configuration (e.g. water and air) with interface tension `it`; no phase when its column can't be
+# allocated, as `PvMultiPhaseConfig_single`. Mirrors `MultiPhaseConfig::two_phase`.
+#must_use
+fn PvMultiPhaseConfig_two_phase(phase_a: PvPhaseProperties, phase_b: PvPhaseProperties, interface_tension: f64):
+PvMultiPhaseConfig {
+    var c: PvMultiPhaseConfig = _pv_mp_empty(interface_tension);
+    if (c.push_phase(phase_a) == 0 || c.push_phase(phase_b) == 0) { c.phases.truncate(0); }
+    return c;
+}
+
+# Releases the configuration's phases (it then has none).
+fn PvMultiPhaseConfig_drop(c: *PvMultiPhaseConfig) {
+    c.phases.drop();
+    return 0;
+}
+
+# The properties of phase `phase` (a word read as Rust's `u8 as usize`), falling back to phase 0 when it is outside
+# the list, and to (1000, 2000, 0) when the list is empty: (rest density, gas constant, viscosity). Mirrors the private
+# `MultiPhaseConfig::get` and its local `FALLBACK`.
+fn _pv_mp_get(c: *PvMultiPhaseConfig, phase) {
+    var count = c.phases.len / 3;
+    var k = phase;
+    if (k < 0 || k >= count) { k = 0; }
+    if (count == 0) {
+        var rf: f64 = 1000.0;
+        var gf: f64 = 2000.0;
+        var vf: f64 = 0.0;
+        return (_pv_bits(rf), _pv_bits(gf), _pv_bits(vf));
+    }
+    var w = c.phases.data + k * 24;
+    return (load64(w), load64(w + 8), load64(w + 16));
+}
+
+impl PvSphSolver {
+    # One multiphase step of the n particles at ps, in Rust's order:
+    # - the config is validated (its error returned); n = 0 is Ok; no phase is PV_ERR_INVALID_PARAMETER; h as f32 must
+    #   be finite and > 0 (PV_ERR_INVALID_SMOOTHING_RADIUS). Nothing changes on any of these. An out-of-range phase
+    #   falls back to phase 0 (Rust also warns, once a step; logging arrives with M7);
+    # - the neighbour lists, the densities, each pressure by its phase's equation of state;
+    # - from a snapshot, each acceleration: gravity, the symmetric pressure term, the viscosity at the mean of the two
+    #   phases' ((μᵢ + μⱼ)·½), the free-surface colour field for σ > 0 (its Laplacian from the self term) and the
+    #   interface colour field over unlike neighbours for an interface tension > 0 (two CSF terms), in that order;
+    # - PV_ERR_DIVERGED at the first non-finite acceleration (those before it written);
+    # - symplectic Euler, then the walls.
+    # PV_ERR_OUT_OF_MEMORY when a buffer can't grow, before any particle changes (Rust aborts). Mirrors
+    # `step_multiphase` (ADR 0002 #22).
+    #must_use
+    fn step_multiphase(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, phase_config: *PvMultiPhaseConfig):
+    Result {
+        var ct, cv = config.validate();
+        if (is_err_result(ct) == 1) { return Err(cv); }
+        if (n <= 0) { return Ok(0); }
+        if (phase_config.phases.len / 3 == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var h: f64 = config.smoothing_radius;
+        var h32: f32 = f32_from(h);
+        var hw: f64 = f32_to(h32);
+        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var g: *PvNeighborGrid = _pv_sph_grid(self);
+        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var kc: PvKernelCoeffs;
+        _pv_kc_init(&kc, h);
+        var h2: f64 = kc.h2;
+        var off = g.offsets.data;
+        var idx = g.indices.data;
+        var dens = self.densities.data;
+
+        # The densities, then each pressure by its phase's equation of state.
+        for (var i = 0; i < n; i = i + 1) {
+            var pi: *PvFluidParticle = ps + i;
+            var d: f64 = 0.0;
+            var a = load64(off + i * 8);
+            var b = load64(off + (i + 1) * 8);
+            for (var k = a; k < b; k = k + 1) {
+                var pj: *PvFluidParticle = ps + load64(idx + k * 8);
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if (r2 <= h2) {
+                    var w: f64 = _pv_kc_poly6(&kc, r2);
+                    var mw: f64 = pj.mass * w;
+                    d = d + mw;
+                }
+            }
+            store64(dens + i * 8, _pv_bits(d));
+        }
+        var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var p: *PvFluidParticle = ps + i2;
+            p.density = load64(dens + i2 * 8);
+            var rw, gw, vw = _pv_mp_get(phase_config, p.phase);
+            var rest: f64 = rw;
+            var gas: f64 = gw;
+            var pr: f64 = equation_of_state(p.density, rest, gas);
+            p.pressure = pr;
+            var sq: *PvFluidParticle = snap + i2;
+            *sq = *p;
+        }
+
+        # The accelerations, from the snapshot.
+        var acc = self.accels.data;
+        var st: f64 = self.surface_tension;
+        var it: f64 = phase_config.interface_tension;
+        var free = 0;
+        if (st > 0.0) { free = 1; }
+        var inter = 0;
+        if (it > 0.0) { inter = 1; }
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = _PV_SPH_MIN_DENSITY;
+        var lap0: f64 = _pv_kc_poly6_lap(&kc, 0.0);
+        for (var q = 0; q < n; q = q + 1) {
+            var si: *PvFluidParticle = snap + q;
+            var ax: f64 = config.gravity.x;
+            var ay: f64 = config.gravity.y;
+            var az: f64 = config.gravity.z;
+            var rho: f64 = _pv_max(si.density, lo);
+            var api: f64 = si.pressure / (rho * rho);
+            var ri, gi, vi_w = _pv_mp_get(phase_config, si.phase);
+            var visc_i: f64 = vi_w;
+            var csx: f64 = 0.0;
+            var csy: f64 = 0.0;
+            var csz: f64 = 0.0;
+            var lap_s: f64 = 0.0;
+            if (free == 1) { lap_s = (si.mass / rho) * lap0; }
+            var cix: f64 = 0.0;
+            var ciy: f64 = 0.0;
+            var ciz: f64 = 0.0;
+            var lap_i: f64 = 0.0;
+            var a2 = load64(off + q * 8);
+            var b2 = load64(off + (q + 1) * 8);
+            for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
+                var j = load64(idx + k2 * 8);
+                if (j != q) {
+                    var sj: *PvFluidParticle = snap + j;
+                    var ex: f64 = si.position.x - sj.position.x;
+                    var ey: f64 = si.position.y - sj.position.y;
+                    var ez: f64 = si.position.z - sj.position.z;
+                    var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                    if ((s2 > h2 || s2 < tiny) == 0) {
+                        var r: f64 = f64_sqrt(s2);
+                        var rho_j: f64 = _pv_max(sj.density, lo);
+                        var bj: f64 = sj.pressure / (rho_j * rho_j);
+                        var sym: f64 = api + bj;
+                        var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                        var mj: f64 = sj.mass;
+                        var nmj: f64 = -mj;
+                        var p_scale: f64 = ((nmj * sym) * grad) / r;
+                        ax = ax + (p_scale * ex);
+                        ay = ay + (p_scale * ey);
+                        az = az + (p_scale * ez);
+                        var rj, gj, vj_w = _pv_mp_get(phase_config, sj.phase);
+                        var visc_j: f64 = vj_w;
+                        var visc: f64 = 0.5 * (visc_i + visc_j);
+                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                        var v_scale: f64 = (((visc * mj) * lap) / rho_j) / rho;
+                        var ux: f64 = sj.velocity.x - si.velocity.x;
+                        var uy: f64 = sj.velocity.y - si.velocity.y;
+                        var uz: f64 = sj.velocity.z - si.velocity.z;
+                        ax = ax + (v_scale * ux);
+                        ay = ay + (v_scale * uy);
+                        az = az + (v_scale * uz);
+                        var unlike = 0;
+                        if (inter == 1 && si.phase != sj.phase) { unlike = 1; }
+                        if (free == 1 || unlike == 1) {
+                            var mor: f64 = mj / rho_j;
+                            var pg: f64 = _pv_kc_poly6_grad(&kc, s2);
+                            var mpg: f64 = mor * pg;
+                            var gx: f64 = ex * mpg;
+                            var gy: f64 = ey * mpg;
+                            var gz: f64 = ez * mpg;
+                            var pl: f64 = _pv_kc_poly6_lap(&kc, s2);
+                            var lap_c: f64 = mor * pl;
+                            if (free == 1) {
+                                csx = csx + gx;
+                                csy = csy + gy;
+                                csz = csz + gz;
+                                lap_s = lap_s + lap_c;
+                            }
+                            if (unlike == 1) {
+                                cix = cix + gx;
+                                ciy = ciy + gy;
+                                ciz = ciz + gz;
+                                lap_i = lap_i + lap_c;
+                            }
+                        }
+                    }
+                }
+            }
+            var a_s: PvVec3 = _pv_csf_acceleration(csx, csy, csz, lap_s, st, rho, kc.h);
+            var a_i: PvVec3 = _pv_csf_acceleration(cix, ciy, ciz, lap_i, it, rho, kc.h);
+            var fx: f64 = (ax + a_s.x) + a_i.x;
+            var fy: f64 = (ay + a_s.y) + a_i.y;
+            var fz: f64 = (az + a_s.z) + a_i.z;
+            store64(acc + q * 24, _pv_bits(fx));
+            store64(acc + q * 24 + 8, _pv_bits(fy));
+            store64(acc + q * 24 + 16, _pv_bits(fz));
+        }
+        for (var c = 0; c < n; c = c + 1) {
+            var gx2: f64 = load64(acc + c * 24);
+            var gy2: f64 = load64(acc + c * 24 + 8);
+            var gz2: f64 = load64(acc + c * 24 + 16);
+            if (_pv_is_finite(gx2) == 0 || _pv_is_finite(gy2) == 0 || _pv_is_finite(gz2) == 0) {
+                return Err(PV_ERR_DIVERGED);
+            }
+            var w2: *PvFluidParticle = ps + c;
+            w2.acceleration = PvVec3_new(gx2, gy2, gz2);
+        }
+
+        # Symplectic Euler, then the walls.
+        var dt: f64 = config.dt;
+        for (var e = 0; e < n; e = e + 1) {
+            var pe: *PvFluidParticle = ps + e;
+            var nvx: f64 = pe.velocity.x + (pe.acceleration.x * dt);
+            var nvy: f64 = pe.velocity.y + (pe.acceleration.y * dt);
+            var nvz: f64 = pe.velocity.z + (pe.acceleration.z * dt);
+            pe.velocity.x = nvx;
+            pe.velocity.y = nvy;
+            pe.velocity.z = nvz;
+            pe.position.x = pe.position.x + (nvx * dt);
+            pe.position.y = pe.position.y + (nvy * dt);
+            pe.position.z = pe.position.z + (nvz * dt);
+        }
+        _pv_sph_walls(ps, n, config);
+        return Ok(0);
+    }
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust

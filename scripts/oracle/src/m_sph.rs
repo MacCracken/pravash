@@ -69,9 +69,13 @@
 //! M5 part c (from its own seed): `SphSolver::step_dfsph` takes a config (14), μ, `i:<max_iterations>`, the error
 //! threshold, `i:<steps>` and `<ps>`, and gives the particles after that many DFSPH steps of one fresh solver, or the
 //! first error (class S trajectories).
+//!
+//! M5 part d (from its own seed): `SphSolver::step_multiphase` takes a config (14), σ (the solver's surface tension),
+//! the interface tension, `i:<k>` and k phases (rest density, gas constant, viscosity), `i:<steps>` and `<ps>`, and
+//! gives the particles after that many multiphase steps of one fresh solver, or the first error (class S
+//! trajectories).
 
 use hisab::DVec3;
-use pravash::sph::SphSolver;
 use pravash::sph::{
     CombustionConfig, HeatConfig, NonNewtonianViscosity, PhaseChangeConfig, ReactionProvider,
     SecondaryParticle, SecondaryType, ViscoelasticConfig, apply_contact_angle, apply_delta_sph,
@@ -84,6 +88,7 @@ use pravash::sph::{
     update_phase_change, update_reaction, update_secondary_particles, update_viscoelastic,
     viscosity_force,
 };
+use pravash::sph::{MultiPhaseConfig, PhaseProperties, SphSolver};
 use pravash::{FluidConfig, FluidParticle};
 
 use crate::grids::{Rng, specials};
@@ -2394,6 +2399,179 @@ fn dfsph_rows(m: &mut Module, rng: &mut Rng) {
     dfsph_row(m, &faint, &faint_cfg, 0.001, 3, 0.01, 2);
 }
 
+// ── M5 part d ───────────────────────────────────────────────────────────────────────
+
+fn phases(list: &[(f64, f64, f64)], it: f64) -> MultiPhaseConfig {
+    let mut c = MultiPhaseConfig::single(1000.0, 2000.0, 0.0);
+    c.phases = list
+        .iter()
+        .map(|&(rest_density, gas_constant, viscosity)| PhaseProperties {
+            rest_density,
+            gas_constant,
+            viscosity,
+        })
+        .collect();
+    c.interface_tension = it;
+    c
+}
+
+/// One multiphase row: `steps` multiphase steps of a fresh solver with σ, stopping at the first error.
+fn multiphase_row(
+    m: &mut Module,
+    ps: &[FluidParticle],
+    cfg: &FluidConfig,
+    sigma: f64,
+    mp: &MultiPhaseConfig,
+    steps: usize,
+) {
+    let mut ins = config(cfg);
+    ins.extend([f(sigma), f(mp.interface_tension), usz(mp.phases.len())]);
+    for p in &mp.phases {
+        ins.extend([f(p.rest_density), f(p.gas_constant), f(p.viscosity)]);
+    }
+    ins.push(usz(steps));
+    ins.extend(ptoks(ps));
+    let mut solver = SphSolver::with_surface_tension(sigma);
+    let mut s = ps.to_vec();
+    let mut out = None;
+    for _ in 0..steps {
+        if let Err(x) = solver.step_multiphase(&mut s, cfg, mp) {
+            out = Some(vec![err(&x)]);
+            break;
+        }
+    }
+    let out = out.unwrap_or_else(|| s.iter().flat_map(particle).collect());
+    m.row("SphSolver::step_multiphase", Class::S, &ins, &out);
+}
+
+fn multiphase_rows(m: &mut Module, rng: &mut Rng) {
+    let water = FluidConfig::water_2d();
+    // The plan's two-phase layer: water (ρ₀ at its middle) below a lighter phase, frames 1, 2, 10, 60, 300.
+    let mut layer = water_block(10, 8, 0.025, 0.0125, 0.0125, 0.05);
+    for p in &mut layer {
+        if p.position.y > 0.1 {
+            p.phase = 1;
+            p.mass *= 0.8;
+        }
+    }
+    let oil_water = phases(&[(1000.0, 2000.0, 0.001), (800.0, 1500.0, 0.005)], 0.072);
+    for k in [1, 2, 10, 60, 300] {
+        multiphase_row(m, &layer, &water, 0.0, &oil_water, k);
+    }
+    // Free-surface tension alone, interface tension alone, both, and the interface tension 0, negative, NaN.
+    for &(sigma, it) in &[
+        (0.5, 0.0),
+        (0.0, 0.5),
+        (0.3, 0.3),
+        (0.0, -0.5),
+        (0.0, f64::NAN),
+    ] {
+        let mp = phases(&[(1000.0, 2000.0, 0.001), (800.0, 1500.0, 0.005)], it);
+        multiphase_row(m, &layer, &water, sigma, &mp, 10);
+    }
+    // Three phases, with indices outside the list (they fall back to phase 0).
+    let mut mixed = layer.clone();
+    for (k, p) in mixed.iter_mut().enumerate() {
+        p.phase = [0, 1, 2, 3, 255][k % 5];
+    }
+    let three = phases(
+        &[
+            (1000.0, 2000.0, 0.001),
+            (500.0, 1000.0, 0.01),
+            (1.225, 2000.0, 1e-5),
+        ],
+        0.1,
+    );
+    for k in [1, 10] {
+        multiphase_row(m, &mixed, &water, 0.0, &three, k);
+    }
+    // Rust's test shapes: the single phase (as the standard step), water under air, two particles of two phases, the
+    // two stacked blocks with and without interface tension.
+    let block = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+    multiphase_row(
+        m,
+        &block,
+        &water,
+        0.0,
+        &MultiPhaseConfig::single(1000.0, 2000.0, 0.001),
+        1,
+    );
+    let mut air = create_particle_block([0.1, 0.1], [0.3, 0.3], 0.02, 0.001);
+    for p in &mut air {
+        if p.position.y > 0.25 {
+            p.phase = 1;
+            p.mass = 0.0001;
+        }
+    }
+    let water_air = MultiPhaseConfig::two_phase(
+        PhaseProperties {
+            rest_density: 1000.0,
+            gas_constant: 2000.0,
+            viscosity: 0.001,
+        },
+        PhaseProperties {
+            rest_density: 1.225,
+            gas_constant: 2000.0,
+            viscosity: 0.00001,
+        },
+        0.072,
+    );
+    multiphase_row(m, &air, &water, 0.0, &water_air, 10);
+    let mut pair = vec![
+        FluidParticle::new_2d(0.5, 0.5, 0.01),
+        FluidParticle::new_2d(0.52, 0.5, 0.01),
+    ];
+    pair[1].phase = 1;
+    let two = phases(&[(1000.0, 2000.0, 0.001), (500.0, 1000.0, 0.01)], 0.0);
+    multiphase_row(m, &pair, &water, 0.0, &two, 1);
+    let mut stacked = create_particle_block([0.2, 0.3], [0.2, 0.1], 0.02, 0.001);
+    let mut upper = create_particle_block([0.2, 0.4], [0.2, 0.1], 0.02, 0.001);
+    for p in &mut upper {
+        p.phase = 1;
+    }
+    stacked.extend(upper);
+    for it in [0.0, 0.5] {
+        let same = phases(&[(1000.0, 2000.0, 0.001), (1000.0, 2000.0, 0.001)], it);
+        multiphase_row(m, &stacked, &water, 0.0, &same, 5);
+    }
+    // A random splash of three phases, and n = 0.
+    let mut splash = cloud(rng, 24, 0.9, 0.05, false, 0.01);
+    for (j, p) in splash.iter_mut().enumerate() {
+        p.velocity = DVec3::new(rng.uniform(-20.0, 20.0), rng.uniform(-20.0, 20.0), 0.0);
+        p.phase = u8::try_from(j % 3).unwrap_or(0);
+    }
+    multiphase_row(m, &splash, &water, 0.2, &three, 5);
+    multiphase_row(m, &[], &water, 0.0, &three, 1);
+    // The errors, in Rust's order: the config, no phase (after n = 0: an empty list with no particles is Ok), h
+    // whose `as f32` is ∞, a divergence on one axis.
+    let small = cloud(rng, 5, 0.2, 0.3, false, 0.01);
+    let mut bad = FluidConfig::water_2d();
+    bad.dt = 0.0;
+    multiphase_row(m, &small, &bad, 0.0, &three, 1);
+    let none = phases(&[], 0.0);
+    multiphase_row(m, &small, &water, 0.0, &none, 1);
+    multiphase_row(m, &[], &water, 0.0, &none, 1);
+    let mut big_h = FluidConfig::water_2d();
+    big_h.smoothing_radius = 1e39;
+    multiphase_row(m, &small, &big_h, 0.0, &three, 1);
+    multiphase_row(m, &small, &big_h, 0.0, &none, 1);
+    let mut one_axis = small.clone();
+    one_axis[0].position = one_axis[1].position;
+    one_axis[0].position.x += 0.01;
+    one_axis[0].velocity = DVec3::new(f64::INFINITY, 0.0, 0.0);
+    multiphase_row(m, &one_axis, &water, 0.0, &three, 1);
+    // Masses of 1e-15: every density sits below the 1e-10 floor that the pressure, viscosity and both CSF terms divide
+    // by. It draws no RNG, so the rows above keep their values.
+    let mut feather = create_particle_block([0.3, 0.3], [0.1, 0.1], 0.02, 1e-15);
+    for p in &mut feather {
+        if p.position.x > 0.35 {
+            p.phase = 1;
+        }
+    }
+    let light = phases(&[(1000.0, 2000.0, 0.001), (800.0, 2000.0, 0.002)], 0.05);
+    multiphase_row(m, &feather, &water, 0.072, &light, 2);
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -2436,5 +2614,8 @@ pub fn emit() -> Module {
     // M5 part c's rows, from their own seed.
     let mut rng = Rng::new(0x0_5f5c);
     dfsph_rows(&mut m, &mut rng);
+    // M5 part d's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f5d);
+    multiphase_rows(&mut m, &mut rng);
     m
 }

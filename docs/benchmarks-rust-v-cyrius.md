@@ -674,3 +674,24 @@ Pinned to core 15. Rust's criterion suite has no DFSPH group.
   close to Rust, as part a's and b's do.
 - **On the dense block the solver rounds widen the gap,** as PCISPH's iterations do. Running every round costs 2.3×
   the 1% row in Cyrius and 1.6× in Rust. Each round is a density-rate sum and a κ application over every list.
+
+## M5 part d: the multiphase step (2026-11-12)
+
+Pinned to core 15. Rust's criterion suite has no multiphase group.
+- **Rust:** the twin `scripts/probes/rust/src/bin/bench_sph_m5d.rs` (bodies in its header), two runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_m5d`, interleaved with it. One solver, the dense 25 × 25 block at
+  spacing 0.02 (as `sph_m5a/dense_625`) copied in before each step, 100 steps a run. The two-phase rows put the
+  particles above y = 0.35 in a phase of rest density 800 and viscosity 0.002.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_m5d/multiphase_one_625` (one phase, water's) | 746 µs | 2.55–2.62 ms | 3.4–3.5× |
+| `sph_m5d/multiphase_two_625` (interface tension 0.05) | 752–754 µs | 2.63–2.64 ms | 3.5× |
+| `sph_m5d/multiphase_two_625_st` (and σ 0.072) | 757–777 µs | 2.92–2.93 ms | 3.8–3.9× |
+
+**Reading it.**
+- **The ratios are part a's WCSPH step's** (3.2–3.6× on the same block): the multiphase step is that step's loops,
+  plus a phase lookup per particle and per pair.
+- **The interface term costs little on both sides** (about 1% in Rust, at most 3% in Cyrius), since only the pairs
+  across the interface add to it. The free-surface term costs 11% in Cyrius and under 3% in Rust, as in part a's
+  `dense_625_st` row (3.6× against 3.2×).

@@ -1283,6 +1283,41 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(db);
         return 1;
     }
+    if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) {
+        # `steps` multiphase steps of one fresh solver, stopping at the first error (M5 part d).
+        var mc: PvFluidConfig;
+        _par_config_in(0, &mc);
+        var msv: PvSphSolver = PvSphSolver_with_surface_tension(_par_in(14));
+        var mp: PvMultiPhaseConfig = _pv_mp_empty(_par_in(15));
+        var np = _par_in(16);
+        for (var a = 0; a < np; a = a + 1) {
+            var pp: PvPhaseProperties;
+            pp.rest_density = _par_in(17 + a * 3);
+            pp.gas_constant = _par_in(18 + a * 3);
+            pp.viscosity = _par_in(19 + a * 3);
+            if (mp.push_phase(pp) == 0) { return 0 - 1; }
+        }
+        var msteps = _par_in(17 + np * 3);
+        var mb, mn, mk = _par_particles_in(18 + np * 3);
+        var mps: *PvFluidParticle = _pv_as_particles(mb);
+        var mfail = 0;
+        for (var t4 = 0; t4 < msteps; t4 = t4 + 1) {
+            if (mfail == 0) {
+                var ft, fv = msv.step_multiphase(mps, mn, &mc, &mp);
+                if (is_err_result(ft) == 1) {
+                    _par_got_err(fv);
+                    mfail = 1;
+                }
+            }
+        }
+        if (mfail == 0) {
+            for (var j4 = 0; j4 < mn; j4 = j4 + 1) { _par_particle_out(mps + j4); }
+        }
+        PvMultiPhaseConfig_drop(&mp);
+        PvSphSolver_drop(&msv);
+        fl_free(mb);
+        return 1;
+    }
     if (_par_eq(fp, fl, "SphSolver::adaptive_dt") == 1) {
         var ab, an, ak = _par_particles_in(5);
         var aps: *PvFluidParticle = _pv_as_particles(ab);
@@ -2556,6 +2591,8 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) { return 0; }
     # M5 part c: DFSPH (class S), likewise.
     if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) { return 0; }
+    # M5 part d: the multiphase step (class S), likewise.
+    if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) { return 0; }
     return 0 - 1;
 }
 
