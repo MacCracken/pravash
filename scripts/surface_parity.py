@@ -53,9 +53,9 @@ FN_RENAMES = {}
 FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-PENDING_FNS = {"apply_ghost_fluid": "M3 part c"}
+PENDING_FNS = {}
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
-PENDING_TYPES = {"grid::KEpsilon": "M3 part c", "grid::MacGrid": "M3 part c"}
+PENDING_TYPES = {}
 EXCEPTIONS = {
     "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "
                                  "(src/constants.cyr); its serde form is drag_coefficient_to_json / _from_json",

@@ -652,6 +652,102 @@ fn bench_grid() {
     return 0;
 }
 
+# ── grid, part c (M3): MacGrid, KEpsilon, apply_ghost_fluid ──
+# Rust has no criterion bench for these; scripts/probes/rust/src/bin/bench_grid_c.rs times the same bodies on the
+# oracle. Each times `iters` calls on one state (which evolves the same way on both sides): mac_step on an n × n grid
+# at dx 0.1 with a 4 × 2 density blob at the floor's centre and the smoke config; kepsilon_step from `new(n, n)`
+# under a solid-body rotation, dx 0.1, dt 0.01; ghost_fluid on a zero pressure and a circle's signed distance.
+
+fn _bench_mac_step(n, iters) {
+    var g: PvMacGrid;
+    var t, v = PvMacGrid_new(n, n, 0.1, &g);
+    for (var x = n / 2 - 2; x < n / 2 + 2; x = x + 1) {
+        store64(g.density.data + (n + x) * 8, _pv_bits(1.0));
+        store64(g.density.data + (2 * n + x) * 8, _pv_bits(1.0));
+    }
+    var c: PvGridConfig = PvGridConfig_smoke();
+    var b = bench_new(_bench_name("mac_step/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ts, vs = g.step(&c);
+        g_sink = g_sink ^ ts;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvMacGrid_drop(&g);
+    return 0;
+}
+
+fn _bench_ke_step(n, iters) {
+    var ke: PvKEpsilon;
+    var ok = PvKEpsilon_new(n, n, &ke);
+    var vx = fl_alloc(n * n * 8);
+    var vy = fl_alloc(n * n * 8);
+    var c: f64 = (f64_from(n) - 1.0) * 0.5;
+    for (var i = 0; i < n * n; i = i + 1) {
+        var y: f64 = f64_from(i / n) - c;
+        var x: f64 = f64_from(i % n) - c;
+        var u: f64 = -y * 0.5;
+        var w: f64 = x * 0.5;
+        store64(vx + i * 8, _pv_bits(u));
+        store64(vy + i * 8, _pv_bits(w));
+    }
+    var b = bench_new(_bench_name("kepsilon_step/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var r = ke.step(vx, n * n, vy, n * n, n, n, 0.1, 0.01);
+        g_sink = g_sink ^ load64(ke.k.data + (n + 1) * 8);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(vx);
+    fl_free(vy);
+    PvKEpsilon_drop(&ke);
+    return 0;
+}
+
+fn _bench_ghost(n, iters) {
+    var nf: f64 = f64_from(n);
+    var cx: f64 = (nf * 0.5) + 0.3;
+    var cy: f64 = (nf * 0.5) - 0.2;
+    var r: f64 = (nf * 0.1) * 0.25;
+    var ls = fl_alloc(n * n * 8);
+    var p = fl_alloc(n * n * 8);
+    for (var i = 0; i < n * n; i = i + 1) {
+        var x: f64 = f64_from(i % n) - cx;
+        var y: f64 = f64_from(i / n) - cy;
+        var d: f64 = f64_sqrt((x * x) + (y * y));
+        var s: f64 = (d * 0.1) - r;
+        store64(ls + i * 8, _pv_bits(s));
+        store64(p + i * 8, 0);
+    }
+    var b = bench_new(_bench_name("ghost_fluid/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ok = apply_ghost_fluid(p, n * n, ls, n * n, n, n, 0.1, 0.07);
+        g_sink = g_sink ^ load64(p + (n * n / 2) * 8);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(ls);
+    fl_free(p);
+    return 0;
+}
+
+# The part c benches (M3 part c): MacGrid, KEpsilon and the ghost fluid, against the Rust twins in bench_grid_c.rs.
+fn bench_grid_c() {
+    _bench_mac_step(16, 2000);
+    _bench_mac_step(32, 500);
+    _bench_mac_step(64, 100);
+    _bench_ke_step(32, 2000);
+    _bench_ke_step(64, 500);
+    _bench_ke_step(128, 100);
+    _bench_ghost(32, 5000);
+    _bench_ghost(64, 1000);
+    _bench_ghost(128, 200);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -674,6 +770,7 @@ fn main(): i64 {
     bench_m1b();
     bench_shallow();
     bench_grid();
+    bench_grid_c();
     return 0;
 }
 

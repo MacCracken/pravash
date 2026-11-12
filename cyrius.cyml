@@ -66,5 +66,7 @@ modules = [
     "src/shallow.cyr",
     "src/grid_solve.cyr",
     "src/grid.cyr",
+    "src/mac_grid.cyr",
+    "src/k_epsilon.cyr",
     "src/json.cyr",
 ]

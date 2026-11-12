@@ -2165,6 +2165,278 @@ def fg_max_speed(g):
     return math.sqrt(m)
 
 
+# ── grid, part c: KEpsilon, apply_ghost_fluid, MacGrid (M3 part c) ───────────────────────────
+
+KE_FIELDS = ["k", "epsilon", "c_mu", "c_eps1", "c_eps2"]
+
+
+def ke_read(x, k=0):
+    """(k-ε dict, the index after it) from the token values at k."""
+    m = {}
+    at = k
+    for name in ("k", "epsilon"):
+        n = x[at][1]
+        m[name] = list(x[at + 1:at + 1 + n])
+        at += 1 + n
+    m["c_mu"], m["c_eps1"], m["c_eps2"] = x[at:at + 3]
+    return m, at + 3
+
+
+def ke_tokens(m):
+    return [("v", len(m["k"]))] + m["k"] + [("v", len(m["epsilon"]))] + m["epsilon"] + [
+        m["c_mu"], m["c_eps1"], m["c_eps2"]]
+
+
+def ke_step(m, vx, vy, nx, ny, dx, dt):
+    """One KEpsilon::step: True, or False where Rust warns and returns."""
+    n = nx * ny
+    if n >= USIZE or nx < 3 or ny < 3 or len(vx) != n or len(vy) != n:
+        return False
+    if len(m["k"]) != n or len(m["epsilon"]) != n or not (fin(dx) and dx > 0.0 and fin(dt) and dt > 0.0):
+        return False
+    inv_2dx = 0.5 / dx
+    ko, eo = list(m["k"]), list(m["epsilon"])
+    k, e = m["k"], m["epsilon"]
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            nu_t = fdiv(m["c_mu"] * ko[i] * ko[i], r_max(eo[i], 1e-20))
+            dudx = (vx[i + 1] - vx[i - 1]) * inv_2dx
+            dudy = (vx[i + nx] - vx[i - nx]) * inv_2dx
+            dvdx = (vy[i + 1] - vy[i - 1]) * inv_2dx
+            dvdy = (vy[i + nx] - vy[i - nx]) * inv_2dx
+            sh = dudy + dvdx
+            s_mag_sq = 2.0 * (dudx * dudx + dvdy * dvdy + 0.5 * (sh * sh))
+            prod = nu_t * s_mag_sq
+            k[i] = r_max(ko[i] + (prod - eo[i]) * dt, 1e-10)
+            eps_over_k = fdiv(eo[i], r_max(ko[i], 1e-10))
+            e[i] = r_max(eo[i] + (m["c_eps1"] * prod - m["c_eps2"] * eo[i]) * eps_over_k * dt, 1e-10)
+    return True
+
+
+def ghost(p, ls, nx, ny, dx, sigma):
+    """apply_ghost_fluid on p in place (nothing where Rust warns and returns)."""
+    n = nx * ny
+    if nx < 3 or ny < 3 or n >= USIZE or len(p) != n or len(ls) != n or not (fin(dx) and dx > 0.0):
+        return
+    inv_dx = 1.0 / dx
+    inv_dx2 = inv_dx * inv_dx
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            phi, pr, pl, pt, pb = ls[i], ls[i + 1], ls[i - 1], ls[i + nx], ls[i - nx]
+            if not (phi * pr < 0.0 or phi * pl < 0.0 or phi * pt < 0.0 or phi * pb < 0.0):
+                continue
+            gx = (pr - pl) * 0.5 * inv_dx
+            gy = (pt - pb) * 0.5 * inv_dx
+            g = r_max(math.sqrt(gx * gx + gy * gy), 1e-20)
+            lxx = (pr - 2.0 * phi + pl) * inv_dx2
+            lyy = (pt - 2.0 * phi + pb) * inv_dx2
+            kappa = fdiv(-(lxx + lyy), g)
+            if phi > 0.0:
+                p[i] -= fdiv(sigma * kappa * phi, g)
+
+
+def mac_velocity_at(g, x, y):
+    nx = g["nx"]
+    u = 0.5 * (g["vx"][y * (nx + 1) + x] + g["vx"][y * (nx + 1) + x + 1])
+    v = 0.5 * (g["vy"][y * nx + x] + g["vy"][(y + 1) * nx + x])
+    return u, v
+
+
+def mac_max_speed(g):
+    m = 0.0
+    for y in range(g["ny"]):
+        for x in range(g["nx"]):
+            u, v = mac_velocity_at(g, x, y)
+            m = r_max(m, u * u + v * v)
+    return math.sqrt(m)
+
+
+def mac_new(nx, ny, dx):
+    if nx < 4 or ny < 4:
+        return ["E:InvalidGridResolution"]
+    if dx <= 0.0 or not fin(dx):
+        return ["E:InvalidParameter"]
+    n = nx * ny
+    out = [nx, ny, dx]
+    for size in ((nx + 1) * ny, nx * (ny + 1), n, n):
+        out += [size, 0.0]
+    return out + [n, n]
+
+
+def mac_step(g, c):
+    """One MacGrid::step: None, or the failure's token. Scratch lengths in g["sd"]."""
+    dt = c["dt"]
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    if c["pressure_iterations"] == 0:
+        return "E:InvalidParameter"
+    alpha, amb = c["buoyancy_alpha"], c["ambient_density"]
+    if not fin(alpha) or not fin(amb):
+        return "E:InvalidParameter"
+    nx, ny, dx = g["nx"], g["ny"], g["dx"]
+    n = nx * ny
+    if (n >= USIZE or nx < 4 or ny < 4 or len(g["vx"]) != (nx + 1) * ny or len(g["vy"]) != nx * (ny + 1)
+            or len(g["pressure"]) != n or len(g["density"]) != n):
+        return "E:InvalidGridResolution"
+    if not fin(dx) or dx <= 0.0:
+        return "E:InvalidParameter"
+    inv_dx = 1.0 / dx
+    u, v, p, rho = g["vx"], g["vy"], g["pressure"], g["density"]
+    n1 = nx + 1
+    for y in range(ny):
+        u[y * n1] = 0.0
+        u[y * n1 + nx] = 0.0
+    for x in range(nx):
+        v[x] = 0.0
+        v[ny * nx + x] = 0.0
+    if alpha != 0.0:
+        for y in range(1, ny):
+            for x in range(nx):
+                rf = 0.5 * (rho[(y - 1) * nx + x] + rho[y * nx + x])
+                v[y * nx + x] += alpha * (rf - amb) * dt
+    rhs = [-((u[y * n1 + x + 1] - u[y * n1 + x]) + (v[(y + 1) * nx + x] - v[y * nx + x])) * dx
+           for y in range(ny) for x in range(nx)]
+    for _ in range(c["pressure_iterations"]):
+        for y in range(ny):
+            for x in range(nx):
+                i = y * nx + x
+                sm, cnt = 0.0, 0.0
+                if x > 0:
+                    sm += p[i - 1]
+                    cnt += 1.0
+                if x + 1 < nx:
+                    sm += p[i + 1]
+                    cnt += 1.0
+                if y > 0:
+                    sm += p[i - nx]
+                    cnt += 1.0
+                if y + 1 < ny:
+                    sm += p[i + nx]
+                    cnt += 1.0
+                p[i] = fdiv(rhs[i] + sm, cnt)
+    total = -0.0
+    for q in p:
+        total += q
+    mean = fdiv(total, float(n))
+    p[:] = [q - mean for q in p]
+    for y in range(ny):
+        for x in range(1, nx):
+            u[y * n1 + x] -= (p[y * nx + x] - p[y * nx + x - 1]) * inv_dx
+    for y in range(1, ny):
+        for x in range(nx):
+            v[y * nx + x] -= (p[y * nx + x] - p[(y - 1) * nx + x]) * inv_dx
+    dt_inv_dx = dt * inv_dx
+    adv = []
+    for y in range(ny):
+        for x in range(nx):
+            cu, cv = mac_velocity_at(g, x, y)
+            adv.append(fg_sample(rho, nx, ny, float(x) - dt_inv_dx * cu, float(y) - dt_inv_dx * cv))
+    g["density"] = adv
+    g["sd"] = n
+    if not all(fin(q) for q in u + v + adv):
+        return "E:Diverged"
+    return None
+
+
+def grid_c_json(func, doc):
+    """serde_json's reading of a MacGrid or KEpsilon document."""
+    def us(v):
+        if not (isinstance(v, tuple) and v[0] == "int") or int(v[1]) < 0:
+            raise JsonRefused("not a usize")
+        return int(v[1])
+
+    try:
+        v = j_load(doc)
+        if func == "KEpsilon::from_json":
+            f = j_struct(v, KE_FIELDS)
+            m = {"k": [j_f64(e) for e in j_arr(f[0])], "epsilon": [j_f64(e) for e in j_arr(f[1])],
+                 "c_mu": j_f64(f[2]), "c_eps1": j_f64(f[3]), "c_eps2": j_f64(f[4])}
+            return ke_tokens(m)
+        f = j_struct(v, ["nx", "ny", "dx"] + FG_FIELDS)
+        g = {"nx": us(f[0]), "ny": us(f[1]), "dx": j_f64(f[2])}
+        for name, val in zip(FG_FIELDS, f[3:]):
+            g[name] = [j_f64(e) for e in j_arr(val)]
+        return fg_tokens(g)
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def grid_c_want(func, x, ins):
+    """The recomputed outputs of a part c row, or None for another function."""
+    if func == "KEpsilon::new":
+        nx, ny = x[0] % USIZE, x[1] % USIZE
+        n = nx * ny
+        return ke_tokens({"k": [1e-4] * n, "epsilon": [1e-5] * n, "c_mu": 0.09, "c_eps1": 1.44,
+                          "c_eps2": 1.92}) + [n, n]
+    if func == "KEpsilon::turbulent_viscosity":
+        m, _ = ke_read(x)
+        return [("v", len(m["k"]))] + [fdiv(m["c_mu"] * kk * kk, r_max(m["epsilon"][i], 1e-20))
+                                       for i, kk in enumerate(m["k"])]
+    if func == "KEpsilon::step":
+        m, k = ke_read(x)
+        scratch = len(m["k"])
+        n1 = x[k][1]
+        vx = list(x[k + 1:k + 1 + n1])
+        k2 = k + 1 + n1
+        n2 = x[k2][1]
+        vy = list(x[k2 + 1:k2 + 1 + n2])
+        k3 = k2 + 1 + n2
+        nx, ny, dx, dt, steps = x[k3] % USIZE, x[k3 + 1] % USIZE, x[k3 + 2], x[k3 + 3], x[k3 + 4]
+        for _ in range(steps):
+            if ke_step(m, vx, vy, nx, ny, dx, dt):
+                scratch = nx * ny
+        return ke_tokens(m) + [scratch, scratch]
+    if func == "apply_ghost_fluid":
+        n = x[0][1]
+        pr = list(x[1:1 + n])
+        m = x[1 + n][1]
+        ls = list(x[2 + n:2 + n + m])
+        k = 2 + n + m
+        ghost(pr, ls, x[k] % USIZE, x[k + 1] % USIZE, x[k + 2], x[k + 3])
+        return [("v", n)] + pr
+    if func == "MacGrid::new":
+        return mac_new(x[0] % USIZE, x[1] % USIZE, x[2])
+    if func in ("MacGrid::from_json", "KEpsilon::from_json"):
+        return grid_c_json(func, unpct(ins[0][2:]))
+    if not func.startswith("MacGrid::"):
+        return None
+    g, k = fg_read(x)
+    nx, ny = g["nx"], g["ny"]
+    if func == "MacGrid::velocity_at":
+        out = [("v", 2 * nx * ny)]
+        for y in range(ny):
+            for xx in range(nx):
+                out += list(mac_velocity_at(g, xx, y))
+        return out
+    if func == "MacGrid::divergence_at":
+        inv_dx = 1.0 / g["dx"]
+        out = [("v", nx * ny)]
+        for y in range(ny):
+            for xx in range(nx):
+                dvx = g["vx"][y * (nx + 1) + xx + 1] - g["vx"][y * (nx + 1) + xx]
+                dvy = g["vy"][(y + 1) * nx + xx] - g["vy"][y * nx + xx]
+                out.append((dvx + dvy) * inv_dx)
+        return out
+    if func == "MacGrid::max_speed":
+        return [mac_max_speed(g)]
+    if func == "MacGrid::cfl_dt":
+        m = x[k][1]
+        mv = mac_max_speed(g)
+        return [("v", m)] + [sys.float_info.max if mv < 1e-20 else fdiv(cf * g["dx"], mv)
+                             for cf in x[k + 1:k + 1 + m]]
+    c = gc_read(x, k)
+    steps = x[k + 13]
+    g["sd"] = None
+    for _ in range(steps):
+        bad = mac_step(g, c)
+        if bad:
+            return [bad]
+    n = nx * ny
+    return fg_tokens(g) + [n, n]
+
+
 def check_grid(rows):
     counts = {}
     for func, cls, ins, outs, where in rows:
@@ -2172,7 +2444,10 @@ def check_grid(rows):
         x = [tok_val(t) for t in ins]
         got = [tok_val(t) for t in outs]
         short = func.split("::")[-1]
-        if func == "FluidGrid::new":
+        cw = grid_c_want(func, x, ins)
+        if cw is not None:
+            want = cw
+        elif func == "FluidGrid::new":
             want = fg_new(x[0] % USIZE, x[1] % USIZE, x[2])
         elif func in ("GridConfig::smoke", "GridConfig::default"):
             want = gc_tokens(GC_SMOKE)

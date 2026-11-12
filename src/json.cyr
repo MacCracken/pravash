@@ -778,3 +778,115 @@ fn PvFluidGrid_from_json(buf, len, out: *PvFluidGrid): Result {
     out.dx = dx;
     return Ok(0);
 }
+
+# ── grid (M3 part c): MacGrid, KEpsilon ───────────────────────────────────────────────
+
+impl PvMacGrid {
+    # Appends the grid as serde_json writes a `MacGrid` (the scratch skipped): 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        for (var k = 0; k < 4; k = k + 1) {
+            rc = rc | _pv_jw_key(sb, _pv_fg_field(k + 3), 0);
+            rc = rc | _pv_jw_col(sb, _pv_mac_col(self, k), 0);
+        }
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `MacGrid` document into *out, a fresh grid with empty scratch (as serde's skipped fields default),
+# released with `PvMacGrid_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The field
+# lengths are the document's (`step` refuses an inconsistent grid).
+#must_use
+fn PvMacGrid_from_json(buf, len, out: *PvMacGrid): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 7);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_mac_zero(out);
+    for (var c = 0; c < 4; c = c + 1) {
+        if (_pv_jr_col(_pv_jr_at(v, f, c + 3, _pv_fg_field(c + 3)), _pv_mac_col(out, c), 0) == 0) {
+            PvMacGrid_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    out.dx = dx;
+    return Ok(0);
+}
+
+# The serde field name of a `KEpsilon` field k (0 k, 1 epsilon, 2 c_mu, 3 c_eps1, 4 c_eps2).
+#must_use
+fn _pv_ke_field(k): i64 {
+    match k {
+        0 => { return "k"; }
+        1 => { return "epsilon"; }
+        2 => { return "c_mu"; }
+        3 => { return "c_eps1"; }
+        _ => { return "c_eps2"; }
+    }
+    return "c_eps2";
+}
+
+impl PvKEpsilon {
+    # Appends the model as serde_json writes a `KEpsilon` (the scratch skipped): 0, or -1 when the builder can't
+    # grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "k", 1);
+        rc = rc | _pv_jw_col(sb, _pv_ke_col(self, 0), 0);
+        rc = rc | _pv_jw_key(sb, "epsilon", 0);
+        rc = rc | _pv_jw_col(sb, _pv_ke_col(self, 1), 0);
+        rc = rc | _pv_jw_key(sb, "c_mu", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_mu);
+        rc = rc | _pv_jw_key(sb, "c_eps1", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_eps1);
+        rc = rc | _pv_jw_key(sb, "c_eps2", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_eps2);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `KEpsilon` document into *out, with empty scratch (as serde's skipped fields default), released with
+# `PvKEpsilon_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The k and ε lengths are the
+# document's (`step` refuses ones that aren't the grid's).
+#must_use
+fn PvKEpsilon_from_json(buf, len, out: *PvKEpsilon): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 5);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_f64(_pv_jr_at(v, f, 2, "c_mu"), &w);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "c_eps1"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "c_eps2"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_ke_zero(out);
+    for (var c = 0; c < 2; c = c + 1) {
+        if (_pv_jr_col(_pv_jr_at(v, f, c, _pv_ke_field(c)), _pv_ke_col(out, c), 0) == 0) {
+            PvKEpsilon_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    var a: f64 = load64(&w);
+    var b: f64 = load64(&w + 8);
+    var c2: f64 = load64(&w + 16);
+    out.c_mu = a;
+    out.c_eps1 = b;
+    out.c_eps2 = c2;
+    return Ok(0);
+}

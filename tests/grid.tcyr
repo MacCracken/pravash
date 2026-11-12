@@ -1,27 +1,23 @@
-# grid.tcyr — the ported Rust tests of rust-old/src/grid.rs's `FluidGrid` (M3 parts a–b).
+# grid.tcyr — the ported Rust tests of rust-old/src/grid.rs: `FluidGrid` (M3 parts a–b), `KEpsilon`,
+# `apply_ghost_fluid` and `MacGrid` (part c).
 #
-# Every test keeps its Rust name as its group, in Rust's order: 44 of the 49 are ported (one in part), and
-# `potential_flow`, `div_norm` and the closures are helpers. Left for M3 part c, where `MacGrid`, `KEpsilon` and
-# `apply_ghost_fluid` arrive:
-# - test_kepsilon_size_mismatch_no_panic (KEpsilon);
-# - test_mac_projection_divergence_free, test_mac_buoyancy_does_not_accumulate_on_walls and test_mac_advects_density
-#   (MacGrid);
-# - test_ghost_fluid_size_mismatch_no_panic (apply_ghost_fluid);
-# - the MacGrid half of test_cfl_dt_finite_without_flow (`m.cfl_dt(0.5) > 1e300`); its FluidGrid half is here.
-# Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9, #10, #12):
+# Every test keeps its Rust name as its group, in Rust's order: all 49 are ported, and `potential_flow`, `div_norm`
+# and the closures are helpers.
+# Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9, #10, #12, #13):
 # - `is_err()` is the `PV_ERR_*` code, checked against the variant Rust's code path returns (which implies is_err);
 # - `.unwrap()` on `new`, `step` and the pressure solves is an assertion that every call was Ok;
 # - a `Vec<f64>` field is a PvColumn (`v[i]` is `get_f` / `set_f`); a local `vec![x; n]` is n f64 words, and a
 #   `&[f64]` argument their pointer; the private helpers are the `_pv_fg_*` functions;
-# - `FluidGrid::diffuse` takes (pointer, count) and returns 1 (diffused) or 0 (refused, where Rust warns and
-#   returns): the tests check that flag too;
+# - `FluidGrid::diffuse`, `KEpsilon::step` and `apply_ghost_fluid` take (pointer, count) for a slice and return 1
+#   (done) or 0 (refused, where Rust warns and returns): the tests check that flag too;
 # - a size mismatch Rust survives without a panic is a call that returns, then Rust's assertions;
 # - a closure is a helper function; Rust's per-cell assertion loops count the failing cells into one check;
 # - `capacity()` is the column's `cap`, and its storage pointer is checked not to move either: the four scratch
 #   columns (4–7) across a later step;
 # - serde_json is `to_json` / `PvFluidGrid_from_json`.
-# Two Cyrius-only groups: `fg_layout_matches_column_offsets` pins the record layouts that src/grid.cyr's `_pv_fg_col`
-# and `_pv_mg_col` offsets assume, and `fg_dst_plan_is_kept_per_length` the DST plans' reuse (M3 part b).
+# Two Cyrius-only groups: `fg_layout_matches_column_offsets` pins the record layouts that the column offsets of
+# src/grid.cyr, src/mac_grid.cyr and src/k_epsilon.cyr assume, and `fg_dst_plan_is_kept_per_length` the DST plans'
+# reuse (M3 part b).
 
 include "tests/lib.cyr"
 
@@ -43,6 +39,20 @@ fn fresh(g: *PvFluidGrid, nx, ny, dx: f64): i64 {
     var t, e = PvFluidGrid_new(nx, ny, dx, g);
     if (is_err_result(t) == 1) { return 0; }
     return 1;
+}
+
+# 1 when `PvMacGrid_new` built *g (Rust's `MacGrid::new(…).unwrap()`).
+fn mac_fresh(g: *PvMacGrid, nx, ny, dx: f64): i64 {
+    var t, e = PvMacGrid_new(nx, ny, dx, g);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# The error code of one MAC step (PV_ERR_NONE when it was Ok).
+fn mac_step_err(g: *PvMacGrid, c: *PvGridConfig): i64 {
+    var t, e = g.step(c);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
 }
 
 # The error code of `PvFluidGrid_new` (PV_ERR_NONE when it built: *g then holds storage to drop).
@@ -958,12 +968,95 @@ fn test_audit_state() {
     }
     assert_eq(changed, 0, "the field is untouched");
 
+    test_group("test_kepsilon_size_mismatch_no_panic");
+    var ke: PvKEpsilon;
+    assert_eq(PvKEpsilon_new(8, 8, &ke), 1, "new");
+    var z = filled(64, 0.0);
+    assert_eq(ke.step(z, 10, z, 10, 8, 8, 0.1, 0.01), 0, "8 × 8 over 10 velocities: refused");
+    assert_eq(ke.step(z, 64, z, 64, 16, 4, 0.1, 0.01), 1, "16 × 4 over 64: k's length, so it steps");
+    PvKEpsilon_drop(&ke);
+
     test_group("test_cfl_dt_finite_without_flow");
-    # The FluidGrid half; the MacGrid half (`m.cfl_dt(0.5) > 1e300`) arrives with MacGrid in M3 part c.
     assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
     var dt: f64 = g.cfl_dt(0.0, 2.0);
     assert_eq(_pv_is_finite(dt), 1, "finite with no flow and no viscosity");
     PvFluidGrid_drop(&g);
+    var mg: PvMacGrid;
+    assert_eq(mac_fresh(&mg, 8, 8, 0.1), 1, "MacGrid::new");
+    var mdt: f64 = mg.cfl_dt(0.5);
+    var huge: f64 = 0x7E37E43C8800759C;   # 1e300
+    assert(mdt > huge, "MacGrid: no flow, no advective limit");
+    PvMacGrid_drop(&mg);
+
+    test_group("test_mac_projection_divergence_free");
+    assert_eq(mac_fresh(&mg, 16, 16, 0.1), 1, "new");
+    for (var k1 = 0; k1 < mg.vx.len; k1 = k1 + 1) {
+        var a1: f64 = f64_from((k1 * 13) % 7) - 3.0;
+        mg.vx.set_f(k1, a1);
+    }
+    for (var k2 = 0; k2 < mg.vy.len; k2 = k2 + 1) {
+        var a2: f64 = f64_from((k2 * 5) % 11) - 5.0;
+        mg.vy.set_f(k2, a2);
+    }
+    c = PvGridConfig_smoke();
+    c.buoyancy_alpha = 0.0;
+    c.pressure_iterations = 3000;
+    assert_eq(mac_step_err(&mg, &c), PV_ERR_NONE, "step");
+    var max_div: f64 = 0.0;
+    for (var y = 0; y < 16; y = y + 1) {
+        for (var x = 0; x < 16; x = x + 1) {
+            var dv: f64 = mg.divergence_at(x, y);
+            var adv: f64 = f64_abs(dv);
+            max_div = _pv_max(max_div, adv);
+        }
+    }
+    var lim: f64 = 0.001;
+    assert(max_div < lim, "MAC projection residual divergence below 1e-3");
+    var open = 0;
+    for (var w = 0; w < 16; w = w + 1) {
+        var vw: f64 = mg.vy.get_f(w);
+        if (vw != 0.0) { open = open + 1; }
+    }
+    assert_eq(open, 0, "walls are closed");
+    PvMacGrid_drop(&mg);
+
+    test_group("test_mac_buoyancy_does_not_accumulate_on_walls");
+    assert_eq(mac_fresh(&mg, 8, 8, 0.1), 1, "new");
+    mg.density.fill(_pv_bits(1.0));
+    c = PvGridConfig_smoke();
+    var ok10 = 1;
+    for (var s = 0; s < 10; s = s + 1) {
+        if (mac_step_err(&mg, &c) != PV_ERR_NONE) { ok10 = 0; }
+    }
+    assert_eq(ok10, 1, "ten steps");
+    var wall = 0;
+    for (var w2 = 0; w2 < 8; w2 = w2 + 1) {
+        var lo: f64 = mg.vy.get_f(w2);
+        var hi: f64 = mg.vy.get_f(64 + w2);
+        if (lo != 0.0) { wall = wall + 1; }
+        if (hi != 0.0) { wall = wall + 1; }
+    }
+    assert_eq(wall, 0, "the bottom and top wall faces stay 0");
+    PvMacGrid_drop(&mg);
+
+    test_group("test_mac_advects_density");
+    assert_eq(mac_fresh(&mg, 16, 16, 0.1), 1, "new");
+    mg.density.set_f(8 * 16 + 4, 1.0);
+    for (var ay = 0; ay < 16; ay = ay + 1) {
+        for (var ax = 1; ax < 16; ax = ax + 1) { mg.vx.set_f(ay * 17 + ax, 0.5); }
+    }
+    c = PvGridConfig_smoke();
+    c.buoyancy_alpha = 0.0;
+    var before_d: f64 = mg.density.get_f(8 * 16 + 4);
+    assert_eq(mac_step_err(&mg, &c), PV_ERR_NONE, "step");
+    var after_d: f64 = mg.density.get_f(8 * 16 + 4);
+    assert(after_d < before_d, "density must move with the flow");
+    PvMacGrid_drop(&mg);
+
+    test_group("test_ghost_fluid_size_mismatch_no_panic");
+    var gp = filled(10, 0.0);
+    var gl = filled(64, 0.0);
+    assert_eq(apply_ghost_fluid(gp, 10, gl, 64, 8, 8, 0.1, 0.07), 0, "10 pressures for 8 × 8: refused");
 
     test_group("test_step_reduces_divergence_small_dx");
     var nx = 33;
@@ -1014,6 +1107,8 @@ fn test_layout() {
     assert_eq(sizeof(PvFluidGrid), 360, "PvFluidGrid: 360 bytes");
     assert_eq(sizeof(PvGridConfig), 104, "PvGridConfig: 104 bytes");
     assert_eq(sizeof(PvMgLevel), 72, "PvMgLevel: 72 bytes");
+    assert_eq(sizeof(PvMacGrid), 168, "PvMacGrid: 168 bytes");
+    assert_eq(sizeof(PvKEpsilon), 120, "PvKEpsilon: 120 bytes");
     assert_eq(fresh(&g, 8, 9, 0.1), 1, "new");
     assert_eq(step_err(&g, &c), PV_ERR_NONE, "a DST step sizes solve_a … solve_c and both plans");
     c.use_multigrid = 1;
@@ -1042,6 +1137,37 @@ fn test_layout() {
     assert_eq(mg_col_data(lv, 1), level.coarse_rhs.data, "level column 1: coarse_rhs");
     assert_eq(mg_col_data(lv, 2), level.coarse_p.data, "level column 2: coarse_p");
     PvFluidGrid_drop(&g);
+    var m: PvMacGrid;
+    assert_eq(mac_fresh(&m, 5, 4, 0.1), 1, "MacGrid::new");
+    var c2: PvGridConfig = PvGridConfig_smoke();
+    assert_eq(mac_step_err(&m, &c2), PV_ERR_NONE, "a MAC step");
+    var mc: *PvColumn = _pv_mac_col(&m, 0);
+    assert_eq(mc.data, m.vx.data, "mac 0: vx");
+    mc = _pv_mac_col(&m, 1);
+    assert_eq(mc.data, m.vy.data, "mac 1: vy");
+    mc = _pv_mac_col(&m, 2);
+    assert_eq(mc.data, m.pressure.data, "mac 2: pressure");
+    mc = _pv_mac_col(&m, 3);
+    assert_eq(mc.data, m.density.data, "mac 3: density");
+    mc = _pv_mac_col(&m, 4);
+    assert_eq(mc.data, m.scratch_div.data, "mac 4: scratch_div");
+    mc = _pv_mac_col(&m, 5);
+    assert_eq(mc.data, m.scratch_density.data, "mac 5: scratch_density");
+    assert(m.vx.len == 24 && m.vy.len == 25 && m.scratch_density.len == 20, "the face and cell sizes");
+    PvMacGrid_drop(&m);
+    var ke: PvKEpsilon;
+    assert_eq(PvKEpsilon_new(4, 4, &ke), 1, "KEpsilon::new");
+    var kc: *PvColumn = _pv_ke_col(&ke, 0);
+    assert_eq(kc.data, ke.k.data, "ke 0: k");
+    kc = _pv_ke_col(&ke, 1);
+    assert_eq(kc.data, ke.epsilon.data, "ke 1: epsilon");
+    kc = _pv_ke_col(&ke, 2);
+    assert_eq(kc.data, ke.scratch_k.data, "ke 2: scratch_k");
+    kc = _pv_ke_col(&ke, 3);
+    assert_eq(kc.data, ke.scratch_eps.data, "ke 3: scratch_eps");
+    var cm: f64 = ke.c_mu;
+    assert_eq(_pv_bits(cm), 0x3FB70A3D70A3D70A, "the constants after the columns: C_mu = 0.09");
+    PvKEpsilon_drop(&ke);
     return 0;
 }
 

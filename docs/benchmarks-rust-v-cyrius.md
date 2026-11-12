@@ -269,3 +269,40 @@ tree; B: this one). The runs agree within 1%. The Rust column is part a's criter
   63 × 63, while the planned DST is a multiply-add per term.
 - Appended to hisab's L6 request (`hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md`): let the
   into-scratch DST take a plan the caller keeps.
+
+## M3 part c: MacGrid, KEpsilon and the ghost fluid (2026-11-12)
+
+rust-old/benches has no bench for these types, so `scripts/probes/rust/src/bin/bench_grid_c.rs` times the same
+bodies on the frozen oracle, and `tests/pravash.bcyr`'s `bench_grid_c` is the Cyrius side. Each row is `iters` calls
+on one state, which evolves the same way on both sides, bit for bit. Runs were pinned on core 15 and interleaved,
+three of each side. The runs agree within 1%, and the table gives medians.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `mac_step/16x16` | 73.6 µs | 210 µs | 2.9× |
+| `mac_step/32x32` | 353 µs | 848 µs | 2.4× |
+| `mac_step/64x64` | 1.53 ms | 3.38 ms | 2.2× |
+| `kepsilon_step/32x32` | 4.30 µs | 61.1 µs | 14× |
+| `kepsilon_step/64x64` | 18.6 µs | 259 µs | 14× |
+| `kepsilon_step/128x128` | 80.0 µs | 1.08 ms | 13× |
+| `ghost_fluid/32x32` | 1.97 µs | 14.6 µs | 7.4× |
+| `ghost_fluid/64x64` | 7.65 µs | 53.9 µs | 7.0× |
+| `ghost_fluid/128x128` | 29.3 µs | 205 µs | 7.0× |
+
+The bodies:
+- `mac_step`: an n × n MAC grid at dx 0.1, density 1 on a 4 × 2 blob at the floor's centre, the smoke config (40
+  Gauss–Seidel sweeps);
+- `kepsilon_step`: `new(n, n)` under a solid-body rotation, dx 0.1, dt 0.01;
+- `ghost_fluid`: a zero pressure and a circle's signed distance, dx 0.1, σ 0.07.
+
+**The A/B behind the k-ε rows** (pinned, interleaved, three runs each): the step's three maxes are each a max against
+a positive constant floor. Written out as `if (x > floor)`, instead of `_pv_max` calls, the step took 73.7–74.2 µs →
+61.0–61.1 µs at 32 × 32 and 1.29–1.30 ms → 1.07–1.09 ms at 128 × 128 (1.21×). The rows are unchanged.
+
+**Reading it.**
+- **The MAC step is 2.2–2.9×.** Its Gauss–Seidel sweeps are a dependent chain, which neither side vectorises, so
+  the gap is the per-operation codegen cost, as for `grid_diffuse`.
+- **The k-ε step is 13–14×.** Its cells are independent: Rust vectorises the loop, and the Cyrius codegen runs it
+  scalar, about 68 ns an interior cell against 4.8.
+- **The ghost fluid is 7.0–7.4×.** Most cells take only the crossing test (five loads and four products), which Rust
+  also vectorises.

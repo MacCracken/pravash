@@ -118,8 +118,9 @@ oracle:
   vector arithmetic, and the particle arena through a transcription of its free-list logic (the token layouts
   and the arena's op codes are in `src/m_common.rs`'s module comment);
 - it recomputes every `shallow` and `grid` row through Python transcriptions of the solvers: the shallow-water step,
-  and the grid's samplers, advections, diffusion, forces, walls and four pressure solves (hisab 1.4.0's DST, IDST
-  and CG among them), with glibc's transcendentals for the record and MPFR's for the corrected oracle
+  the grid's samplers, advections, diffusion, forces, walls and four pressure solves (hisab 1.4.0's DST, IDST
+  and CG among them), and the k-ε model, the ghost fluid and the MAC grid, with glibc's transcendentals for the
+  record and MPFR's for the corrected oracle
   (`grid.cr.tsv`: the rows whose DST uses a sine or cosine glibc misrounds);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;

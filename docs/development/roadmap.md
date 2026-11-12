@@ -50,7 +50,8 @@
   bit-exact; 44 of 49 + 5 Rust tests), the DST / IDST / CG transcriptions, the exact fmod (L14)
 - [x] M3 part b: the DST and CG rows (21 + 49, the corrected oracle's `grid.cr.tsv` 20), 188 step rows on those
   projections, the DST plans (the 63 × 63 DST step 719 ms → 8.6 ms, the bits unchanged)
-- [ ] M3 part c: `MacGrid` and k-ε (the last 5 Rust tests of `grid.rs`)
+- [x] M3 part c: `MacGrid`, k-ε and the ghost fluid (293 rows, 135 class S step rows, all bit-exact; the last 5
+  Rust tests of `grid.rs`)
 - [ ] M3 part d: VOF and the phase field
 - [ ] M3 part e: `src/par.cyr` and the grid's parallel loops
 

@@ -11,7 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M3 part b complete** (2026-11-12); M3 part c (`MacGrid`, k-ε, the ghost fluid) is next. Part b put
+> ⏳ **Status: M3 part c complete** (2026-11-12); M3 part d (VOF and the phase field) is next. Part c ported
+> `KEpsilon`, `apply_ghost_fluid` and `MacGrid` (`src/k_epsilon.cyr`, `src/mac_grid.cyr`): 293 rows bit-exact on the
+> first replay, all 49 Rust tests of `grid.rs` (port-parity §12). Part b put
 > the DST and CG projections under parity: 827 grid rows, 20 of them against the corrected oracle where glibc
 > misrounds a DST sine, and the DST plans that keep the bits and take the 63 × 63 DST step from 719 ms to 8.6 ms
 > (port-parity §11). M3 part a delivered `src/grid.cyr` and `src/grid_solve.cyr`: 569 rows bit-exact (188 class S
@@ -866,7 +868,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - surface parity 165.
 
 **Next:** M3, grid |
-| M3 Grid | 🟡 **parts a–b done 2026-11-11 / 12**; parts c–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
+| M3 Grid | 🟡 **parts a–c done 2026-11-11 / 12**; parts d–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
 - `src/grid.cyr` (every advection, diffusion, Smagorinsky, the forces, the four projections, the wall rules) and `src/grid_solve.cyr` (L5, L6);
 - ADR 0002 #12 (the private solver buffers, the boundary refusal, `PvFluidGrid_diffuse`'s flag);
 - `_pv_fmod`, ledger L14, requested at ganita with a repro;
@@ -885,7 +887,18 @@ Part b (2026-11-12, port-parity §11):
 - 8 of 9 port mutations and 3 of 3 transcription mutations caught (the ninth equivalent);
 - `cyrius audit` made clean (44 test and bench functions documented).
 
-**Next:** M3 part c: `MacGrid`, `KEpsilon` and `apply_ghost_fluid`, their rows, and the last 5 Rust tests of `grid.rs` |
+Part c (2026-11-12, port-parity §12):
+- `src/k_epsilon.cyr` (`PvKEpsilon`), `apply_ghost_fluid` and `src/mac_grid.cyr` (`PvMacGrid`), with JSON;
+  ADR 0002 #13;
+- 293 rows (grid 1,120): 46 `KEpsilon::step` and 89 `MacGrid::step` class S rows, the reads, the ghost fluid, JSON;
+  all bit-exact on the first replay, every one recomputed by `validate.py`;
+- all 49 Rust tests of `grid.rs`; surface parity 227, 0 pending;
+- 8 of 12 port mutations fail rows, 3 are equivalent, and one shows at 1–2 ulp inside class B; 3 of 3 transcription
+  mutations caught;
+- Rust twins (`bench_grid_c.rs`): MAC step 2.2–2.9×, ghost fluid 7.0–7.4×, k-ε step 13–14× (after writing its maxes
+  out, 1.21×).
+
+**Next:** M3 part d: VOF and the phase field, their rows and Rust tests |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |

@@ -1384,3 +1384,57 @@ impl PvFluidGrid {
         return Ok(0);
     }
 }
+
+# ── Ghost fluid ─────────────────────────────────────────────────────────────────────
+
+# The ghost-fluid pressure correction at a level-set interface (plen words of pressure at p, llen of the signed
+# distance at ls, negative inside the fluid): at each interior cell where φ changes sign against a 4-neighbour,
+# with g = ((φ_r − φ_l)·0.5·(1/dx), (φ_t − φ_b)·0.5·(1/dx)), |g| = max(√(g_x² + g_y²), 1e-20) and
+# κ = −(((φ_r − 2φ) + φ_l) + ((φ_t − 2φ) + φ_b))·(1/dx)² / |g| (each Laplacian term scaled before the sum), the
+# pressure loses ((σ·κ)·φ)/|g| where φ > 0. 1, or 0 with nothing changed when nx or ny is below 3, nx·ny overflows
+# or isn't both lengths, or dx isn't finite and > 0 (Rust warns and returns). Mirrors `apply_ghost_fluid`.
+fn apply_ghost_fluid(p, plen, ls, llen, nx, ny, dx: f64, surface_tension: f64): i64 {
+    if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
+    if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+    var n = nx * ny;
+    if (plen != n || llen != n) { return 0; }
+    if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return 0; }
+    var inv_dx: f64 = 1.0 / dx;
+    var inv_dx2: f64 = inv_dx * inv_dx;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var q = ls + i * 8;
+            var phi: f64 = load64(q);
+            var phi_r: f64 = load64(q + 8);
+            var phi_l: f64 = load64(q - 8);
+            var phi_t: f64 = load64(q + nx * 8);
+            var phi_b: f64 = load64(q - nx * 8);
+            var cr: f64 = phi * phi_r;
+            var cl: f64 = phi * phi_l;
+            var ct: f64 = phi * phi_t;
+            var cb: f64 = phi * phi_b;
+            if (cr < 0.0 || cl < 0.0 || ct < 0.0 || cb < 0.0) {
+                var gx: f64 = ((phi_r - phi_l) * 0.5) * inv_dx;
+                var gy: f64 = ((phi_t - phi_b) * 0.5) * inv_dx;
+                var gs: f64 = f64_sqrt((gx * gx) + (gy * gy));
+                var g: f64 = _pv_max(gs, tiny);
+                var tp: f64 = 2.0 * phi;
+                var lxx: f64 = ((phi_r - tp) + phi_l) * inv_dx2;
+                var lyy: f64 = ((phi_t - tp) + phi_b) * inv_dx2;
+                var lap: f64 = lxx + lyy;
+                var nl: f64 = -lap;
+                var kappa: f64 = nl / g;
+                if (phi > 0.0) {
+                    var at = p + i * 8;
+                    var p0: f64 = load64(at);
+                    var c: f64 = ((surface_tension * kappa) * phi) / g;
+                    var p1: f64 = p0 - c;
+                    store64(at, _pv_bits(p1));
+                }
+            }
+        }
+    }
+    return 1;
+}

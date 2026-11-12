@@ -1,0 +1,196 @@
+# k_epsilon.cyr — the k-ε turbulence model of rust-old/src/grid.rs (`KEpsilon`, M3 part c).
+#
+# A two-equation RANS state per cell: k, the turbulent kinetic energy, and ε, its dissipation rate, with the
+# turbulent viscosity ν_t = C_μ·k²/ε. `step` integrates the production and dissipation source terms only, as
+# 1.3.0 does (no advection or diffusion of k and ε). Every formula is Rust's, in its operation order.
+#
+# The record mirrors the struct: the public k and ε columns and constants, then the two private scratch columns
+# `step` swaps through. `PvKEpsilon_new` returns 1 or 0 where Rust's `new` returns `Self` (ADR 0002 #8, #9), and
+# `step` returns 1, or 0 where Rust warns and returns (ADR 0002 #13).
+
+struct PvKEpsilon {
+    k: PvColumn;
+    epsilon: PvColumn;
+    c_mu: f64;
+    c_eps1: f64;
+    c_eps2: f64;
+    scratch_k: PvColumn;
+    scratch_eps: PvColumn;
+}
+
+# Column j of a model (0 k, 1 epsilon, 2 scratch_k, 3 scratch_eps), by its byte offset: k and ε at 0 and 24, the
+# three constants at 48 … 64, the scratch at 72 and 96 (tests/grid.tcyr pins the layout, 120 bytes).
+#must_use
+fn _pv_ke_col(m, j): *PvColumn {
+    if (j < 2) { return _pv_as_columns(_pv_addr(m) + j * 24); }
+    return _pv_as_columns(_pv_addr(m) + 72 + (j - 2) * 24);
+}
+
+# Empties every column of *m without releasing anything (for a record about to be filled).
+fn _pv_ke_zero(m: *PvKEpsilon) {
+    for (var j = 0; j < 4; j = j + 1) {
+        var c: *PvColumn = _pv_ke_col(m, j);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases every column's storage; the model holds no storage after. Mirrors dropping the `KEpsilon`.
+fn PvKEpsilon_drop(m: *PvKEpsilon) {
+    for (var j = 0; j < 4; j = j + 1) {
+        var c: *PvColumn = _pv_ke_col(m, j);
+        c.drop();
+    }
+    return 0;
+}
+
+# The model for an nx × ny grid into *out: k = 1e-4 and ε = 1e-5 in every cell, C_μ = 0.09, C_ε1 = 1.44,
+# C_ε2 = 1.92, the scratch nx·ny zeros. 1, or 0 when nx·ny overflows or is a size no allocation reaches, or the
+# memory isn't there; *out then holds no storage. Rust doesn't check the product: it panics under overflow checks
+# (the oracle's build), wraps without them, and aborts on an allocation that large (ADR 0002 #13). Mirrors
+# `KEpsilon::new`.
+#must_use
+fn PvKEpsilon_new(nx, ny, out: *PvKEpsilon): i64 {
+    _pv_ke_zero(out);
+    var n = 0;
+    if (nx != 0 && ny != 0) {
+        if (nx < 0 || ny < 0) { return 0; }
+        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+        n = nx * ny;
+    }
+    var ok = 1;
+    var k: *PvColumn = _pv_ke_col(out, 0);
+    ok = ok & k.resize(n, 0x3F1A36E2EB1C432D);              # 1e-4
+    var e: *PvColumn = _pv_ke_col(out, 1);
+    ok = ok & e.resize(n, 0x3EE4F8B588E368F1);              # 1e-5
+    for (var j = 2; j < 4; j = j + 1) {
+        var s: *PvColumn = _pv_ke_col(out, j);
+        ok = ok & s.resize(n, 0);
+    }
+    if (ok == 0) {
+        PvKEpsilon_drop(out);
+        return 0;
+    }
+    var c_mu: f64 = 0x3FB70A3D70A3D70A;    # 0.09
+    var c1: f64 = 0x3FF70A3D70A3D70A;      # 1.44
+    var c2: f64 = 0x3FFEB851EB851EB8;      # 1.92
+    out.c_mu = c_mu;
+    out.c_eps1 = c1;
+    out.c_eps2 = c2;
+    return 1;
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `KEpsilon::clone`.
+#must_use
+fn PvKEpsilon_clone(out: *PvKEpsilon, src: *PvKEpsilon): i64 {
+    _pv_ke_zero(out);
+    out.c_mu = src.c_mu;
+    out.c_eps1 = src.c_eps1;
+    out.c_eps2 = src.c_eps2;
+    for (var j = 0; j < 4; j = j + 1) {
+        var s: *PvColumn = _pv_ke_col(src, j);
+        var d: *PvColumn = _pv_ke_col(out, j);
+        if (d.resize(s.len, 0) == 0) {
+            PvKEpsilon_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    return 1;
+}
+
+impl PvKEpsilon {
+    # ν_t = ((C_μ·k)·k)/max(ε, 1e-20) at cell i; NaN for an index outside k or ε (Rust panics). Mirrors
+    # `KEpsilon::turbulent_viscosity`.
+    #must_use
+    fn turbulent_viscosity(self, i): f64 {
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var k: f64 = self.k.get_f(i);
+        var e: f64 = self.epsilon.get_f(i);
+        var a: f64 = (self.c_mu * k) * k;
+        var d: f64 = _pv_max(e, tiny);
+        var r: f64 = a / d;
+        return r;
+    }
+
+    # One step of the source terms from the velocity field (vx_len and vy_len words at vx and vy, an nx × ny
+    # grid, cell size dx, time step dt). On the interior, from the old k and ε:
+    #   ν_t = ((C_μ·k)·k)/max(ε, 1e-20), |S|² = 2·((u_x² + v_y²) + 0.5·(u_y + v_x)²) by central differences,
+    #   P = ν_t·|S|², k ← max(k + (P − ε)·dt, 1e-10),
+    #   ε ← max(ε + (((C_ε1·P) − (C_ε2·ε))·(ε/max(k, 1e-10)))·dt, 1e-10);
+    # the ring keeps its values. The scratch columns end holding the old k and ε (Rust swaps the Vecs). 1, or 0
+    # with nothing changed when nx or ny is below 3, nx·ny overflows, a length isn't nx·ny, dx or dt isn't finite
+    # and > 0 (Rust warns and returns), or the scratch can't grow. Mirrors `KEpsilon::step`.
+    fn step(self, vx, vx_len, vy, vy_len, nx, ny, dx: f64, dt: f64): i64 {
+        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
+        if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+        var n = nx * ny;
+        if (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n) { return 0; }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
+        var inv_2dx: f64 = 0.5 / dx;
+        var sk: *PvColumn = _pv_ke_col(self, 2);
+        var se: *PvColumn = _pv_ke_col(self, 3);
+        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { return 0; }
+        var kc: *PvColumn = _pv_ke_col(self, 0);
+        var ec: *PvColumn = _pv_ke_col(self, 1);
+        _pv_col_swap(kc, sk);
+        _pv_col_swap(ec, se);
+        kc.copy_from(sk);
+        ec.copy_from(se);
+        var ko = sk.data;
+        var eo = se.data;
+        var kn = kc.data;
+        var en = ec.data;
+        var c_mu: f64 = self.c_mu;
+        var c1: f64 = self.c_eps1;
+        var c2: f64 = self.c_eps2;
+        # The three maxes are written out. Each is `x.max(floor)` with a positive constant floor: x when x > floor,
+        # else the floor (a NaN x included), the bits of Rust's max. As `_pv_max` calls they made the step 1.21×
+        # slower (pinned A/B, port-parity §12).
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = 0x3DDB7CDFD9D7BDBB;     # 1e-10
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var k0: f64 = load64(ko + i * 8);
+                var e0: f64 = load64(eo + i * 8);
+                var ed: f64 = tiny;
+                if (e0 > tiny) { ed = e0; }
+                var nu_t: f64 = ((c_mu * k0) * k0) / ed;
+                var pu = vx + i * 8;
+                var pv = vy + i * 8;
+                var ur: f64 = load64(pu + 8);
+                var ul: f64 = load64(pu - 8);
+                var uu: f64 = load64(pu + nx * 8);
+                var ud: f64 = load64(pu - nx * 8);
+                var vr: f64 = load64(pv + 8);
+                var vl: f64 = load64(pv - 8);
+                var vu: f64 = load64(pv + nx * 8);
+                var vd: f64 = load64(pv - nx * 8);
+                var dudx: f64 = (ur - ul) * inv_2dx;
+                var dudy: f64 = (uu - ud) * inv_2dx;
+                var dvdx: f64 = (vr - vl) * inv_2dx;
+                var dvdy: f64 = (vu - vd) * inv_2dx;
+                var sh: f64 = dudy + dvdx;
+                var s_mag_sq: f64 = 2.0 * (((dudx * dudx) + (dvdy * dvdy)) + (0.5 * (sh * sh)));
+                var prod: f64 = nu_t * s_mag_sq;
+                var k1: f64 = k0 + ((prod - e0) * dt);
+                var k2: f64 = lo;
+                if (k1 > lo) { k2 = k1; }
+                store64(kn + i * 8, _pv_bits(k2));
+                var kd: f64 = lo;
+                if (k0 > lo) { kd = k0; }
+                var eok: f64 = e0 / kd;
+                var src: f64 = (c1 * prod) - (c2 * e0);
+                var e1: f64 = e0 + ((src * eok) * dt);
+                var e2: f64 = lo;
+                if (e1 > lo) { e2 = e1; }
+                store64(en + i * 8, _pv_bits(e2));
+            }
+        }
+        return 1;
+    }
+}

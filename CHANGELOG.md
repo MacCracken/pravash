@@ -3,6 +3,49 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **grid** (M3 part c): the rest of `rust-old/src/grid.rs`.
+  - **`src/k_epsilon.cyr`:** `PvKEpsilon`, the k-ε model:
+    - `PvKEpsilon_new`, `_clone` and `_drop`;
+    - `turbulent_viscosity`;
+    - the source-term `step`, which takes (pointer, count) slices and returns 1, or 0 where Rust warns;
+    - JSON.
+  - **`apply_ghost_fluid`** (`src/grid.cyr`): the level-set pressure correction, with the same flag.
+  - **`src/mac_grid.cyr`:** `PvMacGrid`, the staggered grid:
+    - `PvMacGrid_new`, `_clone` and `_drop`;
+    - `velocity_at`, `max_speed`, `divergence_at` and `cfl_dt`;
+    - the step (closed walls, face buoyancy, Neumann Gauss–Seidel with the mean pinned, density advection);
+    - JSON.
+  - **`_pv_col_swap`** (`src/column.cyr`), Rust's `std::mem::swap` of two Vecs.
+  - **ADR 0002 #13:**
+    - the flags;
+    - a `KEpsilon::new` that can fail;
+    - every size product checked where Rust panics on overflow;
+    - NaN for an out-of-range read.
+  - **Parity:** `grid.tsv` grows to 1,120 rows. Part c's 293 rows, from their own seed, are bit-exact on the first
+    replay:
+    - 46 `KEpsilon::step` and 89 `MacGrid::step` rows (class S, bound 0), trajectories up to 300 steps among them;
+    - the constructors, the reads and the ghost fluid;
+    - JSON for both types.
+    - `validate.py` transcribes the three and recomputes every row.
+  - **Tests:** the last five Rust tests of `grid.rs` and the MacGrid half of `test_cfl_dt_finite_without_flow`.
+    `tests/grid.tcyr` now has all 49, with 218 checks, and the layout group pins both new records.
+  - **Surface parity:** all of `grid`, 227 items ok, 0 pending.
+  - **Mutation checks:** 8 of 12 port mutations fail rows.
+    - Three of the rest are provably equivalent.
+    - The ghost Laplacian's re-association shows as 1–2 ulp in the histogram, inside class B's bound
+      (port-parity §12).
+    - All 3 transcription mutations are caught.
+
+### Performance
+- **The part c benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M3 part c),
+  against Rust twins on the same bodies (`scripts/probes/rust/src/bin/bench_grid_c.rs`; Rust has no criterion bench
+  for these). Pinned, interleaved:
+  - `mac_step` 210 µs (Rust 73.6 µs) at 16 × 16, 2.2–2.9×;
+  - `ghost_fluid` 14.6 µs (1.97 µs) at 32 × 32, 7.0–7.4×;
+  - `kepsilon_step` 61.1 µs (4.30 µs) at 32 × 32, 13–14×. Its three maxes are written out, which made the step 1.21×
+    faster (74.0 → 61.1 µs) with the rows unchanged. The rest is the loop Rust vectorises.
+
+### Added (Cyrius)
 - **grid** (M3 part b): the DST and CG projections under parity, and the DST plans.
   - **Parity:** `tests/golden/grid.tsv` grows to 827 rows. Part b's rows come from their own seed, so part a's 569
     keep their values. Every row is bit-exact against the oracle, or against the corrected oracle where glibc

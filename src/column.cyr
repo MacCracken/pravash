@@ -147,3 +147,17 @@ impl PvColumn {
         return 0;
     }
 }
+
+# Swaps two column records (their storage, length and capacity), as `std::mem::swap` swaps two Vecs.
+fn _pv_col_swap(a: *PvColumn, b: *PvColumn) {
+    var d = a.data;
+    var l = a.len;
+    var c = a.cap;
+    a.data = b.data;
+    a.len = b.len;
+    a.cap = b.cap;
+    b.data = d;
+    b.len = l;
+    b.cap = c;
+    return 0;
+}

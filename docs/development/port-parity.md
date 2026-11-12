@@ -832,3 +832,81 @@ Three mutations of the Python transcription are caught as well:
 Rust's criterion bench steps a fresh clone each time, so its twin builds the plans in every timed step. That step
 is 6.0×, 1.03× and 0.85× Rust; a grid's later steps are 1.5×, 0.90× and 0.56×. The first 15 × 15 step still pays
 25 sines on the correctly rounded slow path (L1). The plan form is appended to hisab's L6 request.
+
+## 12. M3 part c: KEpsilon, the ghost fluid and MacGrid (2026-11-12)
+
+The rest of `grid.rs`:
+- **`src/k_epsilon.cyr`:** `PvKEpsilon`, a 120-byte record: k and ε columns, the three constants, two scratch
+  columns. It has `new`, `turbulent_viscosity`, the source-term `step` (Rust swaps the k and ε Vecs with their
+  scratch; the port swaps the column records), clone, drop and JSON.
+- **`apply_ghost_fluid`,** in `src/grid.cyr`.
+- **`src/mac_grid.cyr`:** `PvMacGrid`, 168 bytes: nx, ny, dx, the face and cell columns, two scratch columns. It has
+  `new`, `velocity_at`, `max_speed`, `divergence_at`, `cfl_dt`, the step, clone, drop and JSON.
+- **The step:** closed walls, face buoyancy, Neumann Gauss–Seidel with the mean pinned, and density advection
+  through `FluidGrid`'s sampler.
+- **ADR 0002 #13** records the Cyrius shapes:
+  - the flags where Rust warns and returns;
+  - (pointer, count) slices;
+  - a `KEpsilon::new` that can fail;
+  - every size product checked where Rust panics on overflow;
+  - NaN for an out-of-range read.
+
+**The rows** (`m_grid_c.rs`, from their own seed, after parts a and b): 293 of them, so `grid.tsv` has 1,120.
+
+| Function | Rows | What they cover |
+|---|---|---|
+| `KEpsilon::new` | 7 | sizes 0 × 0 to 16 × 4 |
+| `KEpsilon::turbulent_viscosity` | 12 | log-uniform k and ε (ε down past the 1e-20 floor), the specials, changed constants |
+| `KEpsilon::step` (class S) | 46 | 50-step trajectories under shear, rotation and random flows; random models with the specials; non-square grids; a step that hits both 1e-10 floors; 17 refusals, among them Rust's two size-mismatch shapes (the 16 × 4 one steps) |
+| `apply_ghost_fluid` | 31 | circles of several radii and cell sizes, a plane, random fields, zeros and specials in the level set, σ zero, NaN and ∞, 9 refusals |
+| `MacGrid::new` | 28 | the sizes and every special cell size |
+| the four MAC reads | 52 | random states with NaN, ∞ and −0 faces, the no-flow grid (`cfl_dt` f64::MAX), eight CFL factors a row |
+| `MacGrid::step` (class S) | 89 | 300-step trajectories of an empty and a full tank; single steps at frames {0, 1, 2, 10, 60, 300} of a buoyant blob under four configs (one setting every field the MAC step ignores) and of a carried density; the projection on arbitrary faces at 400 sweeps; 24 random states; 24 refusals and divergences in Rust's order |
+| `MacGrid::from_json`, `KEpsilon::from_json` | 28 | the oracle's documents, seq forms, missing, unknown, mistyped and null fields |
+
+`validate.py` transcribes all three types and both decoders and recomputes every row: 48,050 rows, 0 failures.
+
+**Result:** every row passes on the first replay, all at 0 ulp. The two step functions take class S bound 0, and
+the replay is **9 modules, 0 failing | rows: 45,495 ok, 0 failed, 0 measured, 2,463 pending, 92 accepted
+(ADR 4: 92)**.
+
+**Mutation checks** (each restored after):
+
+| Mutation | Rows failed |
+|---|---|
+| ν_t as C_μ·(k·k) | 22 |
+| \|S\|²'s sum re-associated | 18 |
+| ε/k without k's 1e-10 floor | 8 |
+| the k ring left uncopied | 18 |
+| the crossing test without the bottom neighbour | 15 |
+| the MAC Neumann count wrong at the second row | 61 |
+| the buoyancy product re-associated | 11 |
+| the top wall left open | 25 |
+
+Four mutations survive the gate:
+- **Re-associating the ghost Laplacian** (φ_r − 2φ) + φ_l → φ_r − (2φ − φ_l) shows only as 3 values at 1–2 ulp
+  (`max:2` in the histogram). That is inside class B's 2-ulp bound, so the row passes. Every other part c value is
+  at 0 ulp, so the histogram exposes it, but the gate doesn't. Part a's and b's class B rows share this property.
+- **The other three are equivalent:**
+  - φ > 0 → φ ≥ 0: a cell with φ = 0 never counts as crossing;
+  - the MAC mean summed from +0: Gauss–Seidel never leaves a −0 pressure, because each sum starts at +0;
+  - the density swap written as a copy: it changes only the scratch buffer's contents, which no later read sees.
+
+Three mutations of the Python transcription are caught (8, 11 and 15 rows).
+
+**Tests:** the last five Rust tests of `grid.rs` and the MacGrid half of `test_cfl_dt_finite_without_flow`, so
+`tests/grid.tcyr` has all 49, with 218 checks. The layout group pins `PvMacGrid` and `PvKEpsilon`. Surface parity
+covers all of `grid`: 227 items ok, 0 pending.
+
+**Speed** (benchmarks-rust-v-cyrius, M3 part c). Rust has no criterion bench for these types, so
+`scripts/probes/rust/src/bin/bench_grid_c.rs` times the same bodies on the oracle:
+
+| Bench | Cyrius / Rust |
+|---|---|
+| MAC step | 2.2–2.9× |
+| ghost fluid | 7.0–7.4× |
+| k-ε step | 13–14× |
+
+The k-ε step got there by writing its three maxes out. Each is a max against a positive constant floor, so the bits
+are the same, and the step became 1.21× faster in a pinned A/B. The rest of the k-ε gap is a loop of independent
+cells that Rust vectorises and the Cyrius codegen runs scalar.

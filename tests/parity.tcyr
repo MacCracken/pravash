@@ -1067,6 +1067,240 @@ fn _par_vcol_in(k, c: *PvColumn): i64 {
     return k + 1 + n;
 }
 
+# ── grid, part c (M3): KEpsilon, apply_ghost_fluid, MacGrid ──────────────────────────
+# A k-ε state is `v:` k, `v:` epsilon and the three constants; a MAC state is nx, ny, dx and 4 `v:<n>` fields
+# (scripts/oracle/src/m_grid_c.rs).
+
+# The k-ε state at input k into *m, made as the oracle makes it (`new(k.len(), 1)`, then the public fields, so the
+# scratch is k's length): the index after it, or -1 for no memory.
+fn _par_ke_in(k, m: *PvKEpsilon): i64 {
+    var nk = _par_in(k);
+    if (PvKEpsilon_new(nk, 1, m) == 0) { return 0 - 1; }
+    var at = k;
+    for (var j = 0; j < 2; j = j + 1) {
+        var c: *PvColumn = _pv_ke_col(m, j);
+        c.drop();
+        var n = _par_in(at);
+        if (_par_col_in(at + 1, n, c) == 0) { return 0 - 1; }
+        at = at + 1 + n;
+    }
+    m.c_mu = _par_in(at);
+    m.c_eps1 = _par_in(at + 1);
+    m.c_eps2 = _par_in(at + 2);
+    return at + 3;
+}
+
+# Appends a k-ε state's two columns and three constants.
+fn _par_ke_out(m: *PvKEpsilon) {
+    _par_col_out(_pv_ke_col(m, 0));
+    _par_col_out(_pv_ke_col(m, 1));
+    _par_got_f(_pv_bits(m.c_mu));
+    _par_got_f(_pv_bits(m.c_eps1));
+    _par_got_f(_pv_bits(m.c_eps2));
+    return 0;
+}
+
+# The MAC state at input k into *g (scratch empty): the index after it, or -1 for no memory.
+fn _par_mac_in(k, g: *PvMacGrid): i64 {
+    _pv_mac_zero(g);
+    g.nx = _par_in(k);
+    g.ny = _par_in(k + 1);
+    g.dx = _par_in(k + 2);
+    var at = k + 3;
+    for (var c = 0; c < 4; c = c + 1) {
+        var n = _par_in(at);
+        if (_par_col_in(at + 1, n, _pv_mac_col(g, c)) == 0) { return 0 - 1; }
+        at = at + 1 + n;
+    }
+    return at;
+}
+
+# Appends a MAC state's 3 scalars and 4 fields.
+fn _par_mac_out(g: *PvMacGrid) {
+    _par_got_i(g.nx);
+    _par_got_i(g.ny);
+    _par_got_f(_pv_bits(g.dx));
+    for (var c = 0; c < 4; c = c + 1) { _par_col_out(_pv_mac_col(g, c)); }
+    return 0;
+}
+
+# 1 when two columns hold the same words.
+#must_use
+fn _par_col_same(a: *PvColumn, b: *PvColumn): i64 {
+    if (a.len != b.len) { return 0; }
+    if (a.len > 0 && memeq(a.data, b.data, a.len * 8) != 1) { return 0; }
+    return 1;
+}
+
+# Part c's rows: 1 handled, -1 failed, 0 not one of them.
+fn _par_grid_c(fp, fl): i64 {
+    if (_par_eq(fp, fl, "KEpsilon::new") == 1) {
+        var m: PvKEpsilon;
+        if (PvKEpsilon_new(_par_in(0), _par_in(1), &m) == 0) { return 0 - 1; }
+        _par_ke_out(&m);
+        _par_got_i(m.scratch_k.len);
+        _par_got_i(m.scratch_eps.len);
+        PvKEpsilon_drop(&m);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KEpsilon::turbulent_viscosity") == 1 || _par_eq(fp, fl, "KEpsilon::step") == 1) {
+        var ke: PvKEpsilon;
+        var k = _par_ke_in(0, &ke);
+        if (k < 0) { return 0 - 1; }
+        if (_par_eq(fp, fl, "KEpsilon::turbulent_viscosity") == 1) {
+            _par_got_seq(ke.k.len);
+            for (var i = 0; i < ke.k.len; i = i + 1) {
+                var nu: f64 = ke.turbulent_viscosity(i);
+                _par_got_f(_pv_bits(nu));
+            }
+        } else {
+            var vx: PvColumn;
+            var vy: PvColumn;
+            var k1 = _par_vcol_in(k, &vx);
+            if (k1 < 0) { return 0 - 1; }
+            var k2 = _par_vcol_in(k1, &vy);
+            if (k2 < 0) { return 0 - 1; }
+            var steps = _par_in(k2 + 4);
+            for (var s = 0; s < steps; s = s + 1) {
+                var r = ke.step(vx.data, vx.len, vy.data, vy.len, _par_in(k2), _par_in(k2 + 1), _par_in(k2 + 2),
+                  _par_in(k2 + 3));
+            }
+            _par_ke_out(&ke);
+            _par_got_i(ke.scratch_k.len);
+            _par_got_i(ke.scratch_eps.len);
+            vx.drop();
+            vy.drop();
+        }
+        PvKEpsilon_drop(&ke);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "apply_ghost_fluid") == 1) {
+        var pc: PvColumn;
+        var lc: PvColumn;
+        var a1 = _par_vcol_in(0, &pc);
+        if (a1 < 0) { return 0 - 1; }
+        var a2 = _par_vcol_in(a1, &lc);
+        if (a2 < 0) { return 0 - 1; }
+        var ok = apply_ghost_fluid(pc.data, pc.len, lc.data, lc.len, _par_in(a2), _par_in(a2 + 1), _par_in(a2 + 2),
+          _par_in(a2 + 3));
+        _par_col_out(&pc);
+        pc.drop();
+        lc.drop();
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MacGrid::new") == 1) {
+        var g: PvMacGrid;
+        var t, v = PvMacGrid_new(_par_in(0), _par_in(1), _par_in(2), &g);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_i(g.nx);
+        _par_got_i(g.ny);
+        _par_got_f(_pv_bits(g.dx));
+        for (var c = 0; c < 4; c = c + 1) {
+            var col: *PvColumn = _pv_mac_col(&g, c);
+            _par_got_i(col.len);
+            _par_got_f(load64(col.data));
+        }
+        _par_got_i(g.scratch_div.len);
+        _par_got_i(g.scratch_density.len);
+        PvMacGrid_drop(&g);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MacGrid::from_json") == 1 || _par_eq(fp, fl, "KEpsilon::from_json") == 1) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var dl = strlen(doc);
+        var sb = str_builder_new();
+        if (_par_eq(fp, fl, "KEpsilon::from_json") == 1) {
+            var m1: PvKEpsilon;
+            var tk, vk = PvKEpsilon_from_json(doc, dl, &m1);
+            if (is_err_result(tk) == 1) { _par_got_err(vk); return 1; }
+            _par_ke_out(&m1);
+            if (m1.to_json(sb) != 0) { return 0 - 1; }
+            var dk, nk = _par_sb_text(sb);
+            var m2: PvKEpsilon;
+            var tk2, vk2 = PvKEpsilon_from_json(dk, nk, &m2);
+            if (is_err_result(tk2) == 1) { return 0 - 1; }
+            if (_par_col_same(_pv_ke_col(&m1, 0), _pv_ke_col(&m2, 0)) == 0) { return 0 - 1; }
+            if (_par_col_same(_pv_ke_col(&m1, 1), _pv_ke_col(&m2, 1)) == 0) { return 0 - 1; }
+            if (memeq(&m1 + 48, &m2 + 48, 24) != 1) { return 0 - 1; }
+            PvKEpsilon_drop(&m1);
+            PvKEpsilon_drop(&m2);
+            return 1;
+        }
+        var g1: PvMacGrid;
+        var tm, vm = PvMacGrid_from_json(doc, dl, &g1);
+        if (is_err_result(tm) == 1) { _par_got_err(vm); return 1; }
+        _par_mac_out(&g1);
+        if (g1.to_json(sb) != 0) { return 0 - 1; }
+        var dm, nm = _par_sb_text(sb);
+        var g2: PvMacGrid;
+        var tm2, vm2 = PvMacGrid_from_json(dm, nm, &g2);
+        if (is_err_result(tm2) == 1 || memeq(&g1, &g2, 24) != 1) { return 0 - 1; }
+        for (var c3 = 0; c3 < 4; c3 = c3 + 1) {
+            if (_par_col_same(_pv_mac_col(&g1, c3), _pv_mac_col(&g2, c3)) == 0) { return 0 - 1; }
+        }
+        PvMacGrid_drop(&g1);
+        PvMacGrid_drop(&g2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MacGrid::velocity_at") == 0 && _par_eq(fp, fl, "MacGrid::divergence_at") == 0
+      && _par_eq(fp, fl, "MacGrid::max_speed") == 0 && _par_eq(fp, fl, "MacGrid::cfl_dt") == 0
+      && _par_eq(fp, fl, "MacGrid::step") == 0) {
+        return 0;
+    }
+    # The MAC rows that start with a state.
+    var mg: PvMacGrid;
+    var ks = _par_mac_in(0, &mg);
+    if (ks < 0) { return 0 - 1; }
+    var n = mg.nx * mg.ny;
+    if (_par_eq(fp, fl, "MacGrid::velocity_at") == 1) {
+        _par_got_seq(2 * n);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var u, w = mg.velocity_at(i2 % mg.nx, i2 / mg.nx);
+            var uf: f64 = u;
+            var wf: f64 = w;
+            _par_got_f(_pv_bits(uf));
+            _par_got_f(_pv_bits(wf));
+        }
+    } elif (_par_eq(fp, fl, "MacGrid::divergence_at") == 1) {
+        _par_got_seq(n);
+        for (var i3 = 0; i3 < n; i3 = i3 + 1) {
+            var dv: f64 = mg.divergence_at(i3 % mg.nx, i3 / mg.nx);
+            _par_got_f(_pv_bits(dv));
+        }
+    } elif (_par_eq(fp, fl, "MacGrid::max_speed") == 1) {
+        var ms: f64 = mg.max_speed();
+        _par_got_f(_pv_bits(ms));
+    } elif (_par_eq(fp, fl, "MacGrid::cfl_dt") == 1) {
+        var m3 = _par_in(ks);
+        _par_got_seq(m3);
+        for (var j2 = 0; j2 < m3; j2 = j2 + 1) {
+            var cf: f64 = mg.cfl_dt(_par_in(ks + 1 + j2));
+            _par_got_f(_pv_bits(cf));
+        }
+    } else {
+        var cfg: PvGridConfig;
+        _par_gc_in(ks, &cfg);
+        var steps2 = _par_in(ks + 13);
+        var failed = 0;
+        for (var s2 = 0; s2 < steps2; s2 = s2 + 1) {
+            var ts, vs = mg.step(&cfg);
+            if (is_err_result(ts) == 1) {
+                _par_got_err(vs);
+                failed = 1;
+                break;
+            }
+        }
+        if (failed == 0) {
+            _par_mac_out(&mg);
+            _par_got_i(mg.scratch_div.len);
+            _par_got_i(mg.scratch_density.len);
+        }
+    }
+    PvMacGrid_drop(&mg);
+    return 1;
+}
+
 fn _par_grid(fp, fl): i64 {
     if (_par_eq(fp, fl, "FluidGrid::new") == 1) {
         var g: PvFluidGrid;
@@ -1234,7 +1468,11 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
     if (_par_eq(mp, ml, "shallow") == 1) { return _par_shallow(fp, fl); }
-    if (_par_eq(mp, ml, "grid") == 1) { return _par_grid(fp, fl); }
+    if (_par_eq(mp, ml, "grid") == 1) {
+        var rc = _par_grid_c(fp, fl);
+        if (rc != 0) { return rc; }
+        return _par_grid(fp, fl);
+    }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;
 }
@@ -1366,6 +1604,10 @@ fn _par_c_bound(fp, fl): i64 {
     # else is +, −, ×, ÷ in Rust's order, so each row equals the corrected oracle bit for bit (the oracle's own row
     # where glibc rounded every sine and cosine correctly). The DST step rows take the same bound, 0, above.
     if (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1) { return 0; }
+    # M3 part c: the k-ε source step and the MAC step (class S) are +, −, ×, ÷ and the sampler's floor in Rust's
+    # order, so every field is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "KEpsilon::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "MacGrid::step") == 1) { return 0; }
     return 0 - 1;
 }
 

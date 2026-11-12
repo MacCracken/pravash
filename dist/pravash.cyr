@@ -4389,6 +4389,20 @@ impl PvColumn {
     }
 }
 
+# Swaps two column records (their storage, length and capacity), as `std::mem::swap` swaps two Vecs.
+fn _pv_col_swap(a: *PvColumn, b: *PvColumn) {
+    var d = a.data;
+    var l = a.len;
+    var c = a.cap;
+    a.data = b.data;
+    a.len = b.len;
+    a.cap = b.cap;
+    b.data = d;
+    b.len = l;
+    b.cap = c;
+    return 0;
+}
+
 # --- common.cyr ---
 
 # common.cyr — shared fluid types: materials, particles, configuration, the SoA layout and the particle arena
@@ -7959,6 +7973,610 @@ impl PvFluidGrid {
     }
 }
 
+# ── Ghost fluid ─────────────────────────────────────────────────────────────────────
+
+# The ghost-fluid pressure correction at a level-set interface (plen words of pressure at p, llen of the signed
+# distance at ls, negative inside the fluid): at each interior cell where φ changes sign against a 4-neighbour,
+# with g = ((φ_r − φ_l)·0.5·(1/dx), (φ_t − φ_b)·0.5·(1/dx)), |g| = max(√(g_x² + g_y²), 1e-20) and
+# κ = −(((φ_r − 2φ) + φ_l) + ((φ_t − 2φ) + φ_b))·(1/dx)² / |g| (each Laplacian term scaled before the sum), the
+# pressure loses ((σ·κ)·φ)/|g| where φ > 0. 1, or 0 with nothing changed when nx or ny is below 3, nx·ny overflows
+# or isn't both lengths, or dx isn't finite and > 0 (Rust warns and returns). Mirrors `apply_ghost_fluid`.
+fn apply_ghost_fluid(p, plen, ls, llen, nx, ny, dx: f64, surface_tension: f64): i64 {
+    if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
+    if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+    var n = nx * ny;
+    if (plen != n || llen != n) { return 0; }
+    if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return 0; }
+    var inv_dx: f64 = 1.0 / dx;
+    var inv_dx2: f64 = inv_dx * inv_dx;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var q = ls + i * 8;
+            var phi: f64 = load64(q);
+            var phi_r: f64 = load64(q + 8);
+            var phi_l: f64 = load64(q - 8);
+            var phi_t: f64 = load64(q + nx * 8);
+            var phi_b: f64 = load64(q - nx * 8);
+            var cr: f64 = phi * phi_r;
+            var cl: f64 = phi * phi_l;
+            var ct: f64 = phi * phi_t;
+            var cb: f64 = phi * phi_b;
+            if (cr < 0.0 || cl < 0.0 || ct < 0.0 || cb < 0.0) {
+                var gx: f64 = ((phi_r - phi_l) * 0.5) * inv_dx;
+                var gy: f64 = ((phi_t - phi_b) * 0.5) * inv_dx;
+                var gs: f64 = f64_sqrt((gx * gx) + (gy * gy));
+                var g: f64 = _pv_max(gs, tiny);
+                var tp: f64 = 2.0 * phi;
+                var lxx: f64 = ((phi_r - tp) + phi_l) * inv_dx2;
+                var lyy: f64 = ((phi_t - tp) + phi_b) * inv_dx2;
+                var lap: f64 = lxx + lyy;
+                var nl: f64 = -lap;
+                var kappa: f64 = nl / g;
+                if (phi > 0.0) {
+                    var at = p + i * 8;
+                    var p0: f64 = load64(at);
+                    var c: f64 = ((surface_tension * kappa) * phi) / g;
+                    var p1: f64 = p0 - c;
+                    store64(at, _pv_bits(p1));
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+# --- mac_grid.cyr ---
+
+# mac_grid.cyr — the staggered (MAC) grid of rust-old/src/grid.rs (`MacGrid`, M3 part c).
+#
+# vx lives on the x faces ((nx+1) × ny), vy on the y faces (nx × (ny+1)), pressure and density at the cell centres
+# (nx × ny). A step closes the walls, adds buoyancy on the interior y faces, projects with Gauss–Seidel on the
+# Neumann pressure system (mean pinned to 0), and advects the density semi-Lagrangian from the cell centres with
+# `FluidGrid`'s sampler. Every formula is Rust's, in its operation order.
+#
+# The record mirrors the struct: nx, ny, dx, the four public columns, then the two private scratch columns the step
+# reuses (ADR 0002 #13).
+
+struct PvMacGrid {
+    nx;
+    ny;
+    dx: f64;
+    vx: PvColumn;
+    vy: PvColumn;
+    pressure: PvColumn;
+    density: PvColumn;
+    scratch_div: PvColumn;
+    scratch_density: PvColumn;
+}
+
+# Column k of a MAC grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_div, 5 scratch_density), by its byte offset
+# (tests/grid.tcyr pins the layout: nx, ny, dx, then the six columns, 168 bytes).
+#must_use
+fn _pv_mac_col(g, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
+}
+
+# Empties every column of *g without releasing anything (for a record about to be filled).
+fn _pv_mac_zero(g: *PvMacGrid) {
+    for (var k = 0; k < 6; k = k + 1) {
+        var c: *PvColumn = _pv_mac_col(g, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases every column's storage; the grid holds no storage after. Mirrors dropping the `MacGrid`.
+fn PvMacGrid_drop(g: *PvMacGrid) {
+    for (var k = 0; k < 6; k = k + 1) {
+        var c: *PvColumn = _pv_mac_col(g, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# The three sizes of an nx × ny MAC grid (nx, ny ≥ 4 or words ≥ 2^63): (nx·ny, (nx+1)·ny, nx·(ny+1)), or (-1, -1, -1)
+# when one overflows or reaches 2^63 (a size no allocation reaches).
+fn _pv_mac_sizes(nx, ny) {
+    if (nx < 0 || ny < 0) { return (0 - 1, 0 - 1, 0 - 1); }
+    if (_pv_fg_mul_class(nx, ny) != 0) { return (0 - 1, 0 - 1, 0 - 1); }
+    var n = nx * ny;
+    if (n > 0x7FFFFFFFFFFFFFFF - ny || n > 0x7FFFFFFFFFFFFFFF - nx) { return (0 - 1, 0 - 1, 0 - 1); }
+    return (n, n + ny, n + nx);
+}
+
+# A MAC grid of zeros into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx
+# or ny below 4, PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0; PV_ERR_OUT_OF_MEMORY when a size
+# overflows or the fields can't be allocated. Rust doesn't check the products: it panics under overflow checks (the
+# oracle's build), wraps without them, and aborts on an allocation that large (ADR 0002 #13). On an error *out
+# holds no storage. Mirrors `MacGrid::new`.
+#must_use
+fn PvMacGrid_new(nx, ny, dx: f64, out: *PvMacGrid): Result {
+    _pv_mac_zero(out);
+    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
+    if (cn < 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var ok = 1;
+    var c0: *PvColumn = _pv_mac_col(out, 0);
+    ok = ok & c0.resize(vxn, 0);
+    var c1: *PvColumn = _pv_mac_col(out, 1);
+    ok = ok & c1.resize(vyn, 0);
+    for (var k = 2; k < 6; k = k + 1) {
+        var c: *PvColumn = _pv_mac_col(out, k);
+        ok = ok & c.resize(cn, 0);
+    }
+    if (ok == 0) {
+        PvMacGrid_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    return Ok(0);
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `MacGrid::clone`.
+#must_use
+fn PvMacGrid_clone(out: *PvMacGrid, src: *PvMacGrid): i64 {
+    out.nx = src.nx;
+    out.ny = src.ny;
+    out.dx = src.dx;
+    _pv_mac_zero(out);
+    for (var k = 0; k < 6; k = k + 1) {
+        var s: *PvColumn = _pv_mac_col(src, k);
+        var d: *PvColumn = _pv_mac_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvMacGrid_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    return 1;
+}
+
+impl PvMacGrid {
+    # The cell-centre velocity (0.5·(vx_left + vx_right), 0.5·(vy_bottom + vy_top)) at cell (x, y); NaN for a face
+    # outside a field (Rust panics). Read as `var u, v = …` and bind each to an f64 local. Mirrors
+    # `MacGrid::velocity_at`.
+    #must_use
+    fn velocity_at(self, x, y) {
+        var r = y * (self.nx + 1) + x;
+        var a: f64 = self.vx.get_f(r);
+        var b: f64 = self.vx.get_f(r + 1);
+        var c: f64 = self.vy.get_f(y * self.nx + x);
+        var d: f64 = self.vy.get_f((y + 1) * self.nx + x);
+        var u: f64 = 0.5 * (a + b);
+        var v: f64 = 0.5 * (c + d);
+        return (u, v);
+    }
+
+    # The largest cell-centre speed: √ of the max of u² + v² over every cell, folded with Rust's NaN-ignoring max
+    # from +0 (a face outside a field reads NaN, ignored, where Rust panics). Mirrors `MacGrid::max_speed`.
+    #must_use
+    fn max_speed(self): f64 {
+        var m: f64 = 0.0;
+        for (var y = 0; y < self.ny; y = y + 1) {
+            for (var x = 0; x < self.nx; x = x + 1) {
+                var u, v = self.velocity_at(x, y);
+                var uf: f64 = u;
+                var vf: f64 = v;
+                var q: f64 = (uf * uf) + (vf * vf);
+                if (q >= m || m != m) { m = q; }
+            }
+        }
+        var s: f64 = f64_sqrt(m);
+        return s;
+    }
+
+    # The divergence ((vx_right − vx_left) + (vy_top − vy_bottom))·(1/dx) at cell (x, y), exact on the staggered
+    # layout; NaN for a face outside a field. Mirrors `MacGrid::divergence_at`.
+    #must_use
+    fn divergence_at(self, x, y): f64 {
+        var inv_dx: f64 = 1.0 / self.dx;
+        var r = y * (self.nx + 1) + x;
+        var a: f64 = self.vx.get_f(r + 1);
+        var b: f64 = self.vx.get_f(r);
+        var c: f64 = self.vy.get_f((y + 1) * self.nx + x);
+        var d: f64 = self.vy.get_f(y * self.nx + x);
+        var s: f64 = (a - b) + (c - d);
+        var w: f64 = s * inv_dx;
+        return w;
+    }
+
+    # The CFL time step (cfl_factor·dx)/v_max, or f64::MAX when v_max < 1e-20 (no flow, no advective limit).
+    # Mirrors `MacGrid::cfl_dt`.
+    #must_use
+    fn cfl_dt(self, cfl_factor: f64): f64 {
+        var max_v: f64 = self.max_speed();
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        if (max_v < tiny) {
+            var big: f64 = PV_F64_MAX;
+            return big;
+        }
+        var a: f64 = cfl_factor * self.dx;
+        var r: f64 = a / max_v;
+        return r;
+    }
+
+    # One step by `config` (only dt, pressure_iterations, buoyancy_alpha and ambient_density are read):
+    # - the walls: the normal velocity on the domain's boundary faces set to 0;
+    # - buoyancy: each interior y face gains (alpha·(ρ_face − ambient))·dt, ρ_face the mean of its two cells;
+    # - the projection: rhs = −((vx_r − vx_l) + (vy_t − vy_b))·dx per cell, `pressure_iterations` Gauss–Seidel
+    #   sweeps of p = (rhs + Σ neighbours)/count over the in-domain neighbours (Neumann walls), each sum from +0
+    #   in the order left, right, below, above; the mean (summed from −0) subtracted; the interior faces then lose
+    #   the pressure difference × 1/dx;
+    # - the density advected from each cell centre back along (dt/dx)·(u, v), by `FluidGrid`'s bilinear sampler.
+    # Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0),
+    # PV_ERR_INVALID_PARAMETER (no pressure iterations; buoyancy_alpha or ambient_density not finite),
+    # PV_ERR_INVALID_GRID_RESOLUTION (nx or ny below 4, a size overflowing, a field of the wrong length),
+    # PV_ERR_INVALID_PARAMETER (a cell size not finite and > 0), PV_ERR_DIVERGED (a non-finite velocity or density
+    # after the step, which the state then holds, as Rust's does), PV_ERR_OUT_OF_MEMORY (the scratch can't grow,
+    # checked before anything changes; Rust aborts). Mirrors `MacGrid::step`.
+    #must_use
+    fn step(self, config: *PvGridConfig): Result {
+        var dt: f64 = config.dt;
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (config.pressure_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var alpha: f64 = config.buoyancy_alpha;
+        var amb: f64 = config.ambient_density;
+        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(amb) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var nx = self.nx;
+        var ny = self.ny;
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
+        if (cn < 0) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (self.vx.len != vxn || self.vy.len != vyn || self.pressure.len != cn || self.density.len != cn) {
+            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
+        var dx: f64 = self.dx;
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var sdiv: *PvColumn = _pv_mac_col(self, 4);
+        var sden: *PvColumn = _pv_mac_col(self, 5);
+        if (sdiv.resize(cn, 0) == 0 || sden.resize(cn, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var inv_dx: f64 = 1.0 / dx;
+        var u = self.vx.data;
+        var v = self.vy.data;
+        var p = self.pressure.data;
+        var rho = self.density.data;
+        var nx1 = nx + 1;
+
+        # 0. The walls.
+        for (var y = 0; y < ny; y = y + 1) {
+            store64(u + (y * nx1) * 8, 0);
+            store64(u + (y * nx1 + nx) * 8, 0);
+        }
+        for (var x = 0; x < nx; x = x + 1) {
+            store64(v + x * 8, 0);
+            store64(v + (ny * nx + x) * 8, 0);
+        }
+
+        # 1. Buoyancy on the interior y faces.
+        if (alpha != 0.0) {
+            for (var by = 1; by < ny; by = by + 1) {
+                for (var bx = 0; bx < nx; bx = bx + 1) {
+                    var r0: f64 = load64(rho + ((by - 1) * nx + bx) * 8);
+                    var r1: f64 = load64(rho + (by * nx + bx) * 8);
+                    var rf: f64 = 0.5 * (r0 + r1);
+                    var at = v + (by * nx + bx) * 8;
+                    var w0: f64 = load64(at);
+                    var w1: f64 = w0 + ((alpha * (rf - amb)) * dt);
+                    store64(at, _pv_bits(w1));
+                }
+            }
+        }
+
+        # 2. The projection.
+        var rhs = sdiv.data;
+        for (var ry = 0; ry < ny; ry = ry + 1) {
+            for (var rx = 0; rx < nx; rx = rx + 1) {
+                var ul: f64 = load64(u + (ry * nx1 + rx) * 8);
+                var ur: f64 = load64(u + (ry * nx1 + rx + 1) * 8);
+                var vb: f64 = load64(v + (ry * nx + rx) * 8);
+                var vt: f64 = load64(v + ((ry + 1) * nx + rx) * 8);
+                var fl: f64 = (ur - ul) + (vt - vb);
+                var nf: f64 = -fl;
+                var rv: f64 = nf * dx;
+                store64(rhs + (ry * nx + rx) * 8, _pv_bits(rv));
+            }
+        }
+        for (var it = 0; it < config.pressure_iterations; it = it + 1) {
+            for (var gy = 0; gy < ny; gy = gy + 1) {
+                for (var gx = 0; gx < nx; gx = gx + 1) {
+                    var i = gy * nx + gx;
+                    var q = p + i * 8;
+                    var sum: f64 = 0.0;
+                    var count: f64 = 0.0;
+                    if (gx > 0) {
+                        var pl: f64 = load64(q - 8);
+                        sum = sum + pl;
+                        count = count + 1.0;
+                    }
+                    if (gx + 1 < nx) {
+                        var pr: f64 = load64(q + 8);
+                        sum = sum + pr;
+                        count = count + 1.0;
+                    }
+                    if (gy > 0) {
+                        var pb: f64 = load64(q - nx * 8);
+                        sum = sum + pb;
+                        count = count + 1.0;
+                    }
+                    if (gy + 1 < ny) {
+                        var pt: f64 = load64(q + nx * 8);
+                        sum = sum + pt;
+                        count = count + 1.0;
+                    }
+                    var b: f64 = load64(rhs + i * 8);
+                    var pn: f64 = (b + sum) / count;
+                    store64(q, _pv_bits(pn));
+                }
+            }
+        }
+        var total: f64 = 0x8000000000000000;
+        for (var j = 0; j < cn; j = j + 1) {
+            var pj: f64 = load64(p + j * 8);
+            total = total + pj;
+        }
+        var cnf: f64 = f64_from(cn);
+        var mean: f64 = total / cnf;
+        for (var j2 = 0; j2 < cn; j2 = j2 + 1) {
+            var pk: f64 = load64(p + j2 * 8);
+            var pm: f64 = pk - mean;
+            store64(p + j2 * 8, _pv_bits(pm));
+        }
+        for (var fy = 0; fy < ny; fy = fy + 1) {
+            for (var fx = 1; fx < nx; fx = fx + 1) {
+                var at2 = u + (fy * nx1 + fx) * 8;
+                var pa: f64 = load64(p + (fy * nx + fx) * 8);
+                var pb2: f64 = load64(p + (fy * nx + fx - 1) * 8);
+                var u0: f64 = load64(at2);
+                var u1: f64 = u0 - ((pa - pb2) * inv_dx);
+                store64(at2, _pv_bits(u1));
+            }
+        }
+        for (var hy = 1; hy < ny; hy = hy + 1) {
+            for (var hx = 0; hx < nx; hx = hx + 1) {
+                var at3 = v + (hy * nx + hx) * 8;
+                var pc: f64 = load64(p + (hy * nx + hx) * 8);
+                var pd: f64 = load64(p + ((hy - 1) * nx + hx) * 8);
+                var v0: f64 = load64(at3);
+                var v1: f64 = v0 - ((pc - pd) * inv_dx);
+                store64(at3, _pv_bits(v1));
+            }
+        }
+
+        # 3. The density, advected from the cell centres.
+        var adv = sden.data;
+        var dt_inv_dx: f64 = dt * inv_dx;
+        for (var ay = 0; ay < ny; ay = ay + 1) {
+            var ayf: f64 = f64_from(ay);
+            for (var ax = 0; ax < nx; ax = ax + 1) {
+                var a0: f64 = load64(u + (ay * nx1 + ax) * 8);
+                var a1: f64 = load64(u + (ay * nx1 + ax + 1) * 8);
+                var c0: f64 = load64(v + (ay * nx + ax) * 8);
+                var c1: f64 = load64(v + ((ay + 1) * nx + ax) * 8);
+                var cu: f64 = 0.5 * (a0 + a1);
+                var cv: f64 = 0.5 * (c0 + c1);
+                var axf: f64 = f64_from(ax);
+                var sx: f64 = axf - (dt_inv_dx * cu);
+                var sy: f64 = ayf - (dt_inv_dx * cv);
+                var s: f64 = _pv_fg_sample(rho, nx, ny, sx, sy);
+                store64(adv + (ay * nx + ax) * 8, _pv_bits(s));
+            }
+        }
+        _pv_col_swap(_pv_mac_col(self, 3), sden);
+        if (_pv_fg_any_bad(u, vxn, 1) == 1 || _pv_fg_any_bad(v, vyn, 1) == 1
+          || _pv_fg_any_bad(self.density.data, cn, 1) == 1) {
+            return Err(PV_ERR_DIVERGED);
+        }
+        return Ok(0);
+    }
+}
+
+# --- k_epsilon.cyr ---
+
+# k_epsilon.cyr — the k-ε turbulence model of rust-old/src/grid.rs (`KEpsilon`, M3 part c).
+#
+# A two-equation RANS state per cell: k, the turbulent kinetic energy, and ε, its dissipation rate, with the
+# turbulent viscosity ν_t = C_μ·k²/ε. `step` integrates the production and dissipation source terms only, as
+# 1.3.0 does (no advection or diffusion of k and ε). Every formula is Rust's, in its operation order.
+#
+# The record mirrors the struct: the public k and ε columns and constants, then the two private scratch columns
+# `step` swaps through. `PvKEpsilon_new` returns 1 or 0 where Rust's `new` returns `Self` (ADR 0002 #8, #9), and
+# `step` returns 1, or 0 where Rust warns and returns (ADR 0002 #13).
+
+struct PvKEpsilon {
+    k: PvColumn;
+    epsilon: PvColumn;
+    c_mu: f64;
+    c_eps1: f64;
+    c_eps2: f64;
+    scratch_k: PvColumn;
+    scratch_eps: PvColumn;
+}
+
+# Column j of a model (0 k, 1 epsilon, 2 scratch_k, 3 scratch_eps), by its byte offset: k and ε at 0 and 24, the
+# three constants at 48 … 64, the scratch at 72 and 96 (tests/grid.tcyr pins the layout, 120 bytes).
+#must_use
+fn _pv_ke_col(m, j): *PvColumn {
+    if (j < 2) { return _pv_as_columns(_pv_addr(m) + j * 24); }
+    return _pv_as_columns(_pv_addr(m) + 72 + (j - 2) * 24);
+}
+
+# Empties every column of *m without releasing anything (for a record about to be filled).
+fn _pv_ke_zero(m: *PvKEpsilon) {
+    for (var j = 0; j < 4; j = j + 1) {
+        var c: *PvColumn = _pv_ke_col(m, j);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases every column's storage; the model holds no storage after. Mirrors dropping the `KEpsilon`.
+fn PvKEpsilon_drop(m: *PvKEpsilon) {
+    for (var j = 0; j < 4; j = j + 1) {
+        var c: *PvColumn = _pv_ke_col(m, j);
+        c.drop();
+    }
+    return 0;
+}
+
+# The model for an nx × ny grid into *out: k = 1e-4 and ε = 1e-5 in every cell, C_μ = 0.09, C_ε1 = 1.44,
+# C_ε2 = 1.92, the scratch nx·ny zeros. 1, or 0 when nx·ny overflows or is a size no allocation reaches, or the
+# memory isn't there; *out then holds no storage. Rust doesn't check the product: it panics under overflow checks
+# (the oracle's build), wraps without them, and aborts on an allocation that large (ADR 0002 #13). Mirrors
+# `KEpsilon::new`.
+#must_use
+fn PvKEpsilon_new(nx, ny, out: *PvKEpsilon): i64 {
+    _pv_ke_zero(out);
+    var n = 0;
+    if (nx != 0 && ny != 0) {
+        if (nx < 0 || ny < 0) { return 0; }
+        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+        n = nx * ny;
+    }
+    var ok = 1;
+    var k: *PvColumn = _pv_ke_col(out, 0);
+    ok = ok & k.resize(n, 0x3F1A36E2EB1C432D);              # 1e-4
+    var e: *PvColumn = _pv_ke_col(out, 1);
+    ok = ok & e.resize(n, 0x3EE4F8B588E368F1);              # 1e-5
+    for (var j = 2; j < 4; j = j + 1) {
+        var s: *PvColumn = _pv_ke_col(out, j);
+        ok = ok & s.resize(n, 0);
+    }
+    if (ok == 0) {
+        PvKEpsilon_drop(out);
+        return 0;
+    }
+    var c_mu: f64 = 0x3FB70A3D70A3D70A;    # 0.09
+    var c1: f64 = 0x3FF70A3D70A3D70A;      # 1.44
+    var c2: f64 = 0x3FFEB851EB851EB8;      # 1.92
+    out.c_mu = c_mu;
+    out.c_eps1 = c1;
+    out.c_eps2 = c2;
+    return 1;
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `KEpsilon::clone`.
+#must_use
+fn PvKEpsilon_clone(out: *PvKEpsilon, src: *PvKEpsilon): i64 {
+    _pv_ke_zero(out);
+    out.c_mu = src.c_mu;
+    out.c_eps1 = src.c_eps1;
+    out.c_eps2 = src.c_eps2;
+    for (var j = 0; j < 4; j = j + 1) {
+        var s: *PvColumn = _pv_ke_col(src, j);
+        var d: *PvColumn = _pv_ke_col(out, j);
+        if (d.resize(s.len, 0) == 0) {
+            PvKEpsilon_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    return 1;
+}
+
+impl PvKEpsilon {
+    # ν_t = ((C_μ·k)·k)/max(ε, 1e-20) at cell i; NaN for an index outside k or ε (Rust panics). Mirrors
+    # `KEpsilon::turbulent_viscosity`.
+    #must_use
+    fn turbulent_viscosity(self, i): f64 {
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var k: f64 = self.k.get_f(i);
+        var e: f64 = self.epsilon.get_f(i);
+        var a: f64 = (self.c_mu * k) * k;
+        var d: f64 = _pv_max(e, tiny);
+        var r: f64 = a / d;
+        return r;
+    }
+
+    # One step of the source terms from the velocity field (vx_len and vy_len words at vx and vy, an nx × ny
+    # grid, cell size dx, time step dt). On the interior, from the old k and ε:
+    #   ν_t = ((C_μ·k)·k)/max(ε, 1e-20), |S|² = 2·((u_x² + v_y²) + 0.5·(u_y + v_x)²) by central differences,
+    #   P = ν_t·|S|², k ← max(k + (P − ε)·dt, 1e-10),
+    #   ε ← max(ε + (((C_ε1·P) − (C_ε2·ε))·(ε/max(k, 1e-10)))·dt, 1e-10);
+    # the ring keeps its values. The scratch columns end holding the old k and ε (Rust swaps the Vecs). 1, or 0
+    # with nothing changed when nx or ny is below 3, nx·ny overflows, a length isn't nx·ny, dx or dt isn't finite
+    # and > 0 (Rust warns and returns), or the scratch can't grow. Mirrors `KEpsilon::step`.
+    fn step(self, vx, vx_len, vy, vy_len, nx, ny, dx: f64, dt: f64): i64 {
+        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
+        if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+        var n = nx * ny;
+        if (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n) { return 0; }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
+        var inv_2dx: f64 = 0.5 / dx;
+        var sk: *PvColumn = _pv_ke_col(self, 2);
+        var se: *PvColumn = _pv_ke_col(self, 3);
+        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { return 0; }
+        var kc: *PvColumn = _pv_ke_col(self, 0);
+        var ec: *PvColumn = _pv_ke_col(self, 1);
+        _pv_col_swap(kc, sk);
+        _pv_col_swap(ec, se);
+        kc.copy_from(sk);
+        ec.copy_from(se);
+        var ko = sk.data;
+        var eo = se.data;
+        var kn = kc.data;
+        var en = ec.data;
+        var c_mu: f64 = self.c_mu;
+        var c1: f64 = self.c_eps1;
+        var c2: f64 = self.c_eps2;
+        # The three maxes are written out. Each is `x.max(floor)` with a positive constant floor: x when x > floor,
+        # else the floor (a NaN x included), the bits of Rust's max. As `_pv_max` calls they made the step 1.21×
+        # slower (pinned A/B, port-parity §12).
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = 0x3DDB7CDFD9D7BDBB;     # 1e-10
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var k0: f64 = load64(ko + i * 8);
+                var e0: f64 = load64(eo + i * 8);
+                var ed: f64 = tiny;
+                if (e0 > tiny) { ed = e0; }
+                var nu_t: f64 = ((c_mu * k0) * k0) / ed;
+                var pu = vx + i * 8;
+                var pv = vy + i * 8;
+                var ur: f64 = load64(pu + 8);
+                var ul: f64 = load64(pu - 8);
+                var uu: f64 = load64(pu + nx * 8);
+                var ud: f64 = load64(pu - nx * 8);
+                var vr: f64 = load64(pv + 8);
+                var vl: f64 = load64(pv - 8);
+                var vu: f64 = load64(pv + nx * 8);
+                var vd: f64 = load64(pv - nx * 8);
+                var dudx: f64 = (ur - ul) * inv_2dx;
+                var dudy: f64 = (uu - ud) * inv_2dx;
+                var dvdx: f64 = (vr - vl) * inv_2dx;
+                var dvdy: f64 = (vu - vd) * inv_2dx;
+                var sh: f64 = dudy + dvdx;
+                var s_mag_sq: f64 = 2.0 * (((dudx * dudx) + (dvdy * dvdy)) + (0.5 * (sh * sh)));
+                var prod: f64 = nu_t * s_mag_sq;
+                var k1: f64 = k0 + ((prod - e0) * dt);
+                var k2: f64 = lo;
+                if (k1 > lo) { k2 = k1; }
+                store64(kn + i * 8, _pv_bits(k2));
+                var kd: f64 = lo;
+                if (k0 > lo) { kd = k0; }
+                var eok: f64 = e0 / kd;
+                var src: f64 = (c1 * prod) - (c2 * e0);
+                var e1: f64 = e0 + ((src * eok) * dt);
+                var e2: f64 = lo;
+                if (e1 > lo) { e2 = e1; }
+                store64(en + i * 8, _pv_bits(e2));
+            }
+        }
+        return 1;
+    }
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust
@@ -8739,5 +9357,117 @@ fn PvFluidGrid_from_json(buf, len, out: *PvFluidGrid): Result {
     out.ny = load64(&w + 8);
     var dx: f64 = load64(&w + 16);
     out.dx = dx;
+    return Ok(0);
+}
+
+# ── grid (M3 part c): MacGrid, KEpsilon ───────────────────────────────────────────────
+
+impl PvMacGrid {
+    # Appends the grid as serde_json writes a `MacGrid` (the scratch skipped): 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        for (var k = 0; k < 4; k = k + 1) {
+            rc = rc | _pv_jw_key(sb, _pv_fg_field(k + 3), 0);
+            rc = rc | _pv_jw_col(sb, _pv_mac_col(self, k), 0);
+        }
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `MacGrid` document into *out, a fresh grid with empty scratch (as serde's skipped fields default),
+# released with `PvMacGrid_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The field
+# lengths are the document's (`step` refuses an inconsistent grid).
+#must_use
+fn PvMacGrid_from_json(buf, len, out: *PvMacGrid): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 7);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_mac_zero(out);
+    for (var c = 0; c < 4; c = c + 1) {
+        if (_pv_jr_col(_pv_jr_at(v, f, c + 3, _pv_fg_field(c + 3)), _pv_mac_col(out, c), 0) == 0) {
+            PvMacGrid_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    out.dx = dx;
+    return Ok(0);
+}
+
+# The serde field name of a `KEpsilon` field k (0 k, 1 epsilon, 2 c_mu, 3 c_eps1, 4 c_eps2).
+#must_use
+fn _pv_ke_field(k): i64 {
+    match k {
+        0 => { return "k"; }
+        1 => { return "epsilon"; }
+        2 => { return "c_mu"; }
+        3 => { return "c_eps1"; }
+        _ => { return "c_eps2"; }
+    }
+    return "c_eps2";
+}
+
+impl PvKEpsilon {
+    # Appends the model as serde_json writes a `KEpsilon` (the scratch skipped): 0, or -1 when the builder can't
+    # grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "k", 1);
+        rc = rc | _pv_jw_col(sb, _pv_ke_col(self, 0), 0);
+        rc = rc | _pv_jw_key(sb, "epsilon", 0);
+        rc = rc | _pv_jw_col(sb, _pv_ke_col(self, 1), 0);
+        rc = rc | _pv_jw_key(sb, "c_mu", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_mu);
+        rc = rc | _pv_jw_key(sb, "c_eps1", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_eps1);
+        rc = rc | _pv_jw_key(sb, "c_eps2", 0);
+        rc = rc | _pv_jw_f64(sb, self.c_eps2);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `KEpsilon` document into *out, with empty scratch (as serde's skipped fields default), released with
+# `PvKEpsilon_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The k and ε lengths are the
+# document's (`step` refuses ones that aren't the grid's).
+#must_use
+fn PvKEpsilon_from_json(buf, len, out: *PvKEpsilon): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 5);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_f64(_pv_jr_at(v, f, 2, "c_mu"), &w);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "c_eps1"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "c_eps2"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_ke_zero(out);
+    for (var c = 0; c < 2; c = c + 1) {
+        if (_pv_jr_col(_pv_jr_at(v, f, c, _pv_ke_field(c)), _pv_ke_col(out, c), 0) == 0) {
+            PvKEpsilon_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    var a: f64 = load64(&w);
+    var b: f64 = load64(&w + 8);
+    var c2: f64 = load64(&w + 16);
+    out.c_mu = a;
+    out.c_eps1 = b;
+    out.c_eps2 = c2;
     return Ok(0);
 }

@@ -1,4 +1,5 @@
-//! `grid.tsv` — `rust-old/src/grid.rs`, `FluidGrid` (M3 part a).
+//! `grid.tsv` — `rust-old/src/grid.rs`, `FluidGrid` (M3 parts a and b). Part c's rows (`KEpsilon`,
+//! `apply_ghost_fluid`, `MacGrid`) are in `m_grid_c.rs`, appended to the same module.
 //!
 //! A state is `i:` nx, `i:` ny, dx, then `v:<n>` vx, vy, pressure and density (each with its own length, as Rust's
 //! public Vecs may have). The scratch buffers are not part of it: `step` resizes them and writes each before reading
@@ -43,16 +44,16 @@ use crate::grids::{Rng, specials};
 use crate::tsv::{Class, Module, Tok, b, e, err, f, i, s};
 
 /// A usize as its 64-bit word (two's complement): usize::MAX is `i:-1`, as a Cyrius word holds it.
-fn usz(x: usize) -> Tok {
+pub fn usz(x: usize) -> Tok {
     i(i64::from_ne_bytes(x.to_ne_bytes()))
 }
 
-fn col(out: &mut Vec<Tok>, v: &[f64]) {
+pub fn col(out: &mut Vec<Tok>, v: &[f64]) {
     out.push(Tok::V(v.len()));
     out.extend(v.iter().map(|&x| f(x)));
 }
 
-fn fx(x: usize) -> f64 {
+pub fn fx(x: usize) -> f64 {
     f64::from(u32::try_from(x).unwrap_or(0))
 }
 
@@ -1031,5 +1032,7 @@ pub fn emit() -> Module {
     let mut rng = Rng::new(0x6_72b);
     transform_rows(&mut m, &mut rng);
     step_rows_b(&mut m, &mut rng);
+    // Part c's: KEpsilon, apply_ghost_fluid, MacGrid (m_grid_c.rs).
+    crate::m_grid_c::rows(&mut m);
     m
 }
