@@ -3,6 +3,32 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M4 part a): `src/sph_kernels.cyr`.
+  - **The kernels:** `kernel_poly6`, `kernel_spiky_grad`, `kernel_viscosity_laplacian`, `kernel_wendland_c2`,
+    `_c2_grad`, `_c4` and `_c4_grad`, with `PvKernelCoeffs` (the private `KernelCoeffs`).
+  - **The equations of state:** `equation_of_state` and `equation_of_state_tait` (the γ → 0 `ln` limit included).
+  - **The non-Newtonian viscosity models,** the first data-carrying enum (ADR 0002 #15): `PvNonNewtonianViscosity`,
+    `PvNonNewtonianModel` and its constructors, and `non_newtonian_viscosity_effective_viscosity`.
+  - **`batch_poly6`, `batch_distance_squared`, `total_kinetic_energy` and `max_speed`.**
+  - **Private constants, generated:** `scripts/oracle/src/t_private.rs` writes `src/constants_private.cyr` from each
+    private `const`'s Rust literal (`_PV_SPH_MIN_DENSITY`, `_PV_GRID_MIN_SIZE`, …). It fails on any unlisted one,
+    and `probe_tables.py` compiles each against its literal. The grid's hand-typed 4s became `_PV_GRID_MIN_SIZE`.
+  - **Parity:** a new golden module, `sph.tsv`, 804 rows, bit-exact on the first replay.
+    - It includes 471 Tait rows (12 at arguments where glibc misrounds pow or ln) and 22 viscosity-model rows.
+    - `validate.py` transcribes part a and writes the corrected oracle `sph.cr.tsv` (16 rows). The port matches
+      every one.
+  - **Tests:** 22 Rust tests in `tests/sph.tcyr`. Surface parity adds `sph`, with the rest of it listed as pending
+    by part.
+
+### Performance
+- **The SPH kernels** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M4 part a; against
+  Rust's criterion `sph_kernels` group and a twin for the rest).
+  - poly6 21 ns (Rust 2.03 ns), the classic kernels 10–10.5×, Wendland 8–9×.
+  - Tait 52× and the power law 27×: the correctly rounded `pow` (L1).
+  - Each public kernel computing only its own coefficient made the classic kernels 1.30–1.78× faster with the rows
+    unchanged.
+
+### Added (Cyrius)
 - **The worker pool and the grid's thread count** (M3 part e, which completes M3; port plan D6).
   - **`src/par.cyr`:** `PvPool_new`, `PvPool_drop` and `_pv_par_for`.
     - The caller plus T − 1 persistent workers on `thread_create` and `chan_*`, each running one contiguous slice of

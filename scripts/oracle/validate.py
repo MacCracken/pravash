@@ -2867,6 +2867,153 @@ def check_phase_field(rows):
     return counts
 
 
+# ── sph (M4) ────────────────────────────────────────────────────────────────────────────────
+
+SPH_MIN_DENSITY = 1e-10   # sph.rs `MIN_DENSITY` (src/constants_private.cyr)
+
+
+def kc_new(h):
+    """sph.rs's private `KernelCoeffs::new`: (h, h², poly6, spiky_grad, visc_lap)."""
+    h2 = h * h
+    h3 = h2 * h
+    h6 = h3 * h3
+    h9 = h6 * h3
+    return (h, h2, fdiv(315.0, 64.0 * PI * h9), fdiv(-45.0, PI * h6), fdiv(45.0, PI * h6))
+
+
+def kc_poly6(kc, r2):
+    if r2 > kc[1]:
+        return 0.0
+    d = kc[1] - r2
+    return kc[2] * d * d * d
+
+
+def sph_kernel(name, r, h):
+    """The seven public kernels, in Rust's operation order."""
+    if name in ("kernel_poly6", "kernel_spiky_grad", "kernel_viscosity_laplacian"):
+        if name == "kernel_poly6" and r < 0.0:
+            return 0.0
+        if not h > 0.0:
+            return 0.0
+        kc = kc_new(h)
+        if name == "kernel_poly6":
+            return kc_poly6(kc, r * r)
+        if r > kc[0] or r <= 0.0:
+            return 0.0
+        d = kc[0] - r
+        return kc[3] * d * d if name == "kernel_spiky_grad" else kc[4] * d
+    q = fdiv(r, h)
+    grad = name.endswith("_grad")
+    if grad:
+        if q >= 2.0 or q <= 0.0:
+            return 0.0
+    elif not (q >= 0.0 and q < 2.0):
+        return 0.0
+    t = 1.0 - 0.5 * q
+    c2 = name.startswith("kernel_wendland_c2")
+    sigma = fdiv(7.0 if c2 else 9.0, 4.0 * PI * h * h)
+    if c2:
+        if grad:
+            return fdiv(sigma * (-5.0 * q) * t * t * t, h)
+        return sigma * t * t * t * t * (1.0 + 2.0 * q)
+    g = 1.0 + 3.0 * q + 35.0 / 12.0 * q * q
+    if grad:
+        t5 = t * t * t * t * t
+        gp = 3.0 + 35.0 / 6.0 * q
+        return fdiv(sigma * (t5 * (-3.0 * g + t * gp)), h)
+    t6 = t * t * t * t * t * t
+    return sigma * t6 * g
+
+
+def eos_tait(d, r0, c, g, P):
+    """`equation_of_state_tait`, with ln and pow from P (glibc for the record, MPFR for the corrected oracle)."""
+    rho0 = r_max(r0, SPH_MIN_DENSITY)
+    c2 = c * c
+    x = fdiv(d, rho0)
+    if abs(g) < 1e-12:
+        return r0 * c2 * P["log"](x)
+    b = fdiv(r0 * c2, g)
+    return b * (P["pow"](x, g) - 1.0)
+
+
+def nn_viscosity(kind, k, n, ty, mu_p, rate, P):
+    """`NonNewtonianViscosity::effective_viscosity`, pow from P."""
+    sr = r_max(rate, 1e-10)
+    if kind == "PowerLaw":
+        return k * P["pow"](sr, n - 1.0)
+    if kind == "Bingham":
+        return r_min(mu_p + fdiv(ty, sr), 1e6 * mu_p)
+    return r_min(k * P["pow"](sr, n - 1.0) + fdiv(ty, sr), 1e6 * k)
+
+
+def particle_read(x, k):
+    """A particle's 18 token values at k as a dict (m_common::particle's layout)."""
+    v = x[k:k + 18]
+    return {"pos": tuple(v[0:3]), "vel": tuple(v[3:6]), "acc": tuple(v[6:9]), "density": v[9],
+            "pressure": v[10], "mass": v[11], "phase": v[12], "conf": tuple(v[13:16]), "temperature": v[16],
+            "fuel": v[17]}
+
+
+def v3_len2(v):
+    return v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+
+
+def sph_want(func, x, P):
+    """A part a sph row's recomputed outputs (P: the transcendentals)."""
+    if func.startswith("kernel_"):
+        h, n = x[0], x[1][1]
+        return [("v", n)] + [sph_kernel(func, r, h) for r in x[2:2 + n]]
+    if func == "equation_of_state":
+        return [x[2] * (x[0] - x[1])]
+    if func == "equation_of_state_tait":
+        return [eos_tait(x[0], x[1], x[2], x[3], P)]
+    if func == "NonNewtonianViscosity::effective_viscosity":
+        kind = x[0].split(".")[-1]
+        n = x[5][1]
+        return [("v", n)] + [nn_viscosity(kind, x[1], x[2], x[3], x[4], r, P) for r in x[6:6 + n]]
+    if func == "batch_poly6":
+        n = x[0][1]
+        kc = kc_new(x[1 + n])
+        return [("v", n)] + [kc_poly6(kc, r2) for r2 in x[1:1 + n]]
+    if func == "batch_distance_squared":
+        pos = x[0:3]
+        n = x[3][1] // 3
+        out = [("v", n)]
+        for j in range(n):
+            q = x[4 + 3 * j:7 + 3 * j]
+            d = (pos[0] - q[0], pos[1] - q[1], pos[2] - q[2])
+            out.append(v3_len2(d))
+        return out
+    if func in ("total_kinetic_energy", "max_speed"):
+        n = x[0]
+        ps = [particle_read(x, 1 + 18 * j) for j in range(n)]
+        if func == "total_kinetic_energy":
+            t = -0.0
+            for q in ps:
+                t += 0.5 * q["mass"] * v3_len2(q["vel"])
+            return [t]
+        m = 0.0
+        for q in ps:
+            m = r_max(m, v3_len2(q["vel"]))
+        return [math.sqrt(m) if m == m and m >= 0.0 else m]
+    return None
+
+
+def check_sph(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        want = sph_want(func, x, GLIBC)
+        if want is None:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -2909,6 +3056,15 @@ def corrections(module, rows):
                 continue
             seen = list(dict.fromkeys(log))
             out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
+            continue
+        if module == "sph" and fn in ("equation_of_state_tait", "NonNewtonianViscosity::effective_viscosity"):
+            x = [tok_val(t) for t in ins]
+            want = sph_want(fn, x, mpfr_logged(log))
+            got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            seen = list(dict.fromkeys(log))
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle " + " ".join(outs)[:200] + "; " + "; ".join(seen)))
             continue
         if module == "grid":
             x = [tok_val(t) for t in ins]
@@ -3117,6 +3273,11 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"grid: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "grid", path, rows)
+        elif path.stem == "sph":
+            counts = check_sph(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"sph: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "sph", path, rows)
         elif path.stem in ("vof", "phase_field"):
             counts = check_vof(rows) if path.stem == "vof" else check_phase_field(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

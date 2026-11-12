@@ -57,6 +57,12 @@
 - [x] M3 part e: `src/par.cyr` and the grid's parallel loops (every `FluidGrid::step` row at 2, 3, 4 and 8 threads
   gives its one-thread words)
 - [x] **M3 done 2026-11-12.**
+- [x] M4 part a: the SPH kernels, the equations of state, the non-Newtonian models and the helpers (804 rows, 16
+  against the corrected oracle, all bit-exact; 22 Rust tests); private constants generated
+- [ ] M4 part b: the neighbour grid (f32 keys, L4), the cell key, the lists, `sort_by_zorder` (L9)
+- [ ] M4 part c: density, the forces, the brute-force `step`, the particle blocks, split and merge
+- [ ] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7),
+  implicit viscosity, secondary particles
 
 ### 1.3.0
 

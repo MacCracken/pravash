@@ -31,9 +31,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
-MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field"]
+MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph"]
 PENDING_MODULES = {
-    "sph": "M4–M5",
     "coupling": "M6", "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
 }
 DEFERRED_MODULES = {}
@@ -53,9 +52,21 @@ FN_RENAMES = {}
 FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-PENDING_FNS = {}
+PENDING_FNS = {
+    "sort_by_zorder": "M4 part b",
+    **{f: "M4 part c" for f in ("compute_density", "pressure_force", "viscosity_force", "step", "split_particle",
+                                "merge_particles", "create_particle_block")},
+    **{f: "M4 part d" for f in ("update_viscoelastic", "update_heat", "update_phase_change", "update_reaction",
+                                "update_combustion", "apply_contact_angle", "apply_delta_sph",
+                                "compute_gradient_corrections", "apply_gradient_correction", "apply_implicit_viscosity",
+                                "generate_secondary_particles", "update_secondary_particles")},
+}
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
-PENDING_TYPES = {}
+PENDING_TYPES = {
+    **{f"sph::{t}": "M4 part d" for t in ("ViscoelasticConfig", "HeatConfig", "PhaseChangeConfig", "CombustionConfig",
+                                         "SecondaryType", "SecondaryParticle")},
+    **{f"sph::{t}": "M5" for t in ("PhaseProperties", "MultiPhaseConfig", "SphSolver")},
+}
 EXCEPTIONS = {
     "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "
                                  "(src/constants.cyr); its serde form is drag_coefficient_to_json / _from_json",
@@ -259,6 +270,13 @@ def main():
         for kind, owner, name, extra in items:
             key = f"{module}::{kind} {name}" if kind in ("type",) else None
             label = f"{module}::{owner + '::' if owner else ''}{name} ({kind})"
+            # A type arriving with a later part, with its fields, variants, methods and trait impls.
+            tkey = f"{module}::{name if kind in ('struct', 'enum') and not owner else owner}"
+            if (owner or kind in ("struct", "enum")) and tkey in PENDING_TYPES:
+                used_pending.add(tkey)
+                pending.append(f"{label} [{PENDING_TYPES[tkey]}]")
+                ok += 1
+                continue
             if kind == "type":
                 ex = f"{module}::type {name}"
                 if ex in EXCEPTIONS:
@@ -276,12 +294,6 @@ def main():
                     ok += 1
                 else:
                     missing.append(label)
-                continue
-            tkey = f"{module}::{name if kind == 'struct' else owner}"
-            if (owner or kind == "struct") and tkey in PENDING_TYPES:
-                used_pending.add(tkey)
-                pending.append(f"{label} [{PENDING_TYPES[tkey]}]")
-                ok += 1
                 continue
             ex = f"{module}::{owner + '::' if owner else ''}{name}"
             if ex in EXCEPTIONS:

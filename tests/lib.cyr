@@ -5,6 +5,7 @@
 
 include "src/error.cyr"
 include "src/constants.cyr"
+include "src/constants_private.cyr"
 include "src/crmath_data.cyr"
 include "src/crmath.cyr"
 include "src/crlog_data.cyr"
@@ -24,4 +25,5 @@ include "src/mac_grid.cyr"
 include "src/k_epsilon.cyr"
 include "src/vof.cyr"
 include "src/phase_field.cyr"
+include "src/sph_kernels.cyr"
 include "src/json.cyr"

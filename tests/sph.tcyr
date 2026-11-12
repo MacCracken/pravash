@@ -1,0 +1,189 @@
+# sph.tcyr — the ported Rust tests of rust-old/src/sph.rs (M4 and M5).
+#
+# Every test keeps its Rust name as its group, in Rust's order. M4 part a ports the 22 of the kernels, the equations
+# of state, the non-Newtonian models and the totals; `test_degenerate_inputs_no_panic` waits for part d, whose free
+# functions it also calls, and the solver's for M5. Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): a
+# particle slice is (pointer, count); a `NonNewtonianViscosity` variant is a `PvNonNewtonianModel` made by its
+# constructor, its method `non_newtonian_viscosity_effective_viscosity`; the private `KernelCoeffs` methods are the
+# `_pv_kc_*` functions.
+
+include "tests/lib.cyr"
+
+var EPS: f64 = 0.0000000001;   # the Rust tests' 1e-10
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+# 1 when |a| < EPS.
+fn tiny(a: f64): i64 {
+    return near(a, 0.0, EPS);
+}
+
+# The kernels' tests, through test_kernel_viscosity_laplacian.
+fn test_kernels() {
+    test_group("test_kernel_poly6_at_zero");
+    var w0: f64 = kernel_poly6(0.0, 1.0);
+    assert(w0 > 0.0, "positive at r = 0");
+
+    test_group("test_kernel_poly6_at_boundary");
+    var wb: f64 = kernel_poly6(1.0, 1.0);
+    assert_eq(tiny(wb), 1, "0 at r = h");
+
+    test_group("test_kernel_poly6_outside");
+    var wo: f64 = kernel_poly6(1.5, 1.0);
+    assert_eq(tiny(wo), 1, "0 beyond h");
+
+    test_group("test_kernel_poly6_decreasing");
+    var w1: f64 = kernel_poly6(0.1, 1.0);
+    var w2: f64 = kernel_poly6(0.5, 1.0);
+    assert(w1 > w2, "decreasing in r");
+
+    test_group("test_kernel_spiky_grad");
+    var g: f64 = kernel_spiky_grad(0.5, 1.0);
+    assert(g < 0.0, "negative inside");
+
+    test_group("test_kernel_spiky_grad_outside");
+    var go: f64 = kernel_spiky_grad(1.5, 1.0);
+    assert_eq(tiny(go), 1, "0 beyond h");
+
+    test_group("test_kernel_viscosity_laplacian");
+    var l: f64 = kernel_viscosity_laplacian(0.5, 1.0);
+    assert(l > 0.0, "positive inside");
+    return 0;
+}
+
+# The equation-of-state and totals tests, and test_kernel_negative_r and test_poly6_kernels_consistent, in Rust's
+# order.
+fn test_eos_and_totals() {
+    test_group("test_equation_of_state");
+    var p: f64 = equation_of_state(1100.0, 1000.0, 2000.0);
+    assert_eq(near(p, 200000.0, EPS), 1, "k·(ρ − ρ₀)");
+
+    test_group("test_equation_of_state_at_rest");
+    var p0: f64 = equation_of_state(1000.0, 1000.0, 2000.0);
+    assert_eq(tiny(p0), 1, "0 at rest");
+
+    test_group("test_total_kinetic_energy");
+    var ps[288];
+    var a: *PvFluidParticle = _pv_as_particles(&ps);
+    var q0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 2.0);
+    q0.velocity = PvVec3_new(3.0, 4.0, 0.0);
+    memcpy(a, &q0, sizeof(PvFluidParticle));
+    var ke: f64 = total_kinetic_energy(a, 1);
+    assert_eq(near(ke, 25.0, EPS), 1, "½·2·25");
+
+    test_group("test_max_speed");
+    var q1: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var q2: PvFluidParticle = PvFluidParticle_new_2d(1.0, 0.0, 1.0);
+    q1.velocity = PvVec3_new(1.0, 0.0, 0.0);
+    q2.velocity = PvVec3_new(3.0, 4.0, 0.0);
+    memcpy(a, &q1, sizeof(PvFluidParticle));
+    memcpy(a + 1, &q2, sizeof(PvFluidParticle));
+    var ms: f64 = max_speed(a, 2);
+    assert_eq(near(ms, 5.0, EPS), 1, "the faster particle's speed");
+
+    test_group("test_kernel_negative_r");
+    var n1: f64 = kernel_poly6(-1.0, 1.0);
+    var n2: f64 = kernel_spiky_grad(-1.0, 1.0);
+    var n3: f64 = kernel_viscosity_laplacian(-1.0, 1.0);
+    assert(tiny(n1) == 1 && tiny(n2) == 1 && tiny(n3) == 1, "0 for a negative r");
+
+    test_group("test_poly6_kernels_consistent");
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, 1.0);
+    var pg0: f64 = _pv_kc_poly6_grad(&kc, 0.0);
+    var apg0: f64 = f64_abs(pg0);
+    assert(apg0 > 0.0, "the gradient scalar at r = 0 is nonzero (the formula's)");
+    var lap: f64 = _pv_kc_poly6_lap(&kc, 0.0);
+    assert_eq(_pv_is_finite(lap), 1, "the Laplacian at r = 0 is finite");
+    var o1: f64 = _pv_kc_poly6(&kc, 1.1);
+    var o2: f64 = _pv_kc_poly6_grad(&kc, 1.1);
+    var o3: f64 = _pv_kc_poly6_lap(&kc, 1.1);
+    assert(tiny(o1) == 1 && tiny(o2) == 1 && tiny(o3) == 1, "all 0 beyond h²");
+    return 0;
+}
+
+# A central difference of the kernel at r (Rust's (W(r + dr) − W(r − dr))/(2·dr)), c4 for 1, c2 for 0.
+fn numerical(c4, r: f64, h: f64, dr: f64): f64 {
+    var rp: f64 = r + dr;
+    var rm: f64 = r - dr;
+    var a: f64 = kernel_wendland_c2(rp, h);
+    var b: f64 = kernel_wendland_c2(rm, h);
+    if (c4 == 1) {
+        a = kernel_wendland_c4(rp, h);
+        b = kernel_wendland_c4(rm, h);
+    }
+    var d: f64 = (a - b) / (2.0 * dr);
+    return d;
+}
+
+# The Wendland and non-Newtonian tests, in Rust's order.
+fn test_wendland_and_viscosity() {
+    test_group("test_wendland_c2_at_zero");
+    var w0: f64 = kernel_wendland_c2(0.0, 1.0);
+    assert(w0 > 0.0, "positive at r = 0");
+
+    test_group("test_wendland_c2_at_boundary");
+    var wb: f64 = kernel_wendland_c2(2.0, 1.0);
+    assert_eq(tiny(wb), 1, "0 at r = 2h");
+
+    var dr: f64 = 0.000001;
+    test_group("test_wendland_c4_grad_numerical");
+    var n4: f64 = numerical(1, 0.7, 1.0, dr);
+    var a4: f64 = kernel_wendland_c4_grad(0.7, 1.0);
+    assert_eq(near(n4, a4, 0.0001), 1, "C4: the analytic gradient matches a central difference");
+
+    test_group("test_wendland_c2_grad_numerical");
+    var n2: f64 = numerical(0, 0.7, 1.0, dr);
+    var a2: f64 = kernel_wendland_c2_grad(0.7, 1.0);
+    assert_eq(near(n2, a2, 0.0001), 1, "C2: the analytic gradient matches a central difference");
+
+    test_group("test_wendland_c2_decreasing");
+    var w1: f64 = kernel_wendland_c2(0.1, 1.0);
+    var w2: f64 = kernel_wendland_c2(0.5, 1.0);
+    assert(w1 > w2, "decreasing in r");
+
+    test_group("test_wendland_c4_at_zero");
+    var c40: f64 = kernel_wendland_c4(0.0, 1.0);
+    assert(c40 > 0.0, "positive at r = 0");
+
+    test_group("test_wendland_c2_grad_sign");
+    var gs: f64 = kernel_wendland_c2_grad(0.5, 1.0);
+    assert(gs < 0.0, "the gradient is negative (decreasing)");
+
+    test_group("test_power_law_shear_thinning");
+    var pl: PvNonNewtonianModel = PvNonNewtonianModel_power_law(1.0, 0.5);
+    var lo: f64 = non_newtonian_viscosity_effective_viscosity(&pl, 0.1);
+    var hi: f64 = non_newtonian_viscosity_effective_viscosity(&pl, 10.0);
+    assert(hi < lo, "shear-thinning: the viscosity falls with the rate");
+
+    test_group("test_bingham_yield_stress");
+    var bg: PvNonNewtonianModel = PvNonNewtonianModel_bingham(100.0, 0.1);
+    var bl: f64 = non_newtonian_viscosity_effective_viscosity(&bg, 0.001);
+    assert(bl > 1000.0, "a low strain rate gives a very high viscosity");
+
+    test_group("test_herschel_bulkley");
+    var hb: PvNonNewtonianModel = PvNonNewtonianModel_herschel_bulkley(50.0, 1.0, 0.5);
+    var hv: f64 = non_newtonian_viscosity_effective_viscosity(&hb, 1.0);
+    assert(hv > 50.0, "the yield stress contributes");
+    assert_eq(_pv_is_finite(hv), 1, "finite");
+    return 0;
+}
+
+# Runs the ported SPH tests.
+fn main() {
+    alloc_init();
+    test_kernels();
+    test_eos_and_totals();
+    test_wendland_and_viscosity();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

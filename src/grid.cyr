@@ -217,7 +217,9 @@ fn _pv_fg_mul_class(nx, ny): i64 {
 fn PvFluidGrid_new(nx, ny, dx: f64, out: *PvFluidGrid): Result {
     _pv_fg_zero(out);
     # nx and ny are usizes: a word at or above 2^63 reads negative, and is a size Rust accepts until nx·ny.
-    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if ((nx >= 0 && nx < _PV_GRID_MIN_SIZE) || (ny >= 0 && ny < _PV_GRID_MIN_SIZE)) {
+        return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+    }
     if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
     var ov = _pv_fg_mul_class(nx, ny);
     if (ov == 2) { return Err(PV_ERR_INVALID_PARAMETER); }
@@ -1350,7 +1352,7 @@ impl PvFluidGrid {
         if (bc < 0 || bc > PV_BOUNDARY_CONDITION_PERIODIC) { return Err(PV_ERR_INVALID_PARAMETER); }
         var nx = self.nx;
         var ny = self.ny;
-        if (nx < 4 || ny < 4) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (nx < _PV_GRID_MIN_SIZE || ny < _PV_GRID_MIN_SIZE) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         var n = nx * ny;
         if (self.vx.len != n || self.vy.len != n || self.pressure.len != n || self.density.len != n) {

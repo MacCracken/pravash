@@ -378,3 +378,51 @@ one-thread ones at every count. Rust is its criterion bench built with `parallel
   on the small grids, where rayon's per-call cost exceeds the work.
 - Parallelising the solves would change their order of operations (Gauss–Seidel is a sequential sweep), so no
   thread count could keep the bits. The port stays with Rust's three loops.
+
+## M4 part a: the SPH kernels and equations of state (2026-11-12)
+
+Pinned to core 15.
+- **Rust:** `sph_kernels/*` is its criterion group (poly6, spiky_grad, viscosity_laplacian at (0.3, 1.0)), one run.
+  `sph_a/*` is its twin, `scripts/probes/rust/src/bin/bench_sph_a.rs`, on the same arguments (bodies in its header),
+  three runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_a`, three runs interleaved with Rust's. Each loop calls the function
+  alone, with its arguments in globals so nothing folds.
+
+The medians:
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_kernels/poly6` | 2.03 ns | 21 ns | 10× |
+| `sph_kernels/spiky_grad` | 1.62 ns | 17 ns | 10.5× |
+| `sph_kernels/viscosity_laplacian` | 1.48 ns | 15 ns | 10× |
+| `sph_a/wendland_c2` | 2.57 ns | 24 ns | 9.3× |
+| `sph_a/wendland_c4_grad` | 4.33 ns | 35 ns | 8.1× |
+| `sph_a/tait` (γ = 7, pow) | 14.5 ns | 758 ns | 52× |
+| `sph_a/tait_gamma0` (ln) | 5.86 ns | 84 ns | 14× |
+| `sph_a/power_law` (pow) | 13.3 ns | 365 ns | 27× |
+| `sph_a/batch_poly6_1000` | 314 ns | 16.9 µs | 54× |
+| `sph_a/total_kinetic_energy_1000` | 1.22 µs | 11.3 µs | 9.3× |
+| `sph_a/max_speed_1000` | 974 ns | 11.1 µs | 11× |
+
+**The A/B behind the kernel rows** (pinned, interleaved, three runs each, measured on the first bench layout, which
+also tested the kernel's index against seven branches per call): each public kernel computing only its own
+coefficient, where it had filled the whole coefficient struct (four divisions), took
+
+| Kernel | Before | After |
+|---|---|---|
+| poly6 | 34–35 ns | 27 ns |
+| spiky_grad | 33 ns | 20–21 ns |
+| viscosity_laplacian | 32 ns | 18–19 ns |
+
+That is 1.30–1.78×, with the rows unchanged. Rust's code builds the whole struct too, but rustc inlines it and
+keeps only the coefficient used.
+
+**Reading it.**
+- **The kernels are 8–10.5×,** the codegen's call and per-operation cost on a function of a dozen operations.
+- **The Tait EOS and the power law are pow:** 760 and 365 ns, against about 10 ns for glibc's. That is the
+  correctly rounded stand-in's cost (ledger L1, `math/powf` in M1a part 2). The γ → 0 branch's ln costs 84 ns.
+- **`batch_poly6` is half allocation.** Its 8 KB result buffer comes from the freelist, which maps and unmaps every
+  block over 4 KB (`cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`).
+  - Measured apart: 500 squared distances (4,000 bytes, under the threshold) take 5.2 µs, about 10 ns each.
+  - So the 1,000 evaluations are about 10 µs of the 18.6 µs, and the mapping about 8 µs.
+- **The totals are 9–11×,** a method call per particle.

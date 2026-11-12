@@ -1067,6 +1067,118 @@ fn _par_vcol_in(k, c: *PvColumn): i64 {
     return k + 1 + n;
 }
 
+# ── sph (M4) ────────────────────────────────────────────────────────────────────────
+# scripts/oracle/src/m_sph.rs: part a, the kernels, the equations of state, the non-Newtonian viscosity models and
+# the batch and whole-system helpers.
+
+# The kernel named by fp at (r, h) (kernel_wendland_c4_grad for any other name: the caller checks the name).
+#must_use
+fn _par_kernel(fp, fl, r: f64, h: f64): f64 {
+    if (_par_eq(fp, fl, "kernel_poly6") == 1) { var a: f64 = kernel_poly6(r, h); return a; }
+    if (_par_eq(fp, fl, "kernel_spiky_grad") == 1) { var b: f64 = kernel_spiky_grad(r, h); return b; }
+    if (_par_eq(fp, fl, "kernel_viscosity_laplacian") == 1) {
+        var c: f64 = kernel_viscosity_laplacian(r, h);
+        return c;
+    }
+    if (_par_eq(fp, fl, "kernel_wendland_c2") == 1) { var d: f64 = kernel_wendland_c2(r, h); return d; }
+    if (_par_eq(fp, fl, "kernel_wendland_c2_grad") == 1) { var g: f64 = kernel_wendland_c2_grad(r, h); return g; }
+    if (_par_eq(fp, fl, "kernel_wendland_c4") == 1) { var q: f64 = kernel_wendland_c4(r, h); return q; }
+    var w: f64 = kernel_wendland_c4_grad(r, h);
+    return w;
+}
+
+# The non-Newtonian kind named by the `e:NonNewtonianViscosity.<Variant>` token k, or -1.
+fn _par_nn_kind(k): i64 {
+    var p = _par_in(k);
+    var n = load64(_par_in_l + k * 8);
+    if (_par_eq(p, n, "NonNewtonianViscosity.PowerLaw") == 1) { return PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW; }
+    if (_par_eq(p, n, "NonNewtonianViscosity.Bingham") == 1) { return PV_NON_NEWTONIAN_VISCOSITY_BINGHAM; }
+    if (_par_eq(p, n, "NonNewtonianViscosity.HerschelBulkley") == 1) {
+        return PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY;
+    }
+    return 0 - 1;
+}
+
+fn _par_sph(fp, fl): i64 {
+    if (_par_eq(fp, fl, "kernel_poly6") == 1 || _par_eq(fp, fl, "kernel_spiky_grad") == 1
+      || _par_eq(fp, fl, "kernel_viscosity_laplacian") == 1 || _par_eq(fp, fl, "kernel_wendland_c2") == 1
+      || _par_eq(fp, fl, "kernel_wendland_c2_grad") == 1 || _par_eq(fp, fl, "kernel_wendland_c4") == 1
+      || _par_eq(fp, fl, "kernel_wendland_c4_grad") == 1) {
+        var h: f64 = _par_in(0);
+        var n = _par_in(1);
+        _par_got_seq(n);
+        for (var j = 0; j < n; j = j + 1) {
+            var w: f64 = _par_kernel(fp, fl, _par_in(2 + j), h);
+            _par_got_f(_pv_bits(w));
+        }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "equation_of_state") == 1) {
+        var p: f64 = equation_of_state(_par_in(0), _par_in(1), _par_in(2));
+        _par_got_f(_pv_bits(p));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "equation_of_state_tait") == 1) {
+        var pt: f64 = equation_of_state_tait(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(_pv_bits(pt));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "NonNewtonianViscosity::effective_viscosity") == 1) {
+        var m: PvNonNewtonianModel;
+        m.kind = _par_nn_kind(0);
+        m.consistency = _par_in(1);
+        m.power_index = _par_in(2);
+        m.yield_stress = _par_in(3);
+        m.plastic_viscosity = _par_in(4);
+        var nr = _par_in(5);
+        _par_got_seq(nr);
+        for (var j2 = 0; j2 < nr; j2 = j2 + 1) {
+            var mu: f64 = non_newtonian_viscosity_effective_viscosity(&m, _par_in(6 + j2));
+            _par_got_f(_pv_bits(mu));
+        }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "batch_poly6") == 1) {
+        var n2 = _par_in(0);
+        var r2 = fl_alloc(n2 * 8 + 8);
+        for (var j3 = 0; j3 < n2; j3 = j3 + 1) { store64(r2 + j3 * 8, _par_in(1 + j3)); }
+        var bp, bn = batch_poly6(r2, n2, _par_in(1 + n2));
+        _par_got_seq(bn);
+        for (var j4 = 0; j4 < bn; j4 = j4 + 1) { _par_got_f(load64(bp + j4 * 8)); }
+        if (bp != 0) { fl_free(bp); }
+        fl_free(r2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "batch_distance_squared") == 1) {
+        var pos: PvVec3 = PvVec3_new(_par_in(0), _par_in(1), _par_in(2));
+        var n3 = _par_in(3) / 3;
+        var ps = fl_alloc(n3 * 24 + 8);
+        for (var j5 = 0; j5 < n3 * 3; j5 = j5 + 1) { store64(ps + j5 * 8, _par_in(4 + j5)); }
+        var dp, dn = batch_distance_squared(pos, ps, n3);
+        _par_got_seq(dn);
+        for (var j6 = 0; j6 < dn; j6 = j6 + 1) { _par_got_f(load64(dp + j6 * 8)); }
+        if (dp != 0) { fl_free(dp); }
+        fl_free(ps);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "total_kinetic_energy") == 1 || _par_eq(fp, fl, "max_speed") == 1) {
+        var np = _par_in(0);
+        var buf = fl_alloc(np * sizeof(PvFluidParticle) + 8);
+        var parts: *PvFluidParticle = _pv_as_particles(buf);
+        for (var j7 = 0; j7 < np; j7 = j7 + 1) { _par_particle_in(1 + j7 * 18, parts + j7); }
+        var r: f64 = 0.0;
+        if (_par_eq(fp, fl, "max_speed") == 1) {
+            r = max_speed(parts, np);
+        } else {
+            r = total_kinetic_energy(parts, np);
+        }
+        _par_got_f(_pv_bits(r));
+        fl_free(buf);
+        return 1;
+    }
+    return 0;
+}
+
 # ── vof and phase_field (M3 part d) ─────────────────────────────────────────────────
 # A VOF state is nx, ny, dx, `v:` alpha; a phase-field state is nx, ny, dx, `v:` phi, mobility, epsilon
 # (scripts/oracle/src/m_vof.rs, m_phase_field.rs). Each row's field is built as the generator's `fresh` builds it:
@@ -1845,6 +1957,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
         if (rc != 0) { return rc; }
         return _par_grid(fp, fl);
     }
+    if (_par_eq(mp, ml, "sph") == 1) { return _par_sph(fp, fl); }
     if (_par_eq(mp, ml, "vof") == 1) { return _par_vof(fp, fl); }
     if (_par_eq(mp, ml, "phase_field") == 1) { return _par_phase_field(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
@@ -1986,6 +2099,11 @@ fn _par_c_bound(fp, fl): i64 {
     # order, so every field is the oracle's bit for bit.
     if (_par_eq(fp, fl, "VofField::advect") == 1) { return 0; }
     if (_par_eq(fp, fl, "PhaseField::step") == 1) { return 0; }
+    # M4 part a: the Tait equation of state's ln and powf, and the non-Newtonian models' powf, are correctly rounded
+    # (src/crmath.cyr, src/crlog.cyr) and the rest is Rust's arithmetic in order, so each row equals the corrected
+    # oracle bit for bit (the oracle's own where glibc rounded correctly).
+    if (_par_eq(fp, fl, "equation_of_state_tait") == 1) { return 0; }
+    if (_par_eq(fp, fl, "NonNewtonianViscosity::effective_viscosity") == 1) { return 0; }
     return 0 - 1;
 }
 

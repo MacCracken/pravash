@@ -8,5 +8,6 @@ json
 math
 phase_field
 shallow
+sph
 vof
 vortex

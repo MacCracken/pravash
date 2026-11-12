@@ -5,8 +5,9 @@
 - **The golden corpus, `tests/golden/<module>.tsv`** (port plan §4 step 5). It has one row per call, with every
   float as its IEEE-754 bit pattern. The Cyrius parity harness (`tests/parity.tcyr`, from M0 step 7) replays every
   row against the port and checks it within its tolerance class.
-- **The generated Cyrius sources**: `src/constants.cyr` from step 6, and data modules as milestones need them. No
-  value the port reads is typed by hand.
+- **The generated Cyrius sources**: `src/constants.cyr` from step 6, `src/constants_private.cyr` (the ported modules'
+  private constants, from their Rust literals; M4 part a), and data modules as milestones need them. No value the
+  port reads is typed by hand.
 
 ```sh
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml                        # write
@@ -52,6 +53,7 @@ same files. This README records what is specific to pravash.
 |---|---|---|---|---|
 | `constants` | M0 | 35 | `src/m_constants.rs` (the lists and their completeness proofs: `src/t_constants.rs`) | `src/constants.cyr`: 14 public constants and the 6 std float constants pravash uses; `tests/constants_rows.cyr`: the harness's lookup from each golden path to its value |
 | `math` | M0 | 33,239 | `src/m_math.rs` | — |
+| (private constants) | M4 part a | — | — | `src/constants_private.cyr` (`src/t_private.rs`): each ported module's private `const`, parsed from its Rust literal; every other one fails the generator unless excused |
 
 ## Format 1
 
@@ -123,6 +125,8 @@ oracle:
   and CG among them), and the k-ε model, the ghost fluid and the MAC grid, with glibc's transcendentals for the
   record and MPFR's for the corrected oracle
   (`grid.cr.tsv`: the rows whose DST uses a sine or cosine glibc misrounds);
+- it recomputes every `sph` row (part a: the kernels, the equations of state, the viscosity models), with glibc's ln and
+  pow for the record and MPFR's for the corrected oracle (`sph.cr.tsv`);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;
@@ -135,5 +139,6 @@ A tampered row fails it, and fails `--check`; a header naming another glibc is r
 
 The step between the generator and the harness. For every `constants.tsv` row it derives the Cyrius name
 (`t_constants::cyr_name`'s rule), writes `build/probe_tables.cyr`, which includes `src/constants.cyr` and prints each
-value's bits, builds it with the project's `[deps]`, runs it, and compares with the row. A row with no generated
-value, a value with no row, a build warning, or one differing bit fails it.
+value's bits, builds it with the project's `[deps]`, runs it, and compares with the row. It does the same for each
+private constant in `src/constants_private.cyr`, against the Rust literal in the `# Rust:` line above it. A row with
+no generated value, a value with no row, a build warning, or one differing bit fails it.

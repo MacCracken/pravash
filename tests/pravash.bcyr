@@ -889,6 +889,131 @@ fn bench_m3d() {
     return 0;
 }
 
+# ── sph, part a (M4) ──
+# sph_kernels/*: Rust's criterion group (poly6, spiky_grad, viscosity_laplacian at (0.3, 1.0)). sph_a/*: the rest of
+# part a, against scripts/probes/rust/src/bin/bench_sph_a.rs on the same arguments: the Wendland kernels at (0.3, 1),
+# Tait at (1010, 1000, 1480, 7) and γ = 0, the power law (0.5, 0.7) at 2, batch_poly6 over 1,000 squared distances
+# k·0.0012 at h 1, and the totals over a 1,000-particle 40-wide lattice. The arguments are globals, so no call folds.
+var g_r: f64 = 0.3;
+var g_h: f64 = 1.0;
+
+# One kernel or equation of state `which` (0–6), `iters` calls at the fixed arguments.
+fn _bench_sph_kernel(name, which, iters) {
+    var b = bench_new(name);
+    var acc = 0;
+    bench_batch_start(b);
+    # One loop per function, so the timed body is the call alone (as Rust's).
+    if (which == 0) {
+        for (var k = 0; k < iters; k = k + 1) {
+            var w0: f64 = kernel_poly6(g_r, g_h);
+            acc = acc ^ _pv_bits(w0);
+        }
+    }
+    if (which == 1) {
+        for (var k1 = 0; k1 < iters; k1 = k1 + 1) {
+            var w1: f64 = kernel_spiky_grad(g_r, g_h);
+            acc = acc ^ _pv_bits(w1);
+        }
+    }
+    if (which == 2) {
+        for (var k2 = 0; k2 < iters; k2 = k2 + 1) {
+            var w2: f64 = kernel_viscosity_laplacian(g_r, g_h);
+            acc = acc ^ _pv_bits(w2);
+        }
+    }
+    if (which == 3) {
+        for (var k3 = 0; k3 < iters; k3 = k3 + 1) {
+            var w3: f64 = kernel_wendland_c2(g_r, g_h);
+            acc = acc ^ _pv_bits(w3);
+        }
+    }
+    if (which == 4) {
+        for (var k4 = 0; k4 < iters; k4 = k4 + 1) {
+            var w4: f64 = kernel_wendland_c4_grad(g_r, g_h);
+            acc = acc ^ _pv_bits(w4);
+        }
+    }
+    if (which == 5) {
+        for (var k5 = 0; k5 < iters; k5 = k5 + 1) {
+            var w5: f64 = equation_of_state_tait(1010.0, 1000.0, 1480.0, 7.0);
+            acc = acc ^ _pv_bits(w5);
+        }
+    }
+    if (which == 6) {
+        for (var k6 = 0; k6 < iters; k6 = k6 + 1) {
+            var w6: f64 = equation_of_state_tait(1010.0, 1000.0, 1480.0, 0.0);
+            acc = acc ^ _pv_bits(w6);
+        }
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    g_sink = g_sink ^ acc;
+    return 0;
+}
+
+# The part a benches (M4 part a): Rust's sph_kernels group and the bench_sph_a.rs twins.
+fn bench_sph_a() {
+    _bench_sph_kernel("sph_kernels/poly6", 0, 1000000);
+    _bench_sph_kernel("sph_kernels/spiky_grad", 1, 1000000);
+    _bench_sph_kernel("sph_kernels/viscosity_laplacian", 2, 1000000);
+    _bench_sph_kernel("sph_a/wendland_c2", 3, 1000000);
+    _bench_sph_kernel("sph_a/wendland_c4_grad", 4, 1000000);
+    _bench_sph_kernel("sph_a/tait", 5, 200000);
+    _bench_sph_kernel("sph_a/tait_gamma0", 6, 200000);
+    var nn: PvNonNewtonianModel = PvNonNewtonianModel_power_law(0.5, 0.7);
+    var bn = bench_new("sph_a/power_law");
+    bench_batch_start(bn);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var mu: f64 = non_newtonian_viscosity_effective_viscosity(&nn, 2.0);
+        g_sink = g_sink ^ _pv_bits(mu);
+    }
+    bench_batch_stop(bn, 200000);
+    bench_report(bn);
+    var r2 = fl_alloc(8000);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var x: f64 = f64_from(i) * 0.0012;
+        store64(r2 + i * 8, _pv_bits(x));
+    }
+    var bb = bench_new("sph_a/batch_poly6_1000");
+    bench_batch_start(bb);
+    for (var k2 = 0; k2 < 5000; k2 = k2 + 1) {
+        var wp, wn = batch_poly6(r2, 1000, 1.0);
+        g_sink = g_sink ^ load64(wp + 999 * 8);
+        fl_free(wp);
+    }
+    bench_batch_stop(bb, 5000);
+    bench_report(bb);
+    fl_free(r2);
+    var buf = fl_alloc(1000 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var j = 0; j < 1000; j = j + 1) {
+        var q: PvFluidParticle = PvFluidParticle_new_2d(f64_from(j % 40) * 0.025, f64_from(j / 40) * 0.025, 0.001);
+        var vx: f64 = f64_from(j % 7) * 0.1;
+        var vy: f64 = f64_from(j % 5) * 0.2;
+        var nvy: f64 = -vy;
+        q.velocity = PvVec3_new(vx, nvy, 0.0);
+        memcpy(ps + j, &q, sizeof(PvFluidParticle));
+    }
+    var bk = bench_new("sph_a/total_kinetic_energy_1000");
+    bench_batch_start(bk);
+    for (var k3 = 0; k3 < 20000; k3 = k3 + 1) {
+        var ke: f64 = total_kinetic_energy(ps, 1000);
+        g_sink = g_sink ^ _pv_bits(ke);
+    }
+    bench_batch_stop(bk, 20000);
+    bench_report(bk);
+    var bm = bench_new("sph_a/max_speed_1000");
+    bench_batch_start(bm);
+    for (var k4 = 0; k4 < 20000; k4 = k4 + 1) {
+        var ms: f64 = max_speed(ps, 1000);
+        g_sink = g_sink ^ _pv_bits(ms);
+    }
+    bench_batch_stop(bm, 20000);
+    bench_report(bm);
+    fl_free(buf);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -914,6 +1039,7 @@ fn main(): i64 {
     bench_grid_c();
     bench_m3d();
     bench_threads();
+    bench_sph_a();
     return 0;
 }
 

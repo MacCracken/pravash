@@ -1069,3 +1069,69 @@ A whole step gains less: 1.07× at 8 threads on 63 × 63, 1.15× on 255 × 255. 
 (diffusion, then pressure) dominate it, and the three pooled loops are about a fifth of a periodic step. Rust's own
 `parallel` build gains nothing at its bench sizes either: grid_step_periodic 2.07 ms at 63 × 63, as serial, and
 124 µs against 70.6 µs at 15 × 15.
+
+## 15. M4 part a: the SPH kernels and equations of state (2026-11-12)
+
+M4 splits into four parts:
+- **a:** the kernels, the equations of state and the small helpers;
+- **b:** the neighbour grid with f32 keys (ledger L4), the cell key, the lists and the z-order sort (L9);
+- **c:** density, the forces, the brute-force `step`, the particle blocks, split and merge;
+- **d:** the physics extensions, among them the MLS corrections (L7).
+
+**`src/sph_kernels.cyr`:**
+- **`PvKernelCoeffs`:** `_pv_kc_init` and the poly6, spiky-gradient and viscosity-Laplacian evaluations. Also the two
+  colour-field terms the solver uses, checked by Rust's `test_poly6_kernels_consistent` until M5's rows reach them.
+- **The seven public kernels.** Each computes only its own coefficient, by `_pv_kc_init`'s expression; see Speed.
+- **`equation_of_state` and `equation_of_state_tait`,** with the γ → 0 `ln` limit.
+- **The non-Newtonian viscosity:** the first data-carrying enum, a kind enum plus a payload struct (§7.3,
+  ADR 0002 #15).
+- **`batch_poly6`, `batch_distance_squared`, `total_kinetic_energy` and `max_speed`.**
+
+**Private constants are now generated.** `scripts/oracle/src/t_private.rs`, after impetus's, writes
+`src/constants_private.cyr`.
+- Each private `const` of a ported module is parsed from its Rust literal and written positionally:
+  `_PV_SPH_MIN_DENSITY`, `_PV_SPH_CSF_NORMAL_THRESHOLD` and `_PV_SPH_CONVERGENCE_THRESHOLD` (part d), and
+  `_PV_GRID_MIN_SIZE`, which replaces the grid's two hand-typed 4s.
+- Any other private `const` in a ported module makes the generator fail unless it is excused (`FALLBACK`, a struct
+  literal).
+- `probe_tables.py` compiles each one against its literal: 39 values, 0 failures.
+
+**The rows** (`m_sph.rs`, a new golden module `sph.tsv`): 804.
+
+| Function | Rows | What they cover |
+|---|---|---|
+| the seven kernels | 22 radii each, 29 distances a row | the specials, negative h, 1e±40 (h⁶ and h⁹ over- and underflowing), r from −0.1h to 2.4h with 0, h and 2h exactly, NaN and ±∞ |
+| `equation_of_state` | 120 | random and special (ρ, ρ₀, k) |
+| `equation_of_state_tait` | 471 | γ on both sides of the 1e-12 limit (±1e-13, ±1e-12, 1.1e-12), the usual values, negatives, NaN, ∞; ρ₀ at, below and through the 1e-10 floor; 12 arguments where glibc 2.44 misrounds pow(x, 7), pow(x, 1.4) or ln(x), found by an MPFR search |
+| the non-Newtonian models | 22, 19 strain rates each | every variant, zero, NaN and degenerate fields, rates across the 1e-10 floor, 6 rates where glibc misrounds pow(s, n − 1) |
+| batch and totals | 37 | the batch functions and the totals over up to 100 particles with special velocities and masses |
+
+`validate.py` transcribes all of part a. It recomputes the rows with glibc's `ln` and `pow`, and writes
+`tests/golden/sph.cr.tsv` from MPFR's: 16 rows, the 12 Tait and 4 viscosity rows at the misrounding arguments.
+
+**Result:**
+- Every row passes on the first replay. The 16 corrected rows match MPFR's correctly rounded result, and none
+  matches glibc's.
+- The replay is **12 modules, 0 failing | rows: 46,667 ok, 0 failed, 0 measured, 2,463 pending, 108 accepted
+  (ADR 4: 108)**.
+- 10 of 11 port mutations fail rows. The eleventh, `max_speed`'s max written as `q > m`, is equivalent: m is never
+  NaN, and a squared speed is never −0.
+- 3 of 3 mutations of the transcription are caught.
+
+**Tests:** 22 Rust tests in `tests/sph.tcyr` (26 checks). `test_degenerate_inputs_no_panic` waits for part d, whose
+functions it also calls. Surface parity adds `sph`: 348 items, 72 of them pending, labelled by part (b, c, d, M5).
+
+**Speed** (benchmarks-rust-v-cyrius, M4 part a):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the classic kernels | 10–10.5× |
+| the Wendland kernels | 8–9× |
+| the Tait EOS (`pow`) | 52× (correctly rounded `pow`, L1) |
+| the Tait EOS, γ → 0 (`ln`) | 14× |
+| the power law (`pow`) | 27× (correctly rounded `pow`, L1) |
+| `batch_poly6` over 1,000 | 54× (about 8 µs of its 18.6 µs is an 8 KB freelist block mapped and unmapped per call, the filed `fl_alloc` finding) |
+| the totals over 1,000 | 9–11× |
+
+Each public kernel computing only its own coefficient made the classic kernels 1.30–1.78× faster with the rows
+unchanged.

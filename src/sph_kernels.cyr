@@ -1,0 +1,425 @@
+# sph_kernels.cyr — the SPH smoothing kernels, the equations of state and the small particle helpers of
+# rust-old/src/sph.rs (M4 part a).
+#
+# The 3D kernels (Müller et al. 2003: poly6 for density, the spiky gradient for pressure, the viscosity Laplacian),
+# the Wendland C2 and C4 kernels and gradients, the linear and Tait equations of state, the non-Newtonian
+# viscosity models, and the batch and whole-system helpers. Every formula is Rust's, in its operation order; π is
+# `f64::consts::PI` (src/constants.cyr), the floors are the private constants (src/constants_private.cyr), and ln
+# and powf are the correctly rounded ones (ADR 0004).
+#
+# `PvKernelCoeffs` mirrors the private `KernelCoeffs`: the coefficients for one smoothing radius, computed once. Its
+# colour-field terms (`poly6_grad_scalar`, `poly6_laplacian`) are reached only from the solver, whose rows cover them
+# at M5; until then `tests/sph.tcyr` checks them (Rust's `test_poly6_kernels_consistent`). The CSF acceleration
+# arrives with the solver.
+
+struct PvKernelCoeffs {
+    h: f64;
+    h2: f64;
+    poly6: f64;
+    spiky_grad: f64;
+    visc_lap: f64;
+    poly6_grad: f64;
+    poly6_lap: f64;
+}
+
+# The coefficients for smoothing radius h into *kc (Rust only debug-asserts h > 0; another h gives what its
+# arithmetic gives): h², 315/((64π)·h⁹), −45/(π·h⁶), 45/(π·h⁶) and −945/((32π)·h⁹) twice, with h⁶ = h³·h³ and
+# h⁹ = h⁶·h³. Mirrors `KernelCoeffs::new`.
+fn _pv_kc_init(kc: *PvKernelCoeffs, h: f64) {
+    var pi: f64 = PV_F64_PI;
+    var h2: f64 = h * h;
+    var h3: f64 = h2 * h;
+    var h6: f64 = h3 * h3;
+    var h9: f64 = h6 * h3;
+    var p6: f64 = 315.0 / ((64.0 * pi) * h9);
+    var sg: f64 = -45.0 / (pi * h6);
+    var vl: f64 = 45.0 / (pi * h6);
+    var pg: f64 = -945.0 / ((32.0 * pi) * h9);
+    kc.h = h;
+    kc.h2 = h2;
+    kc.poly6 = p6;
+    kc.spiky_grad = sg;
+    kc.visc_lap = vl;
+    kc.poly6_grad = pg;
+    kc.poly6_lap = pg;
+    return 0;
+}
+
+# poly6 at squared distance r2: 0 beyond h², else ((c·d)·d)·d with d = h² − r2. Mirrors `KernelCoeffs::poly6`.
+#must_use
+fn _pv_kc_poly6(kc: *PvKernelCoeffs, r2: f64): f64 {
+    if (r2 > kc.h2) { return 0.0; }
+    var d: f64 = kc.h2 - r2;
+    var w: f64 = ((kc.poly6 * d) * d) * d;
+    return w;
+}
+
+# The poly6 gradient's scalar at squared distance r2: 0 beyond h², else (c·d)·d with d = h² − r2 and c = −945/(32π·h⁹)
+# (the caller multiplies by the displacement). Mirrors `KernelCoeffs::poly6_grad_scalar`.
+#must_use
+fn _pv_kc_poly6_grad(kc: *PvKernelCoeffs, r2: f64): f64 {
+    if (r2 > kc.h2) { return 0.0; }
+    var d: f64 = kc.h2 - r2;
+    var w: f64 = (kc.poly6_grad * d) * d;
+    return w;
+}
+
+# The poly6 Laplacian at squared distance r2: 0 beyond h², else (c·d)·(3h² − 7r2) with d = h² − r2. Mirrors
+# `KernelCoeffs::poly6_laplacian`.
+#must_use
+fn _pv_kc_poly6_lap(kc: *PvKernelCoeffs, r2: f64): f64 {
+    if (r2 > kc.h2) { return 0.0; }
+    var d: f64 = kc.h2 - r2;
+    var t: f64 = (3.0 * kc.h2) - (7.0 * r2);
+    var w: f64 = (kc.poly6_lap * d) * t;
+    return w;
+}
+
+# The spiky gradient magnitude at distance r: 0 beyond h or for r ≤ 0, else (c·d)·d with d = h − r. Mirrors
+# `KernelCoeffs::spiky_grad`.
+#must_use
+fn _pv_kc_spiky_grad(kc: *PvKernelCoeffs, r: f64): f64 {
+    if (r > kc.h || r <= 0.0) { return 0.0; }
+    var d: f64 = kc.h - r;
+    var w: f64 = (kc.spiky_grad * d) * d;
+    return w;
+}
+
+# The viscosity Laplacian at distance r: 0 beyond h or for r ≤ 0, else c·(h − r). Mirrors
+# `KernelCoeffs::visc_laplacian`.
+#must_use
+fn _pv_kc_visc_lap(kc: *PvKernelCoeffs, r: f64): f64 {
+    if (r > kc.h || r <= 0.0) { return 0.0; }
+    var d: f64 = kc.h - r;
+    var w: f64 = kc.visc_lap * d;
+    return w;
+}
+
+# 1 when x is finite and > 0 (0 for NaN). Mirrors the private `is_positive`.
+#must_use
+fn _pv_is_positive(x: f64): i64 {
+    if (_pv_is_finite(x) == 1 && x > 0.0) { return 1; }
+    return 0;
+}
+
+# ── the kernels (public API) ────────────────────────────────────────────────────────
+
+# The poly6 kernel W(r, h) = 315/(64π·h⁹)·(h² − r²)³ for 0 ≤ r ≤ h; 0 for r < 0, beyond h, or h not > 0 (NaN
+# included). Mirrors `kernel_poly6`.
+#
+# Each public kernel computes only its own coefficient, by `_pv_kc_init`'s expression, where Rust builds the whole
+# `KernelCoeffs` and rustc keeps only what the call uses: the same value, so the same bits, without three unused
+# divisions (pinned A/B, port-parity §15).
+#must_use
+fn kernel_poly6(r: f64, h: f64): f64 {
+    if (r < 0.0 || (h > 0.0) == 0) { return 0.0; }
+    var h2: f64 = h * h;
+    var r2: f64 = r * r;
+    if (r2 > h2) { return 0.0; }
+    var pi: f64 = PV_F64_PI;
+    var h3: f64 = h2 * h;
+    var h6: f64 = h3 * h3;
+    var h9: f64 = h6 * h3;
+    var c: f64 = 315.0 / ((64.0 * pi) * h9);
+    var d: f64 = h2 - r2;
+    var w: f64 = ((c * d) * d) * d;
+    return w;
+}
+
+# The spiky kernel's gradient magnitude −45/(π·h⁶)·(h − r)² for 0 < r ≤ h; 0 otherwise, and for h not > 0. Mirrors
+# `kernel_spiky_grad`.
+#must_use
+fn kernel_spiky_grad(r: f64, h: f64): f64 {
+    if ((h > 0.0) == 0) { return 0.0; }
+    if (r > h || r <= 0.0) { return 0.0; }
+    var pi: f64 = PV_F64_PI;
+    var h2: f64 = h * h;
+    var h3: f64 = h2 * h;
+    var h6: f64 = h3 * h3;
+    var c: f64 = -45.0 / (pi * h6);
+    var d: f64 = h - r;
+    var w: f64 = (c * d) * d;
+    return w;
+}
+
+# The viscosity kernel's Laplacian 45/(π·h⁶)·(h − r) for 0 < r ≤ h; 0 otherwise, and for h not > 0. Mirrors
+# `kernel_viscosity_laplacian`.
+#must_use
+fn kernel_viscosity_laplacian(r: f64, h: f64): f64 {
+    if ((h > 0.0) == 0) { return 0.0; }
+    if (r > h || r <= 0.0) { return 0.0; }
+    var pi: f64 = PV_F64_PI;
+    var h2: f64 = h * h;
+    var h3: f64 = h2 * h;
+    var h6: f64 = h3 * h3;
+    var c: f64 = 45.0 / (pi * h6);
+    var w: f64 = c * (h - r);
+    return w;
+}
+
+# 7/((4π·h)·h), the 2D Wendland C2 normalisation (C4's numerator is 9).
+#must_use
+fn _pv_wendland_sigma(num: f64, h: f64): f64 {
+    var pi: f64 = PV_F64_PI;
+    var s: f64 = num / (((4.0 * pi) * h) * h);
+    return s;
+}
+
+# The Wendland C2 kernel σ·(1 − q/2)⁴·(1 + 2q), σ = 7/(4π·h²), q = r/h in [0, 2); 0 otherwise (NaN q included).
+# Mirrors `kernel_wendland_c2`.
+#must_use
+fn kernel_wendland_c2(r: f64, h: f64): f64 {
+    var q: f64 = r / h;
+    if ((q >= 0.0 && q < 2.0) == 0) { return 0.0; }
+    var t: f64 = 1.0 - (0.5 * q);
+    var s: f64 = _pv_wendland_sigma(7.0, h);
+    var w: f64 = ((((s * t) * t) * t) * t) * (1.0 + (2.0 * q));
+    return w;
+}
+
+# The Wendland C2 gradient magnitude ((((σ·(−5q))·t)·t)·t)/h, t = 1 − q/2, for 0 < q < 2; 0 for q ≥ 2 or q ≤ 0 (a
+# NaN q passes both tests and gives NaN, as Rust's does). Mirrors `kernel_wendland_c2_grad`.
+#must_use
+fn kernel_wendland_c2_grad(r: f64, h: f64): f64 {
+    var q: f64 = r / h;
+    if (q >= 2.0 || q <= 0.0) { return 0.0; }
+    var t: f64 = 1.0 - (0.5 * q);
+    var s: f64 = _pv_wendland_sigma(7.0, h);
+    var m5: f64 = -5.0 * q;
+    var w: f64 = ((((s * m5) * t) * t) * t) / h;
+    return w;
+}
+
+# The Wendland C4 kernel (σ·t⁶)·((1 + 3q) + (35/12)·q·q), σ = 9/(4π·h²), t = 1 − q/2, t⁶ by five multiplies, q in
+# [0, 2); 0 otherwise. Mirrors `kernel_wendland_c4`.
+#must_use
+fn kernel_wendland_c4(r: f64, h: f64): f64 {
+    var q: f64 = r / h;
+    if ((q >= 0.0 && q < 2.0) == 0) { return 0.0; }
+    var t: f64 = 1.0 - (0.5 * q);
+    var t6: f64 = ((((t * t) * t) * t) * t) * t;
+    var s: f64 = _pv_wendland_sigma(9.0, h);
+    var k: f64 = 35.0 / 12.0;
+    var g: f64 = (1.0 + (3.0 * q)) + ((k * q) * q);
+    var w: f64 = (s * t6) * g;
+    return w;
+}
+
+# The Wendland C4 gradient magnitude (σ·(t⁵·(−3g + t·g′)))/h, with g = (1 + 3q) + (35/12)·q·q and
+# g′ = 3 + (35/6)·q, for 0 < q < 2; 0 for q ≥ 2 or q ≤ 0 (NaN passes, as above). Mirrors `kernel_wendland_c4_grad`.
+#must_use
+fn kernel_wendland_c4_grad(r: f64, h: f64): f64 {
+    var q: f64 = r / h;
+    if (q >= 2.0 || q <= 0.0) { return 0.0; }
+    var t: f64 = 1.0 - (0.5 * q);
+    var t5: f64 = (((t * t) * t) * t) * t;
+    var k12: f64 = 35.0 / 12.0;
+    var k6: f64 = 35.0 / 6.0;
+    var g: f64 = (1.0 + (3.0 * q)) + ((k12 * q) * q);
+    var gp: f64 = 3.0 + (k6 * q);
+    var m3: f64 = -3.0 * g;
+    var tg: f64 = t * gp;
+    var dfdq: f64 = t5 * (m3 + tg);
+    var s: f64 = _pv_wendland_sigma(9.0, h);
+    var w: f64 = (s * dfdq) / h;
+    return w;
+}
+
+# ── the equations of state ──────────────────────────────────────────────────────────
+
+# The linear equation of state k·(ρ − ρ₀). Mirrors `equation_of_state`.
+#must_use
+fn equation_of_state(density: f64, rest_density: f64, gas_constant: f64): f64 {
+    var d: f64 = density - rest_density;
+    var p: f64 = gas_constant * d;
+    return p;
+}
+
+# The Tait equation of state B·((ρ/ρ₀′)^γ − 1), B = (ρ₀·c²)/γ, ρ₀′ = max(ρ₀, 1e-10); for |γ| < 1e-12 its limit
+# (ρ₀·c²)·ln(ρ/ρ₀′). ln and powf are correctly rounded (ADR 0004). Mirrors `equation_of_state_tait`.
+#must_use
+fn equation_of_state_tait(density: f64, rest_density: f64, speed_of_sound: f64, gamma: f64): f64 {
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var rho0: f64 = _pv_max(rest_density, lo);
+    var c2: f64 = speed_of_sound * speed_of_sound;
+    var rc2: f64 = rest_density * c2;
+    var x: f64 = density / rho0;
+    var ag: f64 = f64_abs(gamma);
+    var tiny: f64 = 0x3D719799812DEA11;   # 1e-12
+    if (ag < tiny) {
+        var lx: f64 = _pv_ln(x);
+        var p0: f64 = rc2 * lx;
+        return p0;
+    }
+    var b: f64 = rc2 / gamma;
+    var xg: f64 = _pv_powf(x, gamma);
+    var p: f64 = b * (xg - 1.0);
+    return p;
+}
+
+# ── the non-Newtonian viscosity models ──────────────────────────────────────────────
+
+# The kind of a non-Newtonian viscosity model: explicit, append-only values (Rust's `#[non_exhaustive]` enum in
+# declaration order). Its payload is `PvNonNewtonianModel` (port plan §7.3).
+enum PvNonNewtonianViscosity {
+    PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW = 0;
+    PV_NON_NEWTONIAN_VISCOSITY_BINGHAM = 1;
+    PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY = 2;
+}
+
+# A non-Newtonian viscosity model: its kind and the union of the variants' fields (a field a kind doesn't use is
+# 0). Mirrors `NonNewtonianViscosity`.
+struct PvNonNewtonianModel {
+    kind;
+    consistency: f64;
+    power_index: f64;
+    yield_stress: f64;
+    plastic_viscosity: f64;
+}
+
+# The power law μ = K·|γ̇|^(n−1). Mirrors `NonNewtonianViscosity::PowerLaw { consistency, power_index }`.
+#must_use
+fn PvNonNewtonianModel_power_law(consistency: f64, power_index: f64): PvNonNewtonianModel {
+    var m: PvNonNewtonianModel;
+    m.kind = PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW;
+    m.consistency = consistency;
+    m.power_index = power_index;
+    m.yield_stress = 0.0;
+    m.plastic_viscosity = 0.0;
+    return m;
+}
+
+# The Bingham plastic μ = μ_p + τ_y/|γ̇|. Mirrors `NonNewtonianViscosity::Bingham { yield_stress,
+# plastic_viscosity }`.
+#must_use
+fn PvNonNewtonianModel_bingham(yield_stress: f64, plastic_viscosity: f64): PvNonNewtonianModel {
+    var m: PvNonNewtonianModel;
+    m.kind = PV_NON_NEWTONIAN_VISCOSITY_BINGHAM;
+    m.consistency = 0.0;
+    m.power_index = 0.0;
+    m.yield_stress = yield_stress;
+    m.plastic_viscosity = plastic_viscosity;
+    return m;
+}
+
+# Herschel–Bulkley μ = K·|γ̇|^(n−1) + τ_y/|γ̇|. Mirrors `NonNewtonianViscosity::HerschelBulkley { yield_stress,
+# consistency, power_index }`.
+#must_use
+fn PvNonNewtonianModel_herschel_bulkley(yield_stress: f64, consistency: f64, power_index: f64): PvNonNewtonianModel {
+    var m: PvNonNewtonianModel;
+    m.kind = PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY;
+    m.consistency = consistency;
+    m.power_index = power_index;
+    m.yield_stress = yield_stress;
+    m.plastic_viscosity = 0.0;
+    return m;
+}
+
+# The model's effective viscosity at strain rate |γ̇|, with s = max(|γ̇|, 1e-10) (a NaN rate gives 1e-10):
+#   power law K·s^(n−1); Bingham min(μ_p + τ_y/s, 1e6·μ_p); Herschel–Bulkley min(K·s^(n−1) + τ_y/s, 1e6·K)
+# (powf correctly rounded, the mins Rust's NaN-ignoring ones). NaN for a kind outside the enum. Mirrors
+# `NonNewtonianViscosity::effective_viscosity`.
+#must_use
+fn non_newtonian_viscosity_effective_viscosity(m: *PvNonNewtonianModel, strain_rate: f64): f64 {
+    var eps: f64 = 0x3DDB7CDFD9D7BDBB;   # 1e-10
+    var sr: f64 = _pv_max(strain_rate, eps);
+    var big: f64 = 1000000.0;
+    match m.kind {
+        PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW => {
+            var e: f64 = m.power_index - 1.0;
+            var pw: f64 = _pv_powf(sr, e);
+            var mu: f64 = m.consistency * pw;
+            return mu;
+        }
+        PV_NON_NEWTONIAN_VISCOSITY_BINGHAM => {
+            var ys: f64 = m.yield_stress / sr;
+            var mb: f64 = m.plastic_viscosity + ys;
+            var cap: f64 = big * m.plastic_viscosity;
+            var rb: f64 = _pv_min(mb, cap);
+            return rb;
+        }
+        PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY => {
+            var e2: f64 = m.power_index - 1.0;
+            var pw2: f64 = _pv_powf(sr, e2);
+            var base: f64 = m.consistency * pw2;
+            var ys2: f64 = m.yield_stress / sr;
+            var mh: f64 = base + ys2;
+            var cap2: f64 = big * m.consistency;
+            var rh: f64 = _pv_min(mh, cap2);
+            return rh;
+        }
+        _ => {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+    }
+    var nan2: f64 = PV_F64_NAN;
+    return nan2;
+}
+
+# ── the batch and whole-system helpers ──────────────────────────────────────────────
+
+# poly6 at each of the n squared distances at r2 (the coefficients for h, with no check on h, as Rust's), as a new
+# freelist buffer: (pointer, n), which the caller releases with `fl_free`; (0, 0) for n ≤ 0 or no memory. Mirrors
+# `batch_poly6` (ADR 0002 #9).
+#must_use
+fn batch_poly6(r2, n, h: f64) {
+    if (n <= 0) { return (0, 0); }
+    var out = fl_alloc(n * 8);
+    if (out == 0) { return (0, 0); }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(r2 + i * 8);
+        var w: f64 = _pv_kc_poly6(&kc, x);
+        store64(out + i * 8, _pv_bits(w));
+    }
+    return (out, n);
+}
+
+# |pos − positions[i]|² for each of the n `PvVec3`s at positions, as a new freelist buffer: (pointer, n), (0, 0) for
+# n ≤ 0 or no memory. Mirrors `batch_distance_squared` (ADR 0002 #9).
+#must_use
+fn batch_distance_squared(pos: PvVec3, positions, n) {
+    if (n <= 0) { return (0, 0); }
+    var out = fl_alloc(n * 8);
+    if (out == 0) { return (0, 0); }
+    for (var i = 0; i < n; i = i + 1) {
+        var q = positions + i * 24;
+        var qx: f64 = load64(q);
+        var qy: f64 = load64(q + 8);
+        var qz: f64 = load64(q + 16);
+        var dx: f64 = pos.x - qx;
+        var dy: f64 = pos.y - qy;
+        var dz: f64 = pos.z - qz;
+        var d: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        store64(out + i * 8, _pv_bits(d));
+    }
+    return (out, n);
+}
+
+# Σ kinetic energy over the n particles at ps, folded from −0 (Rust's f64 sum). Mirrors `total_kinetic_energy`.
+#must_use
+fn total_kinetic_energy(ps: *PvFluidParticle, n): f64 {
+    var s: f64 = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var e: f64 = p.kinetic_energy();
+        s = s + e;
+    }
+    return s;
+}
+
+# The largest speed over the n particles at ps: √ of the max of |v|², folded from +0 with Rust's NaN-ignoring max.
+# Mirrors `max_speed`.
+#must_use
+fn max_speed(ps: *PvFluidParticle, n): f64 {
+    var m: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var q: f64 = p.speed_squared();
+        if (q >= m || m != m) { m = q; }
+    }
+    var s: f64 = f64_sqrt(m);
+    return s;
+}

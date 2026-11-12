@@ -13,8 +13,8 @@
 //!
 //! Values come from the oracle's API (or Rust's std), never from the source text. `complete` and
 //! `std_complete` prove both lists against `rust-old/src`, so a constant can't be missed. Private
-//! constants (`MIN_DENSITY`, the solver limits, …) are not public API: they are extracted and
-//! proven at the milestone whose module uses them, as impetus did (port plan §4 step 6).
+//! constants (`MIN_DENSITY`, the solver limits, …) are not public API: `t_private.rs` extracts them
+//! from the source into `src/constants_private.cyr`, as impetus did (port plan §4 step 6).
 //!
 //! Cyrius names are derived from the Rust path: `FluidMaterial::WATER.density` is
 //! `PV_FLUID_MATERIAL_WATER_DENSITY`, `DragCoefficient::SPHERE` is `PV_DRAG_COEFFICIENT_SPHERE`.

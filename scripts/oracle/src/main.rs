@@ -37,9 +37,11 @@ mod m_json;
 mod m_math;
 mod m_phase_field;
 mod m_shallow;
+mod m_sph;
 mod m_vof;
 mod m_vortex;
 mod t_constants;
+mod t_private;
 mod tsv;
 
 use std::collections::BTreeSet;
@@ -62,6 +64,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_math::emit(),
         m_phase_field::emit(),
         m_shallow::emit(),
+        m_sph::emit(),
         m_vof::emit(),
         m_vortex::emit(),
     ])
@@ -71,6 +74,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
 fn cyrius_outputs(root: &Path, prov: &str) -> Result<Vec<Output>, String> {
     let files = vec![
         ("src/constants.cyr", t_constants::emit(root, prov)?),
+        ("src/constants_private.cyr", t_private::emit(root, prov)?),
         ("tests/constants_rows.cyr", t_constants::emit_rows(prov)),
     ];
     Ok(files

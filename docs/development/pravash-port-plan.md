@@ -11,7 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M3 complete** (2026-11-12); M4 (SPH foundations) is next. Part e added `src/par.cyr`, the worker
+> ⏳ **Status: M4 part a complete** (2026-11-12); M4 part b (the neighbour grid) is next. Part a ported the SPH
+> kernels, the equations of state and the non-Newtonian models (`src/sph_kernels.cyr`): 804 rows, bit-exact, 16 against
+> the corrected oracle (port-parity §15). M3 is complete. M3 part e added `src/par.cyr`, the worker
 > pool behind each solver's runtime thread count (D6), on the grid's three `parallel` loops: every `FluidGrid::step`
 > row gives its one-thread words at 2, 3, 4 and 8 threads (port-parity §14). Part d ported `VofField` and `PhaseField` (`src/vof.cyr`, `src/phase_field.cyr`): 384 rows in two new golden
 > modules, bit-exact on the first replay, all 8 + 11 Rust tests (port-parity §13). Part c ported
@@ -921,7 +923,12 @@ Part e (2026-11-12, port-parity §14):
   dominating, as Rust's rayon build gains nothing.
 
 **Next:** M4, SPH foundations |
-| M4 SPH foundations | — | — | — | — | |
+| M4 SPH foundations | 🟡 **part a done 2026-11-12**; parts b–d next | sph 804: the seven kernels over 22 radii (the specials, 1e±40) and r ∈ [−0.1h, 2.4h]; the linear EOS; Tait across γ's 1e-12 limit and ρ₀'s 1e-10 floor; the non-Newtonian models; the batch and whole-system helpers. 16 rows against the corrected oracle `sph.cr.tsv` (glibc misrounds pow or ln at MPFR-found arguments); all bit-exact on the first replay | 22 of the 79 Rust tests of `sph.rs` (`tests/sph.tcyr`) | `sph_kernels/*` 10–10.5× (after computing only each kernel's coefficient, 1.30–1.78×), Wendland 8–9×, Tait 52× and the power law 27× (the correctly rounded pow, L1), `batch_poly6` 54× (half of it a mapped 8 KB block) | port-parity §15:
+- `src/sph_kernels.cyr`; ADR 0002 #15 (the first data-carrying enum, §7.3);
+- `t_private.rs` and `src/constants_private.cyr` (private constants from their Rust literals; `_PV_GRID_MIN_SIZE` replaces two hand-typed 4s), proven by `probe_tables.py`;
+- surface parity adds `sph`, the rest pending by part.
+
+**Next:** M4 part b: the neighbour grid on f32 keys (L4), the cell key, the lists, `sort_by_zorder` (L9) |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |
 | M7 Compute, logging and ai | — | — | — | — | |
