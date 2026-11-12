@@ -2958,6 +2958,56 @@ def v3_len2(v):
     return v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 
 
+def nb_key(x32, inv32):
+    """hisab's per-axis cell key: floor(x · inv) in f32, as i32 (saturating)."""
+    return r_as_i32(_libm.floor(f32(x32 * inv32)))
+
+
+def nb_build(pos, h):
+    """`SphSolver::build_neighbors` on a fresh solver (cell size 1.0): the grid's cell size, its point and cell
+    counts, the f32 positions, each particle's own key, and the CSR lists. A dict stands in for hisab's HashMap;
+    each cell keeps its points in insertion (index) order, as the Vec does."""
+    h32 = f32(h)
+    inv_cs = f32(1.0 / h32)
+    half = f32(h32 * 0.5)
+    cell, inv_cell = 1.0, 1.0
+    if abs(f32(cell - h32)) > f32(2.0 ** -23):
+        cell, inv_cell = h32, f32(1.0 / h32)
+    p32 = [tuple(f32(c) for c in q) for q in pos]
+    cells = {}
+    for i, q in enumerate(p32):
+        cells.setdefault(tuple(nb_key(c, inv_cell) for c in q), []).append(i)
+    own = [tuple(nb_key(c, inv_cs) for c in q) for q in p32]
+
+    def wrap(v):
+        return (v + 2 ** 31) % 2 ** 32 - 2 ** 31
+
+    offsets, indices = [0], []
+    for c in own:
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    # (c + d) as f32 rounds the integer first (above 2^24 it moves), then × h, then + h/2.
+                    probe = tuple(f32(f32(f32(float(wrap(k + d))) * h32) + half) for k, d in zip(c, (dx, dy, dz)))
+                    indices += cells.get(tuple(nb_key(t, inv_cell) for t in probe), [])
+        offsets.append(len(indices))
+    return cell, len(pos), len(cells), p32, own, offsets, indices
+
+
+def spread_bits(v):
+    v &= 0xFFFFFFFF
+    for sh, mask in ((16, 0x0000FFFF0000FFFF), (8, 0x00FF00FF00FF00FF), (4, 0x0F0F0F0F0F0F0F0F),
+                     (2, 0x3333333333333333), (1, 0x5555555555555555)):
+        v = (v | (v << sh)) & mask
+    return v
+
+
+def morton_2d(x, y, inv):
+    ix = r_as_u32(r_max(x * inv, 0.0))
+    iy = r_as_u32(r_max(y * inv, 0.0))
+    return spread_bits(ix) | (spread_bits(iy) << 1)
+
+
 def sph_want(func, x, P):
     """A part a sph row's recomputed outputs (P: the transcendentals)."""
     if func.startswith("kernel_"):
@@ -2984,6 +3034,26 @@ def sph_want(func, x, P):
             d = (pos[0] - q[0], pos[1] - q[1], pos[2] - q[2])
             out.append(v3_len2(d))
         return out
+    if func == "SphSolver::neighbor_lists":
+        h, n = x[0], x[1]
+        pos = [tuple(x[2 + 3 * j:5 + 3 * j]) for j in range(n)]
+        cell, ln, nc, p32, own, offsets, indices = nb_build(pos, h)
+        return ([cell, ln, nc, ("v", 3 * n)] + [c for q in p32 for c in q] + [("v", 3 * n)]
+                + [r_cell_key(c, h) for q in p32 for c in q] + [("v", len(offsets))] + offsets
+                + [("v", len(indices))] + indices)
+    if func == "sort_by_zorder":
+        cell, n = x[0], x[1]
+        ps = [x[2 + 18 * j:20 + 18 * j] for j in range(n)]
+        if n < 2 or not (fin(cell) and cell > 0.0):
+            return [("v", 0)] + [t for q in ps for t in q]
+        inv = 1.0 / cell
+        mx = my = sys.float_info.max
+        for q in ps:
+            mx, my = r_min(mx, q[0]), r_min(my, q[1])
+        codes = [morton_2d(q[0] - mx, q[1] - my, inv) for q in ps]
+        order = sorted(range(n), key=lambda j: codes[j])   # Python's sort is stable: (code, input index)
+        return ([("v", n)] + [codes[j] - 2 ** 64 if codes[j] >= 2 ** 63 else codes[j] for j in order]
+                + [t for j in order for t in ps[j]])
     if func in ("total_kinetic_energy", "max_speed"):
         n = x[0]
         ps = [particle_read(x, 1 + 18 * j) for j in range(n)]

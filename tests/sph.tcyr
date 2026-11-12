@@ -1,11 +1,15 @@
 # sph.tcyr — the ported Rust tests of rust-old/src/sph.rs (M4 and M5).
 #
 # Every test keeps its Rust name as its group, in Rust's order. M4 part a ports the 22 of the kernels, the equations
-# of state, the non-Newtonian models and the totals; `test_degenerate_inputs_no_panic` waits for part d, whose free
-# functions it also calls, and the solver's for M5. Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): a
-# particle slice is (pointer, count); a `NonNewtonianViscosity` variant is a `PvNonNewtonianModel` made by its
-# constructor, its method `non_newtonian_viscosity_effective_viscosity`; the private `KernelCoeffs` methods are the
-# `_pv_kc_*` functions.
+# of state, the non-Newtonian models and the totals; part b `test_zorder_negative_coordinates`. `test_sort_by_zorder`
+# and `test_sort_by_zorder_preserves_data` wait for part c, whose `create_particle_block` they build their particles
+# with; `test_degenerate_inputs_no_panic` for part d, whose free functions it also calls; the solver's for M5. Three
+# Cyrius-only groups check what part b adds without an oracle: the merge sort's stability, the neighbour lists
+# against a brute-force search, and the record layout `_pv_nb_col` assumes.
+#
+# Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): a particle slice is (pointer, count); a
+# `NonNewtonianViscosity` variant is a `PvNonNewtonianModel` made by its constructor, its method
+# `non_newtonian_viscosity_effective_viscosity`; the private `KernelCoeffs` methods are the `_pv_kc_*` functions.
 
 include "tests/lib.cyr"
 
@@ -175,12 +179,156 @@ fn test_wendland_and_viscosity() {
     return 0;
 }
 
+# test_zorder_negative_coordinates (part b; the two before it wait for part c's `create_particle_block`).
+fn test_zorder() {
+    test_group("test_zorder_negative_coordinates");
+    var ps: *PvFluidParticle = _pv_as_particles(fl_alloc(3 * sizeof(PvFluidParticle)));
+    var q0: PvFluidParticle = PvFluidParticle_new_2d(-1.0, -1.0, 1.0);
+    var q1: PvFluidParticle = PvFluidParticle_new_2d(-3.0, -3.0, 1.0);
+    var q2: PvFluidParticle = PvFluidParticle_new_2d(-2.0, -2.0, 1.0);
+    memcpy(ps, &q0, sizeof(PvFluidParticle));
+    memcpy(ps + 1, &q1, sizeof(PvFluidParticle));
+    memcpy(ps + 2, &q2, sizeof(PvFluidParticle));
+    assert_eq(sort_by_zorder(ps, 3, 0.5), 1, "sorted");
+    var p0: *PvFluidParticle = ps;
+    var p1: *PvFluidParticle = ps + 1;
+    var p2: *PvFluidParticle = ps + 2;
+    assert(p0.position.x == -3.0 && p1.position.x == -2.0 && p2.position.x == -1.0, "x: −3, −2, −1");
+    fl_free(ps);
+    return 0;
+}
+
+# ── Cyrius-only: the merge sort, the lists, the layout ──────────────────────────────
+
+# The order of two words by their high half (ctx unused), so words sharing it tie.
+fn hi_cmp(ctx, a, b): i64 {
+    var ha = a >> 16;
+    var hb = b >> 16;
+    if (ha < hb) { return 0 - 1; }
+    if (ha > hb) { return 1; }
+    return 0;
+}
+
+# Cyrius-only: `_pv_msort` sorts and keeps tied words in their input order, at every length up to 70.
+fn test_msort() {
+    test_group("msort_is_stable");
+    var idx = fl_alloc(70 * 8);
+    var tmp = fl_alloc(70 * 8);
+    var bad = 0;
+    for (var n = 0; n <= 70; n = n + 1) {
+        # Word i: a key (i·37 mod 11) in the high half, i in the low.
+        for (var i = 0; i < n; i = i + 1) { store64(idx + i * 8, (((i * 37) % 11) << 16) | i); }
+        _pv_msort(idx, n, tmp, &hi_cmp, 0);
+        for (var j = 1; j < n; j = j + 1) {
+            var a = load64(idx + (j - 1) * 8);
+            var b = load64(idx + j * 8);
+            if ((a >> 16) > (b >> 16)) { bad = bad + 1; }
+            if ((a >> 16) == (b >> 16) && (a & 0xFFFF) > (b & 0xFFFF)) { bad = bad + 1; }
+        }
+    }
+    assert_eq(bad, 0, "sorted on (key, input index)");
+    fl_free(idx);
+    fl_free(tmp);
+    return 0;
+}
+
+# 1 when j is in the list [a, b) of the grid's indices.
+fn listed(g: *PvNeighborGrid, a, b, j): i64 {
+    for (var r = a; r < b; r = r + 1) {
+        if (load64(g.indices.data + r * 8) == j) { return 1; }
+    }
+    return 0;
+}
+
+# Cyrius-only: on a jittered 2D lattice at h 0.1, every particle's list holds every particle within h of it (the
+# brute-force search) and itself, and no index twice; a rebuild at the same h gives the same lists.
+fn test_lists() {
+    test_group("nb_lists_cover_brute_force");
+    var n = 120;
+    var ps: *PvFluidParticle = _pv_as_particles(fl_alloc(n * sizeof(PvFluidParticle)));
+    for (var i = 0; i < n; i = i + 1) {
+        var jx: f64 = f64_from((i * 7) % 5) * 0.004;
+        var jy: f64 = f64_from((i * 3) % 7) * 0.003;
+        var x: f64 = f64_from(i % 12) * 0.045 + jx;
+        var y: f64 = f64_from(i / 12) * 0.045 + jy;
+        var q: PvFluidParticle = PvFluidParticle_new_2d(x, y, 0.001);
+        memcpy(ps + i, &q, sizeof(PvFluidParticle));
+    }
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    assert_eq(_pv_nb_build(&g, ps, n, 0.1), 1, "built");
+    assert_eq(g.len, n, "every particle inserted");
+    var h2: f64 = 0.1 * 0.1;
+    var miss = 0;
+    var dup = 0;
+    var off = g.offsets.data;
+    for (var a = 0; a < n; a = a + 1) {
+        var s = load64(off + a * 8);
+        var e = load64(off + (a + 1) * 8);
+        var pa: *PvFluidParticle = ps + a;
+        for (var b = 0; b < n; b = b + 1) {
+            var pb: *PvFluidParticle = ps + b;
+            var dx: f64 = pa.position.x - pb.position.x;
+            var dy: f64 = pa.position.y - pb.position.y;
+            var r2: f64 = dx * dx + dy * dy;
+            if (r2 < h2 && listed(&g, s, e, b) == 0) { miss = miss + 1; }
+        }
+        for (var r = s + 1; r < e; r = r + 1) {
+            if (listed(&g, s, r, load64(g.indices.data + r * 8)) == 1) { dup = dup + 1; }
+        }
+    }
+    assert_eq(miss, 0, "every particle within h is listed (itself included)");
+    assert_eq(dup, 0, "no index listed twice");
+    # A second build at the same h reuses the columns and gives the same lists.
+    var before = g.indices.len;
+    assert_eq(_pv_nb_build(&g, ps, n, 0.1), 1, "rebuilt");
+    assert_eq(g.indices.len, before, "the same lists");
+    PvNeighborGrid_drop(&g);
+    fl_free(ps);
+    return 0;
+}
+
+# Column k's storage pointer through `_pv_nb_col`'s byte offsets.
+fn nb_col_data(g: *PvNeighborGrid, k): i64 {
+    var c: *PvColumn = _pv_nb_col(g, k);
+    return c.data;
+}
+
+# Cyrius-only: the record layout the column offsets assume.
+fn test_layout() {
+    test_group("nb_layout_matches_column_offsets");
+    assert_eq(sizeof(PvNeighborGrid), 224, "224 bytes");
+    var buf[288];
+    var ps: *PvFluidParticle = _pv_as_particles(&buf);
+    var q0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var q1: PvFluidParticle = PvFluidParticle_new_2d(0.05, 0.0, 1.0);
+    memcpy(ps, &q0, sizeof(PvFluidParticle));
+    memcpy(ps + 1, &q1, sizeof(PvFluidParticle));
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    assert_eq(_pv_nb_build(&g, ps, 2, 0.1), 1, "a build sizes every column");
+    assert_eq(nb_col_data(&g, 0), g.pos32.data, "0: pos32");
+    assert_eq(nb_col_data(&g, 1), g.keys.data, "1: keys");
+    assert_eq(nb_col_data(&g, 2), g.order.data, "2: order");
+    assert_eq(nb_col_data(&g, 3), g.tmp.data, "3: tmp");
+    assert_eq(nb_col_data(&g, 4), g.cstart.data, "4: cstart");
+    assert_eq(nb_col_data(&g, 5), g.offsets.data, "5: offsets");
+    assert_eq(nb_col_data(&g, 6), g.indices.data, "6: indices");
+    assert_eq(nb_col_data(&g, 7), g.ckeys.data, "7: ckeys");
+    PvNeighborGrid_drop(&g);
+    return 0;
+}
+
 # Runs the ported SPH tests.
 fn main() {
     alloc_init();
     test_kernels();
     test_eos_and_totals();
     test_wendland_and_viscosity();
+    test_zorder();
+    test_msort();
+    test_lists();
+    test_layout();
     return assert_summary();
 }
 

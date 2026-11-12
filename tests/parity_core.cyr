@@ -29,8 +29,10 @@
 # Three token lists of up to _PAR_MAX tokens: the row's inputs, its wanted outputs, and what the port returned.
 # Each slot is a kind byte ('f' 'i' 'e' 's' 'n' 'E' 'v'), a value word (f64 bits, an
 # integer, or a pointer to text) and a text length.
-# impetus raised kimiya's 1,024 (its broadphase rows carry 1,000 boxes, 4,001 input tokens); pravash keeps it.
-var _PAR_MAX = 8192;
+# impetus raised kimiya's 1,024 (its broadphase rows carry 1,000 boxes, 4,001 input tokens) to 8,192; pravash's
+# neighbour-list rows give up to 23,472 output tokens (M4 part b), so it is 65,536 here. An appender past the cap
+# stores nothing, so the got list comes up short and the row fails, rather than writing past its buffer.
+var _PAR_MAX = 65536;
 var _par_in_k = 0;
 var _par_in_v = 0;
 var _par_in_l = 0;
@@ -184,6 +186,7 @@ fn _par_in_cstr(k): i64 {
 
 # Appends an f64 result word to the got list.
 fn _par_got_f(bits) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 102);
     store64(_par_got_v + at, bits);
@@ -193,6 +196,7 @@ fn _par_got_f(bits) {
 
 # Appends an integer result to the got list.
 fn _par_got_i(v) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 105);
     store64(_par_got_v + at, v);
@@ -202,6 +206,7 @@ fn _par_got_i(v) {
 
 # Appends a sequence length (`v:`) to the got list.
 fn _par_got_seq(n) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 118);
     store64(_par_got_v + at, n);
@@ -211,6 +216,7 @@ fn _par_got_seq(n) {
 
 # Appends an enum result to the got list, as its golden text ("ElementCategory.Halogen").
 fn _par_got_e(name) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 101);
     store64(_par_got_v + at, name);
@@ -220,6 +226,7 @@ fn _par_got_e(name) {
 
 # Appends an error (`E:Variant`) to the got list, by its Rust variant name.
 fn _par_got_err(code) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var name = _par_error_name(code);
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 69);
@@ -230,6 +237,7 @@ fn _par_got_err(code) {
 
 # Appends Option::None (`n:`) to the got list.
 fn _par_got_none() {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 110);
     store64(_par_got_v + at, 0);
@@ -239,6 +247,7 @@ fn _par_got_none() {
 
 # Appends a text result (`s:`) to the got list.
 fn _par_got_s(p, len) {
+    if (_par_got_n >= _PAR_MAX) { return 0; }
     var at = _par_got_n * 8;
     store64(_par_got_k + at, 115);
     store64(_par_got_v + at, p);

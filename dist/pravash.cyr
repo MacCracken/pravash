@@ -9826,6 +9826,470 @@ fn max_speed(ps: *PvFluidParticle, n): f64 {
     return s;
 }
 
+# --- neighbor.cyr ---
+
+# neighbor.cyr — the SPH neighbour grid (M4 part b): hisab 1.4.0's `SpatialHash` as `SphSolver` uses it, on sorted
+# arrays, with its f32 cell keys reproduced bit for bit (port plan D3), and the solver's neighbour lists exactly as
+# its private `build_neighbors` makes them. Also the stable merge sort the grid and `sort_by_zorder` share.
+#
+# hisab keeps a `HashMap<(i32, i32, i32), Vec<usize>>`: each cell's indices in insertion order, which is index
+# order, since the solver inserts particle i at step i. Sorting the points on (cell key, index) gives every cell as
+# one run in that same order, and a cell lookup is a search over the runs: the same lists, with no map to iterate
+# (CLAUDE.md: never iterate a hashmap) and nothing allocated once the grid has grown. The cells are ordered z, then
+# y, then x, so a probe row's three cells (one z and y, three x) sit together: one binary search finds the first, and
+# a short scan the others. The order of the cells never shows in the lists, which follow the probes.
+#
+# The keys are f32, as hisab's are: floor(x · (1/cell)) as i32 per axis on the f32 position, saturating. At large
+# coordinates the f32 rounding moves the solver's probe points into other cells (the defect D3 later fixes with f64
+# keys): the port reproduces that too.
+#
+# UPSTREAM(L4): hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md
+#   replace `PvNeighborGrid` with hisab's `spatial_hash_*` once its query writes into caller storage (and keeps the
+#   f32 keys until the D3 switch); parity: the `SphSolver::neighbor_lists` rows of tests/golden/sph.tsv (class A).
+# UPSTREAM(L9): cyrius:docs/development/issues/2026-11-11-no-stable-sort.md
+#   replace `_pv_msort` with the stdlib's stable sort once it ships; parity: the neighbour lists and the
+#   `sort_by_zorder` rows (class A).
+
+# ── the stable merge sort ───────────────────────────────────────────────────────────
+
+# Sorts the n words at idx stably by cmp(ctx, a, b) (negative, 0 or positive, as a before, tied with or after b),
+# with tmp holding n words of scratch: a bottom-up merge sort, which keeps tied words in their input order. With idx
+# starting in index order, the result is sorted on (key, index), a total order (ADR 0002 #3).
+fn _pv_msort(idx, n, tmp, cmp, ctx) {
+    var src = idx;
+    var dst = tmp;
+    var width = 1;
+    while (width < n) {
+        for (var lo = 0; lo < n; lo = lo + 2 * width) {
+            var mid = lo + width;
+            if (mid > n) { mid = n; }
+            var hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var a = lo;
+            var b = mid;
+            var k = lo;
+            while (a < mid && b < hi) {
+                var wa = load64(src + a * 8);
+                var wb = load64(src + b * 8);
+                if (fncall3(cmp, ctx, wa, wb) <= 0) {
+                    store64(dst + k * 8, wa);
+                    a = a + 1;
+                } else {
+                    store64(dst + k * 8, wb);
+                    b = b + 1;
+                }
+                k = k + 1;
+            }
+            while (a < mid) {
+                store64(dst + k * 8, load64(src + a * 8));
+                a = a + 1;
+                k = k + 1;
+            }
+            while (b < hi) {
+                store64(dst + k * 8, load64(src + b * 8));
+                b = b + 1;
+                k = k + 1;
+            }
+        }
+        var t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != idx) {
+        for (var i = 0; i < n; i = i + 1) { store64(idx + i * 8, load64(src + i * 8)); }
+    }
+    return 0;
+}
+
+# ── the f32 cell key ────────────────────────────────────────────────────────────────
+
+# floor(x · inv) as i32, in f32 (x and inv are f32 values, passed widened): the product rounded to f32, floored
+# exactly, and cast saturating (NaN 0). Mirrors hisab 1.4.0 `SpatialHash::cell_key` on one axis, and the solver's
+# own `(pos.x * inv_cs).floor() as i32`.
+#must_use
+fn _pv_nb_key(x: f64, inv: f64): i64 {
+    var a: f32 = f32_from(x);
+    var b: f32 = f32_from(inv);
+    var p: f32 = a * b;
+    var w: f64 = f32_to(p);
+    var fl: f64 = f64_floor(w);
+    return _pv_as_i32(fl);
+}
+
+# The cell key of position p (f64) at smoothing radius h: (p as f32 · (1 / h as f32)).floor() as i32. Mirrors the
+# oracle hook `sph_cell_key` on one axis.
+#must_use
+fn _pv_sph_cell_key(p: f64, h: f64): i64 {
+    var h32: f32 = f32_from(h);
+    var one: f32 = f32_from(1.0);
+    var inv: f32 = one / h32;
+    var p32: f32 = f32_from(p);
+    var pw: f64 = f32_to(p32);
+    var iw: f64 = f32_to(inv);
+    return _pv_nb_key(pw, iw);
+}
+
+# ── the grid ────────────────────────────────────────────────────────────────────────
+
+# The neighbour grid of one solver: hisab's `SpatialHash` state (its f32 cell size and 1/cell, both widened to
+# f64, exactly), the points of the last build sorted into cells, and the neighbour lists in CSR form. Every column is
+# reused across builds. Starts as `SphSolver::new`'s grid: cell size 1, empty.
+struct PvNeighborGrid {
+    cell_size: f64;
+    inv_cell: f64;
+    len;
+    cells;
+    pos32: PvColumn;
+    keys: PvColumn;
+    order: PvColumn;
+    tmp: PvColumn;
+    cstart: PvColumn;
+    offsets: PvColumn;
+    indices: PvColumn;
+    ckeys: PvColumn;
+}
+
+# Column k of a grid (0 pos32, 1 keys, 2 order, 3 tmp, 4 cstart, 5 offsets, 6 indices, 7 ckeys), by its byte offset
+# (tests/sph.tcyr pins the layout, 224 bytes).
+#must_use
+fn _pv_nb_col(g, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(g) + 32 + k * 24);
+}
+
+# An empty grid of cell size 1 into *g (nothing allocated yet). Mirrors `SpatialHash::new(1.0)` in `SphSolver::new`.
+fn PvNeighborGrid_init(g: *PvNeighborGrid) {
+    g.cell_size = 1.0;
+    g.inv_cell = 1.0;
+    g.len = 0;
+    g.cells = 0;
+    for (var k = 0; k < 8; k = k + 1) {
+        var c: *PvColumn = _pv_nb_col(g, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases the grid's columns; it is empty and usable again (cell size kept).
+fn PvNeighborGrid_drop(g: *PvNeighborGrid) {
+    for (var k = 0; k < 8; k = k + 1) {
+        var c: *PvColumn = _pv_nb_col(g, k);
+        c.drop();
+    }
+    g.len = 0;
+    g.cells = 0;
+    return 0;
+}
+
+# The order of two points' cell keys (ctx: the key column's words, x, y, z a point): negative, 0 or positive,
+# comparing z, then y, then x. Ties keep index order through the stable sort.
+fn _pv_nb_cmp(ctx, a, b): i64 {
+    var pa = ctx + a * 24;
+    var pb = ctx + b * 24;
+    for (var k = 2; k >= 0; k = k - 1) {
+        var ka = load64(pa + k * 8);
+        var kb = load64(pb + k * 8);
+        if (ka < kb) { return 0 - 1; }
+        if (ka > kb) { return 1; }
+    }
+    return 0;
+}
+
+# The first of the cells [lo, hi) (ck: their keys, x, y, z a cell) not before (kx, ky, kz) in the grid's order (z,
+# then y, then x): a binary search.
+#must_use
+fn _pv_nb_lower(ck, lo, hi, kx, ky, kz): i64 {
+    while (lo < hi) {
+        var mid = (lo + hi) / 2;
+        var p = ck + mid * 24;
+        var mz = load64(p + 16);
+        var before = 0;
+        if (mz < kz) {
+            before = 1;
+        } elif (mz == kz) {
+            var my = load64(p + 8);
+            if (my < ky) {
+                before = 1;
+            } elif (my == ky) {
+                if (load64(p) < kx) { before = 1; }
+            }
+        }
+        if (before == 1) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+
+# s as an i32 (two's-complement wrap): `cx + dx` in the solver, which Rust's release builds wrap (an overflow-checked
+# build panics instead, and the oracle's rows never reach it).
+#must_use
+fn _pv_wrap_i32(s): i64 {
+    var w = s & 0xFFFFFFFF;
+    if (w >= 2147483648) { w = w - 4294967296; }
+    return w;
+}
+
+# The grid's key of the probe for cell c on one axis: (c as i32) as f32 · h + h/2 in f32 (h and h/2 f32 values,
+# passed widened), keyed by the grid's 1/cell. Mirrors one axis of `build_neighbors`' probe and `query_cell`.
+#must_use
+fn _pv_nb_probe(c, h: f64, half: f64, inv_cell: f64): i64 {
+    var b: f32 = f32_from(f64_from(_pv_wrap_i32(c)));
+    var p: f32 = (b * f32_from(h)) + f32_from(half);
+    var w: f64 = f32_to(p);
+    return _pv_nb_key(w, inv_cell);
+}
+
+# Appends order[a..b) to the list column: 1, or 0 when it can't grow (unchanged). The capacity at least doubles, as
+# `extend_from_slice`'s does.
+#must_use
+fn _pv_nb_append(c: *PvColumn, order, a, b): i64 {
+    var need = c.len + (b - a);
+    if (need > c.cap) {
+        var want = c.cap * 2;
+        if (want < need) { want = need; }
+        if (want < 8) { want = 8; }
+        if (c.reserve(want) == 0) { return 0; }
+    }
+    var dst = c.data + c.len * 8;
+    for (var r = a; r < b; r = r + 1) {
+        store64(dst, load64(order + r * 8));
+        dst = dst + 8;
+    }
+    c.len = need;
+    return 1;
+}
+
+# Rebuilds the grid from the n particles at ps and makes their neighbour lists at smoothing radius h (the caller has
+# checked h as f32 is finite and > 0), as `SphSolver::build_neighbors` does:
+# - the grid is renewed with cell size h as f32 when it differs from the current one by more than f32::EPSILON;
+#   otherwise only emptied, and it keeps its old 1/cell (the probes below still use 1/h as f32);
+# - each position as f32 is inserted under the grid's key;
+# - each particle's lists are the 27 cells around its own key (by 1/h as f32), probed at (c + d)·h + h/2 in f32 for
+#   d = −1 … 1, z outermost, then y, then x, each probe's cell looked up by the grid's key: a cell probed twice (at
+#   large coordinates) is listed twice, as in Rust.
+# 1, or 0 when a column can't grow (the lists are then unusable; Rust aborts). Mirrors `build_neighbors`.
+#must_use
+fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
+    var h32: f32 = f32_from(h);
+    var one: f32 = f32_from(1.0);
+    var inv_cs: f32 = one / h32;
+    var half: f32 = h32 * f32_from(0.5);
+    var cs: f32 = f32_from(g.cell_size);
+    var d32: f32 = cs - h32;
+    var dw: f64 = f32_to(d32);
+    var ad: f64 = f64_abs(dw);
+    var eps: f64 = f32_to(PV_F32_EPSILON);
+    if (ad > eps) {
+        var inv_new: f32 = one / h32;
+        g.cell_size = f32_to(h32);
+        g.inv_cell = f32_to(inv_new);
+    }
+    var cpos: *PvColumn = _pv_nb_col(g, 0);
+    var ckey: *PvColumn = _pv_nb_col(g, 1);
+    var cord: *PvColumn = _pv_nb_col(g, 2);
+    var ctmp: *PvColumn = _pv_nb_col(g, 3);
+    var ccs: *PvColumn = _pv_nb_col(g, 4);
+    var coff: *PvColumn = _pv_nb_col(g, 5);
+    var cidx: *PvColumn = _pv_nb_col(g, 6);
+    var cck: *PvColumn = _pv_nb_col(g, 7);
+    var ok = cpos.resize(3 * n, 0) & ckey.resize(3 * n, 0) & cord.resize(n, 0) & ctmp.resize(n, 0);
+    ok = ok & ccs.resize(n + 1, 0) & coff.resize(n + 1, 0) & cck.resize(3 * n, 0);
+    if (ok == 0) { return 0; }
+    var pos = cpos.data;
+    var keys = ckey.data;
+    var order = cord.data;
+    var inv_cell: f64 = g.inv_cell;
+    # The f32 positions, inserted under the grid's key.
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var x32: f32 = f32_from(p.position.x);
+        var y32: f32 = f32_from(p.position.y);
+        var z32: f32 = f32_from(p.position.z);
+        var xw: f64 = f32_to(x32);
+        var yw: f64 = f32_to(y32);
+        var zw: f64 = f32_to(z32);
+        store64(pos + i * 24, _pv_bits(xw));
+        store64(pos + i * 24 + 8, _pv_bits(yw));
+        store64(pos + i * 24 + 16, _pv_bits(zw));
+        store64(keys + i * 24, _pv_nb_key(xw, inv_cell));
+        store64(keys + i * 24 + 8, _pv_nb_key(yw, inv_cell));
+        store64(keys + i * 24 + 16, _pv_nb_key(zw, inv_cell));
+        store64(order + i * 8, i);
+    }
+    _pv_msort(order, n, ctmp.data, &_pv_nb_cmp, keys);
+    # The cells: each run of equal keys in sorted order, its start and its key.
+    var cst = ccs.data;
+    var ck = cck.data;
+    var cells = 0;
+    for (var j = 0; j < n; j = j + 1) {
+        var starts = 1;
+        if (j > 0) {
+            if (_pv_nb_cmp(keys, load64(order + (j - 1) * 8), load64(order + j * 8)) == 0) { starts = 0; }
+        }
+        if (starts == 1) {
+            var src = keys + load64(order + j * 8) * 24;
+            store64(cst + cells * 8, j);
+            store64(ck + cells * 24, load64(src));
+            store64(ck + cells * 24 + 8, load64(src + 8));
+            store64(ck + cells * 24 + 16, load64(src + 16));
+            cells = cells + 1;
+        }
+    }
+    store64(cst + cells * 8, n);
+    g.cells = cells;
+    g.len = n;
+    # The lists. Each axis's three probe keys depend on that axis alone, so they're made once a particle.
+    cidx.truncate(0);
+    var off = coff.data;
+    store64(off, 0);
+    var invw: f64 = f32_to(inv_cs);
+    var hw: f64 = f32_to(h32);
+    var halfw: f64 = f32_to(half);
+    var pk[72];   # the probe keys: axis a (x, y, z), offset d (−1, 0, 1) at word 3·a + d + 1
+    for (var q = 0; q < n; q = q + 1) {
+        for (var ax = 0; ax < 3; ax = ax + 1) {
+            var c = _pv_nb_key(load64(pos + q * 24 + ax * 8), invw);
+            for (var d = 0; d < 3; d = d + 1) {
+                store64(&pk + (3 * ax + d) * 8, _pv_nb_probe(c + d - 1, hw, halfw, inv_cell));
+            }
+        }
+        # The row's first cell by a binary search from the least of its x keys, each probe's cell by a scan from
+        # there over the row's cells at x keys below the probe's: two at most, a few where the probes drift (D3),
+        # more only where the keys wrap.
+        var kx0 = load64(&pk);
+        var kx1 = load64(&pk + 8);
+        var kx2 = load64(&pk + 16);
+        var kmin = kx0;
+        if (kx1 < kmin) { kmin = kx1; }
+        if (kx2 < kmin) { kmin = kx2; }
+        for (var dz = 0; dz < 3; dz = dz + 1) {
+            var kz = load64(&pk + (6 + dz) * 8);
+            for (var dy = 0; dy < 3; dy = dy + 1) {
+                var ky = load64(&pk + (3 + dy) * 8);
+                var lb = _pv_nb_lower(ck, 0, cells, kmin, ky, kz);
+                for (var dx = 0; dx < 3; dx = dx + 1) {
+                    var kx = load64(&pk + dx * 8);
+                    var j = lb;
+                    var scan = 1;
+                    while (scan == 1) {
+                        scan = 0;
+                        if (j < cells) {
+                            var at = ck + j * 24;
+                            if (load64(at + 16) == kz && load64(at + 8) == ky && load64(at) < kx) {
+                                j = j + 1;
+                                scan = 1;
+                            }
+                        }
+                    }
+                    if (j < cells) {
+                        var e = ck + j * 24;
+                        if (load64(e + 16) == kz && load64(e + 8) == ky && load64(e) == kx) {
+                            if (_pv_nb_append(cidx, order, load64(cst + j * 8), load64(cst + (j + 1) * 8)) == 0) {
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        store64(off + (q + 1) * 8, cidx.len);
+    }
+    return 1;
+}
+
+# ── the z-order sort ────────────────────────────────────────────────────────────────
+
+# x's 32 bits spread to the even bits of a word (a zero between each). Mirrors the private `spread_bits`.
+#must_use
+fn _pv_spread_bits(x): i64 {
+    var v = x & 0xFFFFFFFF;
+    v = (v | (v << 16)) & 0x0000FFFF0000FFFF;
+    v = (v | (v << 8)) & 0x00FF00FF00FF00FF;
+    v = (v | (v << 4)) & 0x0F0F0F0F0F0F0F0F;
+    v = (v | (v << 2)) & 0x3333333333333333;
+    v = (v | (v << 1)) & 0x5555555555555555;
+    return v;
+}
+
+# The 2D Morton code of (x, y) at 1/cell inv_cell: each axis max(·inv_cell, 0) as u32 (saturating, NaN 0), spread,
+# y's bits above x's. A u64 as a word. Mirrors the private `morton_code_2d`.
+#must_use
+fn _pv_morton_2d(x: f64, y: f64, inv_cell: f64): i64 {
+    var zero: f64 = 0.0;
+    var ax: f64 = x * inv_cell;
+    var ay: f64 = y * inv_cell;
+    var mx: f64 = _pv_max(ax, zero);
+    var my: f64 = _pv_max(ay, zero);
+    var ix = _pv_as_u32(mx);
+    var iy = _pv_as_u32(my);
+    return _pv_spread_bits(ix) | (_pv_spread_bits(iy) << 1);
+}
+
+# The order of two points' Morton codes (ctx: the code words), compared as u64.
+fn _pv_zorder_cmp(ctx, a, b): i64 {
+    var ka = load64(ctx + a * 8) ^ 0x8000000000000000;
+    var kb = load64(ctx + b * 8) ^ 0x8000000000000000;
+    if (ka < kb) { return 0 - 1; }
+    if (ka > kb) { return 1; }
+    return 0;
+}
+
+# Sorts the n particles at ps by the 2D Morton code of (x − min x, y − min y) at 1/cell_size, the minima folded from
+# f64::MAX with Rust's NaN-ignoring min. Ties keep their input order: Rust's `sort_unstable_by_key` leaves them in
+# an order its algorithm picks, which the port doesn't copy (ADR 0002 #3, port-parity §4.5). The codes are made once
+# and the sorted order applied in place, a cycle at a time, each record moved by assignment (a word-wise copy; `memcpy`
+# goes byte by byte). 1, or 0 with nothing changed for fewer than 2 particles or a cell size not finite and > 0 (Rust
+# returns), or when the scratch can't be allocated (Rust aborts). Mirrors `sort_by_zorder`.
+fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
+    if (n < 2 || _pv_is_positive(cell_size) == 0) { return 0; }
+    var inv: f64 = 1.0 / cell_size;
+    var mnx: f64 = PV_F64_MAX;
+    var mny: f64 = PV_F64_MAX;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        mnx = _pv_min(mnx, p.position.x);
+        mny = _pv_min(mny, p.position.y);
+    }
+    # One block: the codes, the order, the sort's scratch.
+    var keys = fl_alloc(n * 24);
+    if (keys == 0) { return 0; }
+    var order = keys + n * 8;
+    var tmp = keys + n * 16;
+    for (var j = 0; j < n; j = j + 1) {
+        var q: *PvFluidParticle = ps + j;
+        var dx: f64 = q.position.x - mnx;
+        var dy: f64 = q.position.y - mny;
+        store64(keys + j * 8, _pv_morton_2d(dx, dy, inv));
+        store64(order + j * 8, j);
+    }
+    _pv_msort(order, n, tmp, &_pv_zorder_cmp, keys);
+    # Slot k takes the particle at order[k]: follow each cycle from its first slot, marking each slot done (order[k]
+    # = k) as it's filled.
+    var held: PvFluidParticle;
+    for (var s = 0; s < n; s = s + 1) {
+        if (load64(order + s * 8) != s) {
+            var first: *PvFluidParticle = ps + s;
+            held = *first;
+            var k = s;
+            var from = load64(order + k * 8);
+            while (from != s) {
+                var dst: *PvFluidParticle = ps + k;
+                var src: *PvFluidParticle = ps + from;
+                *dst = *src;
+                store64(order + k * 8, k);
+                k = from;
+                from = load64(order + k * 8);
+            }
+            var last: *PvFluidParticle = ps + k;
+            *last = held;
+            store64(order + k * 8, k);
+        }
+    }
+    fl_free(keys);
+    return 1;
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust

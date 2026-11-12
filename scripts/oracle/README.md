@@ -126,7 +126,9 @@ oracle:
   record and MPFR's for the corrected oracle
   (`grid.cr.tsv`: the rows whose DST uses a sine or cosine glibc misrounds);
 - it recomputes every `sph` row (part a: the kernels, the equations of state, the viscosity models), with glibc's ln and
-  pow for the record and MPFR's for the corrected oracle (`sph.cr.tsv`);
+  pow for the record and MPFR's for the corrected oracle (`sph.cr.tsv`); and part b's neighbour lists, from a
+  transcription of `build_neighbors` on a dict of cells (f32 keys and probes, the kept grid), and the z-order sort
+  (the Morton codes, stable on input index);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;

@@ -177,6 +177,7 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _pv_max(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _pv_min(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::rem") == 1) { var r: f64 = _pv_fmod(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "oracle::sph_cell_key") == 1) { _par_got_i(_pv_sph_cell_key(x, y)); return 1; }
     if (_par_in_n < 3) { return 0; }
     var z: f64 = _par_in(2);
     if (_par_eq(fp, fl, "f64::clamp") == 1) { var r: f64 = _pv_clamp(x, y, z); _par_got_f(r); return 1; }
@@ -1159,6 +1160,66 @@ fn _par_sph(fp, fl): i64 {
         for (var j6 = 0; j6 < dn; j6 = j6 + 1) { _par_got_f(load64(dp + j6 * 8)); }
         if (dp != 0) { fl_free(dp); }
         fl_free(ps);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "SphSolver::neighbor_lists") == 1) {
+        # Particles at the row's positions; a fresh grid (`SphSolver::new`'s), then one build.
+        var h: f64 = _par_in(0);
+        var n = _par_in(1);
+        var buf = fl_alloc(n * sizeof(PvFluidParticle) + 8);
+        var ps: *PvFluidParticle = _pv_as_particles(buf);
+        for (var j = 0; j < n; j = j + 1) {
+            var q: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 0.001);
+            q.position = PvVec3_new(_par_in(2 + 3 * j), _par_in(3 + 3 * j), _par_in(4 + 3 * j));
+            memcpy(ps + j, &q, sizeof(PvFluidParticle));
+        }
+        var g: PvNeighborGrid;
+        PvNeighborGrid_init(&g);
+        if (_pv_nb_build(&g, ps, n, h) == 0) { return 0 - 1; }
+        _par_got_f(_pv_bits(g.cell_size));
+        _par_got_i(g.len);
+        _par_got_i(g.cells);
+        _par_col_out(_pv_nb_col(&g, 0));
+        _par_got_seq(3 * n);
+        for (var k = 0; k < 3 * n; k = k + 1) { _par_got_i(_pv_sph_cell_key(load64(g.pos32.data + k * 8), h)); }
+        var off: *PvColumn = _pv_nb_col(&g, 5);
+        _par_got_seq(off.len);
+        for (var o = 0; o < off.len; o = o + 1) { _par_got_i(load64(off.data + o * 8)); }
+        var idx: *PvColumn = _pv_nb_col(&g, 6);
+        _par_got_seq(idx.len);
+        for (var x = 0; x < idx.len; x = x + 1) { _par_got_i(load64(idx.data + x * 8)); }
+        PvNeighborGrid_drop(&g);
+        fl_free(buf);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "sort_by_zorder") == 1) {
+        # The Morton codes of the output order (from the input's minima, as Rust's), then the particles.
+        var cell: f64 = _par_in(0);
+        var nz = _par_in(1);
+        var zb = fl_alloc(nz * sizeof(PvFluidParticle) + 8);
+        var zp: *PvFluidParticle = _pv_as_particles(zb);
+        for (var j2 = 0; j2 < nz; j2 = j2 + 1) { _par_particle_in(2 + j2 * 18, zp + j2); }
+        var mnx: f64 = PV_F64_MAX;
+        var mny: f64 = PV_F64_MAX;
+        for (var j3 = 0; j3 < nz; j3 = j3 + 1) {
+            var pm: *PvFluidParticle = zp + j3;
+            mnx = _pv_min(mnx, pm.position.x);
+            mny = _pv_min(mny, pm.position.y);
+        }
+        if (sort_by_zorder(zp, nz, cell) == 1) {
+            var inv: f64 = 1.0 / cell;
+            _par_got_seq(nz);
+            for (var j4 = 0; j4 < nz; j4 = j4 + 1) {
+                var pz: *PvFluidParticle = zp + j4;
+                var ddx: f64 = pz.position.x - mnx;
+                var ddy: f64 = pz.position.y - mny;
+                _par_got_i(_pv_morton_2d(ddx, ddy, inv));
+            }
+        } else {
+            _par_got_seq(0);
+        }
+        for (var j5 = 0; j5 < nz; j5 = j5 + 1) { _par_particle_out(zp + j5); }
+        fl_free(zb);
         return 1;
     }
     if (_par_eq(fp, fl, "total_kinetic_energy") == 1 || _par_eq(fp, fl, "max_speed") == 1) {

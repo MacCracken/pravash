@@ -1135,3 +1135,99 @@ functions it also calls. Surface parity adds `sph`: 348 items, 72 of them pendin
 
 Each public kernel computing only its own coefficient made the classic kernels 1.30–1.78× faster with the rows
 unchanged.
+
+## 16. M4 part b: the neighbour grid and the z-order sort (2026-11-12)
+
+**`src/neighbor.cyr`:**
+- **`_pv_msort`,** a stable bottom-up merge sort over index words with a comparator `cmp(ctx, a, b)` (ledger L9).
+  Started in index order, it sorts on (key, index), a total order (ADR 0002 #3). Both users below share it.
+- **The f32 cell key,** `_pv_nb_key`: floor(x · inv) on the f32 product, cast as a saturating i32. `_pv_sph_cell_key`
+  is the oracle hook `sph_cell_key` on one axis.
+- **`PvNeighborGrid`** (ledger L4), solver-owned, eight reused columns. hisab 1.4.0's `SpatialHash` keeps a
+  `HashMap` of cells, each in insertion order, which is index order. The grid sorts the points on (cell key, index)
+  instead, so each cell is one run in that same order, and keeps each cell's key in a column. Nothing is allocated
+  once the columns have grown.
+- **`_pv_nb_build`** is `SphSolver::build_neighbors`, exactly:
+  - the grid is renewed with cell size h as f32 only when that differs from its own by more than f32::EPSILON;
+    otherwise it is emptied and keeps its old 1/cell, while the probes still use 1/h;
+  - each particle's 27 probes sit at (c + d) as f32 · h + h/2 in f32, z outermost, then y, then x. Each probe's
+    cell comes from the grid's key, so a probe that lands in another cell lists that cell, and a cell probed twice
+    is listed twice;
+  - `c + d` wraps as an i32, as Rust's release builds do. The oracle's build has overflow checks and panics there,
+    so no row reaches it (ADR 0002 #16).
+- **`sort_by_zorder`** makes each Morton code once, sorts stably and applies the order in place.
+
+**Two findings in the oracle's own behaviour, reproduced bit for bit:**
+- **D3 is visible in the rows.** In the clouds at offsets 1e6 and 3e6 (h 0.05), 400 of 720 probe axes land in
+  another cell than the one they aim at. In the kept-grid row at h = 1 + f32::EPSILON, every probe axis of the
+  4.5e6 cluster does (36 of the row's 612). The lists the solver sums over at those coordinates are not the 27
+  cells around the particle.
+- **A grid within f32::EPSILON of h is kept.** It keys by its old 1/cell while each particle's own key uses 1/h,
+  so a point on a cell edge can sit in a grid cell other than its own key's: at h = 1 + f32::EPSILON, x = 1 has
+  key 0 and grid cell 1.
+
+**The rows** (`m_sph.rs`, part b's seed 0x0_5f4b; a fresh `SphSolver` stepped once with `water_2d()` at h, its
+lists read through the oracle dump):
+
+| Function | Rows | What they cover |
+|---|---|---|
+| `SphSolver::neighbor_lists` | 30 | lattices on cell boundaries (h a power of two, so k·h is exact) and off them (h 0.05), plain and jittered, 2D and 3D; random clouds at offsets 0, −0.5, −7.25, 1e3, 1e5, 1e6 and 3e6; h = 1, 1 + EPS, 1 − EPS/2 (kept), 1 + 2·EPS (renewed), 1 + 1e-9; one particle, duplicates, a NaN coordinate and −0, points a hair either side of a boundary; the kept grid on an integer lattice and a cluster at 4.5e6 |
+| `sort_by_zorder` | 20 | shuffled blocks at their own spacing (distinct codes) and at coarse cells (ties), negative and all-positive coordinates; random clouds with NaN, ±∞ and 1e12 (saturated codes); cell 0, −1, NaN and ∞; one particle; none |
+| `oracle::sph_cell_key` (`math.tsv`) | 2,460 | pending since M0 |
+
+Each z-order row records Rust's codes in its output order, then the particles in the stable order. The particles are
+recovered by matching bits, so a row checks the multiset and the codes' sequence (ADR 0002 #3).
+
+`validate.py` transcribes the build (a dict of cells, the f32 keys and probes, the kept grid) and the Morton codes. The
+transcription first missed that `(c + d) as f32` rounds the integer above 2²⁴, and the 3e6 row caught it. Result:
+49,288 rows, 0 failures.
+
+**Result:**
+- Every row passes: 30, 20 and 2,460. The replay is **12 modules, 0 failing | rows: 49,177 ok, 0 failed,
+  0 measured, 3 pending, 108 accepted (ADR 4: 108)**. The 3 pending rows are bayan's JSON policies.
+- **The mutation tests found two corpus gaps.** On the first version, 11 of 14 port mutations failed rows. Two
+  survivors were gaps:
+  - keying the z probes by 1/h instead of the grid's 1/cell;
+  - folding min x from 0 instead of f64::MAX.
+
+  The transcription's survivor, inserting by 1/h, was the first gap again. Four rows close both: the kept grid on
+  integer points and at 4.5e6, at h = 1 + EPS and 1 − EPS/2, and two z-order blocks whose minima are both positive.
+  None draws a random number, so no other row moved. All three mutants then fail rows.
+- **The third survivor, dropping the i32 wrap, is unreachable.** Every key that would wrap is saturated, and the
+  oracle's build panics on it.
+- **Mutations of the second (faster) version:** 15 of 15 caught.
+  - 13 fail rows: ties, the f64 key, the EPS rule, the probe's h/2, the row search's start, the scan's and the lower
+    bound's `<`, the match and the cell order dropping an axis, a cell key from the wrong axis, the cycle's end,
+    signed codes, the min fold.
+  - A list that never grows crashes.
+  - A cycle whose slots aren't marked never ends, and is killed at the test timeout.
+- **Mutations of the transcription:** 6 of 6 caught after the new rows: the probe's integer rounding, the EPS rule's
+  `>` as `>=`, x as the outer probe loop, the Morton axes swapped, ties reversed, inserting by 1/h.
+
+**Tests** (`tests/sph.tcyr`, 45 checks):
+- `test_zorder_negative_coordinates`.
+- `test_sort_by_zorder` and `_preserves_data` wait for part c's `create_particle_block`.
+- Three Cyrius-only groups:
+  - `msort_is_stable`, at every length 0–70;
+  - `nb_lists_cover_brute_force`: on 120 jittered points at h 0.1, every pair within h is listed and no index twice,
+    and a rebuild gives the same lists;
+  - `nb_layout_matches_column_offsets`: 224 bytes.
+
+Surface parity: 348 items ok, 71 pending.
+
+**Speed** (benchmarks-rust-v-cyrius, M4 part b), against a twin of `build_neighbors` on hisab 1.4.0's
+`SpatialHash`:
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the 1,000-particle build, 2D (36 neighbours a particle) | 1.5× |
+| the build, 3D (216 at the interior) | 1.9× |
+| `sort_by_zorder` of 1,000 | 2.0× |
+
+The first version ran the builds at 4.0× Rust and the sort at 7.6×. These changes, A/B'd with the rows unchanged, made the builds 2.2–2.6× faster
+and the sort 3.8× faster:
+- each axis's probe keys are made once per particle;
+- each cell's run is appended in bulk;
+- the cells are ordered z, y, x with their keys in a column, so one binary search and a short scan find a probe row's
+  three cells;
+- the sort permutes in place by assignment instead of byte-wise `memcpy`.

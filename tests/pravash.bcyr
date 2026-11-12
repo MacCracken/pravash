@@ -1014,6 +1014,82 @@ fn bench_sph_a() {
     return 0;
 }
 
+# ── sph, part b (M4) ──
+# sph_b/*: against scripts/probes/rust/src/bin/bench_sph_b.rs on the same inputs: the neighbour build (a grid kept
+# across builds, as the solver's) on a 40-wide 2D lattice of 1,000 at spacing 0.025 and on a 10³ one, both at h 0.05;
+# `sort_by_zorder` on the 2D lattice in a fixed shuffle (k → k·389 mod 1000), copied in (record assignments, the
+# Cyrius form of Rust's `copy_from_slice`; `memcpy` goes byte by byte) and sorted at cell 0.025 per call.
+
+# A 1,000-particle lattice at spacing 0.025 into a new buffer: 40 wide in 2D, or 10³.
+fn _bench_lattice(three_d) {
+    var buf = fl_alloc(1000 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var k = 0; k < 1000; k = k + 1) {
+        var x: f64 = f64_from(k % 40) * 0.025;
+        var y: f64 = f64_from(k / 40) * 0.025;
+        var z: f64 = 0.0;
+        if (three_d == 1) {
+            x = f64_from(k % 10) * 0.025;
+            y = f64_from((k / 10) % 10) * 0.025;
+            z = f64_from(k / 100) * 0.025;
+        }
+        var q: PvFluidParticle = PvFluidParticle_new_2d(x, y, 0.001);
+        q.position = PvVec3_new(x, y, z);
+        memcpy(ps + k, &q, sizeof(PvFluidParticle));
+    }
+    return buf;
+}
+
+# One neighbour-build row: `iters` builds of the lattice at h 0.05 after one that sizes the grid.
+fn _bench_nb(name, three_d, iters) {
+    var buf = _bench_lattice(three_d);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    g_sink = g_sink ^ _pv_nb_build(&g, ps, 1000, 0.05);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        g_sink = g_sink ^ _pv_nb_build(&g, ps, 1000, 0.05);
+        g_sink = g_sink ^ g.indices.len;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvNeighborGrid_drop(&g);
+    fl_free(buf);
+    return 0;
+}
+
+# The part b benches (M4 part b): the bench_sph_b.rs twins.
+fn bench_sph_b() {
+    _bench_nb("sph_b/neighbor_build_2d_1000", 0, 500);
+    _bench_nb("sph_b/neighbor_build_3d_1000", 1, 200);
+    var lat = _bench_lattice(0);
+    var sz = sizeof(PvFluidParticle);
+    var shuf = fl_alloc(1000 * sz);
+    var work = fl_alloc(1000 * sz);
+    for (var k = 0; k < 1000; k = k + 1) { memcpy(shuf + ((k * 389) % 1000) * sz, lat + k * sz, sz); }
+    var wp: *PvFluidParticle = _pv_as_particles(work);
+    var sp: *PvFluidParticle = _pv_as_particles(shuf);
+    var bz = bench_new("sph_b/zorder_1000");
+    bench_batch_start(bz);
+    for (var k2 = 0; k2 < 1000; k2 = k2 + 1) {
+        for (var c = 0; c < 1000; c = c + 1) {
+            var d: *PvFluidParticle = wp + c;
+            var e: *PvFluidParticle = sp + c;
+            *d = *e;
+        }
+        g_sink = g_sink ^ sort_by_zorder(wp, 1000, 0.025);
+        g_sink = g_sink ^ _pv_bits(wp.position.x);
+    }
+    bench_batch_stop(bz, 1000);
+    bench_report(bz);
+    fl_free(work);
+    fl_free(shuf);
+    fl_free(lat);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1040,6 +1116,7 @@ fn main(): i64 {
     bench_m3d();
     bench_threads();
     bench_sph_a();
+    bench_sph_b();
     return 0;
 }
 

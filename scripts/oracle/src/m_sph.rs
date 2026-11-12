@@ -12,15 +12,27 @@
 //! - `batch_poly6` takes `v:` squared distances and h; `batch_distance_squared` takes a position (x, y, z) and `v:<3k>`
 //!   positions, and gives `v:<k>` (class B);
 //! - `total_kinetic_energy` and `max_speed` take `i:<n>` and n particles (18 tokens each, `m_common::particle`).
+//!
+//! Part b (from its own seed, after part a's rows): the neighbour grid and the z-order sort.
+//! - `SphSolver::neighbor_lists` takes h, `i:<n>` and n positions (x, y, z), and gives what a fresh solver's first
+//!   step builds from them (`neighbor_lists` and `oracle_dump`): the grid's f32 cell size (widened), `i:` its point
+//!   and cell counts, `v:<3n>` the f32 positions (widened), `v:<3n>` each particle's own cell key (`sph_cell_key`),
+//!   `v:<n+1>` the CSR offsets and `v:<m>` the neighbour indices, in the order the solver sums them (class A). The
+//!   lists depend only on the positions and h; no position's key is saturated, where the solver's `cx + 1` would
+//!   overflow (the oracle's build panics on it);
+//! - `sort_by_zorder` takes the cell size, `i:<n>` and n particles, and gives `v:<n>` the Morton codes in Rust's
+//!   output order (as words; `v:0` when it returns early) and the particles in the stable order on (code, input
+//!   index), which Rust's unstable sort need not keep for ties (ADR 0002 #3): class A on both.
 
 use hisab::DVec3;
-use pravash::FluidParticle;
+use pravash::sph::SphSolver;
 use pravash::sph::{
     NonNewtonianViscosity, batch_distance_squared, batch_poly6, equation_of_state,
     equation_of_state_tait, kernel_poly6, kernel_spiky_grad, kernel_viscosity_laplacian,
     kernel_wendland_c2, kernel_wendland_c2_grad, kernel_wendland_c4, kernel_wendland_c4_grad,
-    max_speed, total_kinetic_energy,
+    max_speed, sort_by_zorder, total_kinetic_energy,
 };
+use pravash::{FluidConfig, FluidParticle};
 
 use crate::grids::{Rng, specials};
 use crate::m_common::particle;
@@ -421,6 +433,313 @@ fn total_rows(m: &mut Module, rng: &mut Rng) {
     }
 }
 
+/// One neighbour-list row: a fresh solver's first step on particles at `pos`, smoothing radius h.
+fn neighbor_row(m: &mut Module, pos: &[DVec3], h: f64) {
+    let mut ps: Vec<FluidParticle> = pos.iter().map(|&p| FluidParticle::new(p, 0.001)).collect();
+    let mut cfg = FluidConfig::water_2d();
+    cfg.smoothing_radius = h;
+    let mut solver = SphSolver::new();
+    let _ = solver.step(&mut ps, &cfg, 0.0);
+    let d = solver.oracle_dump();
+    let (offsets, indices) = solver.neighbor_lists();
+    assert_eq!(offsets.len(), pos.len() + 1, "the step built the lists");
+    let h32 = h as f32;
+    let mut ins = vec![f(h), i(i64::try_from(pos.len()).unwrap_or(0))];
+    for p in pos {
+        ins.extend([f(p.x), f(p.y), f(p.z)]);
+    }
+    let mut out = vec![
+        f(f64::from(d.cell_size)),
+        i(i64::try_from(d.grid_len).unwrap_or(0)),
+        i(i64::try_from(d.grid_cells).unwrap_or(0)),
+        Tok::V(3 * pos.len()),
+    ];
+    for q in &d.positions_f32 {
+        out.extend(q.iter().map(|&c| f(f64::from(c))));
+    }
+    out.push(Tok::V(3 * pos.len()));
+    for q in &d.positions_f32 {
+        let k = pravash::oracle::sph_cell_key(*q, h32);
+        out.extend(k.iter().map(|&c| i(i64::from(c))));
+    }
+    out.push(Tok::V(offsets.len()));
+    out.extend(offsets.iter().map(|&o| i(i64::from(o))));
+    out.push(Tok::V(indices.len()));
+    out.extend(indices.iter().map(|&j| i(i64::try_from(j).unwrap_or(0))));
+    m.row("SphSolver::neighbor_lists", Class::A, &ins, &out);
+}
+
+/// A jittered lattice of `side`^d points at spacing `sp` (d = 2: z = 0), shifted by `off`.
+fn lattice(rng: &mut Rng, side: usize, three_d: bool, sp: f64, jit: f64, off: f64) -> Vec<DVec3> {
+    let mut v = Vec::new();
+    let nz = if three_d { side } else { 1 };
+    for z in 0..nz {
+        for y in 0..side {
+            for x in 0..side {
+                let j = |r: &mut Rng| if jit > 0.0 { r.uniform(-jit, jit) } else { 0.0 };
+                let (a, b, c) = (j(rng), j(rng), j(rng));
+                v.push(DVec3::new(
+                    off + crate::m_grid::fx(x) * sp + a,
+                    off + crate::m_grid::fx(y) * sp + b,
+                    if three_d {
+                        off + crate::m_grid::fx(z) * sp + c
+                    } else {
+                        0.0
+                    },
+                ));
+            }
+        }
+    }
+    v
+}
+
+fn neighbor_rows(m: &mut Module, rng: &mut Rng) {
+    // Lattices on cell boundaries (h a power of two, so k·h is exact; and h = 0.05, which isn't), jittered ones,
+    // 2D and 3D.
+    for &(side, three_d, sp, h) in &[
+        (8, false, 0.125, 0.125),
+        (8, false, 0.05, 0.05),
+        (6, true, 0.125, 0.25),
+        (5, true, 0.05, 0.1),
+        (10, false, 0.025, 0.05),
+    ] {
+        neighbor_row(m, &lattice(rng, side, three_d, sp, 0.0, 0.0), h);
+        neighbor_row(m, &lattice(rng, side, three_d, sp, sp * 0.1, 0.0), h);
+    }
+    // Random clouds, negative coordinates, and large offsets where the f32 positions and probes lose precision (the
+    // probes land in other cells: D3).
+    for &(n, l, off, h) in &[
+        (60, 0.5, 0.0, 0.1),
+        (200, 1.0, -0.5, 0.1),
+        (120, 0.3, -7.25, 0.07),
+        (80, 0.5, 1e3, 0.05),
+        (80, 0.5, 1e5, 0.05),
+        (80, 0.5, 1e6, 0.05),
+        (80, 0.5, 3e6, 0.05),
+        (40, 2.0, 0.0, 1.0),
+        (500, 1.0, 0.0, 0.08),
+    ] {
+        let pts: Vec<DVec3> = (0..n)
+            .map(|k| {
+                DVec3::new(
+                    off + rng.uniform(0.0, l),
+                    off + rng.uniform(0.0, l),
+                    if k % 2 == 0 {
+                        0.0
+                    } else {
+                        off + rng.uniform(0.0, l)
+                    },
+                )
+            })
+            .collect();
+        neighbor_row(m, &pts, h);
+    }
+    // A cell size within f32::EPSILON of the fresh grid's 1.0, which keeps that grid (and its 1/cell) while the
+    // probes use 1/h; one 2·EPSILON away, which renews it; and one that rounds to 1.0 in f32.
+    let near_one: Vec<DVec3> = (0..30)
+        .map(|_| {
+            DVec3::new(
+                rng.uniform(-3.0, 3.0),
+                rng.uniform(-3.0, 3.0),
+                rng.uniform(-3.0, 3.0),
+            )
+        })
+        .collect();
+    for h in [
+        1.0,
+        1.0 + f64::from(f32::EPSILON),
+        1.0 - f64::from(f32::EPSILON) / 2.0,
+        1.0 + 2.0 * f64::from(f32::EPSILON),
+        1.0 + 1e-9,
+    ] {
+        neighbor_row(m, &near_one, h);
+    }
+    // One particle, duplicates, a NaN coordinate (its key is 0), points a hair either side of a cell boundary.
+    neighbor_row(m, &[DVec3::new(0.3, 0.4, 0.0)], 0.1);
+    let mut dup = vec![DVec3::new(0.21, 0.37, 0.05); 5];
+    dup.push(DVec3::new(0.22, 0.37, 0.05));
+    neighbor_row(m, &dup, 0.1);
+    let mut nan = lattice(rng, 4, false, 0.1, 0.0, 0.0);
+    nan[5].x = f64::NAN;
+    nan[9].y = -0.0;
+    neighbor_row(m, &nan, 0.1);
+    let edge: Vec<DVec3> = [
+        0.1,
+        0.1 - 1e-12,
+        0.1 + 1e-12,
+        0.2,
+        0.2 - 1e-9,
+        -1e-12,
+        0.0,
+        -0.0,
+    ]
+    .iter()
+    .map(|&x| DVec3::new(x, 0.05, 0.0))
+    .collect();
+    neighbor_row(m, &edge, 0.1);
+    // The kept grid again, on integer points (where its 1/cell and 1/h key apart) and on a cluster at 4.5e6 (where
+    // its probes drift a cell, the D3 defect): the only rows that tell the grid's key from 1/h. No RNG, so the rows
+    // after keep their values.
+    let mut kept = Vec::new();
+    for z in -1..3 {
+        for y in -1..3 {
+            for x in -1..3 {
+                kept.push(DVec3::new(f64::from(x), f64::from(y), f64::from(z)));
+            }
+        }
+    }
+    for k in 0..4 {
+        let o = 0.5 * f64::from(k);
+        kept.push(DVec3::new(4.5e6 + o, 4.5e6 - o, 4.5e6 + o));
+    }
+    for h in [
+        1.0 + f64::from(f32::EPSILON),
+        1.0 - f64::from(f32::EPSILON) / 2.0,
+    ] {
+        neighbor_row(m, &kept, h);
+    }
+}
+
+fn zorder_row(m: &mut Module, input: &[FluidParticle], cell: f64) {
+    let mut ins = vec![f(cell), i(i64::try_from(input.len()).unwrap_or(0))];
+    for p in input {
+        ins.extend(particle(p));
+    }
+    let mut ps = input.to_vec();
+    sort_by_zorder(&mut ps, cell);
+    let sorted = ps.len() >= 2 && cell.is_finite() && cell > 0.0;
+    let mut out = Vec::new();
+    if sorted {
+        let inv = 1.0 / cell;
+        let (mx, my) = input.iter().fold((f64::MAX, f64::MAX), |(a, b), p| {
+            (a.min(p.position.x), b.min(p.position.y))
+        });
+        let code = |p: &FluidParticle| {
+            let spread = |x: u32| {
+                let mut v = u64::from(x);
+                v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+                v = (v | (v << 8)) & 0x00FF_00FF_00FF_00FF;
+                v = (v | (v << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+                v = (v | (v << 2)) & 0x3333_3333_3333_3333;
+                (v | (v << 1)) & 0x5555_5555_5555_5555
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ix = ((p.position.x - mx) * inv).max(0.0) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let iy = ((p.position.y - my) * inv).max(0.0) as u32;
+            spread(ix) | (spread(iy) << 1)
+        };
+        out.push(Tok::V(ps.len()));
+        out.extend(
+            ps.iter()
+                .map(|p| i(i64::from_ne_bytes(code(p).to_ne_bytes()))),
+        );
+        // The stable order: each output particle's input index (the first unused input with the same bits), then
+        // the particles sorted on (code, input index).
+        let bits = |p: &FluidParticle| {
+            particle(p)
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+        };
+        let mut used = vec![false; input.len()];
+        let mut tagged: Vec<(u64, usize, FluidParticle)> = ps
+            .iter()
+            .map(|p| {
+                let b = bits(p);
+                let j = (0..input.len())
+                    .find(|&j| !used[j] && bits(&input[j]) == b)
+                    .expect("a permutation");
+                used[j] = true;
+                (code(p), j, *p)
+            })
+            .collect();
+        tagged.sort_by_key(|&(c, j, _)| (c, j));
+        for (_, _, p) in &tagged {
+            out.extend(particle(p));
+        }
+    } else {
+        out.push(Tok::V(0));
+        for p in &ps {
+            out.extend(particle(p));
+        }
+    }
+    m.row("sort_by_zorder", Class::A, &ins, &out);
+}
+
+fn zorder_rows(m: &mut Module, rng: &mut Rng) {
+    let block = |nx: usize, ny: usize, sp: f64, ox: f64| -> Vec<FluidParticle> {
+        let mut v = Vec::new();
+        for y in 0..ny {
+            for x in 0..nx {
+                v.push(FluidParticle::new_2d(
+                    ox + crate::m_grid::fx(x) * sp,
+                    crate::m_grid::fx(y) * sp,
+                    0.001,
+                ));
+            }
+        }
+        v
+    };
+    // Rust's test shapes: a block in a shuffled order, at its own spacing (distinct codes) and at a coarse cell
+    // (many ties); negative coordinates.
+    for &(nx, ny, sp, ox, cell) in &[
+        (10, 10, 0.1, 0.0, 0.1),
+        (10, 10, 0.1, 0.0, 0.35),
+        (5, 5, 0.1, -3.0, 0.1),
+        (7, 3, 0.25, -1.0, 1.0),
+    ] {
+        let mut ps = block(nx, ny, sp, ox);
+        for k in (1..ps.len()).rev() {
+            let j = usize::try_from(rng.int(0, i64::try_from(k).unwrap_or(0))).unwrap_or(0);
+            ps.swap(k, j);
+        }
+        for (k, p) in ps.iter_mut().enumerate() {
+            p.velocity = DVec3::new(crate::m_grid::fx(k), 0.0, 0.0);
+        }
+        zorder_row(m, &ps, cell);
+    }
+    // Random clouds, special coordinates (NaN, ±∞, huge: saturated codes), ties, and the early returns.
+    let sp = specials();
+    for k in 0..8 {
+        let n = [2, 3, 17, 40, 64, 9, 12, 30][k];
+        let ps: Vec<FluidParticle> = (0..n)
+            .map(|j| {
+                let mut p =
+                    FluidParticle::new_2d(rng.uniform(-2.0, 2.0), rng.uniform(-2.0, 2.0), 0.001);
+                p.mass = crate::m_grid::fx(j);
+                if k >= 5 && j % 4 == 1 {
+                    p.position.x = sp[(j + k) % sp.len()];
+                }
+                if k == 7 && j % 5 == 0 {
+                    p.position.y = 1e12;
+                }
+                p
+            })
+            .collect();
+        zorder_row(m, &ps, [0.1, 0.5, 0.03, 1.0, 0.2, 0.1, 0.25, 0.05][k]);
+    }
+    // Every coordinate positive, so both minima are the particles' own (each row above has a minimum ≤ 0 or returns
+    // early). No RNG.
+    for &(ox, oy, cell) in &[(0.37, 1.25, 0.1), (5.0, 7.5, 0.3)] {
+        let mut ps = block(6, 4, 0.1, ox);
+        ps.reverse();
+        for p in &mut ps {
+            p.position.y += oy;
+        }
+        zorder_row(m, &ps, cell);
+    }
+    let pair = vec![
+        FluidParticle::new_2d(0.5, 0.5, 1.0),
+        FluidParticle::new_2d(0.1, 0.1, 2.0),
+    ];
+    for cell in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        zorder_row(m, &pair, cell);
+    }
+    zorder_row(m, &pair[..1], 0.1);
+    zorder_row(m, &[], 0.1);
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -429,5 +748,9 @@ pub fn emit() -> Module {
     viscosity_rows(&mut m, &mut rng);
     batch_rows(&mut m, &mut rng);
     total_rows(&mut m, &mut rng);
+    // Part b's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f4b);
+    neighbor_rows(&mut m, &mut rng);
+    zorder_rows(&mut m, &mut rng);
     m
 }

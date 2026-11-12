@@ -53,7 +53,6 @@ FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    "sort_by_zorder": "M4 part b",
     **{f: "M4 part c" for f in ("compute_density", "pressure_force", "viscosity_force", "step", "split_particle",
                                 "merge_particles", "create_particle_block")},
     **{f: "M4 part d" for f in ("update_viscoelastic", "update_heat", "update_phase_change", "update_reaction",

@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M4 part b): `src/neighbor.cyr`.
+  - **The neighbour grid,** `PvNeighborGrid` (ledger L4): hisab 1.4.0's `SpatialHash` as `SphSolver` uses it,
+    with its f32 cell keys reproduced bit for bit (D3), on sorted columns instead of a `HashMap`. `_pv_nb_build`
+    makes the solver's neighbour lists exactly as its private `build_neighbors` does: the grid kept within
+    `f32::EPSILON` of h, the 27 probes per particle, and the probes that drift into other cells at large
+    coordinates. Nothing is allocated once the columns have grown.
+  - **`sort_by_zorder`,** stable on (Morton code, input index) (ADR 0002 #3), with `_pv_msort`, the stable merge
+    sort both users share (ledger L9).
+  - **ADR 0002 row 16:** the grid's form, the i32 probe offset (wraps, as Rust's release builds do), and
+    `sort_by_zorder` returning 1 sorted or 0 unchanged.
+  - **Parity:** 50 new `sph.tsv` rows, all bit-exact: 30 neighbour-list rows and 20 z-order rows. The 2,460
+    `oracle::sph_cell_key` rows of `math.tsv`, pending since M0, now pass.
+    - `validate.py` transcribes the grid and the Morton codes: 49,288 rows, 0 failures.
+    - Two corpus gaps the mutation tests found are closed by four rows that draw no random numbers, so no other row
+      moved. One gap was a grid kept within `f32::EPSILON` of h with points on cell edges and at 4.5e6. The other
+      was a z-order input whose minima are both positive.
+  - **Tests:** `test_zorder_negative_coordinates`, and three Cyrius-only groups in `tests/sph.tcyr`: the merge sort's
+    stability, the lists against a brute-force search, and the grid's layout. `test_sort_by_zorder` and
+    `_preserves_data` wait for part c's `create_particle_block`.
+
+### Performance
+- **The neighbour build and the z-order sort** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md),
+  M4 part b; against a Rust twin on hisab 1.4.0's `SpatialHash`).
+  - Builds of 1,000 particles: 1.24 ms in 2D and 1.60 ms in 3D. Rust takes 0.81–0.84 ms, so that is 1.5× and
+    1.9×.
+  - `sort_by_zorder` of 1,000: 191 µs, 2.0× Rust's 95 µs.
+  - Against the first version, pinned and interleaved, with the rows unchanged:
+    - the builds got 2.6× and 2.2× faster. Each axis's probe keys are made once per particle, each cell's run is
+      appended in bulk, and the cells are ordered z, y, x with their keys in a column, so one binary search plus a
+      short scan finds a probe row's three cells.
+    - the sort got 3.8× faster. The order is applied in place, cycle by cycle, with each record moved by
+      assignment instead of `memcpy` (which copies a byte at a time), and the scratch is one block.
+
+### Added (Cyrius)
 - **sph** (M4 part a): `src/sph_kernels.cyr`.
   - **The kernels:** `kernel_poly6`, `kernel_spiky_grad`, `kernel_viscosity_laplacian`, `kernel_wendland_c2`,
     `_c2_grad`, `_c4` and `_c4_grad`, with `PvKernelCoeffs` (the private `KernelCoeffs`).

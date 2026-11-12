@@ -426,3 +426,59 @@ keeps only the coefficient used.
   - Measured apart: 500 squared distances (4,000 bytes, under the threshold) take 5.2 µs, about 10 ns each.
   - So the 1,000 evaluations are about 10 µs of the 18.6 µs, and the mapping about 8 µs.
 - **The totals are 9–11×,** a method call per particle.
+
+## M4 part b: the neighbour grid and the z-order sort (2026-11-12)
+
+Pinned to core 15.
+- **Rust:** `SphSolver::build_neighbors` is private, so the twin, `scripts/probes/rust/src/bin/bench_sph_b.rs`,
+  re-states it line for line on hisab 1.4.0's public `SpatialHash` (`new`, `clear`, `insert`, `query_cell`), the
+  calls the solver makes. Its grid is kept across builds, which is the solver's `clear` path. `sort_by_zorder` is
+  the public function. Medians of 7 runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_b`, on the same inputs:
+  - a 40-wide 2D lattice of 1,000 and a 10³ lattice, both at spacing 0.025 and h 0.05, built after one build that
+    sizes the grid;
+  - the 2D lattice in a fixed shuffle (k → k·389 mod 1000), copied in and sorted at cell 0.025 per call. Both
+    copy with their fast form: Rust's `copy_from_slice`, and record assignment in Cyrius, since `memcpy` copies a
+    byte at a time.
+
+Two runs, interleaved with Rust's:
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_b/neighbor_build_2d_1000` (36 neighbours a particle) | 0.81–0.83 ms | 1.24–1.25 ms | 1.5× |
+| `sph_b/neighbor_build_3d_1000` (216 at the interior) | 0.83–0.84 ms | 1.60–1.64 ms | 1.9× |
+| `sph_b/zorder_1000` | 95–96 µs | 191–193 µs | 2.0× |
+
+**The A/B behind the rows.** The same bench was run against the first `src/neighbor.cyr` (built in a copy of the
+tree), pinned, four runs interleaved:
+
+| Bench | Before | After | |
+|---|---|---|---|
+| `neighbor_build_2d_1000` | 3.22–3.26 ms | 1.20–1.24 ms | 2.6× |
+| `neighbor_build_3d_1000` | 3.38–3.45 ms | 1.56–1.60 ms | 2.2× |
+| `zorder_1000` | 722–739 µs | 189–192 µs | 3.8× |
+
+All 50 rows were unchanged.
+- **The build.** Before the changes, the phases measured apart came to:
+  - 27,000 binary searches over the cells, 1.94 ms (72 ns each, three dependent loads a step);
+  - the probe keys, 0.5 ms;
+  - 36,000 pushes, 0.22 ms;
+  - the merge sort, 0.1 ms.
+
+  The changes:
+  - Each axis's three probe keys depend on that axis alone, so they are made once per particle: 9 instead of 39.
+  - Each cell's run is appended in one loop instead of a push per index.
+  - The cells are ordered z, then y, then x, with their keys in a column of their own. A probe row's three x cells
+    then sit together, so one binary search and a scan of at most a few cells replace three searches.
+- **The sort.** Before the changes, it allocated a 144 KB block for the permuted copy (mapped and unmapped per call,
+  about 60 µs) and moved each record with `memcpy` twice, about 480 µs. Now the sorted order is applied in place,
+  cycle by cycle, with each record moved by assignment, and the codes, order and merge buffer share one 24 KB block.
+
+**Reading it.**
+- **The build is within 2× of Rust's `HashMap`.** Rust's cost is mostly the 27,000 hash lookups, so its 2D and 3D
+  rows are about equal. The stand-in's grows with the lists: 216 neighbours a particle in 3D, against 36 in 2D.
+- **The sort's remaining cost is the comparator call.** Measured apart, the merge sort over 1,000 codes takes
+  100 µs, about 10 ns a comparison through `fncall3`, and the Morton codes 37 µs. The numbers are on the stable-sort
+  request (`cyrius:docs/development/issues/2026-11-11-no-stable-sort.md`, ledger L9). The build's numbers are on
+  hisab's spatial-hash request (L4).
+- **`memcpy` again.** A 144 KB copy took 232 µs (0.6 GB/s). The fix was M1's: move records by assignment (L12).
