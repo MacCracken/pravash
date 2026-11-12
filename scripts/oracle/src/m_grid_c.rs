@@ -654,7 +654,10 @@ fn json_rows(m: &mut Module, rng: &mut Rng) {
         (r#""c_eps2":1.92"#, r#""c_eps2":null"#),
         (r#","c_eps1":1.44"#, ""),
         (r#""c_eps2":1.92"#, r#""c_eps2":1.92,"scratch_k":[]"#),
-        (r#""epsilon":[0.00001,0.00001,0.00001,0.00001]"#, r#""epsilon":[]"#),
+        (
+            r#""epsilon":[0.00001,0.00001,0.00001,0.00001]"#,
+            r#""epsilon":[]"#,
+        ),
     ] {
         docs.push(base.replacen(from, to, 1));
     }

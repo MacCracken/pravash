@@ -52,7 +52,8 @@
   projections, the DST plans (the 63 × 63 DST step 719 ms → 8.6 ms, the bits unchanged)
 - [x] M3 part c: `MacGrid`, k-ε and the ghost fluid (293 rows, 135 class S step rows, all bit-exact; the last 5
   Rust tests of `grid.rs`)
-- [ ] M3 part d: VOF and the phase field
+- [x] M3 part d: VOF and the phase field (384 rows in two new modules, 138 class S step rows, all bit-exact; 8 + 11
+  Rust tests)
 - [ ] M3 part e: `src/par.cyr` and the grid's parallel loops
 
 ### 1.3.0

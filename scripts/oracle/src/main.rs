@@ -35,7 +35,9 @@ mod m_grid;
 mod m_grid_c;
 mod m_json;
 mod m_math;
+mod m_phase_field;
 mod m_shallow;
+mod m_vof;
 mod m_vortex;
 mod t_constants;
 mod tsv;
@@ -58,7 +60,9 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_grid::emit(),
         m_json::emit(),
         m_math::emit(),
+        m_phase_field::emit(),
         m_shallow::emit(),
+        m_vof::emit(),
         m_vortex::emit(),
     ])
 }

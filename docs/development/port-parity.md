@@ -910,3 +910,98 @@ covers all of `grid`: 227 items ok, 0 pending.
 The k-ε step got there by writing its three maxes out. Each is a max against a positive constant floor, so the bits
 are the same, and the step became 1.21× faster in a pinned A/B. The rest of the k-ε gap is a loop of independent
 cells that Rust vectorises and the Cyrius codegen runs scalar.
+
+## 13. M3 part d: VOF and the phase field (2026-11-12)
+
+Two more grid modules:
+- **`src/vof.cyr`:** `PvVofField`, a 72-byte record: nx, ny, dx, the α column, the scratch column. It has `new`,
+  the surface, full and empty queries (with and without a threshold), `fill_rect`, `fill_circle`, `total_volume`,
+  `interface_normal`, `advect`, clone, drop and JSON.
+- **The advect:** donor-cell face fluxes with closed walls, sub-cycled to Courant 0.5 at most (at most 1,024
+  sub-steps, and none when the count is NaN).
+- **`src/phase_field.cyr`:** `PvPhaseField`, 88 bytes: nx, ny, dx, the φ column, mobility and ε, the scratch column.
+  It has `new`, `set_circle`, `set_rect`, `is_phase_b`, `is_interface`, `phase_b_area`, the Allen–Cahn `step` with
+  first-order upwind advection and zero-gradient ghosts, clone, drop and JSON.
+- **Shared:** the fills (`_pv_fill_shape`).
+- **ADR 0002 #14:**
+  - (pointer, count) velocities;
+  - every size product checked where Rust panics;
+  - the scratch grown before any change;
+  - a cell outside a field reads NaN where Rust panics.
+
+**The rows:** two new golden modules, 384 rows, so `modules.txt` lists 11.
+
+| Module | Rows | What they cover |
+|---|---|---|
+| `vof.tsv` | 224 | `new` (sizes, every special dx); the six queries and `interface_normal` over every cell of 13 states (random α with the edge values 0, 1, 1e-6, 1 − 1e-6, −0.1, 1.2, NaN, ∞, and gradients just above and below the normal's 1e-20 floor), eight thresholds each; `total_volume`; eight rectangles and eight circles (inverted, degenerate, NaN, infinite); 63 advect rows (class S) |
+| `phase_field.tsv` | 160 | `new`; seven circles and seven rectangles; the queries and `phase_b_area` over 10 states; 75 step rows (class S) |
+
+The VOF advect rows include:
+- 300-step trajectories of a block in a rotation;
+- single steps at frames {0, 1, 2, 10, 60, 300} of a disc under uniform, vortex and random flows;
+- 1, 6, 600 and 1,024 sub-steps;
+- 16 random states;
+- cell sizes of 0, NaN and −0.1 (advect doesn't check dx);
+- faces of exactly zero velocity next to NaN and ∞;
+- 11 refusals in Rust's order.
+
+The phase-field step rows include:
+- trajectories of a uniform field and a sharpening ramp;
+- frames of a relaxing disc, a carried strip, a high-Péclet front with no mobility, a rotation and a random flow;
+- 16 random states with random mobility and ε;
+- a clamping step and a negative mobility;
+- the cell sizes, u = 0 beside ±∞, and the 3 × 3 minimum;
+- 12 refusals.
+
+`validate.py` transcribes both modules and recomputes every row: 48,434 rows, 0 failures.
+
+**Result:** every row passes on the first replay, all at 0 ulp. The replay is **11 modules, 0 failing | rows: 45,879
+ok, 0 failed, 0 measured, 2,463 pending, 92 accepted (ADR 4: 92)**.
+
+**Mutation checks:**
+
+| Mutation | Rows failed |
+|---|---|
+| the flux as (u·α)·(dt/dx) | 34 |
+| the net flux re-associated | 22 |
+| the bottom wall at the second row | 32 |
+| the Courant target 0.5 → 0.25 | 21 |
+| a rectangle's right edge exclusive | 3 |
+| the phase-field Laplacian re-associated | 15 |
+| the ghost columns skipping the corners | 39 |
+
+Four mutations first survived, because no row reached what they change:
+- the VOF donor at u ≥ 0;
+- the 1,024 sub-step cap;
+- the normal's 1e-20 floor;
+- the phase field's upwind choice at u = 0.
+
+Each now fails one targeted row:
+- an 8 × 8 still field with NaN and ∞ beside finite cells (0·∞ shows the donor choice);
+- 600 sub-steps with α unsaturated;
+- gradients of 1e-12 and 1e-21;
+- u = 0 beside ±∞.
+
+Three mutations survive, and none can be caught:
+- **Two are equivalent:**
+  - (φ·φ)·φ → φ·(φ·φ) multiplies the same two operands;
+  - reading the current φ from the field instead of the scratch reads the same value, because that cell isn't
+    written yet.
+- **The third changes only a signed zero:** starting the no-velocity advection term at −0 instead of +0.
+  Classes B, C and S measure ulp distance, where +0 and −0 are the same point (tests/ulp.cyr, shared with impetus
+  and tanmatra), so it can't fail a row by design.
+
+Three mutations of the Python transcription are caught (3, 15 and 40 rows).
+
+**Tests:** all 8 Rust tests of `vof.rs` (`tests/vof.tcyr`, 27 checks; the cellular-flow test uses the correctly rounded
+sin and cos within its own 1% bound) and all 11 of `phase_field.rs` (`tests/phase_field.tcyr`, 38 checks), each with a
+layout group. Surface parity adds both modules: 258 items ok, 0 missing.
+
+**Speed** (benchmarks-rust-v-cyrius, M3 part d). Rust has no criterion bench for these, so
+`scripts/probes/rust/src/bin/bench_vof_pf.rs` times the same bodies on the oracle. Both run 8.1–8.9× Rust, after
+two changes that keep the bits:
+- The VOF sub-step's four flux calls and its clamp are written out, and each x face shared along a row is computed
+  once. Rust computes each twice from the same four values, so the left cell's F_r is the right cell's F_l.
+- The phase-field step's clamp is written out.
+
+Each made its step 1.17–1.19× faster in a pinned A/B. The rest is a loop of independent cells that Rust vectorises.

@@ -117,7 +117,8 @@ oracle:
 - it recomputes every `common` row in Python, in Rust's and glam's order: the validation rules, the defaults, the
   vector arithmetic, and the particle arena through a transcription of its free-list logic (the token layouts
   and the arena's op codes are in `src/m_common.rs`'s module comment);
-- it recomputes every `shallow` and `grid` row through Python transcriptions of the solvers: the shallow-water step,
+- it recomputes every `shallow`, `grid`, `vof` and `phase_field` row through Python transcriptions of the solvers:
+  the shallow-water step, the VOF advection and the phase-field step,
   the grid's samplers, advections, diffusion, forces, walls and four pressure solves (hisab 1.4.0's DST, IDST
   and CG among them), and the k-ε model, the ghost fluid and the MAC grid, with glibc's transcendentals for the
   record and MPFR's for the corrected oracle

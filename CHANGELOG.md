@@ -3,6 +3,50 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **vof** and **phase_field** (M3 part d): `src/vof.cyr` and `src/phase_field.cyr`, the ports of `rust-old/src/vof.rs`
+  and `phase_field.rs`.
+  - **`PvVofField`:**
+    - `PvVofField_new`, `_clone` and `_drop`;
+    - `is_surface`, `is_full`, `is_empty` and their `_with_threshold` forms;
+    - `fill_rect`, `fill_circle`, `total_volume` and `interface_normal`;
+    - `advect` (donor-cell fluxes, closed walls, sub-cycled to Courant 0.5);
+    - JSON.
+  - **`PvPhaseField`:**
+    - `PvPhaseField_new`, `_clone` and `_drop`;
+    - `set_circle`, `set_rect`, `is_phase_b`, `is_interface` and `phase_b_area`;
+    - the Allen–Cahn `step` (upwind advection, zero-gradient ghosts);
+    - JSON.
+  - **ADR 0002 #14:**
+    - (pointer, count) velocities;
+    - every size product checked where Rust panics;
+    - the scratch grown before any change;
+    - NaN for a cell outside a field.
+  - **Parity:** two new golden modules, `vof.tsv` (224 rows) and `phase_field.tsv` (160), bit-exact on the first
+    replay.
+    - They include 63 `VofField::advect` and 75 `PhaseField::step` rows (class S, bound 0), with 300-step
+      trajectories, 1 to 1,024 sub-steps, unchecked cell sizes and every refusal.
+    - `validate.py` transcribes both modules and recomputes every row.
+  - **Tests:** all 8 Rust tests of `vof.rs` (`tests/vof.tcyr`) and all 11 of `phase_field.rs`
+    (`tests/phase_field.tcyr`), with layout groups.
+  - **Surface parity:** both modules added, 258 items ok.
+  - **Mutation checks:**
+    - 11 of 14 port mutations fail rows, 4 of them through rows added when they first survived.
+    - Two of the rest are equivalent, and one changes only a signed zero, which classes B, C and S treat as equal.
+    - All 3 transcription mutations are caught.
+
+### Performance
+- **The part d benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M3 part d),
+  against Rust twins on the same bodies (`scripts/probes/rust/src/bin/bench_vof_pf.rs`). Pinned, interleaved:
+  - `vof_advect` 54.5 µs (Rust 6.77 µs) at 32 × 32, 8.1–8.7×;
+  - `phase_field_step` 41.3 µs (4.65 µs), 8.7–8.9×.
+
+  Writing out the VOF sub-step's flux and clamp calls, and computing each shared x face once, made the advection
+  1.17–1.18× faster. Writing out the phase-field clamp made its step 1.18–1.19× faster. Both keep the rows unchanged.
+
+### Fixed
+- **`scripts/oracle/src/m_grid_c.rs`** was not rustfmt-clean (one tuple line, after a late edit in part c).
+
+### Added (Cyrius)
 - **grid** (M3 part c): the rest of `rust-old/src/grid.rs`.
   - **`src/k_epsilon.cyr`:** `PvKEpsilon`, the k-ε model:
     - `PvKEpsilon_new`, `_clone` and `_drop`;

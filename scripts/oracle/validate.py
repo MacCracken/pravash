@@ -2552,6 +2552,321 @@ def mpfr_logged(log):
     return {"exp": unary("exp", "exp"), "log": unary("log", "log"), "log10": unary("log10", "log10"), "pow": pw}
 
 
+# ── vof and phase_field (M3 part d) ─────────────────────────────────────────────────────────
+
+def r_clamp(x, lo, hi):
+    """Rust's f64::clamp (a NaN x stays NaN)."""
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def r_as_usize(x):
+    """Rust's saturating `as usize`: NaN and negatives 0."""
+    if x != x or x <= 0.0:
+        return 0
+    if x >= 2.0 ** 64:
+        return USIZE - 1
+    return int(x)
+
+
+def fill_shape(field, nx, ny, dx, kind, a, b, c, d):
+    """VofField::fill_rect / fill_circle and PhaseField::set_rect / set_circle: 1.0 at each matching cell centre."""
+    r2 = c * c
+    for y in range(ny):
+        py = float(y) * dx
+        for x in range(nx):
+            px = float(x) * dx
+            if kind == 0:
+                hit = px >= a and px <= c and py >= b and py <= d
+            else:
+                ddx, ddy = px - a, py - b
+                hit = ddx * ddx + ddy * ddy < r2
+            if hit:
+                field[y * nx + x] = 1.0
+
+
+def vof_read(x, k=0):
+    v = {"nx": x[k] % USIZE, "ny": x[k + 1] % USIZE, "dx": x[k + 2]}
+    n = x[k + 3][1]
+    v["alpha"] = list(x[k + 4:k + 4 + n])
+    return v, k + 4 + n
+
+
+def vof_tokens(v):
+    return [word(v["nx"]), word(v["ny"]), v["dx"], ("v", len(v["alpha"]))] + v["alpha"]
+
+
+def fresh_scratch(nx, ny, dx):
+    """The scratch length of the generator's `fresh` field: new(nx, ny, dx)'s, else new(4, 4, 0.1)'s."""
+    ok = nx < 1 << 16 and ny < 1 << 16 and nx >= 4 and ny >= 4 and fin(dx) and dx > 0.0
+    return nx * ny if ok else 16
+
+
+def vof_advect(v, vx, vy, dt):
+    """One VofField::advect: None, or the failure's token. The scratch length in v["sl"]."""
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    nx, ny, dx = v["nx"], v["ny"], v["dx"]
+    n = nx * ny
+    if nx < 4 or ny < 4 or len(v["alpha"]) != n or len(vx) != n or len(vy) != n:
+        return "E:InvalidParameter"
+    if not all(fin(q) for q in vx + vy):
+        return "E:Diverged"
+    m = 0.0
+    for q in vx + vy:
+        m = r_max(m, abs(q))
+    courant = fdiv(2.0 * m * dt, dx)
+    q = courant / 0.5
+    c = math.ceil(q) if fin(q) else q
+    sub = r_as_usize(r_clamp(float(c), 1.0, 1024.0))
+    if sub == 0:
+        return None
+    sub_dt = dt / float(sub)
+    inv_dx = fdiv(1.0, dx)
+    a = v["alpha"]
+
+    def flux(v0, v1, a0, a1):
+        u = 0.5 * (v0 + v1)
+        donor = a0 if u > 0.0 else a1
+        return u * donor * sub_dt * inv_dx
+
+    for _ in range(sub):
+        o = list(a)
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                fr = 0.0 if x + 1 == nx - 1 else flux(vx[i], vx[i + 1], o[i], o[i + 1])
+                fl = 0.0 if x == 1 else flux(vx[i - 1], vx[i], o[i - 1], o[i])
+                ft = 0.0 if y + 1 == ny - 1 else flux(vy[i], vy[i + nx], o[i], o[i + nx])
+                fb = 0.0 if y == 1 else flux(vy[i - nx], vy[i], o[i - nx], o[i])
+                a[i] = r_clamp(o[i] - (fr - fl + ft - fb), 0.0, 1.0)
+    v["sl"] = n
+    return None
+
+
+def vof_json(doc):
+    def us(val):
+        if not (isinstance(val, tuple) and val[0] == "int") or int(val[1]) < 0:
+            raise JsonRefused("not a usize")
+        return int(val[1])
+
+    try:
+        f = j_struct(j_load(doc), ["nx", "ny", "dx", "alpha"])
+        return vof_tokens({"nx": us(f[0]), "ny": us(f[1]), "dx": j_f64(f[2]),
+                           "alpha": [j_f64(e) for e in j_arr(f[3])]})
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def check_vof(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        if func == "VofField::new":
+            nx, ny, dx = x[0] % USIZE, x[1] % USIZE, x[2]
+            if nx < 4 or ny < 4:
+                want = ["E:InvalidGridResolution"]
+            elif dx <= 0.0 or not fin(dx):
+                want = ["E:InvalidParameter"]
+            else:
+                want = [nx, ny, dx, nx * ny, 0.0, nx * ny]
+        elif func == "VofField::from_json":
+            want = vof_json(unpct(ins[0][2:]))
+        else:
+            v, k = vof_read(x)
+            nx, ny = v["nx"], v["ny"]
+            a = v["alpha"]
+            short = func.split("::")[-1]
+            queries = {"is_surface": lambda q, t: q > t and q < 1.0 - t,
+                       "is_full": lambda q, t: q > 1.0 - t,
+                       "is_empty": lambda q, t: q < t}
+            base = short.replace("_with_threshold", "")
+            if base in queries:
+                ths = list(x[k + 1:k + 1 + x[k][1]]) if short.endswith("_with_threshold") else [1e-6]
+                want = [("v", len(ths) * nx * ny)] + [int(queries[base](a[y * nx + xx], t))
+                                                      for t in ths for y in range(ny) for xx in range(nx)]
+            elif short == "interface_normal":
+                want = [("v", 2 * nx * ny)]
+                for y in range(ny):
+                    for xx in range(nx):
+                        if xx == 0 or xx >= nx - 1 or y == 0 or y >= ny - 1:
+                            want += [0.0, 0.0]
+                            continue
+                        i = y * nx + xx
+                        inv_2dx = 0.5 / v["dx"]
+                        gx = (a[i + 1] - a[i - 1]) * inv_2dx
+                        gy = (a[i + nx] - a[i - nx]) * inv_2dx
+                        mag = math.sqrt(gx * gx + gy * gy) if fin(gx * gx + gy * gy) else gx * gx + gy * gy
+                        want += [0.0, 0.0] if mag < 1e-20 else [fdiv(gx, mag), fdiv(gy, mag)]
+            elif short == "total_volume":
+                area = v["dx"] * v["dx"]
+                t = -0.0
+                for q in a:
+                    t += q * area
+                want = [t]
+            elif short == "fill_rect":
+                fill_shape(a, nx, ny, v["dx"], 0, *x[k:k + 4])
+                want = vof_tokens(v)
+            elif short == "fill_circle":
+                fill_shape(a, nx, ny, v["dx"], 1, x[k], x[k + 1], x[k + 2], 0.0)
+                want = vof_tokens(v)
+            elif short == "advect":
+                n1 = x[k][1]
+                vx = list(x[k + 1:k + 1 + n1])
+                k2 = k + 1 + n1
+                n2 = x[k2][1]
+                vy = list(x[k2 + 1:k2 + 1 + n2])
+                dt, steps = x[k2 + 1 + n2], x[k2 + 2 + n2]
+                v["sl"] = fresh_scratch(nx, ny, v["dx"])
+                want = None
+                for _ in range(steps):
+                    bad = vof_advect(v, vx, vy, dt)
+                    if bad:
+                        want = [bad]
+                        break
+                if want is None:
+                    want = vof_tokens(v) + [v["sl"]]
+            else:
+                fail(f"{where}: no check for {func}")
+                continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
+def pf_read(x, k=0):
+    p = {"nx": x[k] % USIZE, "ny": x[k + 1] % USIZE, "dx": x[k + 2]}
+    n = x[k + 3][1]
+    p["phi"] = list(x[k + 4:k + 4 + n])
+    p["mobility"], p["epsilon"] = x[k + 4 + n], x[k + 5 + n]
+    return p, k + 6 + n
+
+
+def pf_tokens(p):
+    return [word(p["nx"]), word(p["ny"]), p["dx"], ("v", len(p["phi"]))] + p["phi"] + [p["mobility"], p["epsilon"]]
+
+
+def pf_step(p, vx, vy, dt):
+    """One PhaseField::step: None, or the failure's token."""
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    nx, ny = p["nx"], p["ny"]
+    n = nx * ny
+    if len(p["phi"]) != n or nx < 3 or ny < 3:
+        return "E:InvalidGridResolution"
+    has_v = not (len(vx) == 0 and len(vy) == 0)
+    if has_v and (len(vx) != n or len(vy) != n):
+        return "E:InvalidParameter"
+    inv_dx = fdiv(1.0, p["dx"])
+    inv_dx2 = inv_dx * inv_dx
+    m, eps2 = p["mobility"], p["epsilon"] * p["epsilon"]
+    f = p["phi"]
+    ph = list(f)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            q = ph[i]
+            lap = (ph[i + 1] + ph[i - 1] + ph[i + nx] + ph[i - nx] - 4.0 * q) * inv_dx2
+            fp = q * q * q - q
+            react = m * (eps2 * lap - fp)
+            adv = 0.0
+            if has_v:
+                u, w = vx[i], vy[i]
+                dpdx = (q - ph[i - 1] if u > 0.0 else ph[i + 1] - q) * inv_dx
+                dpdy = (q - ph[i - nx] if w > 0.0 else ph[i + nx] - q) * inv_dx
+                adv = -(u * dpdx + w * dpdy)
+            f[i] = r_clamp(f[i] + (adv + react) * dt, -1.0, 1.0)
+    for x in range(nx):
+        f[x] = f[nx + x]
+        f[(ny - 1) * nx + x] = f[(ny - 2) * nx + x]
+    for y in range(ny):
+        f[y * nx] = f[y * nx + 1]
+        f[y * nx + nx - 1] = f[y * nx + nx - 2]
+    return None
+
+
+def pf_json(doc):
+    def us(val):
+        if not (isinstance(val, tuple) and val[0] == "int") or int(val[1]) < 0:
+            raise JsonRefused("not a usize")
+        return int(val[1])
+
+    try:
+        f = j_struct(j_load(doc), ["nx", "ny", "dx", "phi", "mobility", "epsilon"])
+        return pf_tokens({"nx": us(f[0]), "ny": us(f[1]), "dx": j_f64(f[2]),
+                          "phi": [j_f64(e) for e in j_arr(f[3])], "mobility": j_f64(f[4]),
+                          "epsilon": j_f64(f[5])})
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def check_phase_field(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        if func == "PhaseField::new":
+            nx, ny, dx = x[0] % USIZE, x[1] % USIZE, x[2]
+            if nx < 4 or ny < 4:
+                want = ["E:InvalidGridResolution"]
+            elif dx <= 0.0 or not fin(dx):
+                want = ["E:InvalidParameter"]
+            else:
+                want = pf_tokens({"nx": nx, "ny": ny, "dx": dx, "phi": [-1.0] * (nx * ny), "mobility": 1.0,
+                                  "epsilon": 2.0 * dx}) + [nx * ny]
+        elif func == "PhaseField::from_json":
+            want = pf_json(unpct(ins[0][2:]))
+        else:
+            p, k = pf_read(x)
+            nx, ny = p["nx"], p["ny"]
+            f = p["phi"]
+            short = func.split("::")[-1]
+            if short == "is_phase_b":
+                want = [("v", nx * ny)] + [int(f[i] > 0.0) for i in range(nx * ny)]
+            elif short == "is_interface":
+                ths = list(x[k + 1:k + 1 + x[k][1]])
+                want = [("v", len(ths) * nx * ny)] + [int(abs(f[i]) < t) for t in ths for i in range(nx * ny)]
+            elif short == "phase_b_area":
+                area = p["dx"] * p["dx"]
+                t = -0.0
+                for q in f:
+                    t += (q + 1.0) * 0.5 * area
+                want = [t]
+            elif short == "set_circle":
+                fill_shape(f, nx, ny, p["dx"], 1, x[k], x[k + 1], x[k + 2], 0.0)
+                want = pf_tokens(p)
+            elif short == "set_rect":
+                fill_shape(f, nx, ny, p["dx"], 0, *x[k:k + 4])
+                want = pf_tokens(p)
+            elif short == "step":
+                n1 = x[k][1]
+                vx = list(x[k + 1:k + 1 + n1])
+                k2 = k + 1 + n1
+                n2 = x[k2][1]
+                vy = list(x[k2 + 1:k2 + 1 + n2])
+                dt, steps = x[k2 + 1 + n2], x[k2 + 2 + n2]
+                want = None
+                for _ in range(steps):
+                    bad = pf_step(p, vx, vy, dt)
+                    if bad:
+                        want = [bad]
+                        break
+                if want is None:
+                    want = pf_tokens(p) + [nx * ny]
+            else:
+                fail(f"{where}: no check for {func}")
+                continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -2802,6 +3117,10 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"grid: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "grid", path, rows)
+        elif path.stem in ("vof", "phase_field"):
+            counts = check_vof(rows) if path.stem == "vof" else check_phase_field(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"{path.stem}: {len(rows)} rows recomputed ({summary})")
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

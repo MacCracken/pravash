@@ -1067,6 +1067,297 @@ fn _par_vcol_in(k, c: *PvColumn): i64 {
     return k + 1 + n;
 }
 
+# ── vof and phase_field (M3 part d) ─────────────────────────────────────────────────
+# A VOF state is nx, ny, dx, `v:` alpha; a phase-field state is nx, ny, dx, `v:` phi, mobility, epsilon
+# (scripts/oracle/src/m_vof.rs, m_phase_field.rs). Each row's field is built as the generator's `fresh` builds it:
+# `new(nx, ny, dx)`, or `new(4, 4, 0.1)` when that is refused or the size is 2^16 or more, then the public fields.
+
+# 1 when a side is below 2^16 (as a usize), so `fresh` builds the field at its own size.
+#must_use
+fn _par_small(nx, ny): i64 {
+    if (nx >= 0 && nx < 65536 && ny >= 0 && ny < 65536) { return 1; }
+    return 0;
+}
+
+# The VOF state at input k into *v: the index after it, or -1 for no memory.
+fn _par_vof_in(k, v: *PvVofField): i64 {
+    var nx = _par_in(k);
+    var ny = _par_in(k + 1);
+    var dx: f64 = _par_in(k + 2);
+    var built = 0;
+    if (_par_small(nx, ny) == 1) {
+        var t, e = PvVofField_new(nx, ny, dx, v);
+        if (is_err_result(t) == 0) { built = 1; }
+    }
+    if (built == 0) {
+        var t2, e2 = PvVofField_new(4, 4, 0.1, v);
+        if (is_err_result(t2) == 1) { return 0 - 1; }
+    }
+    v.nx = nx;
+    v.ny = ny;
+    v.dx = dx;
+    var a: *PvColumn = _pv_vof_col(v, 0);
+    a.drop();
+    var n = _par_in(k + 3);
+    if (_par_col_in(k + 4, n, a) == 0) { return 0 - 1; }
+    return k + 4 + n;
+}
+
+# Appends a VOF state.
+fn _par_vof_out(v: *PvVofField) {
+    _par_got_i(v.nx);
+    _par_got_i(v.ny);
+    _par_got_f(_pv_bits(v.dx));
+    _par_col_out(_pv_vof_col(v, 0));
+    return 0;
+}
+
+# The phase-field state at input k into *p: the index after it, or -1 for no memory.
+fn _par_pf_in(k, p: *PvPhaseField): i64 {
+    var nx = _par_in(k);
+    var ny = _par_in(k + 1);
+    var dx: f64 = _par_in(k + 2);
+    var built = 0;
+    if (_par_small(nx, ny) == 1) {
+        var t, e = PvPhaseField_new(nx, ny, dx, p);
+        if (is_err_result(t) == 0) { built = 1; }
+    }
+    if (built == 0) {
+        var t2, e2 = PvPhaseField_new(4, 4, 0.1, p);
+        if (is_err_result(t2) == 1) { return 0 - 1; }
+    }
+    p.nx = nx;
+    p.ny = ny;
+    p.dx = dx;
+    var f: *PvColumn = _pv_pf_col(p, 0);
+    f.drop();
+    var n = _par_in(k + 3);
+    if (_par_col_in(k + 4, n, f) == 0) { return 0 - 1; }
+    p.mobility = _par_in(k + 4 + n);
+    p.epsilon = _par_in(k + 5 + n);
+    return k + 6 + n;
+}
+
+# Appends a phase-field state.
+fn _par_pf_out(p: *PvPhaseField) {
+    _par_got_i(p.nx);
+    _par_got_i(p.ny);
+    _par_got_f(_pv_bits(p.dx));
+    _par_col_out(_pv_pf_col(p, 0));
+    _par_got_f(_pv_bits(p.mobility));
+    _par_got_f(_pv_bits(p.epsilon));
+    return 0;
+}
+
+# The VOF query `q` (0 surface, 1 full, 2 empty) at a cell, at threshold t when `with_t`, else the default.
+#must_use
+fn _par_vof_q(v: *PvVofField, q, x, y, with_t, t: f64): i64 {
+    if (with_t == 0) {
+        if (q == 0) { return v.is_surface(x, y); }
+        if (q == 1) { return v.is_full(x, y); }
+        return v.is_empty(x, y);
+    }
+    if (q == 0) { return v.is_surface_with_threshold(x, y, t); }
+    if (q == 1) { return v.is_full_with_threshold(x, y, t); }
+    return v.is_empty_with_threshold(x, y, t);
+}
+
+fn _par_vof(fp, fl): i64 {
+    if (_par_eq(fp, fl, "VofField::new") == 1) {
+        var g: PvVofField;
+        var t, e = PvVofField_new(_par_in(0), _par_in(1), _par_in(2), &g);
+        if (is_err_result(t) == 1) { _par_got_err(e); return 1; }
+        _par_got_i(g.nx);
+        _par_got_i(g.ny);
+        _par_got_f(_pv_bits(g.dx));
+        _par_got_i(g.alpha.len);
+        _par_got_f(load64(g.alpha.data));
+        _par_got_i(g.scratch.len);
+        PvVofField_drop(&g);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "VofField::from_json") == 1) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var j: PvVofField;
+        var tj, ej = PvVofField_from_json(doc, strlen(doc), &j);
+        if (is_err_result(tj) == 1) { _par_got_err(ej); return 1; }
+        _par_vof_out(&j);
+        var sb = str_builder_new();
+        if (j.to_json(sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var j2: PvVofField;
+        var tj2, ej2 = PvVofField_from_json(d, n, &j2);
+        if (is_err_result(tj2) == 1 || memeq(&j, &j2, 24) != 1) { return 0 - 1; }
+        if (_par_col_same(_pv_vof_col(&j, 0), _pv_vof_col(&j2, 0)) == 0) { return 0 - 1; }
+        PvVofField_drop(&j);
+        PvVofField_drop(&j2);
+        return 1;
+    }
+    var v: PvVofField;
+    var k = _par_vof_in(0, &v);
+    if (k < 0) { return 0 - 1; }
+    var nx = v.nx;
+    var ny = v.ny;
+    var handled = 1;
+    var q = 0 - 1;
+    var with_t = 0;
+    if (_par_eq(fp, fl, "VofField::is_surface") == 1) { q = 0; }
+    if (_par_eq(fp, fl, "VofField::is_full") == 1) { q = 1; }
+    if (_par_eq(fp, fl, "VofField::is_empty") == 1) { q = 2; }
+    if (_par_eq(fp, fl, "VofField::is_surface_with_threshold") == 1) { q = 0; with_t = 1; }
+    if (_par_eq(fp, fl, "VofField::is_full_with_threshold") == 1) { q = 1; with_t = 1; }
+    if (_par_eq(fp, fl, "VofField::is_empty_with_threshold") == 1) { q = 2; with_t = 1; }
+    if (q >= 0) {
+        var nt = 1;
+        if (with_t == 1) { nt = _par_in(k); }
+        _par_got_seq(nt * nx * ny);
+        for (var it = 0; it < nt; it = it + 1) {
+            var th: f64 = 0.0;
+            if (with_t == 1) { th = _par_in(k + 1 + it); }
+            for (var y = 0; y < ny; y = y + 1) {
+                for (var x = 0; x < nx; x = x + 1) { _par_got_i(_par_vof_q(&v, q, x, y, with_t, th)); }
+            }
+        }
+    } elif (_par_eq(fp, fl, "VofField::interface_normal") == 1) {
+        _par_got_seq(2 * nx * ny);
+        for (var y2 = 0; y2 < ny; y2 = y2 + 1) {
+            for (var x2 = 0; x2 < nx; x2 = x2 + 1) {
+                var a, c = v.interface_normal(x2, y2);
+                var af: f64 = a;
+                var cf: f64 = c;
+                _par_got_f(_pv_bits(af));
+                _par_got_f(_pv_bits(cf));
+            }
+        }
+    } elif (_par_eq(fp, fl, "VofField::total_volume") == 1) {
+        var tv: f64 = v.total_volume();
+        _par_got_f(_pv_bits(tv));
+    } elif (_par_eq(fp, fl, "VofField::fill_rect") == 1) {
+        v.fill_rect(_par_in(k), _par_in(k + 1), _par_in(k + 2), _par_in(k + 3));
+        _par_vof_out(&v);
+    } elif (_par_eq(fp, fl, "VofField::fill_circle") == 1) {
+        v.fill_circle(_par_in(k), _par_in(k + 1), _par_in(k + 2));
+        _par_vof_out(&v);
+    } elif (_par_eq(fp, fl, "VofField::advect") == 1) {
+        var vx: PvColumn;
+        var vy: PvColumn;
+        var k1 = _par_vcol_in(k, &vx);
+        if (k1 < 0) { return 0 - 1; }
+        var k2 = _par_vcol_in(k1, &vy);
+        if (k2 < 0) { return 0 - 1; }
+        var steps = _par_in(k2 + 1);
+        var failed = 0;
+        for (var s = 0; s < steps; s = s + 1) {
+            var ts, vs = v.advect(vx.data, vx.len, vy.data, vy.len, _par_in(k2));
+            if (is_err_result(ts) == 1) {
+                _par_got_err(vs);
+                failed = 1;
+                break;
+            }
+        }
+        if (failed == 0) {
+            _par_vof_out(&v);
+            _par_got_i(v.scratch.len);
+        }
+        vx.drop();
+        vy.drop();
+    } else {
+        handled = 0;
+    }
+    PvVofField_drop(&v);
+    return handled;
+}
+
+fn _par_phase_field(fp, fl): i64 {
+    if (_par_eq(fp, fl, "PhaseField::new") == 1) {
+        var g: PvPhaseField;
+        var t, e = PvPhaseField_new(_par_in(0), _par_in(1), _par_in(2), &g);
+        if (is_err_result(t) == 1) { _par_got_err(e); return 1; }
+        _par_pf_out(&g);
+        _par_got_i(g.scratch.len);
+        PvPhaseField_drop(&g);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "PhaseField::from_json") == 1) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var j: PvPhaseField;
+        var tj, ej = PvPhaseField_from_json(doc, strlen(doc), &j);
+        if (is_err_result(tj) == 1) { _par_got_err(ej); return 1; }
+        _par_pf_out(&j);
+        var sb = str_builder_new();
+        if (j.to_json(sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var j2: PvPhaseField;
+        var tj2, ej2 = PvPhaseField_from_json(d, n, &j2);
+        if (is_err_result(tj2) == 1 || memeq(&j, &j2, 24) != 1 || memeq(&j + 48, &j2 + 48, 16) != 1) {
+            return 0 - 1;
+        }
+        if (_par_col_same(_pv_pf_col(&j, 0), _pv_pf_col(&j2, 0)) == 0) { return 0 - 1; }
+        PvPhaseField_drop(&j);
+        PvPhaseField_drop(&j2);
+        return 1;
+    }
+    var p: PvPhaseField;
+    var k = _par_pf_in(0, &p);
+    if (k < 0) { return 0 - 1; }
+    var nx = p.nx;
+    var ny = p.ny;
+    var handled = 1;
+    if (_par_eq(fp, fl, "PhaseField::is_phase_b") == 1) {
+        _par_got_seq(nx * ny);
+        for (var y = 0; y < ny; y = y + 1) {
+            for (var x = 0; x < nx; x = x + 1) { _par_got_i(p.is_phase_b(x, y)); }
+        }
+    } elif (_par_eq(fp, fl, "PhaseField::is_interface") == 1) {
+        var nt = _par_in(k);
+        _par_got_seq(nt * nx * ny);
+        for (var it = 0; it < nt; it = it + 1) {
+            var th: f64 = _par_in(k + 1 + it);
+            for (var y2 = 0; y2 < ny; y2 = y2 + 1) {
+                for (var x2 = 0; x2 < nx; x2 = x2 + 1) { _par_got_i(p.is_interface(x2, y2, th)); }
+            }
+        }
+    } elif (_par_eq(fp, fl, "PhaseField::phase_b_area") == 1) {
+        var ar: f64 = p.phase_b_area();
+        _par_got_f(_pv_bits(ar));
+    } elif (_par_eq(fp, fl, "PhaseField::set_circle") == 1) {
+        p.set_circle(_par_in(k), _par_in(k + 1), _par_in(k + 2));
+        _par_pf_out(&p);
+    } elif (_par_eq(fp, fl, "PhaseField::set_rect") == 1) {
+        p.set_rect(_par_in(k), _par_in(k + 1), _par_in(k + 2), _par_in(k + 3));
+        _par_pf_out(&p);
+    } elif (_par_eq(fp, fl, "PhaseField::step") == 1) {
+        var vx: PvColumn;
+        var vy: PvColumn;
+        var k1 = _par_vcol_in(k, &vx);
+        if (k1 < 0) { return 0 - 1; }
+        var k2 = _par_vcol_in(k1, &vy);
+        if (k2 < 0) { return 0 - 1; }
+        var steps = _par_in(k2 + 1);
+        var failed = 0;
+        for (var s = 0; s < steps; s = s + 1) {
+            var ts, vs = p.step(vx.data, vx.len, vy.data, vy.len, _par_in(k2));
+            if (is_err_result(ts) == 1) {
+                _par_got_err(vs);
+                failed = 1;
+                break;
+            }
+        }
+        if (failed == 0) {
+            _par_pf_out(&p);
+            _par_got_i(p.scratch.len);
+        }
+        vx.drop();
+        vy.drop();
+    } else {
+        handled = 0;
+    }
+    PvPhaseField_drop(&p);
+    return handled;
+}
+
 # ── grid, part c (M3): KEpsilon, apply_ghost_fluid, MacGrid ──────────────────────────
 # A k-ε state is `v:` k, `v:` epsilon and the three constants; a MAC state is nx, ny, dx and 4 `v:<n>` fields
 # (scripts/oracle/src/m_grid_c.rs).
@@ -1473,6 +1764,8 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
         if (rc != 0) { return rc; }
         return _par_grid(fp, fl);
     }
+    if (_par_eq(mp, ml, "vof") == 1) { return _par_vof(fp, fl); }
+    if (_par_eq(mp, ml, "phase_field") == 1) { return _par_phase_field(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;
 }
@@ -1608,6 +1901,10 @@ fn _par_c_bound(fp, fl): i64 {
     # order, so every field is the oracle's bit for bit.
     if (_par_eq(fp, fl, "KEpsilon::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "MacGrid::step") == 1) { return 0; }
+    # M3 part d: the VOF advection and the phase-field step (class S) are +, −, ×, ÷, √, ceil and clamp in Rust's
+    # order, so every field is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "VofField::advect") == 1) { return 0; }
+    if (_par_eq(fp, fl, "PhaseField::step") == 1) { return 0; }
     return 0 - 1;
 }
 

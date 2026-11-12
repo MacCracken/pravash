@@ -1,0 +1,221 @@
+# phase_field.cyr — the Allen–Cahn phase field of rust-old/src/phase_field.rs (`PhaseField`, M3 part d).
+#
+# An order parameter φ ∈ [−1, 1] per cell of an nx × ny grid: −1 phase A, +1 phase B, the interface at 0. `step`
+# integrates ∂φ/∂t + u·∇φ = M·(ε²·∇²φ − (φ³ − φ)) by forward Euler, with first-order upwind advection, then copies
+# the zero-gradient ghosts. Every formula is Rust's, in its operation order.
+#
+# The record mirrors the struct: nx, ny, dx, the public φ column, mobility and ε, then the private scratch column
+# `step` reads the old φ from (ADR 0002 #14).
+
+struct PvPhaseField {
+    nx;
+    ny;
+    dx: f64;
+    phi: PvColumn;
+    mobility: f64;
+    epsilon: f64;
+    scratch: PvColumn;
+}
+
+# Column k of a phase field (0 phi at 24, 1 scratch at 64, after mobility and ε), by its byte offset
+# (tests/phase_field.tcyr pins the layout, 88 bytes).
+#must_use
+fn _pv_pf_col(p, k): *PvColumn {
+    if (k == 0) { return _pv_as_columns(_pv_addr(p) + 24); }
+    return _pv_as_columns(_pv_addr(p) + 64);
+}
+
+# Empties both columns of *p without releasing anything (for a record about to be filled).
+fn _pv_pf_zero(p: *PvPhaseField) {
+    for (var k = 0; k < 2; k = k + 1) {
+        var c: *PvColumn = _pv_pf_col(p, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases both columns' storage; the field holds no storage after. Mirrors dropping the `PhaseField`.
+fn PvPhaseField_drop(p: *PvPhaseField) {
+    for (var k = 0; k < 2; k = k + 1) {
+        var c: *PvColumn = _pv_pf_col(p, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# A field of phase A (φ = −1) into *out, mobility 1 and ε = 2·dx: Ok(0), or the first failure in Rust's order:
+# PV_ERR_INVALID_GRID_RESOLUTION for nx or ny below 4, PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0;
+# PV_ERR_OUT_OF_MEMORY when nx·ny overflows or the columns can't be allocated (Rust doesn't check the product: it
+# panics under overflow checks and aborts on an allocation that large; ADR 0002 #14). On an error *out holds no
+# storage. Mirrors `PhaseField::new`.
+#must_use
+fn PvPhaseField_new(nx, ny, dx: f64, out: *PvPhaseField): Result {
+    _pv_pf_zero(out);
+    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_fg_mul_class(nx, ny) != 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var n = nx * ny;
+    var f: *PvColumn = _pv_pf_col(out, 0);
+    var s: *PvColumn = _pv_pf_col(out, 1);
+    if (f.resize(n, 0xBFF0000000000000) == 0 || s.resize(n, 0) == 0) {
+        PvPhaseField_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    out.mobility = 1.0;
+    var eps: f64 = 2.0 * dx;
+    out.epsilon = eps;
+    return Ok(0);
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `PhaseField::clone`.
+#must_use
+fn PvPhaseField_clone(out: *PvPhaseField, src: *PvPhaseField): i64 {
+    out.nx = src.nx;
+    out.ny = src.ny;
+    out.dx = src.dx;
+    out.mobility = src.mobility;
+    out.epsilon = src.epsilon;
+    _pv_pf_zero(out);
+    for (var k = 0; k < 2; k = k + 1) {
+        var s: *PvColumn = _pv_pf_col(src, k);
+        var d: *PvColumn = _pv_pf_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvPhaseField_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    return 1;
+}
+
+impl PvPhaseField {
+    # φ = +1 at every cell whose centre (x·dx, y·dx) is strictly within `radius` of (cx, cy). Mirrors
+    # `PhaseField::set_circle`.
+    fn set_circle(self, cx: f64, cy: f64, radius: f64) {
+        _pv_fill_shape(_pv_pf_col(self, 0), self.nx, self.ny, self.dx, 1, cx, cy, radius, 0.0, 0x3FF0000000000000);
+        return 0;
+    }
+
+    # φ = +1 at every cell whose centre lies in [x_min, x_max] × [y_min, y_max]. Mirrors `PhaseField::set_rect`.
+    fn set_rect(self, x_min: f64, y_min: f64, x_max: f64, y_max: f64) {
+        _pv_fill_shape(_pv_pf_col(self, 0), self.nx, self.ny, self.dx, 0, x_min, y_min, x_max, y_max,
+          0x3FF0000000000000);
+        return 0;
+    }
+
+    # 1 when the cell is phase B (φ > 0); 0 otherwise (and for a cell outside φ, where Rust panics). Mirrors
+    # `PhaseField::is_phase_b`.
+    #must_use
+    fn is_phase_b(self, x, y): i64 {
+        var p: f64 = self.phi.get_f(y * self.nx + x);
+        if (p > 0.0) { return 1; }
+        return 0;
+    }
+
+    # 1 when |φ| < threshold at the cell (an interface cell). Mirrors `PhaseField::is_interface`.
+    #must_use
+    fn is_interface(self, x, y, threshold: f64): i64 {
+        var p: f64 = self.phi.get_f(y * self.nx + x);
+        var a: f64 = f64_abs(p);
+        if (a < threshold) { return 1; }
+        return 0;
+    }
+
+    # Σ ((φ + 1)·0.5)·dx² over every cell, folded from −0. Mirrors `PhaseField::phase_b_area`.
+    #must_use
+    fn phase_b_area(self): f64 {
+        var area: f64 = self.dx * self.dx;
+        var s: f64 = 0x8000000000000000;
+        for (var i = 0; i < self.phi.len; i = i + 1) {
+            var p: f64 = load64(self.phi.data + i * 8);
+            var w: f64 = ((p + 1.0) * 0.5) * area;
+            s = s + w;
+        }
+        return s;
+    }
+
+    # One step of length dt with the velocity (vx_len and vy_len words at vx and vy; both 0 for none). On the
+    # interior, from the old φ (copied to the scratch):
+    #   ∇²φ = ((((φ_r + φ_l) + φ_t) + φ_b) − 4φ)·(1/dx)², f' = (φ·φ)·φ − φ, R = M·(ε²·∇²φ − f'),
+    #   A = −((u·∂xφ) + (v·∂yφ)) with one-sided upwind differences ×(1/dx) (A = +0 without a velocity),
+    #   φ ← clamp(φ + (A + R)·dt, −1, 1);
+    # then the ghosts: the bottom and top rows, then the left and right columns, each copied from its inner
+    # neighbour. Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0),
+    # PV_ERR_INVALID_GRID_RESOLUTION (φ not nx·ny long, nx or ny below 3, nx·ny overflowing, where Rust panics),
+    # PV_ERR_INVALID_PARAMETER (a velocity that is neither both empty nor both nx·ny long), PV_ERR_OUT_OF_MEMORY (the
+    # scratch can't grow, checked before φ changes; Rust aborts). Rust's divergence warning (|φ| > 1.5) has no
+    # effect on the state and isn't kept. Mirrors `PhaseField::step`.
+    #must_use
+    fn step(self, vx, vx_len, vy, vy_len, dt: f64): Result {
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var nx = self.nx;
+        var ny = self.ny;
+        if (nx != 0 && ny != 0 && (nx < 0 || ny < 0 || nx > 0x7FFFFFFFFFFFFFFF / ny)) {
+            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
+        var n = nx * ny;
+        if (self.phi.len != n || nx < 3 || ny < 3) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var has_v = 1;
+        if (vx_len == 0 && vy_len == 0) { has_v = 0; }
+        if (has_v == 1 && (vx_len != n || vy_len != n)) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var sc: *PvColumn = _pv_pf_col(self, 1);
+        if (sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var inv_dx: f64 = 1.0 / self.dx;
+        var inv_dx2: f64 = inv_dx * inv_dx;
+        var m: f64 = self.mobility;
+        var eps2: f64 = self.epsilon * self.epsilon;
+        var f = self.phi.data;
+        var ph = sc.data;
+        _pv_fg_copy(ph, f, n);
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var i = y * nx + x;
+                var q = ph + i * 8;
+                var p: f64 = load64(q);
+                var pr: f64 = load64(q + 8);
+                var pl: f64 = load64(q - 8);
+                var pt: f64 = load64(q + nx * 8);
+                var pb: f64 = load64(q - nx * 8);
+                var s4: f64 = 4.0 * p;
+                var lap: f64 = ((((pr + pl) + pt) + pb) - s4) * inv_dx2;
+                var fp: f64 = ((p * p) * p) - p;
+                var react: f64 = m * ((eps2 * lap) - fp);
+                var adv: f64 = 0.0;
+                if (has_v == 1) {
+                    var u: f64 = load64(vx + i * 8);
+                    var v: f64 = load64(vy + i * 8);
+                    var ddx: f64 = pr - p;
+                    if (u > 0.0) { ddx = p - pl; }
+                    var dpdx: f64 = ddx * inv_dx;
+                    var ddy: f64 = pt - p;
+                    if (v > 0.0) { ddy = p - pb; }
+                    var dpdy: f64 = ddy * inv_dx;
+                    var t: f64 = (u * dpdx) + (v * dpdy);
+                    adv = -t;
+                }
+                var cur: f64 = load64(f + i * 8);
+                # clamp(·, −1, 1) written out (a NaN stays NaN): as a `_pv_clamp` call it made the step 1.18–1.19×
+                # slower (pinned A/B, port-parity §13).
+                var c: f64 = cur + ((adv + react) * dt);
+                if (c < -1.0) { c = -1.0; }
+                if (c > 1.0) { c = 1.0; }
+                store64(f + i * 8, _pv_bits(c));
+            }
+        }
+        for (var gx = 0; gx < nx; gx = gx + 1) {
+            store64(f + gx * 8, load64(f + (nx + gx) * 8));
+            store64(f + ((ny - 1) * nx + gx) * 8, load64(f + ((ny - 2) * nx + gx) * 8));
+        }
+        for (var gy = 0; gy < ny; gy = gy + 1) {
+            store64(f + (gy * nx) * 8, load64(f + (gy * nx + 1) * 8));
+            store64(f + (gy * nx + nx - 1) * 8, load64(f + (gy * nx + nx - 2) * 8));
+        }
+        return Ok(0);
+    }
+}

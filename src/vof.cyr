@@ -1,0 +1,315 @@
+# vof.cyr — the volume-of-fluid field of rust-old/src/vof.rs (`VofField`, M3 part d).
+#
+# A volume fraction α ∈ [0, 1] per cell of an nx × ny grid: 0 empty, 1 full. `advect` moves it with donor-cell face
+# fluxes, closed walls on the boundary ring, and sub-steps that keep the Courant number at or below 0.5. Every
+# formula is Rust's, in its operation order.
+#
+# The record mirrors the struct: nx, ny, dx, the public α column, then the private scratch column the sub-steps read
+# the old α from (ADR 0002 #14).
+
+struct PvVofField {
+    nx;
+    ny;
+    dx: f64;
+    alpha: PvColumn;
+    scratch: PvColumn;
+}
+
+# Column k of a VOF field (0 alpha, 1 scratch), by its byte offset (tests/vof.tcyr pins the layout, 72 bytes).
+#must_use
+fn _pv_vof_col(v, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(v) + 24 + k * 24);
+}
+
+# Empties both columns of *v without releasing anything (for a record about to be filled).
+fn _pv_vof_zero(v: *PvVofField) {
+    for (var k = 0; k < 2; k = k + 1) {
+        var c: *PvColumn = _pv_vof_col(v, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return 0;
+}
+
+# Releases both columns' storage; the field holds no storage after. Mirrors dropping the `VofField`.
+fn PvVofField_drop(v: *PvVofField) {
+    for (var k = 0; k < 2; k = k + 1) {
+        var c: *PvColumn = _pv_vof_col(v, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# An empty field (α = 0) into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for
+# nx or ny below 4, PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0; PV_ERR_OUT_OF_MEMORY when nx·ny
+# overflows or the columns can't be allocated (Rust doesn't check the product: it panics under overflow checks and
+# aborts on an allocation that large; ADR 0002 #14). On an error *out holds no storage. Mirrors `VofField::new`.
+#must_use
+fn PvVofField_new(nx, ny, dx: f64, out: *PvVofField): Result {
+    _pv_vof_zero(out);
+    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_fg_mul_class(nx, ny) != 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var n = nx * ny;
+    var a: *PvColumn = _pv_vof_col(out, 0);
+    var s: *PvColumn = _pv_vof_col(out, 1);
+    if (a.resize(n, 0) == 0 || s.resize(n, 0) == 0) {
+        PvVofField_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    return Ok(0);
+}
+
+# A deep copy of `src` into *out, scratch included: 1, or 0 when the memory isn't there (then *out holds no
+# storage). Mirrors `VofField::clone`.
+#must_use
+fn PvVofField_clone(out: *PvVofField, src: *PvVofField): i64 {
+    out.nx = src.nx;
+    out.ny = src.ny;
+    out.dx = src.dx;
+    _pv_vof_zero(out);
+    for (var k = 0; k < 2; k = k + 1) {
+        var s: *PvColumn = _pv_vof_col(src, k);
+        var d: *PvColumn = _pv_vof_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvVofField_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    return 1;
+}
+
+# Sets every cell (x, y) whose centre (x·dx, y·dx) passes `inside` to the word w, over the nx × ny cells a column
+# holds (a cell outside it is skipped, where Rust panics). kind 0: the rectangle a ≤ px ≤ c and b ≤ py ≤ d, kind 1:
+# the disc (px − a)² + (py − b)² < c². Shared by `VofField::fill_*` and `PhaseField::set_*`.
+fn _pv_fill_shape(col: *PvColumn, nx, ny, dx: f64, kind, a: f64, b: f64, c: f64, d: f64, w) {
+    var r2: f64 = c * c;
+    for (var y = 0; y < ny; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        var py: f64 = yf * dx;
+        for (var x = 0; x < nx; x = x + 1) {
+            var xf: f64 = f64_from(x);
+            var px: f64 = xf * dx;
+            var hit = 0;
+            if (kind == 0) {
+                if (px >= a && px <= c && py >= b && py <= d) { hit = 1; }
+            } else {
+                var ddx: f64 = px - a;
+                var ddy: f64 = py - b;
+                var q: f64 = (ddx * ddx) + (ddy * ddy);
+                if (q < r2) { hit = 1; }
+            }
+            if (hit == 1) { col.set(y * nx + x, w); }
+        }
+    }
+    return 0;
+}
+
+# One donor-cell sub-step of length dt (the scratch already nx·ny words): the old α copied to the scratch, then
+# each interior cell's α ← clamp(α − (((F_r − F_l) + F_t) − F_b), 0, 1). A face flux is ((u·α_donor)·dt)·(1/dx)
+# with u = 0.5·(v_0 + v_1), the face's two cell velocities, and α_donor the upstream cell's old α (the lower cell's
+# when u > 0, else the upper's); a face on the boundary ring is a wall, flux 0. Mirrors the private
+# `advect_substep`.
+#
+# The fluxes and the clamp are written out, and a face shared along a row is computed once: Rust evaluates each
+# interior x face twice (as F_r of the cell on its left and F_l of the cell on its right) from the same four
+# values, so the left cell's F_r is the right cell's F_l, bit for bit. Together they made the advection 1.17–1.18×
+# faster (pinned A/B, port-parity §13).
+fn _pv_vof_substep(fd: *PvVofField, vx, vy, dt: f64) {
+    var nx = fd.nx;
+    var ny = fd.ny;
+    var inv_dx: f64 = 1.0 / fd.dx;
+    var a = fd.alpha.data;
+    var o = fd.scratch.data;
+    _pv_fg_copy(o, a, nx * ny);
+    var zero: f64 = 0.0;
+    var row = nx * 8;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var carry: f64 = zero;   # F_l of the row's first interior cell: its left face is a wall
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var pu = vx + i * 8;
+            var pv = vy + i * 8;
+            var po = o + i * 8;
+            var old: f64 = load64(po);
+            var fl: f64 = carry;
+            var fr: f64 = zero;
+            if (x + 1 != nx - 1) {
+                var u0: f64 = load64(pu);
+                var u1: f64 = load64(pu + 8);
+                var u: f64 = 0.5 * (u0 + u1);
+                var dr: f64 = load64(po + 8);
+                if (u > 0.0) { dr = old; }
+                fr = ((u * dr) * dt) * inv_dx;
+            }
+            carry = fr;
+            var ft: f64 = zero;
+            if (y + 1 != ny - 1) {
+                var w0: f64 = load64(pv);
+                var w1: f64 = load64(pv + row);
+                var w: f64 = 0.5 * (w0 + w1);
+                var dt2: f64 = load64(po + row);
+                if (w > 0.0) { dt2 = old; }
+                ft = ((w * dt2) * dt) * inv_dx;
+            }
+            var fb: f64 = zero;
+            if (y != 1) {
+                var b0: f64 = load64(pv - row);
+                var b1: f64 = load64(pv);
+                var bw: f64 = 0.5 * (b0 + b1);
+                var db: f64 = old;
+                if (bw > 0.0) { db = load64(po - row); }
+                fb = ((bw * db) * dt) * inv_dx;
+            }
+            var net: f64 = ((fr - fl) + ft) - fb;
+            var c: f64 = old - net;
+            if (c < 0.0) { c = 0.0; }
+            if (c > 1.0) { c = 1.0; }
+            store64(a + i * 8, _pv_bits(c));
+        }
+    }
+    return 0;
+}
+
+impl PvVofField {
+    # 1 when the cell is partially filled: threshold < α < 1 − threshold; 0 otherwise (and for a cell outside α,
+    # where Rust panics). Mirrors `VofField::is_surface_with_threshold`.
+    #must_use
+    fn is_surface_with_threshold(self, x, y, threshold: f64): i64 {
+        var a: f64 = self.alpha.get_f(y * self.nx + x);
+        var hi: f64 = 1.0 - threshold;
+        if (a > threshold && a < hi) { return 1; }
+        return 0;
+    }
+
+    # `is_surface_with_threshold` at 1e-6. Mirrors `VofField::is_surface`.
+    #must_use
+    fn is_surface(self, x, y): i64 {
+        return self.is_surface_with_threshold(x, y, 0x3EB0C6F7A0B5ED8D);
+    }
+
+    # 1 when α > 1 − threshold. Mirrors `VofField::is_full_with_threshold`.
+    #must_use
+    fn is_full_with_threshold(self, x, y, threshold: f64): i64 {
+        var a: f64 = self.alpha.get_f(y * self.nx + x);
+        var hi: f64 = 1.0 - threshold;
+        if (a > hi) { return 1; }
+        return 0;
+    }
+
+    # `is_full_with_threshold` at 1e-6. Mirrors `VofField::is_full`.
+    #must_use
+    fn is_full(self, x, y): i64 {
+        return self.is_full_with_threshold(x, y, 0x3EB0C6F7A0B5ED8D);
+    }
+
+    # 1 when α < threshold. Mirrors `VofField::is_empty_with_threshold`.
+    #must_use
+    fn is_empty_with_threshold(self, x, y, threshold: f64): i64 {
+        var a: f64 = self.alpha.get_f(y * self.nx + x);
+        if (a < threshold) { return 1; }
+        return 0;
+    }
+
+    # `is_empty_with_threshold` at 1e-6. Mirrors `VofField::is_empty`.
+    #must_use
+    fn is_empty(self, x, y): i64 {
+        return self.is_empty_with_threshold(x, y, 0x3EB0C6F7A0B5ED8D);
+    }
+
+    # α = 1 at every cell whose centre (x·dx, y·dx) lies in [x_min, x_max] × [y_min, y_max]. Mirrors
+    # `VofField::fill_rect`.
+    fn fill_rect(self, x_min: f64, y_min: f64, x_max: f64, y_max: f64) {
+        _pv_fill_shape(_pv_vof_col(self, 0), self.nx, self.ny, self.dx, 0, x_min, y_min, x_max, y_max,
+          0x3FF0000000000000);
+        return 0;
+    }
+
+    # α = 1 at every cell whose centre is strictly within `radius` of (cx, cy). Mirrors `VofField::fill_circle`.
+    fn fill_circle(self, cx: f64, cy: f64, radius: f64) {
+        _pv_fill_shape(_pv_vof_col(self, 0), self.nx, self.ny, self.dx, 1, cx, cy, radius, 0.0, 0x3FF0000000000000);
+        return 0;
+    }
+
+    # Σ α·dx² over every cell, folded from −0. Mirrors `VofField::total_volume`.
+    #must_use
+    fn total_volume(self): f64 {
+        var area: f64 = self.dx * self.dx;
+        var s: f64 = 0x8000000000000000;
+        for (var i = 0; i < self.alpha.len; i = i + 1) {
+            var a: f64 = load64(self.alpha.data + i * 8);
+            s = s + (a * area);
+        }
+        return s;
+    }
+
+    # The interface normal (g_x/|g|, g_y/|g|) from α's central differences (×0.5/dx) at interior cell (x, y); (0, 0)
+    # on the boundary ring, outside the grid, or where |g| < 1e-20. A neighbour outside α reads NaN (Rust panics).
+    # Read as `var u, v = …` and bind each to an f64 local. Mirrors `VofField::interface_normal`.
+    #must_use
+    fn interface_normal(self, x, y) {
+        var zero: f64 = 0.0;
+        var nx = self.nx;
+        if (x <= 0 || x >= nx - 1 || y <= 0 || y >= self.ny - 1) { return (zero, zero); }
+        var i = y * nx + x;
+        var inv_2dx: f64 = 0.5 / self.dx;
+        var r: f64 = self.alpha.get_f(i + 1);
+        var l: f64 = self.alpha.get_f(i - 1);
+        var t: f64 = self.alpha.get_f(i + nx);
+        var b: f64 = self.alpha.get_f(i - nx);
+        var gx: f64 = (r - l) * inv_2dx;
+        var gy: f64 = (t - b) * inv_2dx;
+        var mag: f64 = f64_sqrt((gx * gx) + (gy * gy));
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        if (mag < tiny) { return (zero, zero); }
+        var u: f64 = gx / mag;
+        var v: f64 = gy / mag;
+        return (u, v);
+    }
+
+    # Advects α by the cell-centred velocity (vx_len and vy_len words at vx and vy) for dt, in
+    # clamp(⌈(((2·v_max)·dt)/dx)/0.5⌉, 1, 1024) sub-steps of dt/count (v_max the largest |v| of vx then vy, folded
+    # from +0; a NaN count, from a cell size of 0 or NaN, runs none, as Rust's `as usize` makes it 0). Ok(0), or the
+    # first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0), PV_ERR_INVALID_PARAMETER (nx or
+    # ny below 4, nx·ny overflowing (Rust panics), α, vx or vy not nx·ny long), PV_ERR_DIVERGED (a non-finite
+    # velocity), PV_ERR_OUT_OF_MEMORY (the scratch can't grow, checked before α changes; Rust aborts). Mirrors
+    # `VofField::advect`.
+    #must_use
+    fn advect(self, vx, vx_len, vy, vy_len, dt: f64): Result {
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var nx = self.nx;
+        var ny = self.ny;
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_fg_mul_class(nx, ny) != 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var n = nx * ny;
+        if (self.alpha.len != n || vx_len != n || vy_len != n) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
+        var m: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var u: f64 = load64(vx + i * 8);
+            var au: f64 = f64_abs(u);
+            if (au >= m) { m = au; }
+        }
+        for (var j = 0; j < n; j = j + 1) {
+            var w: f64 = load64(vy + j * 8);
+            var aw: f64 = f64_abs(w);
+            if (aw >= m) { m = aw; }
+        }
+        var courant: f64 = ((2.0 * m) * dt) / self.dx;
+        var q: f64 = courant / 0.5;
+        var cq: f64 = f64_ceil(q);
+        var cl: f64 = _pv_clamp(cq, 1.0, 1024.0);
+        var substeps = _pv_as_usize(cl);
+        var sf: f64 = f64_from(substeps);
+        var sub_dt: f64 = dt / sf;
+        var sc: *PvColumn = _pv_vof_col(self, 1);
+        if (substeps > 0 && sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        for (var s = 0; s < substeps; s = s + 1) { _pv_vof_substep(self, vx, vy, sub_dt); }
+        return Ok(0);
+    }
+}

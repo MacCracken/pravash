@@ -1,0 +1,199 @@
+# phase_field.tcyr — the ported Rust tests of rust-old/src/phase_field.rs (M3 part d).
+#
+# Every test keeps its Rust name as its group, in Rust's order: all 11. Re-expressed for the Cyrius shapes (ADR 0002
+# #1, #8, #14): `.unwrap()` on `new` and `step` is an assertion that the call was Ok; `is_err()` is the `PV_ERR_*`
+# code Rust's path returns; `step` takes (pointer, count) for each velocity, an empty slice as (0, 0); the private
+# `idx(x, y)` is y·nx + x. One Cyrius-only group, `pf_layout_matches_column_offsets`, pins the record layout
+# `_pv_pf_col` assumes.
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+# 1 when `PvPhaseField_new` built *p (Rust's `PhaseField::new(…).unwrap()`).
+fn fresh(p: *PvPhaseField, nx, ny, dx: f64): i64 {
+    var t, e = PvPhaseField_new(nx, ny, dx, p);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# The error code of `PvPhaseField_new` (PV_ERR_NONE when it built: *p then holds storage to drop).
+fn new_err(p: *PvPhaseField, nx, ny, dx: f64): i64 {
+    var t, e = PvPhaseField_new(nx, ny, dx, p);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
+}
+
+# The error code of one `step` (PV_ERR_NONE when it was Ok).
+fn step_err(p: *PvPhaseField, vx, vx_len, vy, vy_len, dt: f64): i64 {
+    var t, e = p.step(vx, vx_len, vy, vy_len, dt);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
+}
+
+# n f64 words, each x.
+fn filled(n, x: f64): i64 {
+    var q = alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) { store64(q + i * 8, _pv_bits(x)); }
+    return q;
+}
+
+# Runs the ported PhaseField tests.
+fn main() {
+    alloc_init();
+    var pf: PvPhaseField;
+
+    test_group("test_phase_field_new");
+    assert_eq(fresh(&pf, 10, 10, 0.1), 1, "new");
+    assert_eq(pf.phi.len, 100, "100 cells");
+    var p0: f64 = pf.phi.get_f(0);
+    assert_eq(near(p0, -1.0, 0.0000000001), 1, "phase A everywhere");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_phase_field_invalid");
+    assert_eq(new_err(&pf, 2, 10, 0.1), PV_ERR_INVALID_GRID_RESOLUTION, "nx = 2: an error");
+    assert_eq(new_err(&pf, 10, 10, 0.0), PV_ERR_INVALID_PARAMETER, "dx = 0: an error");
+
+    test_group("test_set_circle");
+    assert_eq(fresh(&pf, 20, 20, 0.1), 1, "new");
+    pf.set_circle(1.0, 1.0, 0.3);
+    assert_eq(pf.is_phase_b(10, 10), 1, "the centre is phase B");
+    assert_eq(pf.is_phase_b(0, 0), 0, "the corner is phase A");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_set_rect");
+    assert_eq(fresh(&pf, 20, 20, 0.1), 1, "new");
+    pf.set_rect(0.5, 0.5, 1.0, 1.0);
+    assert_eq(pf.is_phase_b(7, 7), 1, "(7, 7) is phase B");
+    assert_eq(pf.is_phase_b(0, 0), 0, "(0, 0) is phase A");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_uniform_stays_uniform");
+    assert_eq(fresh(&pf, 10, 10, 0.1), 1, "new");
+    assert_eq(step_err(&pf, 0, 0, 0, 0, 0.01), PV_ERR_NONE, "step");
+    var off = 0;
+    for (var i = 0; i < 100; i = i + 1) {
+        var q: f64 = pf.phi.get_f(i);
+        if (near(q, -1.0, 0.000001) == 0) { off = off + 1; }
+    }
+    assert_eq(off, 0, "f'(−1) = 0: the uniform field stays");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_interface_sharpens");
+    assert_eq(fresh(&pf, 40, 6, 0.1), 1, "new");
+    for (var y = 0; y < 6; y = y + 1) {
+        for (var x = 0; x < 40; x = x + 1) {
+            var r: f64 = (f64_from(x) / 20.0) - 1.0;
+            var rc: f64 = _pv_clamp(r, -1.0, 1.0);
+            pf.phi.set_f(y * pf.nx + x, rc);
+        }
+    }
+    var ok100 = 1;
+    for (var s = 0; s < 100; s = s + 1) {
+        if (step_err(&pf, 0, 0, 0, 0, 0.001) != PV_ERR_NONE) { ok100 = 0; }
+    }
+    assert_eq(ok100, 1, "100 steps");
+    var has_neg = 0;
+    var has_pos = 0;
+    for (var j = 0; j < pf.phi.len; j = j + 1) {
+        var q2: f64 = pf.phi.get_f(j);
+        if (q2 < -0.5) { has_neg = 1; }
+        if (q2 > 0.5) { has_pos = 1; }
+    }
+    assert(has_neg == 1 && has_pos == 1, "the interface persists");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_advection_moves_interface");
+    assert_eq(fresh(&pf, 30, 6, 0.1), 1, "new");
+    pf.set_rect(0.5, 0.0, 1.0, 0.6);
+    var n = pf.nx * pf.ny;
+    var vx = filled(n, 1.0);
+    var vy = filled(n, 0.0);
+    var initial_b: f64 = pf.phase_b_area();
+    var ok50 = 1;
+    for (var s2 = 0; s2 < 50; s2 = s2 + 1) {
+        if (step_err(&pf, vx, n, vy, n, 0.001) != PV_ERR_NONE) { ok50 = 0; }
+    }
+    assert_eq(ok50, 1, "50 steps");
+    var final_b: f64 = pf.phase_b_area();
+    assert(final_b > 0.0, "phase B still exists after advection");
+    var drift: f64 = final_b - initial_b;
+    var rel: f64 = f64_abs(drift) / initial_b;
+    assert(rel < 0.3, "phase B's area roughly conserved");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_phase_b_area");
+    assert_eq(fresh(&pf, 10, 10, 0.1), 1, "new");
+    var a0: f64 = pf.phase_b_area();
+    assert(a0 < 0.0000000001, "all phase A: no area");
+    pf.phi.fill(_pv_bits(1.0));
+    var total: f64 = ((10.0 * 10.0) * 0.1) * 0.1;
+    var a1: f64 = pf.phase_b_area();
+    assert_eq(near(a1, total, 0.000001), 1, "all phase B: the whole area");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_is_interface");
+    assert_eq(fresh(&pf, 10, 10, 0.1), 1, "new");
+    pf.phi.set_f(5 * pf.nx + 5, 0.1);
+    assert_eq(pf.is_interface(5, 5, 0.5), 1, "φ = 0.1 is at the interface");
+    assert_eq(pf.is_interface(0, 0, 0.5), 0, "φ = −1 is not");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_phase_field_rejects_wrong_velocity_length");
+    assert_eq(fresh(&pf, 8, 8, 0.1), 1, "new");
+    var z = filled(10, 0.0);
+    assert_eq(step_err(&pf, z, 10, z, 10, 0.001), PV_ERR_INVALID_PARAMETER, "10 velocities: an error");
+    assert_eq(step_err(&pf, 0, 0, 0, 0, 0.001), PV_ERR_NONE, "none: Ok");
+    PvPhaseField_drop(&pf);
+
+    test_group("test_phase_field_upwind_advection_bounded");
+    assert_eq(fresh(&pf, 32, 8, 0.1), 1, "new");
+    pf.mobility = 0.0;
+    for (var fy = 0; fy < 8; fy = fy + 1) {
+        for (var fx = 0; fx < 32; fx = fx + 1) {
+            var side: f64 = -1.0;
+            if (fx < 10) { side = 1.0; }
+            pf.phi.set_f(fy * 32 + fx, side);
+        }
+    }
+    var m = 32 * 8;
+    var ux = filled(m, 1.0);
+    var uy = filled(m, 0.0);
+    var ok20 = 1;
+    for (var s3 = 0; s3 < 20; s3 = s3 + 1) {
+        if (step_err(&pf, ux, m, uy, m, 0.05) != PV_ERR_NONE) { ok20 = 0; }
+    }
+    assert_eq(ok20, 1, "20 steps");
+    var out = 0;
+    for (var k = 0; k < m; k = k + 1) {
+        var q3: f64 = pf.phi.get_f(k);
+        if (q3 < -1.0 || q3 > 1.0 || q3 != q3) { out = out + 1; }
+    }
+    assert_eq(out, 0, "upwind is monotone: no new extrema");
+    var down: f64 = pf.phi.get_f(4 * 32 + 12);
+    assert(down > -1.0, "the front moved downstream");
+    PvPhaseField_drop(&pf);
+
+    # ── Cyrius-only: the record layout ──
+    test_group("pf_layout_matches_column_offsets");
+    assert_eq(sizeof(PvPhaseField), 88, "PvPhaseField: 88 bytes");
+    assert_eq(fresh(&pf, 5, 4, 0.5), 1, "new");
+    var c0: *PvColumn = _pv_pf_col(&pf, 0);
+    var c1: *PvColumn = _pv_pf_col(&pf, 1);
+    assert(c0.data == pf.phi.data && c1.data == pf.scratch.data, "0: phi, 1: scratch");
+    var eps: f64 = pf.epsilon;
+    var mob: f64 = pf.mobility;
+    assert(eps == 1.0 && mob == 1.0, "mobility and ε between the columns: 1 and 2·dx");
+    PvPhaseField_drop(&pf);
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

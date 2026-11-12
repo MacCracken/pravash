@@ -11,7 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M3 part c complete** (2026-11-12); M3 part d (VOF and the phase field) is next. Part c ported
+> ⏳ **Status: M3 part d complete** (2026-11-12); M3 part e (`src/par.cyr` and the grid's parallel loops) is next.
+> Part d ported `VofField` and `PhaseField` (`src/vof.cyr`, `src/phase_field.cyr`): 384 rows in two new golden
+> modules, bit-exact on the first replay, all 8 + 11 Rust tests (port-parity §13). Part c ported
 > `KEpsilon`, `apply_ghost_fluid` and `MacGrid` (`src/k_epsilon.cyr`, `src/mac_grid.cyr`): 293 rows bit-exact on the
 > first replay, all 49 Rust tests of `grid.rs` (port-parity §12). Part b put
 > the DST and CG projections under parity: 827 grid rows, 20 of them against the corrected oracle where glibc
@@ -868,7 +870,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - surface parity 165.
 
 **Next:** M3, grid |
-| M3 Grid | 🟡 **parts a–c done 2026-11-11 / 12**; parts d–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
+| M3 Grid | 🟡 **parts a–d done 2026-11-11 / 12**; part e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
 - `src/grid.cyr` (every advection, diffusion, Smagorinsky, the forces, the four projections, the wall rules) and `src/grid_solve.cyr` (L5, L6);
 - ADR 0002 #12 (the private solver buffers, the boundary refusal, `PvFluidGrid_diffuse`'s flag);
 - `_pv_fmod`, ledger L14, requested at ganita with a repro;
@@ -898,7 +900,17 @@ Part c (2026-11-12, port-parity §12):
 - Rust twins (`bench_grid_c.rs`): MAC step 2.2–2.9×, ghost fluid 7.0–7.4×, k-ε step 13–14× (after writing its maxes
   out, 1.21×).
 
-**Next:** M3 part d: VOF and the phase field, their rows and Rust tests |
+Part d (2026-11-12, port-parity §13):
+- `src/vof.cyr` (`PvVofField`) and `src/phase_field.cyr` (`PvPhaseField`), with JSON; ADR 0002 #14;
+- `vof.tsv` 224 and `phase_field.tsv` 160 rows (63 + 75 class S step rows); all bit-exact on the first replay, every
+  one recomputed by `validate.py`;
+- all 8 + 11 Rust tests; surface parity 258, 0 pending;
+- 11 of 14 port mutations fail rows (4 through rows added when they first survived), 2 are equivalent, and 1
+  changes only a signed zero; 3 of 3 transcription mutations caught;
+- Rust twins (`bench_vof_pf.rs`): VOF advect 8.1–8.7×, phase-field step 8.7–8.9× (each 1.17–1.19× faster after
+  writing its calls out).
+
+**Next:** M3 part e: `src/par.cyr` and the grid's parallel loops (every grid row at several thread counts) |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |

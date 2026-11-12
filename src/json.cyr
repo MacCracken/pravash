@@ -890,3 +890,103 @@ fn PvKEpsilon_from_json(buf, len, out: *PvKEpsilon): Result {
     out.c_eps2 = c2;
     return Ok(0);
 }
+
+# ── VOF and the phase field (M3 part d) ──────────────────────────────────────────────
+
+impl PvVofField {
+    # Appends the field as serde_json writes a `VofField` (the scratch skipped): 0, or -1 when the builder can't
+    # grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        rc = rc | _pv_jw_key(sb, "alpha", 0);
+        rc = rc | _pv_jw_col(sb, _pv_vof_col(self, 0), 0);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `VofField` document into *out, with empty scratch (as serde's skipped field defaults), released with
+# `PvVofField_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. α's length is the document's
+# (`advect` refuses one that isn't nx·ny).
+#must_use
+fn PvVofField_from_json(buf, len, out: *PvVofField): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 4);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_vof_zero(out);
+    if (_pv_jr_col(_pv_jr_at(v, f, 3, "alpha"), _pv_vof_col(out, 0), 0) == 0) {
+        PvVofField_drop(out);
+        return Err(PV_ERR_DESERIALIZE);
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    out.dx = dx;
+    return Ok(0);
+}
+
+impl PvPhaseField {
+    # Appends the field as serde_json writes a `PhaseField` (the scratch skipped): 0, or -1 when the builder can't
+    # grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        rc = rc | _pv_jw_key(sb, "phi", 0);
+        rc = rc | _pv_jw_col(sb, _pv_pf_col(self, 0), 0);
+        rc = rc | _pv_jw_key(sb, "mobility", 0);
+        rc = rc | _pv_jw_f64(sb, self.mobility);
+        rc = rc | _pv_jw_key(sb, "epsilon", 0);
+        rc = rc | _pv_jw_f64(sb, self.epsilon);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `PhaseField` document into *out, with empty scratch (as serde's skipped field defaults), released with
+# `PvPhaseField_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding no storage. φ's length is the document's
+# (`step` refuses one that isn't nx·ny).
+#must_use
+fn PvPhaseField_from_json(buf, len, out: *PvPhaseField): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 6);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[40];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "mobility"), &w + 24);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 5, "epsilon"), &w + 32);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_pf_zero(out);
+    if (_pv_jr_col(_pv_jr_at(v, f, 3, "phi"), _pv_pf_col(out, 0), 0) == 0) {
+        PvPhaseField_drop(out);
+        return Err(PV_ERR_DESERIALIZE);
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    var mob: f64 = load64(&w + 24);
+    var eps: f64 = load64(&w + 32);
+    out.dx = dx;
+    out.mobility = mob;
+    out.epsilon = eps;
+    return Ok(0);
+}

@@ -748,6 +748,85 @@ fn bench_grid_c() {
     return 0;
 }
 
+# ── vof and phase_field (M3 part d) ──
+# Rust has no criterion bench for these; scripts/probes/rust/src/bin/bench_vof_pf.rs times the same bodies on the
+# oracle. Each times `iters` calls on one state: vof_advect on an n × n field at dx 0.1 with [0.2·L, 0.6·L]² filled
+# (L = n·dx), in the rotation u = −0.1·(y − c), v = 0.1·(x − c), dt 0.01; phase_field_step with a disc of radius
+# 0.25·L at the centre, in the same rotation, dt 0.001.
+
+# The rotation u = −0.1·(y − c), v = 0.1·(x − c) on an n × n grid into the n² words at vx and vy.
+fn _bench_rotation(n, vx, vy) {
+    var c: f64 = (f64_from(n) - 1.0) * 0.5;
+    for (var i = 0; i < n * n; i = i + 1) {
+        var y: f64 = f64_from(i / n) - c;
+        var x: f64 = f64_from(i % n) - c;
+        var u: f64 = -y * 0.1;
+        var w: f64 = x * 0.1;
+        store64(vx + i * 8, _pv_bits(u));
+        store64(vy + i * 8, _pv_bits(w));
+    }
+    return 0;
+}
+
+fn _bench_vof(n, iters) {
+    var v: PvVofField;
+    var t, e = PvVofField_new(n, n, 0.1, &v);
+    var l: f64 = f64_from(n) * 0.1;
+    var lo: f64 = 0.2 * l;
+    var hi: f64 = 0.6 * l;
+    v.fill_rect(lo, lo, hi, hi);
+    var vx = fl_alloc(n * n * 8);
+    var vy = fl_alloc(n * n * 8);
+    _bench_rotation(n, vx, vy);
+    var b = bench_new(_bench_name("vof_advect/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ta, va = v.advect(vx, n * n, vy, n * n, 0.01);
+        g_sink = g_sink ^ ta;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(vx);
+    fl_free(vy);
+    PvVofField_drop(&v);
+    return 0;
+}
+
+fn _bench_pf(n, iters) {
+    var p: PvPhaseField;
+    var t, e = PvPhaseField_new(n, n, 0.1, &p);
+    var l: f64 = f64_from(n) * 0.1;
+    var c: f64 = 0.5 * l;
+    var r: f64 = 0.25 * l;
+    p.set_circle(c, c, r);
+    var vx = fl_alloc(n * n * 8);
+    var vy = fl_alloc(n * n * 8);
+    _bench_rotation(n, vx, vy);
+    var b = bench_new(_bench_name("phase_field_step/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ts, vs = p.step(vx, n * n, vy, n * n, 0.001);
+        g_sink = g_sink ^ ts;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(vx);
+    fl_free(vy);
+    PvPhaseField_drop(&p);
+    return 0;
+}
+
+# The part d benches (M3 part d): VOF advection and the phase-field step, against the Rust twins in bench_vof_pf.rs.
+fn bench_m3d() {
+    _bench_vof(32, 2000);
+    _bench_vof(64, 500);
+    _bench_vof(128, 100);
+    _bench_pf(32, 2000);
+    _bench_pf(64, 500);
+    _bench_pf(128, 100);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -771,6 +850,7 @@ fn main(): i64 {
     bench_shallow();
     bench_grid();
     bench_grid_c();
+    bench_m3d();
     return 0;
 }
 

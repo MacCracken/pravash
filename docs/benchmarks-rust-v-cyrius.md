@@ -306,3 +306,41 @@ a positive constant floor. Written out as `if (x > floor)`, instead of `_pv_max`
   scalar, about 68 ns an interior cell against 4.8.
 - **The ghost fluid is 7.0–7.4×.** Most cells take only the crossing test (five loads and four products), which Rust
   also vectorises.
+
+## M3 part d: VOF and the phase field (2026-11-12)
+
+rust-old/benches has no bench for `VofField` or `PhaseField`, so `scripts/probes/rust/src/bin/bench_vof_pf.rs` times
+the same bodies on the frozen oracle, and `tests/pravash.bcyr`'s `bench_m3d` is the Cyrius side. Each row is `iters`
+calls on one state, which evolves the same way on both sides. Runs were pinned on core 15 and interleaved, three of
+each side, and the table gives medians. The Rust column comes from the runs interleaved with the first Cyrius build
+(they agree within 5%). The Cyrius column is the B side of the A/B below (within 1%).
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `vof_advect/32x32` | 6.77 µs | 54.5 µs | 8.1× |
+| `vof_advect/64x64` | 48.5 µs | 421 µs | 8.7× |
+| `vof_advect/128x128` | 288 µs | 2.52 ms | 8.7× |
+| `phase_field_step/32x32` | 4.65 µs | 41.3 µs | 8.9× |
+| `phase_field_step/64x64` | 20.0 µs | 176 µs | 8.8× |
+| `phase_field_step/128x128` | 82.7 µs | 722 µs | 8.7× |
+
+The bodies:
+- `vof_advect`: an n × n field at dx 0.1 with [0.2·L, 0.6·L]² filled (L = n·dx), in the rotation
+  u = −0.1·(y − c), v = 0.1·(x − c), dt 0.01;
+- `phase_field_step`: a disc of radius 0.25·L at the centre, in the same rotation, dt 0.001.
+
+**The A/B behind both rows** (pinned, interleaved, three runs each, the rows unchanged):
+
+| Bench | Before | After | Speedup |
+|---|---|---|---|
+| VOF advect 32 / 64 / 128 | 63.6–64.5 µs / 494–497 µs / 2.95–2.97 ms | 54.3–54.5 µs / 420–421 µs / 2.52 ms | 1.17–1.18× |
+| phase-field step 32 / 64 / 128 | 48.9–49.0 µs / 209 µs / 859–860 µs | 41.3 µs / 176 µs / 721–724 µs | 1.18–1.19× |
+
+- **The VOF advect:** the sub-step's four `_pv_vof_flux` calls and its `_pv_clamp` call are written out, and each x
+  face shared along a row is computed once. Rust computes it twice from the same four values, so the left cell's
+  F_r is the right cell's F_l.
+- **The phase-field step:** its one `_pv_clamp` call per cell is written out.
+
+**Reading it.** Both loops update independent cells from a copy of the old field, which Rust vectorises and the
+Cyrius codegen runs scalar. That puts them at about 9×, between the MAC step (a dependent Gauss–Seidel chain, 2.2–2.9×)
+and the k-ε step (13–14×).

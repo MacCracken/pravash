@@ -68,5 +68,7 @@ modules = [
     "src/grid.cyr",
     "src/mac_grid.cyr",
     "src/k_epsilon.cyr",
+    "src/vof.cyr",
+    "src/phase_field.cyr",
     "src/json.cyr",
 ]

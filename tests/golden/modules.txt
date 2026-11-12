@@ -6,5 +6,7 @@ constants
 grid
 json
 math
+phase_field
 shallow
+vof
 vortex
