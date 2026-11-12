@@ -3,9 +3,13 @@
 # `cyrius test` never prepends [lib] (cyrius distlib alone reads it), so every test that exercises the library
 # includes this file. Keep it in step with [lib] (impetus port-parity §4.4 found the same).
 
+include "src/error.cyr"
 include "src/constants.cyr"
 include "src/crmath_data.cyr"
 include "src/crmath.cyr"
 include "src/crlog_data.cyr"
 include "src/crlog.cyr"
 include "src/mathx.cyr"
+include "src/vec3.cyr"
+include "src/column.cyr"
+include "src/common.cyr"

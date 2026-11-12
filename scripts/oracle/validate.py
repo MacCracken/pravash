@@ -400,6 +400,266 @@ def check_math(rows):
     return counts
 
 
+# ── common (M1 part 3) ─────────────────────────────────────────────────────────────────────
+# Each row recomputed from rust-old/src/common.rs and glam 0.29.3, in Rust's operation order: the validation
+# rules, the particle and config defaults, the vector arithmetic (no fused operations), and the arena, whose
+# free-list logic is transcribed below. Token layouts: scripts/oracle/src/m_common.rs.
+
+def fin(x):
+    return math.isfinite(x)
+
+
+def r_custom(d, v, s, c):
+    if not fin(d) or d <= 0.0:
+        return "E:InvalidDensity"
+    if not fin(v) or v < 0.0:
+        return "E:InvalidViscosity"
+    if not fin(s) or s < 0.0:
+        return "E:InvalidParameter"
+    if not fin(c) or c <= 0.0:
+        return "E:InvalidParameter"
+    return [d, v, s, c]
+
+
+def r_particle(pos, mass):
+    return [pos[0], pos[1], pos[2], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, mass, 0, 1.0, 0.0, 1.0, 293.15, 0.0]
+
+
+def dot3(x, y, z):
+    return ((x * x) + (y * y)) + (z * z)
+
+
+WATER_2D = [0.001, 0.0, -9.81, 0.0, 0.05, 2000.0, 1000.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.5]
+
+
+def r_validate(c):
+    dt, gx, gy, gz, h, k, rho, lx, ly, lz, hx, hy, hz, bd = c
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    if not fin(h) or h <= 0.0:
+        return "E:InvalidSmoothingRadius"
+    if not fin(rho) or rho <= 0.0:
+        return "E:InvalidDensity"
+    if not fin(k) or k <= 0.0:
+        return "E:InvalidParameter"
+    if not (0.0 <= bd <= 1.0):
+        return "E:InvalidParameter"
+    if not (fin(gx) and fin(gy) and fin(gz)):
+        return "E:InvalidParameter"
+    if not all(fin(x) for x in (lx, ly, lz, hx, hy, hz)):
+        return "E:InvalidParameter"
+    if lx > hx or ly > hy or lz > hz:
+        return "E:InvalidParameter"
+    return None
+
+
+def r_check_cfl(c, v):
+    cfl = (abs(v) * c[0]) / c[4]
+    if not fin(cfl) or cfl > 1.0:
+        return "E:CflViolation"
+    return None
+
+
+class Arena:
+    """rust-old/src/common.rs's ParticleArena, transcribed: slots hold only the mass the scenario writes."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.mass = [0.0] * capacity
+        self.watermark = 0
+        self.free_list = []
+        self.generation = 0
+
+    def active_count(self):
+        return max(self.watermark - sum(l for _, l in self.free_list), 0)
+
+    def alloc(self, n):
+        if n == 0:
+            return (0, 0, self.generation)
+        if n < 0 or n >= 1 << 63:
+            return None
+        start = None
+        for i, (s, l) in enumerate(self.free_list):
+            if l >= n:
+                start = s
+                if l == n:
+                    del self.free_list[i]
+                else:
+                    self.free_list[i] = (s + n, l - n)
+                break
+        if start is None:
+            if n <= self.capacity - self.watermark:
+                start = self.watermark
+                self.watermark += n
+            else:
+                return None
+        for j in range(start, start + n):
+            self.mass[j] = 0.0
+        return (start, n, self.generation)
+
+    def in_range(self, h):
+        s, n, g = h
+        return g == self.generation and s + n <= self.watermark
+
+    def free(self, h):
+        s, n, g = h
+        if n == 0 or not self.in_range(h):
+            return
+        end = s + n
+        pos = 0
+        while pos < len(self.free_list) and self.free_list[pos][0] < s:
+            pos += 1
+        if pos > 0 and sum(self.free_list[pos - 1]) > s:
+            return
+        if pos < len(self.free_list) and self.free_list[pos][0] < end:
+            return
+        self.free_list.insert(pos, (s, n))
+        if pos + 1 < len(self.free_list):
+            (s1, l1), (s2, l2) = self.free_list[pos], self.free_list[pos + 1]
+            if s1 + l1 == s2:
+                self.free_list[pos] = (s1, l1 + l2)
+                del self.free_list[pos + 1]
+        if pos > 0:
+            (s0, l0), (s1, l1) = self.free_list[pos - 1], self.free_list[pos]
+            if s0 + l0 == s1:
+                self.free_list[pos - 1] = (s0, l0 + l1)
+                del self.free_list[pos]
+        if self.free_list and sum(self.free_list[-1]) == self.watermark:
+            self.watermark = self.free_list.pop()[0]
+
+    def get_len(self, h):
+        return h[1] if self.in_range(h) else 0
+
+    def compact(self):
+        if not self.free_list:
+            return self.watermark
+        write = read = fi = 0
+        while read < self.watermark:
+            if fi < len(self.free_list) and read == self.free_list[fi][0]:
+                read += self.free_list[fi][1]
+                fi += 1
+                continue
+            self.mass[write] = self.mass[read]
+            write += 1
+            read += 1
+        self.watermark = write
+        self.free_list = []
+        self.generation = (self.generation + 1) % (1 << 64)
+        return write
+
+
+def r_scenario(ins):
+    a = Arena(ins[0])
+    issued = []
+    out = []
+    ops = ins[1:]
+    for k in range(len(ops) // 4):
+        code, x, y, z = ops[4 * k: 4 * k + 4]
+        if code == 0:
+            h = a.alloc(x)
+            if h is None:
+                out += [0, 0, 0, 0]
+            else:
+                out += [1, h[0], h[1], h[2]]
+                for j in range(h[0], h[0] + a.get_len(h)):
+                    a.mass[j] = float(k + 1)
+                issued.append(h)
+        elif code in (1, 3):
+            if not issued:
+                out.append(-1)
+                continue
+            h = issued[x % len(issued)]
+            if code == 1:
+                a.free(h)
+                out.append(a.active_count())
+            else:
+                out.append(a.get_len(h))
+        elif code == 2:
+            out.append(a.compact())
+        else:
+            h = (x, y, z)
+            if code == 4:
+                a.free(h)
+                out.append(a.active_count())
+            else:
+                out.append(a.get_len(h))
+    out += [a.watermark, a.generation, ("v", 2 * len(a.free_list))]
+    for s, l in a.free_list:
+        out += [s, l]
+    out.append(("v", a.watermark))
+    out += [("f", m) for m in a.mass[: a.watermark]]
+    return out
+
+
+def tok_val(t):
+    """A token's value: floats and integers, `v:` as ("v", n), errors as their text."""
+    if t.startswith("f:"):
+        return tok_f(t)
+    if t.startswith("i:"):
+        return tok_i(t)
+    if t.startswith("v:"):
+        return ("v", int(t[2:]))
+    return t
+
+
+def same_list(got, want):
+    """Token lists equal: floats by bits (NaN matches NaN), the rest exactly."""
+    if len(got) != len(want):
+        return False
+    for g, w in zip(got, want):
+        if isinstance(w, tuple) and w[0] == "f":
+            w = w[1]
+        if isinstance(w, float) or isinstance(g, float):
+            if not (isinstance(g, float) and isinstance(w, float) and same(g, w)):
+                return False
+        elif g != w:
+            return False
+    return True
+
+
+def check_common(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        if func == "FluidMaterial::custom":
+            r = r_custom(*x)
+            want = [r] if isinstance(r, str) else r
+        elif func == "FluidParticle::new":
+            want = r_particle(x[0:3], x[3])
+        elif func == "FluidParticle::new_2d":
+            want = r_particle([x[0], x[1], 0.0], x[2])
+        elif func in ("FluidParticle::speed_squared", "FluidParticle::speed", "FluidParticle::kinetic_energy"):
+            v2 = dot3(x[0], x[1], x[2])
+            want = [{"FluidParticle::speed_squared": v2, "FluidParticle::speed": r_sqrt(v2),
+                     "FluidParticle::kinetic_energy": (0.5 * x[3]) * v2}[func]]
+        elif func in ("FluidParticle::distance_squared_to", "ParticleSoa::distance_squared",
+                      "FluidParticle::distance_to"):
+            d2 = dot3(x[0] - x[3], x[1] - x[4], x[2] - x[5])
+            want = [r_sqrt(d2) if func == "FluidParticle::distance_to" else d2]
+        elif func == "FluidConfig::water_2d":
+            want = WATER_2D
+        elif func == "FluidConfig::validate":
+            r = r_validate(x)
+            want = [] if r is None else [r]
+        elif func == "FluidConfig::check_cfl":
+            r = r_check_cfl(x[:14], x[14])
+            want = [] if r is None else [r]
+        elif func == "ParticleSoa::roundtrip":
+            want = x
+        elif func == "ParticleSoa::consistent_len":
+            want = [x[0], min(x), int(all(l == x[0] for l in x)), min(x)]
+        elif func == "ParticleArena::scenario":
+            want = r_scenario(x)
+        else:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 # ── the correctly rounded math (ADR 0004) ─────────────────────────────────────────────────────
 # The corrected oracle: the oracle's own operations with every exp, ln, log10, sin, cos, hypot, pow and
 # atan2 result correctly rounded (MPFR). Where glibc rounded every call correctly the row is unchanged
@@ -570,6 +830,10 @@ def main():
         if path.stem == "constants":
             n = check_constants(root, rows)
             print(f"constants: {n} rows checked against the Rust literals and std")
+        elif path.stem == "common":
+            counts = check_common(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"common: {len(rows)} rows recomputed ({summary})")
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

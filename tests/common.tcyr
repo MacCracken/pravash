@@ -1,0 +1,460 @@
+# common.tcyr — the ported Rust tests of rust-old/src/common.rs (M1 part 3).
+#
+# Every test keeps its Rust name as its group. The two serde tests (test_material_serde, test_config_serde) arrive
+# with the JSON codecs in part 4. Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): `is_err()` is
+# `is_err_result`, `Option<ArenaHandle>` is alloc's 1/0, a slice is (pointer, count).
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+var EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
+var TOL: f64 = 0.0000000001;                         # 1e-10
+
+# 1 when the material builds.
+fn custom_ok(d: f64, v: f64, s: f64, c: f64): i64 {
+    var m: PvFluidMaterial;
+    var t, e = PvFluidMaterial_custom(d, v, s, c, &m);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# 1 when validate() fails.
+fn invalid(c: PvFluidConfig): i64 {
+    var t, e = c.validate();
+    return is_err_result(t);
+}
+
+# 1 when check_cfl(v) fails.
+fn cfl_err(c: PvFluidConfig, v: f64): i64 {
+    var t, e = c.check_cfl(v);
+    return is_err_result(t);
+}
+
+# Particle k of a (pointer, count) view.
+fn at(p, k): *PvFluidParticle {
+    var ps: *PvFluidParticle = _pv_as_particles(p);
+    return ps + k;
+}
+
+fn test_materials() {
+    test_group("test_water_material");
+    var w: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+    assert(near(w.density, 1000.0, EPS) == 1, "water density 1000");
+    var wv: f64 = w.viscosity;
+    assert(wv > 0.0, "water viscosity > 0");
+
+    test_group("test_custom_material_valid");
+    var m: PvFluidMaterial;
+    var t, e = PvFluidMaterial_custom(800.0, 0.01, 0.05, 1400.0, &m);
+    assert(is_err_result(t) == 0, "builds");
+    assert(near(m.density, 800.0, EPS) == 1, "density 800");
+
+    test_group("test_custom_material_invalid_density");
+    assert(custom_ok(-1.0, 0.01, 0.05, 1400.0) == 0, "-1");
+    assert(custom_ok(0.0, 0.01, 0.05, 1400.0) == 0, "0");
+    var t2, e2 = PvFluidMaterial_custom(0.0, 0.01, 0.05, 1400.0, &m);
+    assert_eq(e2, PV_ERR_INVALID_DENSITY, "the code is InvalidDensity");
+
+    test_group("test_custom_material_invalid_viscosity");
+    assert(custom_ok(1000.0, -0.01, 0.05, 1400.0) == 0, "-0.01");
+
+    test_group("test_custom_material_invalid_speed_of_sound");
+    assert(custom_ok(1000.0, 0.01, 0.05, 0.0) == 0, "0");
+    assert(custom_ok(1000.0, 0.01, 0.05, -1.0) == 0, "-1");
+
+    test_group("test_all_predefined_materials");
+    var bad = 0;
+    for (var k = 0; k < 5; k = k + 1) {
+        var q: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+        if (k == 1) { q = PV_FLUID_MATERIAL_OIL; }
+        if (k == 2) { q = PV_FLUID_MATERIAL_HONEY; }
+        if (k == 3) { q = PV_FLUID_MATERIAL_AIR; }
+        if (k == 4) { q = PV_FLUID_MATERIAL_LAVA; }
+        var d: f64 = q.density;
+        var v: f64 = q.viscosity;
+        var c: f64 = q.speed_of_sound;
+        if (d > 0.0 && v >= 0.0 && c > 0.0) {} else { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every preset is physical");
+
+    test_group("test_custom_material_rejects_non_finite");
+    var nan: f64 = PV_F64_NAN;
+    var inf: f64 = PV_F64_INFINITY;
+    assert(custom_ok(nan, 0.01, 0.05, 1400.0) == 0, "NaN density");
+    assert(custom_ok(1000.0, inf, 0.05, 1400.0) == 0, "inf viscosity");
+    assert(custom_ok(1000.0, 0.01, nan, 1400.0) == 0, "NaN surface tension");
+    assert(custom_ok(1000.0, 0.01, -0.1, 1400.0) == 0, "negative surface tension");
+    assert(custom_ok(1000.0, 0.01, 0.05, nan) == 0, "NaN speed of sound");
+    return 0;
+}
+
+fn test_particles() {
+    test_group("test_particle_new");
+    var p: PvFluidParticle = PvFluidParticle_new(PvVec3_new(1.0, 2.0, 3.0), 0.01);
+    assert(near(p.position.x, 1.0, EPS) == 1, "x = 1");
+    var s: f64 = p.speed();
+    assert(near(s, 0.0, EPS) == 1, "at rest");
+
+    test_group("test_particle_copy");
+    var a: PvFluidParticle = PvFluidParticle_new_2d(1.0, 2.0, 0.01);
+    var b: PvFluidParticle = a;
+    b.position.x = 9.0;
+    assert(near(a.position.x, 1.0, EPS) == 1, "a copy, not an alias");
+
+    test_group("test_particle_2d");
+    var q: PvFluidParticle = PvFluidParticle_new_2d(5.0, 10.0, 0.01);
+    assert(near(q.position.z, 0.0, EPS) == 1, "z = 0");
+
+    test_group("test_particle_speed");
+    var r: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    r.velocity = PvVec3_new(3.0, 4.0, 0.0);
+    var sp: f64 = r.speed();
+    assert(near(sp, 5.0, TOL) == 1, "|(3, 4, 0)| = 5");
+
+    test_group("test_particle_kinetic_energy");
+    var k: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 2.0);
+    k.velocity = PvVec3_new(3.0, 4.0, 0.0);
+    var ke: f64 = k.kinetic_energy();
+    assert(near(ke, 25.0, TOL) == 1, "0.5 · 2 · 25 = 25");
+
+    test_group("test_particle_distance");
+    var u: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var v: PvFluidParticle = PvFluidParticle_new_2d(3.0, 4.0, 1.0);
+    var d: f64 = u.distance_to(&v);
+    assert(near(d, 5.0, TOL) == 1, "5");
+
+    test_group("test_particle_distance_squared");
+    var d2: f64 = u.distance_squared_to(&v);
+    assert(near(d2, 25.0, TOL) == 1, "25");
+    return 0;
+}
+
+fn test_configs() {
+    test_group("test_config_water_2d");
+    var c: PvFluidConfig = PvFluidConfig_water_2d();
+    assert(invalid(c) == 0, "valid");
+
+    test_group("test_config_nan_dt_rejected");
+    var nan: f64 = PV_F64_NAN;
+    c = PvFluidConfig_water_2d();
+    c.dt = nan;
+    assert(invalid(c) == 1, "NaN dt");
+    var t, e = c.validate();
+    assert_eq(e, PV_ERR_INVALID_TIMESTEP, "InvalidTimestep");
+
+    test_group("test_config_nan_smoothing_rejected");
+    c = PvFluidConfig_water_2d();
+    c.smoothing_radius = nan;
+    assert(invalid(c) == 1, "NaN h");
+
+    test_group("test_config_inf_density_rejected");
+    c = PvFluidConfig_water_2d();
+    c.rest_density = PV_F64_INFINITY;
+    assert(invalid(c) == 1, "inf rest density");
+
+    test_group("test_config_copy");
+    var c1: PvFluidConfig = PvFluidConfig_water_2d();
+    var c2: PvFluidConfig = c1;
+    c2.dt = 1.0;
+    assert(near(c1.dt, 0.001, EPS) == 1, "a copy, not an alias");
+
+    test_group("test_config_invalid_dt");
+    c = PvFluidConfig_water_2d();
+    c.dt = -0.001;
+    assert(invalid(c) == 1, "negative dt");
+
+    test_group("test_config_invalid_smoothing");
+    c = PvFluidConfig_water_2d();
+    c.smoothing_radius = 0.0;
+    assert(invalid(c) == 1, "h = 0");
+
+    test_group("test_config_invalid_gas_constant");
+    c = PvFluidConfig_water_2d();
+    c.gas_constant = 0.0;
+    assert(invalid(c) == 1, "k = 0");
+
+    test_group("test_config_invalid_boundary_damping");
+    c = PvFluidConfig_water_2d();
+    c.boundary_damping = 1.5;
+    assert(invalid(c) == 1, "1.5");
+    c.boundary_damping = -0.1;
+    assert(invalid(c) == 1, "-0.1");
+
+    test_group("test_config_invalid_bounds");
+    c = PvFluidConfig_water_2d();
+    c.bounds_min = PvVec3_new(1.0, 0.0, 0.0);
+    c.bounds_max = PvVec3_new(0.0, 1.0, 0.0);
+    assert(invalid(c) == 1, "min_x > max_x");
+
+    test_group("test_config_equal_bounds_valid");
+    c = PvFluidConfig_water_2d();
+    c.bounds_min = PvVec3_new(0.0, 0.0, 0.0);
+    c.bounds_max = PvVec3_new(0.0, 1.0, 0.0);
+    assert(invalid(c) == 0, "min_x = max_x is valid (2D)");
+
+    test_group("test_cfl_ok");
+    c = PvFluidConfig_water_2d();
+    assert(cfl_err(c, 1.0) == 0, "1 m/s");
+
+    test_group("test_cfl_violated");
+    assert(cfl_err(c, 1000.0) == 1, "1000 m/s");
+    var t2, e2 = c.check_cfl(1000.0);
+    assert_eq(e2, PV_ERR_CFL_VIOLATION, "CflViolation");
+
+    test_group("test_config_rejects_nan_fields");
+    c = PvFluidConfig_water_2d();
+    c.boundary_damping = nan;
+    assert(invalid(c) == 1, "NaN damping");
+    c = PvFluidConfig_water_2d();
+    c.gravity = PvVec3_new(0.0, nan, 0.0);
+    assert(invalid(c) == 1, "NaN gravity");
+    c = PvFluidConfig_water_2d();
+    c.bounds_max = PvVec3_new(nan, 1.0, 0.0);
+    assert(invalid(c) == 1, "NaN bound");
+
+    test_group("test_check_cfl_negative_and_nan_velocity");
+    c = PvFluidConfig_water_2d();
+    assert(cfl_err(c, -1000000.0) == 1, "-1e6");
+    assert(cfl_err(c, nan) == 1, "NaN");
+    assert(cfl_err(c, -0.1) == 0, "-0.1");
+    return 0;
+}
+
+fn test_soa() {
+    test_group("test_soa_roundtrip");
+    var one = fl_alloc(sizeof(PvFluidParticle));
+    var p: *PvFluidParticle = _pv_as_particles(one);
+    var p0: PvFluidParticle = PvFluidParticle_new(PvVec3_new(1.0, 2.0, 3.0), 0.5);
+    *p = p0;
+    p.velocity = PvVec3_new(4.0, 5.0, 6.0);
+    p.density = 1000.0;
+    p.pressure = 200.0;
+    var s: PvParticleSoa;
+    assert_eq(PvParticleSoa_from_aos(&s, p, 1), 1, "from_aos");
+    assert_eq(s.len(), 1, "len 1");
+    var x0: f64 = s.pos_x.get_f(0);
+    var vy0: f64 = s.vel_y.get_f(0);
+    var m0: f64 = s.mass.get_f(0);
+    assert(near(x0, 1.0, EPS) == 1 && near(vy0, 5.0, EPS) == 1 && near(m0, 0.5, EPS) == 1, "columns");
+    var back, nb = s.to_aos();
+    assert_eq(nb, 1, "one back");
+    var b0: *PvFluidParticle = at(back, 0);
+    assert(near(b0.position.x, 1.0, EPS) == 1 && near(b0.velocity.y, 5.0, EPS) == 1, "particle back");
+    fl_free(back);
+    PvParticleSoa_drop(&s);
+
+    test_group("test_soa_write_to_aos");
+    var two = fl_alloc(2 * sizeof(PvFluidParticle));
+    var a0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var a1: PvFluidParticle = PvFluidParticle_new_2d(1.0, 1.0, 1.0);
+    *at(two, 0) = a0;
+    *at(two, 1) = a1;
+    var s2: PvParticleSoa;
+    assert_eq(PvParticleSoa_from_aos(&s2, at(two, 0), 2), 1, "from_aos");
+    s2.pos_x.set_f(0, 99.0);
+    s2.density.set_f(1, 500.0);
+    s2.write_to_aos(at(two, 0), 2);
+    assert(near(at(two, 0).position.x, 99.0, EPS) == 1, "x written back");
+    assert(near(at(two, 1).density, 500.0, EPS) == 1, "density written back");
+
+    test_group("test_soa_distance_squared");
+    var dz: PvFluidParticle = PvFluidParticle_new_2d(3.0, 4.0, 1.0);
+    *at(two, 1) = dz;
+    *at(two, 0) = a0;
+    PvParticleSoa_drop(&s2);
+    assert_eq(PvParticleSoa_from_aos(&s2, at(two, 0), 2), 1, "from_aos");
+    var d2: f64 = s2.distance_squared(0, 1);
+    assert(near(d2, 25.0, TOL) == 1, "25");
+    var oob: f64 = s2.distance_squared(0, 2);
+    assert_eq(_pv_is_nan(oob), 1, "out of range is NaN, where Rust panics (ADR 0002 #8)");
+    PvParticleSoa_drop(&s2);
+
+    test_group("test_soa_empty");
+    var e: PvParticleSoa = PvParticleSoa_new();
+    assert_eq(e.is_empty(), 1, "empty");
+    assert_eq(e.len(), 0, "len 0");
+    var ep, en = e.to_aos();
+    assert_eq(en, 0, "to_aos is empty");
+
+    test_group("test_soa_mismatched_lengths_no_panic");
+    var four = fl_alloc(4 * sizeof(PvFluidParticle));
+    for (var i = 0; i < 4; i = i + 1) { *at(four, i) = a0; }
+    var s4: PvParticleSoa;
+    assert_eq(PvParticleSoa_from_aos(&s4, at(four, 0), 4), 1, "from_aos");
+    assert_eq(s4.is_consistent(), 1, "consistent");
+    s4.mass.truncate(2);
+    assert_eq(s4.is_consistent(), 0, "not after truncating mass");
+    assert_eq(s4.consistent_len(), 2, "two complete particles");
+    var tp, tn = s4.to_aos();
+    assert_eq(tn, 2, "to_aos gives 2");
+    fl_free(tp);
+    s4.write_to_aos(at(four, 0), 4);
+    PvParticleSoa_drop(&s4);
+    fl_free(one);
+    fl_free(two);
+    fl_free(four);
+    return 0;
+}
+
+fn test_arena() {
+    var h: PvArenaHandle;
+    var h1: PvArenaHandle;
+    var h2: PvArenaHandle;
+    var h3: PvArenaHandle;
+    var h4: PvArenaHandle;
+
+    test_group("test_arena_alloc_and_get");
+    var a: *PvParticleArena = PvParticleArena_new(100);
+    assert_eq(a.alloc(10, &h), 1, "Some");
+    assert_eq(h.len(), 10, "len 10");
+    assert_eq(a.active_count(), 10, "10 active");
+    var gp, gn = a.get(h);
+    assert_eq(gn, 10, "slice of 10");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_alloc_zero");
+    a = PvParticleArena_new(10);
+    assert_eq(a.alloc(0, &h), 1, "Some");
+    assert_eq(h.is_empty(), 1, "empty");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_capacity_exceeded");
+    a = PvParticleArena_new(10);
+    assert_eq(a.alloc(11, &h), 0, "11 > 10: None");
+    assert_eq(a.alloc(10, &h), 1, "10: Some");
+    assert_eq(a.alloc(1, &h), 0, "full: None");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_free_and_reuse");
+    a = PvParticleArena_new(20);
+    assert_eq(a.alloc(10, &h1) + a.alloc(5, &h2), 2, "two blocks");
+    assert_eq(a.active_count(), 15, "15 active");
+    a.free(h1);
+    assert_eq(a.active_count(), 5, "5 after the free");
+    assert_eq(a.alloc(8, &h3), 1, "Some");
+    assert_eq(h3.start(), h1.start(), "reuses the freed block");
+    assert_eq(a.active_count(), 13, "13 active");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_free_merges_adjacent");
+    a = PvParticleArena_new(30);
+    assert_eq(a.alloc(10, &h1) + a.alloc(10, &h2) + a.alloc(10, &h3), 3, "three blocks");
+    a.free(h1);
+    a.free(h2);
+    assert_eq(a.alloc(20, &h4), 1, "Some");
+    assert_eq(h4.start(), 0, "the merged 20-slot block");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_compact");
+    a = PvParticleArena_new(30);
+    assert_eq(a.alloc(10, &h1) + a.alloc(10, &h2), 2, "two blocks");
+    var q1: PvFluidParticle = PvFluidParticle_new(PvVec3_new(1.0, 0.0, 0.0), 1.0);
+    var q2: PvFluidParticle = PvFluidParticle_new(PvVec3_new(2.0, 0.0, 0.0), 2.0);
+    var m1, n1 = a.get_mut(h1);
+    *at(m1, 0) = q1;
+    var m2, n2 = a.get_mut(h2);
+    *at(m2, 0) = q2;
+    a.free(h1);
+    assert_eq(a.active_count(), 10, "10 active");
+    assert_eq(a.compact(), 10, "compact gives 10");
+    var ap, an = a.active_particles();
+    assert(near(at(ap, 0).position.x, 2.0, EPS) == 1, "h2's data moved to the front");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_free_at_end_shrinks_watermark");
+    a = PvParticleArena_new(20);
+    assert_eq(a.alloc(5, &h1) + a.alloc(5, &h2), 2, "two blocks");
+    a.free(h2);
+    assert_eq(a.alloc(15, &h3), 1, "15 fit");
+    assert_eq(h3.start(), 5, "at 5");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_get_mut_writes");
+    a = PvParticleArena_new(10);
+    assert_eq(a.alloc(3, &h), 1, "Some");
+    var w: PvFluidParticle = PvFluidParticle_new(PvVec3_new(99.0, 0.0, 0.0), 1.0);
+    var wp, wn = a.get_mut(h);
+    *at(wp, 0) = w;
+    var rp, rn = a.get(h);
+    assert(near(at(rp, 0).position.x, 99.0, EPS) == 1, "written through get_mut");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_watermark_alloc_is_zeroed");
+    a = PvParticleArena_new(10);
+    assert_eq(a.alloc(5, &h), 1, "Some");
+    var zp, zn = a.get_mut(h);
+    at(zp, 0).mass = 7.0;
+    a.free(h);
+    assert_eq(a.alloc(5, &h2), 1, "Some");
+    var yp, yn = a.get(h2);
+    var nonzero = 0;
+    for (var i = 0; i < yn; i = i + 1) {
+        var mi: f64 = at(yp, i).mass;
+        if (mi != 0.0) { nonzero = nonzero + 1; }
+    }
+    assert_eq(nonzero, 0, "every mass is 0");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_double_free_ignored");
+    a = PvParticleArena_new(20);
+    assert_eq(a.alloc(5, &h1) + a.alloc(5, &h2), 2, "two blocks");
+    a.free(h1);
+    a.free(h1);
+    assert_eq(a.active_count(), 5, "5 active");
+    assert_eq(a.alloc(5, &h3) + a.alloc(5, &h4), 2, "two more");
+    assert(h3.start() != h4.start(), "two live handles must not alias");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_stale_handle_after_compact");
+    a = PvParticleArena_new(20);
+    assert_eq(a.alloc(5, &h1) + a.alloc(5, &h2), 2, "two blocks");
+    a.free(h1);
+    var cnt = a.compact();
+    var sp, sn = a.get(h2);
+    assert_eq(sn, 0, "pre-compact handle is stale");
+    a.free(h2);
+    assert_eq(a.active_count(), 5, "the stale free is ignored");
+    PvParticleArena_drop(a);
+
+    test_group("test_arena_foreign_handle_no_panic");
+    var big: *PvParticleArena = PvParticleArena_new(100);
+    assert_eq(big.alloc(50, &h1) + big.alloc(10, &h), 2, "two blocks");
+    var small: *PvParticleArena = PvParticleArena_new(10);
+    var fp, fnn = small.get(h);
+    var gp2, gn2 = small.get_mut(h);
+    assert_eq(fnn + gn2, 0, "empty views");
+    small.free(h);
+    assert_eq(small.active_count(), 0, "nothing freed");
+    PvParticleArena_drop(big);
+    PvParticleArena_drop(small);
+
+    test_group("test_arena_alloc_overflow");
+    a = PvParticleArena_new(10);
+    assert_eq(a.alloc(3, &h), 1, "Some");
+    assert_eq(a.alloc(0 - 1, &h1), 0, "usize::MAX (the word -1): None");
+    assert_eq(a.active_count(), 3, "3 active");
+    PvParticleArena_drop(a);
+    return 0;
+}
+
+# Runs the ported common tests.
+fn main() {
+    alloc_init();
+    test_materials();
+    test_particles();
+    test_configs();
+    test_soa();
+    test_arena();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

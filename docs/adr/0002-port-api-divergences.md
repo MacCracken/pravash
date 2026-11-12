@@ -24,6 +24,8 @@ parity. The list is extended by amendment, one row per accepted difference.
 | 5 | features select modules at compile time | one `[lib]` bundle, with dead-code elimination: probe 7 measured a full-hisab consumer at 677 KB with it and 3.06 MB without (port-parity §4.7) | — |
 | 6 | serde_json's shortest f64 digits | bayan's Grisu2 digits, which round-trip exactly (D4) | every oracle document decodes to the same bits, and every Cyrius document round-trips; the text is not compared |
 | 7 | results bit-identical only on one platform | bit-identical across targets for pravash-owned arithmetic | measured on x86_64 ELF, x86_64 PE and aarch64 |
+| 8 | a panic (an index out of range, an `expect`) or an abort on allocation failure | the call returns a neutral value and never aborts (CLAUDE.md: no aborts in library code): NaN for an f64, 0 for a word, (0, 0) for a view, 0 for "failed" from a constructor or a growth, each named in the function's comment (amendment 2026-11-11, M1 part 3) | no rows: a panic has no outputs. Each such path has a reference test (`tests/common.tcyr`: `ParticleSoa::distance_squared` out of range, `alloc(usize::MAX)`) |
+| 9 | `Option<ArenaHandle>`, slices (`&[FluidParticle]`), `Vec<FluidParticle>` returns, struct-building `Result<Self>`, and `Drop` | an `out` pointer plus 1 / 0 (`alloc`); (pointer, count) for a slice; a freelist buffer the caller frees for a returned Vec (`to_aos`); an `out` pointer plus `Result` (`PvFluidMaterial_custom`); an explicit `PvX_drop` (named so because Rust's `ParticleArena::free(handle)` takes `free`) (amendment 2026-11-11, M1 part 3) | class A on the same values: the harness reads the pointer, count and flag |
 
 ## Consequences
 

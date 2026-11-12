@@ -82,6 +82,7 @@ cyrius distlib --all && cyrius distlib --check   # once [lib] exists (M1)
 cyrius deps --locked
 cyrius audit
 python3 -I scripts/upstream_ledger.py --check    # once the ledger exists (M0 step 10)
+python3 -I -B scripts/surface_parity.py .        # from M1 part 3: every ported Rust item has its counterpart
 ```
 
 `cyrius test` must be **warning-free**. The float type diagnostics come only from the compiles that `test`

@@ -6,6 +6,75 @@
 # Requires (compile-verified; the leaves of dist/pravash.deps):
 include "lib/string.cyr"
 include "lib/ganita.cyr"
+include "lib/freelist.cyr"
+include "lib/result.cyr"
+
+# --- error.cyr ---
+
+# error.cyr — pravash's error codes (port of rust-old/src/error.rs).
+#
+# A fallible pravash function returns a value-form Result whose Err payload is one of these codes:
+# `var t, v = f(..); if (is_err_result(t) == 1) { .. v is the code .. }`. The golden token
+# `E:InvalidTimestep` is PV_ERR_INVALID_TIMESTEP: PV_ERR_ + snake(variant). The values follow the Rust variant
+# order and are append-only (the Cyrius form of #[non_exhaustive]).
+#
+# The Rust variants carry their inputs (`InvalidTimestep { dt }`) or a reason string
+# (`InvalidParameter { reason }`); the code carries neither (ADR 0002 #1). Every payload restates what the
+# caller passed in, so the caller already has it. `pv_error_message(code)` gives thiserror's message up to its
+# first field, the part that doesn't depend on the payload.
+
+enum PvError {
+    PV_ERR_NONE = 0;
+    PV_ERR_INVALID_PARTICLE_COUNT = 1;
+    PV_ERR_INVALID_GRID_RESOLUTION = 2;
+    PV_ERR_INVALID_TIMESTEP = 3;
+    PV_ERR_INVALID_DENSITY = 4;
+    PV_ERR_INVALID_VISCOSITY = 5;
+    PV_ERR_INVALID_SMOOTHING_RADIUS = 6;
+    PV_ERR_CFL_VIOLATION = 7;
+    PV_ERR_DIVERGED = 8;
+    PV_ERR_INVALID_PARAMETER = 9;
+}
+
+# The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, or "Unknown" for a value
+# that is no code.
+#must_use
+fn pv_error_name(code): i64 {
+    match code {
+        PV_ERR_NONE => { return "None"; }
+        PV_ERR_INVALID_PARTICLE_COUNT => { return "InvalidParticleCount"; }
+        PV_ERR_INVALID_GRID_RESOLUTION => { return "InvalidGridResolution"; }
+        PV_ERR_INVALID_TIMESTEP => { return "InvalidTimestep"; }
+        PV_ERR_INVALID_DENSITY => { return "InvalidDensity"; }
+        PV_ERR_INVALID_VISCOSITY => { return "InvalidViscosity"; }
+        PV_ERR_INVALID_SMOOTHING_RADIUS => { return "InvalidSmoothingRadius"; }
+        PV_ERR_CFL_VIOLATION => { return "CflViolation"; }
+        PV_ERR_DIVERGED => { return "Diverged"; }
+        PV_ERR_INVALID_PARAMETER => { return "InvalidParameter"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# The Rust error's Display text up to its first field (`"invalid timestep"` for `invalid timestep: -1 (must be
+# > 0)`). "no error" for PV_ERR_NONE and "unknown error" for a value that is no code.
+#must_use
+fn pv_error_message(code): i64 {
+    match code {
+        PV_ERR_NONE => { return "no error"; }
+        PV_ERR_INVALID_PARTICLE_COUNT => { return "invalid particle count"; }
+        PV_ERR_INVALID_GRID_RESOLUTION => { return "invalid grid resolution"; }
+        PV_ERR_INVALID_TIMESTEP => { return "invalid timestep"; }
+        PV_ERR_INVALID_DENSITY => { return "density out of range"; }
+        PV_ERR_INVALID_VISCOSITY => { return "viscosity out of range"; }
+        PV_ERR_INVALID_SMOOTHING_RADIUS => { return "smoothing radius must be positive"; }
+        PV_ERR_CFL_VIOLATION => { return "CFL condition violated"; }
+        PV_ERR_DIVERGED => { return "simulation diverged"; }
+        PV_ERR_INVALID_PARAMETER => { return "invalid parameter"; }
+        _ => { return "unknown error"; }
+    }
+    return "unknown error";
+}
 
 # --- constants.cyr ---
 
@@ -4006,4 +4075,945 @@ fn _pv_cos(x: f64): f64 {
 fn _pv_atan2(y: f64, x: f64): f64 {
     var r: f64 = _pv_cr_atan2(y, x);
     return r;
+}
+
+# --- vec3.cyr ---
+
+# vec3.cyr — glam's `DVec3`, the operations pravash calls (port plan §7.2).
+#
+# `PvVec3` is a 24-byte value, stored inline in the records that hold one (`PvFluidParticle.position`). Each
+# operation is glam 0.29.3's (`src/f64/dvec3.rs`) in its exact order: `dot` is (x·x' + y·y') + z·z', `length`
+# its square root, `distance` the length of the difference, with no fused operations, as rustc compiles them. So
+# the results have the oracle's bits (class A). Operations arrive with the modules that call them. Hot loops read
+# the components into f64 locals instead of passing values (port-parity §4.2: a struct value costs 2.5×).
+#
+# UPSTREAM(L3): hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md
+#   replace with hisab's vector forms (`hvec3_*`) once a call's allocation can be scoped (each result allocates
+#   24 B today, port-parity §4.1); parity: every row that goes through a vector operation.
+
+struct PvVec3 { x: f64; y: f64; z: f64; }
+
+# (x, y, z). Mirrors `DVec3::new`.
+#must_use
+fn PvVec3_new(x: f64, y: f64, z: f64): PvVec3 {
+    var v: PvVec3;
+    v.x = x;
+    v.y = y;
+    v.z = z;
+    return v;
+}
+
+# (0, 0, 0). Mirrors `DVec3::ZERO`.
+#must_use
+fn PvVec3_zero(): PvVec3 {
+    var v: PvVec3;
+    v.x = 0.0;
+    v.y = 0.0;
+    v.z = 0.0;
+    return v;
+}
+
+impl PvVec3 {
+    # (x·x' + y·y') + z·z'. Mirrors `DVec3::dot`.
+    #must_use
+    fn dot(self, rhs: PvVec3): f64 {
+        var d: f64 = ((self.x * rhs.x) + (self.y * rhs.y)) + (self.z * rhs.z);
+        return d;
+    }
+
+    # The squared length, self·self. Mirrors `DVec3::length_squared`.
+    #must_use
+    fn length_squared(self): f64 {
+        var d: f64 = ((self.x * self.x) + (self.y * self.y)) + (self.z * self.z);
+        return d;
+    }
+
+    # √(self·self). Mirrors `DVec3::length`.
+    #must_use
+    fn length(self): f64 {
+        var d: f64 = ((self.x * self.x) + (self.y * self.y)) + (self.z * self.z);
+        var r: f64 = f64_sqrt(d);
+        return r;
+    }
+
+    # |self − rhs|², the difference formed first. Mirrors `DVec3::distance_squared`.
+    #must_use
+    fn distance_squared(self, rhs: PvVec3): f64 {
+        var dx: f64 = self.x - rhs.x;
+        var dy: f64 = self.y - rhs.y;
+        var dz: f64 = self.z - rhs.z;
+        var d: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        return d;
+    }
+
+    # |self − rhs|. Mirrors `DVec3::distance`.
+    #must_use
+    fn distance(self, rhs: PvVec3): f64 {
+        var dx: f64 = self.x - rhs.x;
+        var dy: f64 = self.y - rhs.y;
+        var dz: f64 = self.z - rhs.z;
+        var d: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        var r: f64 = f64_sqrt(d);
+        return r;
+    }
+
+    # 1 when no component is infinite or NaN. Mirrors `DVec3::is_finite`.
+    #must_use
+    fn is_finite(self): i64 {
+        if (_pv_is_finite(self.x) == 0) { return 0; }
+        if (_pv_is_finite(self.y) == 0) { return 0; }
+        return _pv_is_finite(self.z);
+    }
+}
+
+# --- column.cyr ---
+
+# column.cyr — a growable column of 8-byte slots on the freelist: what `ParticleSoa`'s `Vec<f64>` and `Vec<u8>`
+# fields become (port plan §7.3).
+#
+# A `PvColumn` is (data, len, cap) by value, with its slots on the freelist: `push` doubles the capacity and
+# frees the outgrown buffer, and `drop` releases it, so a column never grows the bump heap. An f64 slot holds the
+# value's bits (`get_f` / `set_f` / `push_f`); a word slot holds an integer (`get` / `set` / `push`; the SoA's
+# phase, a Rust u8). Nothing aborts (ADR 0002 #8):
+# - an index out of range reads NaN (`get_f`) or 0 (`get`) and writes nothing (`set*` return 0), where Rust's
+#   `v[i]` panics;
+# - an allocation failure leaves the column as it was and returns 0, where Rust's `push` aborts.
+#
+# UPSTREAM(L13): cyrius:docs/development/issues/2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md
+#   replace with the stdlib `vec` once `vec_push_a` frees the outgrown buffer through its Allocator and an
+#   out-of-range access returns instead of aborting; parity: the ParticleSoa rows of tests/golden/common.tsv.
+
+struct PvColumn { data; len; cap; }
+
+# An empty column (no storage until the first push or reserve). Mirrors `Vec::new`.
+#must_use
+fn PvColumn_new(): PvColumn {
+    var c: PvColumn;
+    c.data = 0;
+    c.len = 0;
+    c.cap = 0;
+    return c;
+}
+
+impl PvColumn {
+    # The number of slots in use. Mirrors `Vec::len`.
+    #must_use
+    fn len(self): i64 {
+        return self.len;
+    }
+
+    # Room for at least `n` slots: 1, or 0 when the memory isn't there (the column unchanged). Mirrors
+    # `Vec::reserve` to a total of n.
+    #must_use
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var d = fl_alloc(n * 8);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 8); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = n;
+        return 1;
+    }
+
+    # Appends the word w: 1, or 0 when the column can't grow (unchanged). The capacity doubles from 8.
+    # Mirrors `Vec::push`.
+    #must_use
+    fn push(self, w): i64 {
+        if (self.len == self.cap) {
+            var want = self.cap * 2;
+            if (want < 8) { want = 8; }
+            if (self.reserve(want) == 0) { return 0; }
+        }
+        store64(self.data + self.len * 8, w);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # Appends x's bits. Mirrors `Vec::<f64>::push`.
+    #must_use
+    fn push_f(self, x: f64): i64 {
+        return self.push(_pv_bits(x));
+    }
+
+    # Slot i as a word, or 0 out of range. Mirrors `v[i]` on a `Vec<u8>`.
+    #must_use
+    fn get(self, i): i64 {
+        if (i < 0 || i >= self.len) { return 0; }
+        return load64(self.data + i * 8);
+    }
+
+    # Slot i as an f64, or NaN out of range. Mirrors `v[i]` on a `Vec<f64>`.
+    #must_use
+    fn get_f(self, i): f64 {
+        if (i < 0 || i >= self.len) {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+        var x: f64 = load64(self.data + i * 8);
+        return x;
+    }
+
+    # Sets slot i to the word w: 1, or 0 out of range (nothing written). Mirrors `v[i] = w`.
+    fn set(self, i, w): i64 {
+        if (i < 0 || i >= self.len) { return 0; }
+        store64(self.data + i * 8, w);
+        return 1;
+    }
+
+    # Sets slot i to x: 1, or 0 out of range. Mirrors `v[i] = x`.
+    fn set_f(self, i, x: f64): i64 {
+        return self.set(i, _pv_bits(x));
+    }
+
+    # Shortens the column to `n` slots (no effect when it is not longer). Mirrors `Vec::truncate`.
+    fn truncate(self, n) {
+        if (n >= 0 && n < self.len) { self.len = n; }
+        return 0;
+    }
+
+    # Releases the storage; the column is empty and usable again. Mirrors dropping the `Vec`.
+    fn drop(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# --- common.cyr ---
+
+# common.cyr — shared fluid types: materials, particles, configuration, the SoA layout and the particle arena
+# (port of rust-old/src/common.rs).
+#
+# Shapes (port plan §7.3, ADR 0002 #1, #8 and #9):
+# - `PvFluidParticle` is a 144-byte record laid out as Rust's `FluidParticle` (probe 2, port-parity §4.2): three
+#   `PvVec3`s, density, pressure, mass, the phase as a word (Rust's u8, 0–255), the conformation tensor as an
+#   inline (f64, f64, f64) tuple, temperature and fuel. Particle buffers are typed stride arrays plus a count.
+# - A fallible function returns a value-form Result with a `PV_ERR_*` code. One that builds a struct writes it
+#   through an `out` pointer and returns `Ok(0)`.
+# - `Option<ArenaHandle>` is an `out` pointer plus 1 (Some) or 0 (None); a slice is (pointer, count).
+# - Nothing aborts: where Rust panics (an index out of range) or aborts (out of memory), the call returns NaN,
+#   0, (0, 0) or 0 for failure, as each function says.
+# - Owned storage is freelist (`fl_alloc`), released by the type's `_drop`.
+# - Rust's `tracing::warn!` on a stale or double-freed arena handle arrives with M7's logging (sakshi).
+
+# ── FluidMaterial ───────────────────────────────────────────────────────────────────
+
+# Physical properties of a fluid material: rest density (kg/m³), dynamic viscosity (Pa·s), surface tension
+# (N/m) and the speed of sound (m/s). Mirrors `FluidMaterial`.
+struct PvFluidMaterial {
+    density: f64;
+    viscosity: f64;
+    surface_tension: f64;
+    speed_of_sound: f64;
+}
+
+# The presets, from the generated constants (src/constants.cyr). Mirror `FluidMaterial::WATER`, `OIL`,
+# `HONEY`, `AIR` and `LAVA`; copy one (`var m: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;`), never assign to it.
+var PV_FLUID_MATERIAL_WATER: PvFluidMaterial = PvFluidMaterial { PV_FLUID_MATERIAL_WATER_DENSITY,
+    PV_FLUID_MATERIAL_WATER_VISCOSITY, PV_FLUID_MATERIAL_WATER_SURFACE_TENSION,
+    PV_FLUID_MATERIAL_WATER_SPEED_OF_SOUND };
+var PV_FLUID_MATERIAL_OIL: PvFluidMaterial = PvFluidMaterial { PV_FLUID_MATERIAL_OIL_DENSITY,
+    PV_FLUID_MATERIAL_OIL_VISCOSITY, PV_FLUID_MATERIAL_OIL_SURFACE_TENSION, PV_FLUID_MATERIAL_OIL_SPEED_OF_SOUND };
+var PV_FLUID_MATERIAL_HONEY: PvFluidMaterial = PvFluidMaterial { PV_FLUID_MATERIAL_HONEY_DENSITY,
+    PV_FLUID_MATERIAL_HONEY_VISCOSITY, PV_FLUID_MATERIAL_HONEY_SURFACE_TENSION,
+    PV_FLUID_MATERIAL_HONEY_SPEED_OF_SOUND };
+var PV_FLUID_MATERIAL_AIR: PvFluidMaterial = PvFluidMaterial { PV_FLUID_MATERIAL_AIR_DENSITY,
+    PV_FLUID_MATERIAL_AIR_VISCOSITY, PV_FLUID_MATERIAL_AIR_SURFACE_TENSION, PV_FLUID_MATERIAL_AIR_SPEED_OF_SOUND };
+var PV_FLUID_MATERIAL_LAVA: PvFluidMaterial = PvFluidMaterial { PV_FLUID_MATERIAL_LAVA_DENSITY,
+    PV_FLUID_MATERIAL_LAVA_VISCOSITY, PV_FLUID_MATERIAL_LAVA_SURFACE_TENSION,
+    PV_FLUID_MATERIAL_LAVA_SPEED_OF_SOUND };
+
+# A material from its four properties, validated in Rust's order: the density finite and > 0
+# (PV_ERR_INVALID_DENSITY), the viscosity finite and ≥ 0 (PV_ERR_INVALID_VISCOSITY), the surface tension finite and
+# ≥ 0, the speed of sound finite and > 0 (both PV_ERR_INVALID_PARAMETER). Writes *out and returns Ok(0); on an
+# error *out is untouched. Mirrors `FluidMaterial::custom`.
+#must_use
+fn PvFluidMaterial_custom(density: f64, viscosity: f64, surface_tension: f64, speed_of_sound: f64,
+  out: *PvFluidMaterial): Result {
+    if (_pv_is_finite(density) == 0 || density <= 0.0) { return Err(PV_ERR_INVALID_DENSITY); }
+    if (_pv_is_finite(viscosity) == 0 || viscosity < 0.0) { return Err(PV_ERR_INVALID_VISCOSITY); }
+    if (_pv_is_finite(surface_tension) == 0 || surface_tension < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_is_finite(speed_of_sound) == 0 || speed_of_sound <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    out.density = density;
+    out.viscosity = viscosity;
+    out.surface_tension = surface_tension;
+    out.speed_of_sound = speed_of_sound;
+    return Ok(0);
+}
+
+# ── FluidParticle ───────────────────────────────────────────────────────────────────
+
+# An SPH particle. Mirrors `FluidParticle`: position (2D: z = 0), velocity, acceleration (accumulated forces /
+# mass), density (from the neighbours), pressure (from the equation of state), mass, the phase index (0 the
+# primary phase), the viscoelastic conformation tensor (c_xx, c_xy, c_yy; identity (1, 0, 1)), temperature (K)
+# and fuel (0–1).
+struct PvFluidParticle {
+    position: PvVec3;
+    velocity: PvVec3;
+    acceleration: PvVec3;
+    density: f64;
+    pressure: f64;
+    mass: f64;
+    phase;
+    conformation: (f64, f64, f64);
+    temperature: f64;
+    fuel: f64;
+}
+
+# A typed view of a word (what fl_alloc returns, or a record's address).
+#must_use
+fn _pv_as_particles(p): *PvFluidParticle {
+    return p;
+}
+
+# A pointer's address as a plain word, for byte offsets (typed pointer arithmetic steps whole records).
+#must_use
+fn _pv_addr(p): i64 {
+    return p;
+}
+
+# A particle at rest at `position`: no velocity or acceleration, density and pressure 0, phase 0, the identity
+# conformation (1, 0, 1), 293.15 K (20 °C) and no fuel. Mirrors `FluidParticle::new`.
+#must_use
+fn PvFluidParticle_new(position: PvVec3, mass: f64): PvFluidParticle {
+    var p: PvFluidParticle;
+    p.position = position;
+    p.velocity = PvVec3_zero();
+    p.acceleration = PvVec3_zero();
+    p.density = 0.0;
+    p.pressure = 0.0;
+    p.mass = mass;
+    p.phase = 0;
+    p.conformation = (1.0, 0.0, 1.0);
+    p.temperature = 293.15;
+    p.fuel = 0.0;
+    return p;
+}
+
+# A 2D particle at (x, y, 0). Mirrors `FluidParticle::new_2d`.
+#must_use
+fn PvFluidParticle_new_2d(x: f64, y: f64, mass: f64): PvFluidParticle {
+    var p: PvFluidParticle = PvFluidParticle_new(PvVec3_new(x, y, 0.0), mass);
+    return p;
+}
+
+# Writes the default particle (`FluidParticle::new(DVec3::ZERO, 0.0)`) into each of the `n` records at `ps`: one
+# record built, then copied whole (a struct copy moves the 144 bytes word by word, 3× faster than storing each
+# field: docs/benchmarks-rust-v-cyrius.md, M1 part 3).
+fn _pv_particles_reset(ps: *PvFluidParticle, n) {
+    var d: PvFluidParticle = PvFluidParticle_new(PvVec3_zero(), 0.0);
+    for (var i = 0; i < n; i = i + 1) {
+        var q: *PvFluidParticle = ps + i;
+        *q = d;
+    }
+    return 0;
+}
+
+impl PvFluidParticle {
+    # The squared speed, |v|² (glam's dot order). Mirrors `speed_squared`.
+    #must_use
+    fn speed_squared(self): f64 {
+        var r: f64 = self.velocity.length_squared();
+        return r;
+    }
+
+    # The speed, |v|. Mirrors `speed`.
+    #must_use
+    fn speed(self): f64 {
+        var r: f64 = self.velocity.length();
+        return r;
+    }
+
+    # The kinetic energy, (0.5·m)·|v|² in Rust's order. Mirrors `kinetic_energy`.
+    #must_use
+    fn kinetic_energy(self): f64 {
+        var v2: f64 = self.velocity.length_squared();
+        var r: f64 = (0.5 * self.mass) * v2;
+        return r;
+    }
+
+    # The squared distance to `other`'s position. Mirrors `distance_squared_to`.
+    #must_use
+    fn distance_squared_to(self, other: *PvFluidParticle): f64 {
+        var r: f64 = self.position.distance_squared(other.position);
+        return r;
+    }
+
+    # The distance to `other`'s position. Mirrors `distance_to`.
+    #must_use
+    fn distance_to(self, other: *PvFluidParticle): f64 {
+        var r: f64 = self.position.distance(other.position);
+        return r;
+    }
+}
+
+# ── FluidConfig ─────────────────────────────────────────────────────────────────────
+
+# Simulation configuration. Mirrors `FluidConfig`: the timestep (s), gravity, the SPH smoothing radius, the gas
+# constant of the equation of state, the rest density, the domain's corners, and the boundary damping (the velocity
+# kept on a wall collision, 0–1).
+struct PvFluidConfig {
+    dt: f64;
+    gravity: PvVec3;
+    smoothing_radius: f64;
+    gas_constant: f64;
+    rest_density: f64;
+    bounds_min: PvVec3;
+    bounds_max: PvVec3;
+    boundary_damping: f64;
+}
+
+# The default 2D water simulation: dt 0.001, gravity (0, −9.81, 0), h 0.05, gas constant 2000, water's rest
+# density, the unit square (z = 0) and damping 0.5. Mirrors `FluidConfig::water_2d`.
+#must_use
+fn PvFluidConfig_water_2d(): PvFluidConfig {
+    var c: PvFluidConfig;
+    c.dt = 0.001;
+    c.gravity = PvVec3_new(0.0, -9.81, 0.0);
+    c.smoothing_radius = 0.05;
+    c.gas_constant = 2000.0;
+    c.rest_density = PV_FLUID_MATERIAL_WATER_DENSITY;
+    c.bounds_min = PvVec3_zero();
+    c.bounds_max = PvVec3_new(1.0, 1.0, 0.0);
+    c.boundary_damping = 0.5;
+    return c;
+}
+
+impl PvFluidConfig {
+    # Ok(0), or the first failure in Rust's order: dt finite and > 0 (PV_ERR_INVALID_TIMESTEP); the smoothing
+    # radius finite and > 0 (PV_ERR_INVALID_SMOOTHING_RADIUS); the rest density finite and > 0
+    # (PV_ERR_INVALID_DENSITY); then PV_ERR_INVALID_PARAMETER for a gas constant not finite and > 0, a damping
+    # outside [0, 1] (NaN included: `RangeInclusive::contains`), a non-finite gravity, non-finite bounds, or
+    # bounds_min above bounds_max on any axis. Mirrors `validate`.
+    #must_use
+    fn validate(self): Result {
+        var dt: f64 = self.dt;
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var h: f64 = self.smoothing_radius;
+        if (_pv_is_finite(h) == 0 || h <= 0.0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        var rho: f64 = self.rest_density;
+        if (_pv_is_finite(rho) == 0 || rho <= 0.0) { return Err(PV_ERR_INVALID_DENSITY); }
+        var k: f64 = self.gas_constant;
+        if (_pv_is_finite(k) == 0 || k <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var bd: f64 = self.boundary_damping;
+        if (bd >= 0.0 && bd <= 1.0) {} else { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (self.gravity.is_finite() == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (self.bounds_min.is_finite() == 0 || self.bounds_max.is_finite() == 0) {
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
+        var lx: f64 = self.bounds_min.x;
+        var ly: f64 = self.bounds_min.y;
+        var lz: f64 = self.bounds_min.z;
+        var hx: f64 = self.bounds_max.x;
+        var hy: f64 = self.bounds_max.y;
+        var hz: f64 = self.bounds_max.z;
+        if (lx > hx || ly > hy || lz > hz) { return Err(PV_ERR_INVALID_PARAMETER); }
+        return Ok(0);
+    }
+
+    # The CFL check: Ok(0) when |v|·dt / h is finite and at most 1, else PV_ERR_CFL_VIOLATION (a NaN velocity
+    # too). Mirrors `check_cfl`.
+    #must_use
+    fn check_cfl(self, max_velocity: f64): Result {
+        var dx: f64 = self.smoothing_radius;
+        var av: f64 = f64_abs(max_velocity);
+        var cfl: f64 = (av * self.dt) / dx;
+        if (_pv_is_finite(cfl) == 0 || cfl > 1.0) { return Err(PV_ERR_CFL_VIOLATION); }
+        return Ok(0);
+    }
+}
+
+# ── ParticleSoa ─────────────────────────────────────────────────────────────────────
+
+# Structure-of-arrays particle data: one column per field component. Mirrors `ParticleSoa`. The columns are
+# public, as Rust's are, so they can be resized independently: `is_consistent` checks them and `consistent_len` is
+# the number of complete particles. `phase` holds words (Rust's u8). Release with `PvParticleSoa_drop`.
+struct PvParticleSoa {
+    pos_x: PvColumn;
+    pos_y: PvColumn;
+    pos_z: PvColumn;
+    vel_x: PvColumn;
+    vel_y: PvColumn;
+    vel_z: PvColumn;
+    accel_x: PvColumn;
+    accel_y: PvColumn;
+    accel_z: PvColumn;
+    density: PvColumn;
+    pressure: PvColumn;
+    mass: PvColumn;
+    phase: PvColumn;
+    conf_xx: PvColumn;
+    conf_xy: PvColumn;
+    conf_yy: PvColumn;
+    temperature: PvColumn;
+    fuel: PvColumn;
+}
+
+# The number of columns, and column k of `s` (0 … 17, in declaration order) as a pointer.
+const _PV_SOA_COLUMNS = 18;
+
+#must_use
+fn _pv_as_columns(p): *PvColumn {
+    return p;
+}
+
+#must_use
+fn _pv_soa_col(s, k): *PvColumn {
+    var c: *PvColumn = _pv_as_columns(s);
+    return c + k;
+}
+
+# An empty store, with no storage. Mirrors `ParticleSoa::new` (and `Default`).
+#must_use
+fn PvParticleSoa_new(): PvParticleSoa {
+    var s: PvParticleSoa;
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_soa_col(&s, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    return s;
+}
+
+# `Default for ParticleSoa`: the empty store.
+#must_use
+fn PvParticleSoa_default(): PvParticleSoa {
+    var s: PvParticleSoa = PvParticleSoa_new();
+    return s;
+}
+
+# An empty store with room for `n` particles in every column: 1, or 0 when the memory isn't there (then *out
+# holds no storage). Mirrors `ParticleSoa::with_capacity`.
+#must_use
+fn PvParticleSoa_with_capacity(out: *PvParticleSoa, n): i64 {
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_soa_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_soa_col(out, k);
+        if (c.reserve(n) == 0) {
+            PvParticleSoa_drop(out);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+# Releases every column's storage; the store is empty and usable again. Mirrors dropping the `ParticleSoa`.
+fn PvParticleSoa_drop(s: *PvParticleSoa) {
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_soa_col(s, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# A particle record's 18 words, in column order (declaration order, the conformation's three in the tuple's): the
+# record is laid out exactly as the 18 columns are, so word k of particle i is column k's slot i.
+const _PV_PARTICLE_WORDS = 18;
+
+# The store of the `n` particles at `ps`: 1, or 0 when the memory isn't there (then *out holds no storage).
+# Mirrors `ParticleSoa::from_aos`. Each column's `n` slots are reserved, then filled straight from the records'
+# words (Rust's pushes, without a call per field).
+#must_use
+fn PvParticleSoa_from_aos(out: *PvParticleSoa, ps: *PvFluidParticle, n): i64 {
+    if (PvParticleSoa_with_capacity(out, n) == 0) { return 0; }
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_soa_col(out, k);
+        var d = c.data;
+        var src = _pv_addr(ps) + k * 8;
+        for (var i = 0; i < n; i = i + 1) { store64(d + i * 8, load64(src + i * sizeof(PvFluidParticle))); }
+        c.len = n;
+    }
+    return 1;
+}
+
+impl PvParticleSoa {
+    # The number of particles: the length of `pos_x`. Mirrors `len`.
+    #must_use
+    fn len(self): i64 {
+        return self.pos_x.len;
+    }
+
+    # 1 when `pos_x` is empty. Mirrors `is_empty`.
+    #must_use
+    fn is_empty(self): i64 {
+        if (self.pos_x.len == 0) { return 1; }
+        return 0;
+    }
+
+    # 1 when every column has `pos_x`'s length. Mirrors `is_consistent`.
+    #must_use
+    fn is_consistent(self): i64 {
+        var n = self.pos_x.len;
+        for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+            var c: *PvColumn = _pv_soa_col(self, k);
+            if (c.len != n) { return 0; }
+        }
+        return 1;
+    }
+
+    # The shortest column's length: the number of complete particles. Mirrors `consistent_len`.
+    #must_use
+    fn consistent_len(self): i64 {
+        var n = self.pos_x.len;
+        for (var k = 1; k < _PV_SOA_COLUMNS; k = k + 1) {
+            var c: *PvColumn = _pv_soa_col(self, k);
+            if (c.len < n) { n = c.len; }
+        }
+        return n;
+    }
+
+    # Writes complete particles 0 … m − 1 (m ≤ consistent_len) into the records at `ps`, column by column: word k
+    # of particle i is column k's slot i (the record's layout is the columns' order).
+    fn _rows_to(self, ps: *PvFluidParticle, m) {
+        for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+            var c: *PvColumn = _pv_soa_col(self, k);
+            var d = c.data;
+            var dst = _pv_addr(ps) + k * 8;
+            for (var i = 0; i < m; i = i + 1) { store64(dst + i * sizeof(PvFluidParticle), load64(d + i * 8)); }
+        }
+        return 0;
+    }
+
+    # The complete particles (`consistent_len` of them) as a new freelist buffer: (pointer, count), which the
+    # caller releases with `fl_free(pointer)`. (0, 0) when there are none, or when the memory isn't there (then
+    # `consistent_len()` is above 0). Mirrors `to_aos`.
+    #must_use
+    fn to_aos(self) {
+        var n = self.consistent_len();
+        if (n == 0) { return (0, 0); }
+        var buf = fl_alloc(n * sizeof(PvFluidParticle));
+        if (buf == 0) { return (0, 0); }
+        self._rows_to(_pv_as_particles(buf), n);
+        return (buf, n);
+    }
+
+    # Writes the complete particles into the `n` records at `ps`, as many as both have. Mirrors `write_to_aos`.
+    fn write_to_aos(self, ps: *PvFluidParticle, n) {
+        var m = self.consistent_len();
+        if (n < m) { m = n; }
+        self._rows_to(ps, m);
+        return 0;
+    }
+
+    # The squared distance between particles i and j: (dx² + dy²) + dz², in Rust's order. NaN when either index
+    # is outside a position column (Rust panics). Mirrors `distance_squared`.
+    #must_use
+    fn distance_squared(self, i, j): f64 {
+        var dx: f64 = self.pos_x.get_f(i) - self.pos_x.get_f(j);
+        var dy: f64 = self.pos_y.get_f(i) - self.pos_y.get_f(j);
+        var dz: f64 = self.pos_z.get_f(i) - self.pos_z.get_f(j);
+        var r: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        return r;
+    }
+}
+
+# ── ParticleArena ───────────────────────────────────────────────────────────────────
+
+# A block of a `PvParticleArena`: its start index, its length, and the arena generation it was issued in (bumped
+# by `compact`, which makes older handles stale). The fields are private in Rust; read them through `start`,
+# `len` and `is_empty`. Mirrors `ArenaHandle` (Copy, Eq).
+struct PvArenaHandle { start; len; generation; }
+
+impl PvArenaHandle {
+    # The block's first index. Mirrors `start`.
+    #must_use
+    fn start(self): i64 {
+        return self.start;
+    }
+
+    # The block's length. Mirrors `len`.
+    #must_use
+    fn len(self): i64 {
+        return self.len;
+    }
+
+    # 1 when the block is empty. Mirrors `is_empty`.
+    #must_use
+    fn is_empty(self): i64 {
+        if (self.len == 0) { return 1; }
+        return 0;
+    }
+
+    # 1 when both handles have the same fields (Rust's derived `PartialEq`).
+    #must_use
+    fn eq(self, other: *PvArenaHandle): i64 {
+        if (self.start == other.start && self.len == other.len && self.generation == other.generation) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+# A pre-allocated particle arena. Mirrors `ParticleArena`: `capacity` particle records, the high-water mark (the
+# first index never handed out since the last shrink), the free list of (start, len) blocks sorted by start, with
+# adjacent blocks merged, and the generation. The free list's storage is allocated once with room for every block
+# the arena can hold (free blocks are separated by allocated ones, so there are at most capacity / 2), so no
+# operation allocates. Create with `PvParticleArena_new`, release with `PvParticleArena_drop`.
+struct PvParticleArena {
+    particles;
+    capacity;
+    watermark;
+    free_list;
+    free_count;
+    free_cap;
+    generation;
+}
+
+#must_use
+fn _pv_as_arena(p): *PvParticleArena {
+    return p;
+}
+
+# An arena of `capacity` default particles (`FluidParticle::new(DVec3::ZERO, 0.0)`), or 0 when the memory isn't
+# there (Rust aborts) or `capacity` is negative. Mirrors `ParticleArena::new`.
+#must_use
+fn PvParticleArena_new(capacity): *PvParticleArena {
+    if (capacity < 0) { return _pv_as_arena(0); }
+    var a: *PvParticleArena = _pv_as_arena(fl_alloc(sizeof(PvParticleArena)));
+    if (a == 0) { return a; }
+    var fcap = capacity / 2 + 1;
+    var ps = fl_alloc(capacity * sizeof(PvFluidParticle) + 8);
+    var fl = fl_alloc(fcap * 16);
+    if (ps == 0 || fl == 0) {
+        if (ps != 0) { fl_free(ps); }
+        if (fl != 0) { fl_free(fl); }
+        fl_free(a);
+        return _pv_as_arena(0);
+    }
+    _pv_particles_reset(_pv_as_particles(ps), capacity);
+    a.particles = ps;
+    a.capacity = capacity;
+    a.watermark = 0;
+    a.free_list = fl;
+    a.free_count = 0;
+    a.free_cap = fcap;
+    a.generation = 0;
+    return a;
+}
+
+# Releases the arena and its storage (0 is ignored). Mirrors dropping the `ParticleArena`.
+fn PvParticleArena_drop(a: *PvParticleArena) {
+    if (a == 0) { return 0; }
+    fl_free(a.particles);
+    fl_free(a.free_list);
+    fl_free(a);
+    return 0;
+}
+
+impl PvParticleArena {
+    # Free-list entry i's start and length.
+    #must_use
+    fn _fs(self, i): i64 {
+        return load64(self.free_list + i * 16);
+    }
+
+    #must_use
+    fn _fl(self, i): i64 {
+        return load64(self.free_list + i * 16 + 8);
+    }
+
+    fn _fset(self, i, s, n) {
+        store64(self.free_list + i * 16, s);
+        store64(self.free_list + i * 16 + 8, n);
+        return 0;
+    }
+
+    # Removes free-list entry i, keeping the order (`Vec::remove`).
+    fn _fremove(self, i) {
+        for (var k = i; k + 1 < self.free_count; k = k + 1) {
+            self._fset(k, self._fs(k + 1), self._fl(k + 1));
+        }
+        self.free_count = self.free_count - 1;
+        return 0;
+    }
+
+    # Inserts (s, n) as free-list entry i, keeping the order (`Vec::insert`). The capacity bound holds by
+    # construction; 0 if it ever didn't (nothing changes).
+    fn _finsert(self, i, s, n): i64 {
+        if (self.free_count >= self.free_cap) { return 0; }
+        var k = self.free_count;
+        while (k > i) {
+            self._fset(k, self._fs(k - 1), self._fl(k - 1));
+            k = k - 1;
+        }
+        self._fset(i, s, n);
+        self.free_count = self.free_count + 1;
+        return 1;
+    }
+
+    # The arena's capacity. Mirrors `capacity`.
+    #must_use
+    fn capacity(self): i64 {
+        return self.capacity;
+    }
+
+    # The number of allocated particles: the watermark less every free block, saturating at 0. Mirrors
+    # `active_count`.
+    #must_use
+    fn active_count(self): i64 {
+        var free_total = 0;
+        for (var i = 0; i < self.free_count; i = i + 1) { free_total = free_total + self._fl(i); }
+        if (free_total >= self.watermark) { return 0; }
+        return self.watermark - free_total;
+    }
+
+    # Allocates a block of `n` default particles: the first free block long enough (split from its front), else
+    # the watermark bumped. Writes the handle to *out and returns 1, or returns 0 when there is no room (*out
+    # untouched). n = 0 gives the empty handle (0, 0, generation). Mirrors `alloc`'s `Option<ArenaHandle>`.
+    #must_use
+    fn alloc(self, n, out: *PvArenaHandle): i64 {
+        if (n == 0) {
+            out.start = 0;
+            out.len = 0;
+            out.generation = self.generation;
+            return 1;
+        }
+        if (n < 0) { return 0; }
+        var start = 0 - 1;
+        for (var i = 0; i < self.free_count; i = i + 1) {
+            if (self._fl(i) >= n) {
+                start = self._fs(i);
+                var free_len = self._fl(i);
+                if (free_len == n) { self._fremove(i); } else { self._fset(i, start + n, free_len - n); }
+                break;
+            }
+        }
+        if (start < 0) {
+            if (n > self.capacity - self.watermark) { return 0; }
+            start = self.watermark;
+            self.watermark = self.watermark + n;
+        }
+        _pv_particles_reset(_pv_as_particles(self.particles) + start, n);
+        out.start = start;
+        out.len = n;
+        out.generation = self.generation;
+        return 1;
+    }
+
+    # 1 when the handle is of this generation and lies within the allocated range.
+    #must_use
+    fn _in_range(self, h: PvArenaHandle): i64 {
+        if (h.generation != self.generation) { return 0; }
+        if (h.start < 0 || h.len < 0) { return 0; }
+        if (h.start > self.watermark - h.len) { return 0; }
+        return 1;
+    }
+
+    # Returns a block to the pool: inserted in start order, merged with an adjacent free block on either side,
+    # and the watermark shrunk when the block ends there. A stale handle (from before a `compact`), an
+    # out-of-range one, or a block that overlaps a free one (a double free) is ignored. Mirrors `free`.
+    fn free(self, h: PvArenaHandle) {
+        if (h.len == 0) { return 0; }
+        if (self._in_range(h) == 0) { return 0; }
+        var end = h.start + h.len;
+        # binary_search_by_key on start: the first entry whose start is not below h.start.
+        var lo = 0;
+        var hi = self.free_count;
+        while (lo < hi) {
+            var mid = (lo + hi) / 2;
+            if (self._fs(mid) < h.start) { lo = mid + 1; } else { hi = mid; }
+        }
+        var pos = lo;
+        if (pos > 0) {
+            if (self._fs(pos - 1) + self._fl(pos - 1) > h.start) { return 0; }
+        }
+        if (pos < self.free_count) {
+            if (self._fs(pos) < end) { return 0; }
+        }
+        if (self._finsert(pos, h.start, h.len) == 0) { return 0; }
+        if (pos + 1 < self.free_count) {
+            if (self._fs(pos) + self._fl(pos) == self._fs(pos + 1)) {
+                self._fset(pos, self._fs(pos), self._fl(pos) + self._fl(pos + 1));
+                self._fremove(pos + 1);
+            }
+        }
+        if (pos > 0) {
+            if (self._fs(pos - 1) + self._fl(pos - 1) == self._fs(pos)) {
+                self._fset(pos - 1, self._fs(pos - 1), self._fl(pos - 1) + self._fl(pos));
+                self._fremove(pos);
+            }
+        }
+        if (self.free_count > 0) {
+            var last = self.free_count - 1;
+            if (self._fs(last) + self._fl(last) == self.watermark) {
+                self.watermark = self._fs(last);
+                self.free_count = last;
+            }
+        }
+        return 0;
+    }
+
+    # The block's particles: (pointer to the first record, count), or (0, 0) for a stale or out-of-range
+    # handle. Writable, as `get_mut`'s are. Mirrors `get`.
+    #must_use
+    fn get(self, h: PvArenaHandle) {
+        if (self._in_range(h) == 0) { return (0, 0); }
+        if (h.len == 0) { return (0, 0); }
+        var p = self.particles + h.start * sizeof(PvFluidParticle);
+        return (p, h.len);
+    }
+
+    # The same view as `get`. Mirrors `get_mut`.
+    #must_use
+    fn get_mut(self, h: PvArenaHandle) {
+        var p, n = self.get(h);
+        return (p, n);
+    }
+
+    # Every record below the watermark, freed gaps included: (pointer, watermark). Mirrors `raw_slice`.
+    #must_use
+    fn raw_slice(self) {
+        return (self.particles, self.watermark);
+    }
+
+    # Moves every allocated particle to the front, in order, and returns how many there are. Clears the free list
+    # and bumps the generation (wrapping), which makes every earlier handle stale; with no free block it changes
+    # nothing and returns the watermark. Mirrors `compact`.
+    fn compact(self): i64 {
+        if (self.free_count == 0) { return self.watermark; }
+        var ps: *PvFluidParticle = _pv_as_particles(self.particles);
+        var write = 0;
+        var read = 0;
+        var wm = self.watermark;
+        var fi = 0;
+        while (read < wm) {
+            if (fi < self.free_count && read == self._fs(fi)) {
+                read = read + self._fl(fi);
+                fi = fi + 1;
+                continue;
+            }
+            if (read != write) {
+                var src: *PvFluidParticle = ps + read;
+                var dst: *PvFluidParticle = ps + write;
+                *dst = *src;
+            }
+            write = write + 1;
+            read = read + 1;
+        }
+        self.watermark = write;
+        self.free_count = 0;
+        self.generation = self.generation + 1;
+        return write;
+    }
+
+    # Every allocated particle after a `compact`: (pointer, watermark). Mirrors `active_particles`.
+    #must_use
+    fn active_particles(self) {
+        return (self.particles, self.watermark);
+    }
+
+    # The same view, for writing. Mirrors `active_particles_mut`.
+    #must_use
+    fn active_particles_mut(self) {
+        return (self.particles, self.watermark);
+    }
 }

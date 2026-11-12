@@ -17,6 +17,9 @@ python3 -I -B scripts/oracle/validate.py . --write                              
 python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
 ```
 
+The generator depends on the oracle by path and on `hisab =1.4.0` (for glam's `DVec3`, to build `common`'s
+inputs), both resolved through `Cargo.lock`, which was seeded from `rust-old/Cargo.lock`.
+
 The format, the comparison rules and the generator's structure are impetus's
 (`/home/macro/Repos/impetus/scripts/oracle/`), which are kimiya's and tanmatra's: every port's harness reads the
 same files. This README records what is specific to pravash.
@@ -103,6 +106,9 @@ oracle:
   exactly the files present;
 - it checks `constants.tsv` against the literals in `rust-old/src`;
 - it recomputes every class-A/B `math` row in Python, in Rust's operation order;
+- it recomputes every `common` row in Python, in Rust's and glam's order: the validation rules, the defaults, the
+  vector arithmetic, and the particle arena through a transcription of its free-list logic (the token layouts
+  and the arena's op codes are in `src/m_common.rs`'s module comment);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;

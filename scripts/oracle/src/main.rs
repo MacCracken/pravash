@@ -27,6 +27,7 @@
 mod cyr;
 mod glibc;
 mod grids;
+mod m_common;
 mod m_constants;
 mod m_math;
 mod t_constants;
@@ -42,7 +43,11 @@ const PARALLEL: bool = cfg!(feature = "parallel");
 
 /// Every golden emitter, in file-name order.
 fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
-    Ok(vec![m_constants::emit(root)?, m_math::emit()])
+    Ok(vec![
+        m_common::emit(),
+        m_constants::emit(root)?,
+        m_math::emit(),
+    ])
 }
 
 /// Every generated Cyrius source, in file-name order.

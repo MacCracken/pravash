@@ -436,3 +436,67 @@ is the gate that covers every table word.
 **For M3:** crmath loads its tables lazily behind a plain flag, and counts its slow-path calls in globals.
 `src/par.cyr` calls `_pv_cr_load()` before it starts workers, so that on aarch64 a worker never sees the flag set
 before the tables are visible. The counters are racy but never feed a result (ADR 0004, Consequences).
+
+## 7. M1a part 3: error, vec3, common (2026-11-11)
+
+Five `[lib]` modules, in order:
+- `src/error.cyr` first: the `PV_ERR_*` codes, `pv_error_name` and `pv_error_message`;
+- after `src/mathx.cyr`: `src/vec3.cyr` (`PvVec3`, glam's operations in glam's order, `UPSTREAM(L3)`),
+  `src/column.cyr` (a freelist column, `UPSTREAM(L13)`) and `src/common.cyr`.
+
+`src/common.cyr` holds:
+- `PvFluidMaterial`, its five presets as struct globals, and `custom`;
+- `PvFluidParticle`, the 144-byte record of probe 2, with the conformation as an inline `(f64, f64, f64)`;
+- `PvFluidConfig`, with `validate` and `check_cfl`;
+- `PvParticleSoa`, 18 columns;
+- `PvArenaHandle` and `PvParticleArena`, whose free list is allocated once at capacity / 2 + 1 entries, so no
+  operation allocates.
+
+The API shapes are ADR 0002 #1, #8 (no aborts) and #9 (out pointers, (pointer, count) views, `_drop`).
+
+**The golden module** `tests/golden/common.tsv` (scripts/oracle/src/m_common.rs) has **3,683 rows**:
+- `custom` 297;
+- `new` and `new_2d` 90 each;
+- `speed_squared`, `speed` and `kinetic_energy` 330 each;
+- the two particle distances and the SoA's `distance_squared` 280 each;
+- `water_2d` 1, `validate` 644, `check_cfl` 492;
+- the SoA round trip 60 and `consistent_len` 120;
+- 59 arena scenarios.
+
+Each scenario row replays an op sequence and gives every op's result, then the arena's private state from the
+oracle dump: watermark, generation, free list, and every slot's mass, which marks where each block went. The 59 are
+the Rust tests' scenarios, foreign and stale handles, `alloc(usize::MAX)`, a zero-capacity arena, and 48 seeded
+mixes at six capacities.
+
+`validate.py` recomputes every row without the oracle, in Rust's order:
+- the validation rules;
+- the defaults;
+- glam's dot order;
+- a transcription of the arena's free-list logic.
+
+The generator gained a direct `hisab =1.4.0` dependency for `DVec3`; the lock changed by that one edge.
+
+**Result:** on the first replay, all 3,683 rows pass, every one bit-exact (the class B rows at 0 ulp on all 1,830).
+The replay is **3 modules, 0 failing | rows: 34,454 ok, 0 failed, 0 measured, 2,460 pending, 43 accepted (ADR 4: 43)**.
+It is identical on x86_64 ELF, x86_64 PE and aarch64, warning-free, and under `--bounds`. `tests/common.tcyr` ports
+47 of the 49 Rust tests (108 checks); the 2 serde tests wait for part 4's JSON. `tests/error.tcyr` ports the 6
+error tests, re-expressed for codes (15 checks).
+
+**Surface parity** (`scripts/surface_parity.py`, impetus's, now in CI): error and common, **98 items ok, 0
+missing**. Every other `rust-old/src` file is listed with its milestone. It carries impetus's scan for the open
+cyrius 6.7.18 miscompile, where `s.f = g(t.e)` stores `t.e` when `g` returns a struct. That scan flagged three
+stores in the SoA's row copy. They were correct in practice: the 60 round-trip rows pass. They are bound to locals
+anyway, and the faster column copy replaced them since.
+
+**Mutation checks** (each restored and re-verified after):
+- **The corpus**, three rows edited together: a `speed` value moved 1 ulp, a passing `validate` row given
+  `E:InvalidTimestep`, an arena scenario's final free-list start changed.
+  - `validate.py` fails all three.
+  - The replay fails the `validate` and arena rows. The 1-ulp `speed` row passes, as class B's ≤ 2 ulp allows,
+    and shows in its histogram as `1:1`. Class B is the plan's arithmetic class (§5). Every bit of these rows is
+    still pinned, by `validate.py`'s exact recomputation.
+- **The SoA's column mapping**, two columns swapped: all 60 round-trip rows fail.
+- **The surface parity script**: a renamed method, field and enum variant are each reported missing.
+
+**The memcpy question (ledger L12)** is answered and closed. A struct assignment moves a 144-byte record in
+11.7 ns, `memcpy` in 245 ns, so every particle move is an assignment. Details: benchmarks-rust-v-cyrius, M1 part 3.

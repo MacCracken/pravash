@@ -1,0 +1,113 @@
+# column.cyr — a growable column of 8-byte slots on the freelist: what `ParticleSoa`'s `Vec<f64>` and `Vec<u8>`
+# fields become (port plan §7.3).
+#
+# A `PvColumn` is (data, len, cap) by value, with its slots on the freelist: `push` doubles the capacity and
+# frees the outgrown buffer, and `drop` releases it, so a column never grows the bump heap. An f64 slot holds the
+# value's bits (`get_f` / `set_f` / `push_f`); a word slot holds an integer (`get` / `set` / `push`; the SoA's
+# phase, a Rust u8). Nothing aborts (ADR 0002 #8):
+# - an index out of range reads NaN (`get_f`) or 0 (`get`) and writes nothing (`set*` return 0), where Rust's
+#   `v[i]` panics;
+# - an allocation failure leaves the column as it was and returns 0, where Rust's `push` aborts.
+#
+# UPSTREAM(L13): cyrius:docs/development/issues/2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md
+#   replace with the stdlib `vec` once `vec_push_a` frees the outgrown buffer through its Allocator and an
+#   out-of-range access returns instead of aborting; parity: the ParticleSoa rows of tests/golden/common.tsv.
+
+struct PvColumn { data; len; cap; }
+
+# An empty column (no storage until the first push or reserve). Mirrors `Vec::new`.
+#must_use
+fn PvColumn_new(): PvColumn {
+    var c: PvColumn;
+    c.data = 0;
+    c.len = 0;
+    c.cap = 0;
+    return c;
+}
+
+impl PvColumn {
+    # The number of slots in use. Mirrors `Vec::len`.
+    #must_use
+    fn len(self): i64 {
+        return self.len;
+    }
+
+    # Room for at least `n` slots: 1, or 0 when the memory isn't there (the column unchanged). Mirrors
+    # `Vec::reserve` to a total of n.
+    #must_use
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var d = fl_alloc(n * 8);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 8); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = n;
+        return 1;
+    }
+
+    # Appends the word w: 1, or 0 when the column can't grow (unchanged). The capacity doubles from 8.
+    # Mirrors `Vec::push`.
+    #must_use
+    fn push(self, w): i64 {
+        if (self.len == self.cap) {
+            var want = self.cap * 2;
+            if (want < 8) { want = 8; }
+            if (self.reserve(want) == 0) { return 0; }
+        }
+        store64(self.data + self.len * 8, w);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # Appends x's bits. Mirrors `Vec::<f64>::push`.
+    #must_use
+    fn push_f(self, x: f64): i64 {
+        return self.push(_pv_bits(x));
+    }
+
+    # Slot i as a word, or 0 out of range. Mirrors `v[i]` on a `Vec<u8>`.
+    #must_use
+    fn get(self, i): i64 {
+        if (i < 0 || i >= self.len) { return 0; }
+        return load64(self.data + i * 8);
+    }
+
+    # Slot i as an f64, or NaN out of range. Mirrors `v[i]` on a `Vec<f64>`.
+    #must_use
+    fn get_f(self, i): f64 {
+        if (i < 0 || i >= self.len) {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+        var x: f64 = load64(self.data + i * 8);
+        return x;
+    }
+
+    # Sets slot i to the word w: 1, or 0 out of range (nothing written). Mirrors `v[i] = w`.
+    fn set(self, i, w): i64 {
+        if (i < 0 || i >= self.len) { return 0; }
+        store64(self.data + i * 8, w);
+        return 1;
+    }
+
+    # Sets slot i to x: 1, or 0 out of range. Mirrors `v[i] = x`.
+    fn set_f(self, i, x: f64): i64 {
+        return self.set(i, _pv_bits(x));
+    }
+
+    # Shortens the column to `n` slots (no effect when it is not longer). Mirrors `Vec::truncate`.
+    fn truncate(self, n) {
+        if (n >= 0 && n < self.len) { self.len = n; }
+        return 0;
+    }
+
+    # Releases the storage; the column is empty and usable again. Mirrors dropping the `Vec`.
+    fn drop(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}

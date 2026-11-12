@@ -1,0 +1,64 @@
+# error.cyr — pravash's error codes (port of rust-old/src/error.rs).
+#
+# A fallible pravash function returns a value-form Result whose Err payload is one of these codes:
+# `var t, v = f(..); if (is_err_result(t) == 1) { .. v is the code .. }`. The golden token
+# `E:InvalidTimestep` is PV_ERR_INVALID_TIMESTEP: PV_ERR_ + snake(variant). The values follow the Rust variant
+# order and are append-only (the Cyrius form of #[non_exhaustive]).
+#
+# The Rust variants carry their inputs (`InvalidTimestep { dt }`) or a reason string
+# (`InvalidParameter { reason }`); the code carries neither (ADR 0002 #1). Every payload restates what the
+# caller passed in, so the caller already has it. `pv_error_message(code)` gives thiserror's message up to its
+# first field, the part that doesn't depend on the payload.
+
+enum PvError {
+    PV_ERR_NONE = 0;
+    PV_ERR_INVALID_PARTICLE_COUNT = 1;
+    PV_ERR_INVALID_GRID_RESOLUTION = 2;
+    PV_ERR_INVALID_TIMESTEP = 3;
+    PV_ERR_INVALID_DENSITY = 4;
+    PV_ERR_INVALID_VISCOSITY = 5;
+    PV_ERR_INVALID_SMOOTHING_RADIUS = 6;
+    PV_ERR_CFL_VIOLATION = 7;
+    PV_ERR_DIVERGED = 8;
+    PV_ERR_INVALID_PARAMETER = 9;
+}
+
+# The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, or "Unknown" for a value
+# that is no code.
+#must_use
+fn pv_error_name(code): i64 {
+    match code {
+        PV_ERR_NONE => { return "None"; }
+        PV_ERR_INVALID_PARTICLE_COUNT => { return "InvalidParticleCount"; }
+        PV_ERR_INVALID_GRID_RESOLUTION => { return "InvalidGridResolution"; }
+        PV_ERR_INVALID_TIMESTEP => { return "InvalidTimestep"; }
+        PV_ERR_INVALID_DENSITY => { return "InvalidDensity"; }
+        PV_ERR_INVALID_VISCOSITY => { return "InvalidViscosity"; }
+        PV_ERR_INVALID_SMOOTHING_RADIUS => { return "InvalidSmoothingRadius"; }
+        PV_ERR_CFL_VIOLATION => { return "CflViolation"; }
+        PV_ERR_DIVERGED => { return "Diverged"; }
+        PV_ERR_INVALID_PARAMETER => { return "InvalidParameter"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# The Rust error's Display text up to its first field (`"invalid timestep"` for `invalid timestep: -1 (must be
+# > 0)`). "no error" for PV_ERR_NONE and "unknown error" for a value that is no code.
+#must_use
+fn pv_error_message(code): i64 {
+    match code {
+        PV_ERR_NONE => { return "no error"; }
+        PV_ERR_INVALID_PARTICLE_COUNT => { return "invalid particle count"; }
+        PV_ERR_INVALID_GRID_RESOLUTION => { return "invalid grid resolution"; }
+        PV_ERR_INVALID_TIMESTEP => { return "invalid timestep"; }
+        PV_ERR_INVALID_DENSITY => { return "density out of range"; }
+        PV_ERR_INVALID_VISCOSITY => { return "viscosity out of range"; }
+        PV_ERR_INVALID_SMOOTHING_RADIUS => { return "smoothing radius must be positive"; }
+        PV_ERR_CFL_VIOLATION => { return "CFL condition violated"; }
+        PV_ERR_DIVERGED => { return "simulation diverged"; }
+        PV_ERR_INVALID_PARAMETER => { return "invalid parameter"; }
+        _ => { return "unknown error"; }
+    }
+    return "unknown error";
+}

@@ -73,3 +73,52 @@ Two pinned runs, within 3 % of each other; the table gives the second.
 These numbers go to the ganita request (ledger L1,
 `ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`) as the tier's third
 consumer's.
+
+## M1a part 3: common — particles, configuration, the SoA layout and the arena (2026-11-11)
+
+`common/*`, `soa/*` and `arena/*` in `tests/pravash.bcyr` against `scripts/probes/rust/src/bin/bench_common.rs`,
+the same bodies on the frozen pravash 1.3.0. Pinned and interleaved. The Cyrius column is the last of three runs; the
+first two are within 10 % except `config_validate`, which read 64 ns and then 100 ns with no code change, on a box
+whose noise is ±20 %.
+
+| Bench | Body | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `common/particle_new_2d` | build a 2D particle | 0.8 ns | 69 ns | 86× |
+| `common/kinetic_energy` | (0.5·m)·\|v\|² over 1,000 particles | 1.6 ns | 13 ns | 8× |
+| `common/config_validate` | `water_2d().validate()` | 12.5 ns | 64–100 ns | 5–8× |
+| `common/check_cfl` | the CFL check, 64 speeds | 1.6 ns | 13 ns | 8× |
+| `common/material_custom` | a validated material | 7.4 ns | 31 ns | 4.2× |
+| `soa/from_aos_1000` | 1,000 particles into 18 columns, then dropped | 16.9 µs | 206 µs | 12× |
+| `soa/to_aos_1000` | back to a new particle buffer, then freed | 11.2 µs | 99 µs | 8.8× |
+| `soa/write_to_aos_1000` | into an existing buffer | 6.5 µs | 36 µs | 5.6× |
+| `arena/cycle_1000` | `new(1000)`, 100 blocks of 10, every other freed, `compact` (500 records moved), drop | 8.3 µs | 110 µs | 13× |
+
+**The A/B that set two of these rows** (pinned and interleaved, two runs each; before → after):
+- **Record resets copy one default record**, `*q = d`, instead of storing ten fields and three `PvVec3_zero()`
+  results: `arena/cycle_1000` 163–183 µs → 109–126 µs.
+- **The SoA conversions move words straight between the records and the reserved columns**, instead of a
+  `push_f` / `get_f` call chain per field:
+  - `from_aos` 360–372 → 204–208 µs;
+  - `to_aos` 195 → 99–109 µs;
+  - `write_to_aos` 133–153 → 36–40 µs.
+
+  A particle record's 18 words are the 18 columns' order, so word k of record i is column k's slot i. The
+  round-trip rows pin that mapping: swapping two columns fails all 60.
+
+**Reading it.**
+- **A struct copy is the fast way to move a record.** Measured on 500 copies of a 144-byte particle:
+  - `*dst = *src` takes 11.7 ns a record;
+  - an 18-word `load64` / `store64` loop takes 37 ns;
+  - `memcpy` takes **245 ns**, because it copies a byte at a time.
+
+  So `compact` and the resets assign records, and the ledger's conditional L12 (a record copy of pravash's own)
+  closed unneeded. The numbers are on the open cyrius `memcpy` issue.
+- **What's left of `from_aos` and the arena cycle is the freelist's large blocks.**
+  - `fl_alloc` maps and unmaps every block over 4 KB, and each page faults on first touch: 60 µs for a 144 KB
+    arena, about 9 µs for each of the SoA's 18 columns of 8 KB.
+  - glibc's malloc reuses those buffers.
+  - Filed, with these numbers (`cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`).
+    Solvers allocate once, so no step pays it.
+- **Small bodies pay for calls and struct returns.** rustc inlines `new_2d` and `kinetic_energy` to a handful of
+  instructions. Cyrius calls each function and returns the 144-byte particle through a hidden pointer. Hot loops
+  read fields into f64 locals instead (port-parity §4.2).

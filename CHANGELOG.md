@@ -3,6 +3,55 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **error, vec3, common** (M1 part 3): the shared fluid types, the port of `rust-old/src/error.rs` and
+  `common.rs`.
+  - **`src/error.cyr`:** the `PV_ERR_*` codes in Rust's variant order, append-only, with `pv_error_name` and
+    `pv_error_message` (ADR 0002 #1).
+  - **`src/vec3.cyr`:** `PvVec3` with glam 0.29.3's `dot`, `length`, `distance` and `is_finite`, in glam's order. It
+    is a marked stand-in (`UPSTREAM(L3)`).
+  - **`src/common.cyr`:**
+    - `PvFluidMaterial`, with the five presets and `custom`;
+    - `PvFluidParticle`, a 144-byte record laid out as Rust's;
+    - `PvFluidConfig`, with `water_2d`, `validate` and `check_cfl`;
+    - `PvParticleSoa`, 18 columns;
+    - `PvArenaHandle` and `PvParticleArena`, whose free list is sorted and merged, whose handles go stale after
+      `compact`, and which allocates nothing after `new`.
+  - **`src/column.cyr`:** the freelist column the SoA's `Vec` fields become. It frees on growth and never aborts. It
+    is a marked stand-in (`UPSTREAM(L13)`), because the stdlib `vec` keeps outgrown buffers and aborts on a bad
+    index (filed).
+  - **API shapes:** ADR 0002 rows 8 and 9.
+    - Nothing aborts: a Rust panic becomes NaN, 0 or an empty view.
+    - `Option<ArenaHandle>` is an out pointer plus 1 / 0, and a slice is (pointer, count).
+    - Destructors are `_drop`.
+  - **Parity:** the golden module `tests/golden/common.tsv`, 3,683 rows, 59 of them arena scenarios.
+    - `validate.py` recomputes every row, with a Python transcription of the arena.
+    - All rows are bit-exact on the first replay, on x86_64 ELF, x86_64 PE and aarch64.
+    - The replay is 34,454 ok and 43 accepted (ADR 4).
+  - **Tests:** `tests/common.tcyr` ports 47 of `common.rs`'s 49 Rust tests; the two serde tests come with part 4's
+    JSON. `tests/error.tcyr` ports the six error tests.
+  - **Surface parity:** `scripts/surface_parity.py` (impetus's) checks every public Rust item of the ported modules
+    against its Cyrius name (98 items), and now runs in CI.
+
+### Performance
+- **The `common` benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M1 part 3),
+  against a Rust 1.3.0 twin (`scripts/probes/rust/src/bin/bench_common.rs`).
+
+  | Bench | Rust 1.3.0 | Cyrius |
+  |---|---|---|
+  | `soa/from_aos_1000` | 16.9 µs | 206 µs |
+  | `soa/write_to_aos_1000` | 6.5 µs | 36 µs |
+  | `arena/cycle_1000` | 8.3 µs | 110 µs |
+  | `common/config_validate` | 12.5 ns | 64–100 ns |
+
+  Two changes, measured A/B (pinned, interleaved):
+  - **Record resets** copy one default record: `arena/cycle_1000` from 163–183 µs to 109–126 µs.
+  - **The SoA conversions** move words straight between records and columns: `from_aos` 1.8×, `to_aos` 1.9×,
+    `write_to_aos` 3.6× faster.
+
+  The rest is the freelist mapping each block over 4 KB, which is filed upstream.
+- **Ledger L12 closed, no stand-in needed.** A struct assignment copies a 144-byte particle in 11.7 ns, against
+  `memcpy`'s 245 ns. Every particle move is an assignment. The numbers are on the open cyrius `memcpy` issue.
+
 - **crmath and crlog** (M1 part 2, [ADR 0004](docs/adr/0004-correct-rounding-is-the-accuracy-target.md)): every
   std transcendental pravash calls is now correctly rounded, the same bits on every target. Each file is a marked
   stand-in (`UPSTREAM(L1)`) until ganita's correctly rounded tier ships.

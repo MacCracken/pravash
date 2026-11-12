@@ -11,13 +11,15 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M1 in progress** (2026-11-11). M0 is complete (§4). M1 parts 1 and 2 are done:
+> ⏳ **Status: M1 in progress** (2026-11-11). M0 is complete (§4). M1 parts 1–3 are done:
 > - `src/mathx.cyr`, the first `[lib]` and the bundle;
 > - the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`), gated at 0 ulp against the MPFR-corrected
->   oracle (ADR 0004).
+>   oracle (ADR 0004);
+> - `src/error.cyr`, `src/vec3.cyr` and `src/common.cyr`: 3,683 common rows bit-exact, 47 Rust tests ported, surface
+>   parity in CI.
 >
-> Every math row but the M4 cell key is gated: 30,771 ok and 43 accepted (ADR 4), identical on three targets. Next is
-> part 3 (error, vec3, common).
+> 34,454 rows ok and 43 accepted (ADR 4), identical on three targets; only the M4 cell key is pending. Next is part
+> 4 (buoyancy, vortex, bridge, the M1 JSON).
 
 | Thing | Value | Source |
 |---|---|---|
@@ -710,7 +712,8 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 
 Probe 1 settles this:
 - **Solver lifetime**: particles, grid fields, neighbour structures and persistent buffers live in storage the
-  solver owns, freed by its `_free`.
+  solver owns, freed by its `_drop` (`PvSphSolver_drop`; not `_free`, which `ParticleArena::free(handle)` already
+  names: ADR 0002 #9).
 - **Step lifetime**: candidate lists, the `accels` arrays (which 1.3 allocates each step) and solver scratch
   live in a step arena that is reset at the start of every step. Each worker thread gets its own slice of it.
 - **JSON** decoding allocates (the derive returns a fresh struct), which is fine: it is never on the step path.
@@ -766,10 +769,13 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | L9 | open | `src/sph_fns.cyr`: a stable merge sort on (key, input index) (ADR 0002 #3; port-parity §4.5) | `vec_sort_by` is introsort; no stable sort exists | `cyrius:docs/development/issues/2026-11-11-no-stable-sort.md` | the stdlib's stable sort | the z-order rows (class A) |
 | L10 | open | `src/json.cyr`: hand codecs for `DVec3` fields (`[x, y, z]`) and the data-carrying enums | `#derive` has no array form for a vector struct and no externally tagged data variants | `cyrius:docs/development/issues/2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md` | `#derive(Serialize)` / `#derive(Deserialize)` | the JSON table (class A) |
 | L11 | open | `src/logging.cyr`: a chrome://tracing writer over sakshi's spans (M7) | sakshi 2.5.10 has spans and text outputs, but no Trace Event export (checked at M0 step 10) | `sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md` | sakshi's exporter | the logging test |
-| L12 | conditional | an 8-byte-chunk record copy for particles, if M1's benchmarks show `memcpy` dominating | `memcpy` copies a byte at a time | the open `cyrius:docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` (being edited elsewhere; pravash adds its numbers at M1, with the measurement) | stdlib `memcpy` | none (it moves bytes); the benchmark rows |
+| L12 | closed | (none needed) an 8-byte-chunk record copy for particles, had M1's benchmarks shown `memcpy` dominating. Closed at M1 part 3: struct assignment `*dst = *src` copies a 144-byte record word-wise in 11.7 ns, against `memcpy`'s 245 ns, and every particle move is an assignment (benchmarks-rust-v-cyrius, M1 part 3) | `memcpy` copies a byte at a time | the open `cyrius:docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` (pravash's numbers added 2026-11-11) | stdlib `memcpy`, where raw bytes are copied | none |
+| L13 | open | `src/column.cyr`: a growable column of 8-byte slots on the freelist (push doubling and freeing the outgrown buffer, `drop`, NaN / 0 on a bad index), what `ParticleSoa`'s `Vec<f64>` / `Vec<u8>` fields become | `vec_push_a` never frees the outgrown buffer, even through a freeing Allocator, there is no `vec_free`, and `vec_get` / `vec_set` abort on a bad index | `cyrius:docs/development/issues/2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md` | the stdlib `vec` with a freeing grow, `vec_free_a` and non-aborting access | the ParticleSoa rows of `tests/golden/common.tsv` (class A) |
 
 **Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
+
+**Also filed at M1, outside the ledger** (a finding with no stand-in): `cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`. `fl_alloc` maps and unmaps every block over 4 KB, so building and dropping an arena or an SoA store pays an mmap and a page fault per page. Solvers allocate once, so the step path is untouched.
 
 ---
 
@@ -798,7 +804,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
   - nine upstream requests filed, four open issues extended, and the ledger seeded and checked in CI.
 
   Next: M1 |
-| M1 Foundation | ⏳ in progress | math: 30,771 ok, 43 accepted (ADR 4), 0 failed, 0 measured, 2,460 pending (the M4 cell key) | `tests/crmath.tcyr` (85 checks) | `math/*`: 10 primitives against Rust's glibc | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
+| M1 Foundation | ⏳ in progress | common 3,683 + math: 34,454 ok, 43 accepted (ADR 4), 0 failed, 0 measured, 2,460 pending (the M4 cell key) | `tests/crmath.tcyr` (85 checks), `tests/common.tcyr` (47 Rust tests, 108 checks), `tests/error.tcyr` (6, 15) | `math/*` (10 primitives against Rust's glibc); `common/*`, `soa/*`, `arena/*` (9 against Rust 1.3.0) | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
 
 **Part 2 done 2026-11-11** (port-parity §6, ADR 0004): the correctly rounded primitives (`UPSTREAM(L1)`):
 - `src/crmath.cyr` (impetus's crmath: exp, sin, cos, sin_cos, hypot, pow, atan2) and `src/crlog.cyr` (kimiya's ln, log10);
@@ -808,7 +814,15 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - K = 0 for every class C math function, powf and log10 included: all 43 corrected rows accepted, identical on three targets;
 - `tests/crmath.tcyr` and the first benchmark record (`docs/benchmarks-rust-v-cyrius.md`).
 
-**Then:** part 3 (error, vec3, common, with surface parity from here on) and part 4 (buoyancy, vortex, bridge, the M1 JSON) |
+**Part 3 done 2026-11-11** (port-parity §7): `src/error.cyr` (`PV_ERR_*`), `src/vec3.cyr` (`UPSTREAM(L3)`), `src/column.cyr` (`UPSTREAM(L13)`, filed) and `src/common.cyr`:
+- the golden module `common.tsv`, 3,683 rows (59 arena scenarios among them), recomputed by `validate.py` and bit-exact on the first replay on three targets;
+- the ported Rust tests (the 2 serde tests wait for part 4);
+- `scripts/surface_parity.py` in CI, 98 items ok;
+- ADR 0002 rows 8 (no aborts) and 9 (out pointers, views, `_drop`);
+- L12 closed: struct assignment copies records word-wise, 21× faster than `memcpy`;
+- the freelist's large-block cost filed upstream.
+
+**Then:** part 4 (buoyancy, vortex, bridge, the M1 JSON and the two serde tests) |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |
 | M4 SPH foundations | — | — | — | — | |

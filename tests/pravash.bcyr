@@ -146,6 +146,147 @@ fn bench_math() {
     return 0;
 }
 
+# ── common, ParticleSoa, ParticleArena (M1 part 3) ─────────────────────────────────────────────
+# The bodies of scripts/probes/rust/src/bin/bench_common.rs, on the same inputs.
+
+var NB = 10000;
+
+# 1,000 particles on a 40-wide lattice, each with a velocity (the Rust twin's `particles()`).
+fn _bench_particles(): i64 {
+    var buf = fl_alloc(1000 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var x: f64 = f64_from(i % 40) * 0.025;
+        var y: f64 = f64_from(i / 40) * 0.025;
+        var p: PvFluidParticle = PvFluidParticle_new_2d(x, y, 0.001);
+        var vx: f64 = f64_from(i % 7) * 0.1;
+        var vy: f64 = f64_from(i % 5) * 0.2;
+        p.velocity = PvVec3_new(vx, -vy, 0.0);
+        var q: *PvFluidParticle = ps + i;
+        *q = p;
+    }
+    return buf;
+}
+
+fn bench_common() {
+    var buf = _bench_particles();
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+
+    var b = bench_new("common/particle_new_2d");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var x: f64 = f64_from(i & 1023);
+        var p: PvFluidParticle = PvFluidParticle_new_2d(x, 0.5, 0.001);
+        g_sink = g_sink ^ _pv_bits(p.position.x);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("common/kinetic_energy");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var q: *PvFluidParticle = ps + (i % 1000);
+        var e: f64 = q.kinetic_energy();
+        g_sink = g_sink ^ _pv_bits(e);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    b = bench_new("common/config_validate");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var t, v = cfg.validate();
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("common/check_cfl");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var sp: f64 = f64_from(i & 63);
+        var t2, v2 = cfg.check_cfl(sp);
+        g_sink = g_sink ^ t2;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("common/material_custom");
+    var m: PvFluidMaterial;
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var t3, v3 = PvFluidMaterial_custom(800.0, 0.01, 0.05, 1400.0, &m);
+        g_sink = g_sink ^ _pv_bits(m.density);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    var s: PvParticleSoa;
+    b = bench_new("soa/from_aos_1000");
+    bench_batch_start(b);
+    for (var i = 0; i < NB; i = i + 1) {
+        var ok = PvParticleSoa_from_aos(&s, ps, 1000);
+        g_sink = g_sink ^ _pv_bits(s.pos_x.get_f(999));
+        PvParticleSoa_drop(&s);
+    }
+    bench_batch_stop(b, NB);
+    bench_report(b);
+
+    var ok2 = PvParticleSoa_from_aos(&s, ps, 1000);
+    b = bench_new("soa/to_aos_1000");
+    bench_batch_start(b);
+    for (var i = 0; i < NB; i = i + 1) {
+        var bp, bn = s.to_aos();
+        var last: *PvFluidParticle = _pv_as_particles(bp) + 999;
+        g_sink = g_sink ^ _pv_bits(last.position.x);
+        fl_free(bp);
+    }
+    bench_batch_stop(b, NB);
+    bench_report(b);
+
+    var outb = _bench_particles();
+    var outp: *PvFluidParticle = _pv_as_particles(outb);
+    b = bench_new("soa/write_to_aos_1000");
+    bench_batch_start(b);
+    for (var i = 0; i < NB; i = i + 1) {
+        s.write_to_aos(outp, 1000);
+        var lw: *PvFluidParticle = outp + 999;
+        g_sink = g_sink ^ _pv_bits(lw.position.x);
+    }
+    bench_batch_stop(b, NB);
+    bench_report(b);
+    PvParticleSoa_drop(&s);
+
+    # new(1000), 100 blocks of 10, every other one freed, then compact (500 records moved).
+    var hs = fl_alloc(100 * sizeof(PvArenaHandle));
+    b = bench_new("arena/cycle_1000");
+    bench_batch_start(b);
+    for (var i = 0; i < NB; i = i + 1) {
+        var a: *PvParticleArena = PvParticleArena_new(1000);
+        var hp: *PvArenaHandle = _bench_handles(hs);
+        for (var k = 0; k < 100; k = k + 1) { var got = a.alloc(10, hp + k); }
+        for (var k = 0; k < 100; k = k + 2) {
+            var h: *PvArenaHandle = hp + k;
+            a.free(*h);
+        }
+        g_sink = g_sink ^ a.compact();
+        PvParticleArena_drop(a);
+    }
+    bench_batch_stop(b, NB);
+    bench_report(b);
+    fl_free(hs);
+    fl_free(outb);
+    fl_free(buf);
+    return 0;
+}
+
+# A typed view of a word.
+#must_use
+fn _bench_handles(p): *PvArenaHandle {
+    return p;
+}
+
 fn main(): i64 {
     alloc_init();
     _bx = alloc(8192);
@@ -157,6 +298,7 @@ fn main(): i64 {
     bench_batch_stop(b, NS);
     bench_report(b);
     bench_math();
+    bench_common();
     return 0;
 }
 

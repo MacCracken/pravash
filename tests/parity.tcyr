@@ -31,11 +31,10 @@ include "tests/constants_rows.cyr"
 
 # ── hooks ───────────────────────────────────────────────────────────────────────────
 
-# The Rust variant name of an error code. src/error.cyr (M1) brings the real table; until then no
-# dispatcher returns an error.
+# The Rust variant name of an error code (src/error.cyr), which the golden `E:<Variant>` token names.
 #must_use
 fn _par_error_name(code): i64 {
-    return "Unknown";
+    return pv_error_name(code);
 }
 
 # ── cross-target digests (M0 step 8) ────────────────────────────────────────────────
@@ -183,8 +182,290 @@ fn _par_math(fp, fl): i64 {
     return 0;
 }
 
+# ── common (M1 part 3) ──────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_common.rs. A particle is 18 tokens, a config 14, a material 4.
+
+# The particle whose 18 tokens start at input k, into *p.
+fn _par_particle_in(k, p: *PvFluidParticle) {
+    p.position = PvVec3_new(_par_in(k), _par_in(k + 1), _par_in(k + 2));
+    p.velocity = PvVec3_new(_par_in(k + 3), _par_in(k + 4), _par_in(k + 5));
+    p.acceleration = PvVec3_new(_par_in(k + 6), _par_in(k + 7), _par_in(k + 8));
+    p.density = _par_in(k + 9);
+    p.pressure = _par_in(k + 10);
+    p.mass = _par_in(k + 11);
+    p.phase = _par_in(k + 12);
+    var c0: f64 = _par_in(k + 13);
+    var c1: f64 = _par_in(k + 14);
+    var c2: f64 = _par_in(k + 15);
+    p.conformation = (c0, c1, c2);
+    p.temperature = _par_in(k + 16);
+    p.fuel = _par_in(k + 17);
+    return 0;
+}
+
+# Appends the particle's 18 tokens.
+fn _par_particle_out(p: *PvFluidParticle) {
+    _par_got_f(_pv_bits(p.position.x));
+    _par_got_f(_pv_bits(p.position.y));
+    _par_got_f(_pv_bits(p.position.z));
+    _par_got_f(_pv_bits(p.velocity.x));
+    _par_got_f(_pv_bits(p.velocity.y));
+    _par_got_f(_pv_bits(p.velocity.z));
+    _par_got_f(_pv_bits(p.acceleration.x));
+    _par_got_f(_pv_bits(p.acceleration.y));
+    _par_got_f(_pv_bits(p.acceleration.z));
+    _par_got_f(_pv_bits(p.density));
+    _par_got_f(_pv_bits(p.pressure));
+    _par_got_f(_pv_bits(p.mass));
+    _par_got_i(p.phase);
+    _par_got_f(_pv_bits(p.conformation.0));
+    _par_got_f(_pv_bits(p.conformation.1));
+    _par_got_f(_pv_bits(p.conformation.2));
+    _par_got_f(_pv_bits(p.temperature));
+    _par_got_f(_pv_bits(p.fuel));
+    return 0;
+}
+
+# The config whose 14 tokens start at input k, into *c.
+fn _par_config_in(k, c: *PvFluidConfig) {
+    c.dt = _par_in(k);
+    c.gravity = PvVec3_new(_par_in(k + 1), _par_in(k + 2), _par_in(k + 3));
+    c.smoothing_radius = _par_in(k + 4);
+    c.gas_constant = _par_in(k + 5);
+    c.rest_density = _par_in(k + 6);
+    c.bounds_min = PvVec3_new(_par_in(k + 7), _par_in(k + 8), _par_in(k + 9));
+    c.bounds_max = PvVec3_new(_par_in(k + 10), _par_in(k + 11), _par_in(k + 12));
+    c.boundary_damping = _par_in(k + 13);
+    return 0;
+}
+
+# Appends the config's 14 tokens.
+fn _par_config_out(c: *PvFluidConfig) {
+    _par_got_f(_pv_bits(c.dt));
+    _par_got_f(_pv_bits(c.gravity.x));
+    _par_got_f(_pv_bits(c.gravity.y));
+    _par_got_f(_pv_bits(c.gravity.z));
+    _par_got_f(_pv_bits(c.smoothing_radius));
+    _par_got_f(_pv_bits(c.gas_constant));
+    _par_got_f(_pv_bits(c.rest_density));
+    _par_got_f(_pv_bits(c.bounds_min.x));
+    _par_got_f(_pv_bits(c.bounds_min.y));
+    _par_got_f(_pv_bits(c.bounds_min.z));
+    _par_got_f(_pv_bits(c.bounds_max.x));
+    _par_got_f(_pv_bits(c.bounds_max.y));
+    _par_got_f(_pv_bits(c.bounds_max.z));
+    _par_got_f(_pv_bits(c.boundary_damping));
+    return 0;
+}
+
+# Appends a unit Result: nothing for Ok, `E:<Variant>` for Err.
+fn _par_unit_out(t, v) {
+    if (is_err_result(t) == 1) { _par_got_err(v); }
+    return 0;
+}
+
+# Particle k of a (pointer, count) view.
+fn _par_pk(p, k): *PvFluidParticle {
+    var ps: *PvFluidParticle = _pv_as_particles(p);
+    return ps + k;
+}
+
+# A typed view of a word.
+#must_use
+fn _par_as_handles(p): *PvArenaHandle {
+    return p;
+}
+
+# One `ParticleArena::scenario` row (the op codes: scripts/oracle/src/m_common.rs).
+fn _par_arena_scenario(): i64 {
+    var cap = _par_in(0);
+    var a: *PvParticleArena = PvParticleArena_new(cap);
+    if (a == 0) { return 0 - 1; }
+    var nops = (_par_in_n - 1) / 4;
+    var issued = fl_alloc(nops * sizeof(PvArenaHandle) + 8);
+    var hs: *PvArenaHandle = _par_as_handles(issued);
+    var ni = 0;
+    for (var k = 0; k < nops; k = k + 1) {
+        var code = _par_in(1 + k * 4);
+        var arg = _par_in(2 + k * 4);
+        if (code == 0) {
+            var h: PvArenaHandle;
+            if (a.alloc(arg, &h) == 1) {
+                _par_got_i(1);
+                _par_got_i(h.start);
+                _par_got_i(h.len);
+                _par_got_i(h.generation);
+                var bp, bn = a.get_mut(h);
+                var mass: f64 = f64_from(k + 1);
+                for (var j = 0; j < bn; j = j + 1) { _par_pk(bp, j).mass = mass; }
+                var slot: *PvArenaHandle = hs + ni;
+                *slot = h;
+                ni = ni + 1;
+            } else {
+                _par_got_i(0);
+                _par_got_i(0);
+                _par_got_i(0);
+                _par_got_i(0);
+            }
+        } elif (code == 1 || code == 3) {
+            if (ni == 0) {
+                _par_got_i(0 - 1);
+            } else {
+                var src: *PvArenaHandle = hs + (arg % ni);
+                var hi: PvArenaHandle = *src;
+                if (code == 1) {
+                    a.free(hi);
+                    _par_got_i(a.active_count());
+                } else {
+                    var gp, gn = a.get(hi);
+                    _par_got_i(gn);
+                }
+            }
+        } elif (code == 2) {
+            _par_got_i(a.compact());
+        } else {
+            var hf: PvArenaHandle;
+            hf.start = arg;
+            hf.len = _par_in(3 + k * 4);
+            hf.generation = _par_in(4 + k * 4);
+            if (code == 4) {
+                a.free(hf);
+                _par_got_i(a.active_count());
+            } else {
+                var fp2, fn2 = a.get(hf);
+                _par_got_i(fn2);
+            }
+        }
+    }
+    _par_got_i(a.watermark);
+    _par_got_i(a.generation);
+    _par_got_seq(a.free_count * 2);
+    for (var q = 0; q < a.free_count; q = q + 1) {
+        _par_got_i(a._fs(q));
+        _par_got_i(a._fl(q));
+    }
+    var rp, rn = a.raw_slice();
+    _par_got_seq(rn);
+    for (var r = 0; r < rn; r = r + 1) { _par_got_f(_pv_bits(_par_pk(rp, r).mass)); }
+    fl_free(issued);
+    PvParticleArena_drop(a);
+    return 1;
+}
+
+# `common` rows: src/common.cyr.
+fn _par_common(fp, fl): i64 {
+    if (_par_eq(fp, fl, "FluidMaterial::custom") == 1) {
+        var m: PvFluidMaterial;
+        var t, v = PvFluidMaterial_custom(_par_in(0), _par_in(1), _par_in(2), _par_in(3), &m);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_f(_pv_bits(m.density));
+        _par_got_f(_pv_bits(m.viscosity));
+        _par_got_f(_pv_bits(m.surface_tension));
+        _par_got_f(_pv_bits(m.speed_of_sound));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidParticle::new") == 1) {
+        var p: PvFluidParticle = PvFluidParticle_new(PvVec3_new(_par_in(0), _par_in(1), _par_in(2)), _par_in(3));
+        _par_particle_out(&p);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidParticle::new_2d") == 1) {
+        var p2: PvFluidParticle = PvFluidParticle_new_2d(_par_in(0), _par_in(1), _par_in(2));
+        _par_particle_out(&p2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidParticle::speed_squared") == 1 || _par_eq(fp, fl, "FluidParticle::speed") == 1
+      || _par_eq(fp, fl, "FluidParticle::kinetic_energy") == 1) {
+        var q: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, _par_in(3));
+        q.velocity = PvVec3_new(_par_in(0), _par_in(1), _par_in(2));
+        var r: f64 = q.kinetic_energy();
+        if (_par_eq(fp, fl, "FluidParticle::speed_squared") == 1) { r = q.speed_squared(); }
+        if (_par_eq(fp, fl, "FluidParticle::speed") == 1) { r = q.speed(); }
+        _par_got_f(_pv_bits(r));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidParticle::distance_squared_to") == 1
+      || _par_eq(fp, fl, "FluidParticle::distance_to") == 1) {
+        var a: PvFluidParticle = PvFluidParticle_new(PvVec3_new(_par_in(0), _par_in(1), _par_in(2)), 1.0);
+        var b: PvFluidParticle = PvFluidParticle_new(PvVec3_new(_par_in(3), _par_in(4), _par_in(5)), 1.0);
+        var d: f64 = a.distance_to(&b);
+        if (_par_eq(fp, fl, "FluidParticle::distance_squared_to") == 1) { d = a.distance_squared_to(&b); }
+        _par_got_f(_pv_bits(d));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ParticleSoa::distance_squared") == 1) {
+        var two = fl_alloc(2 * sizeof(PvFluidParticle));
+        var pa: PvFluidParticle = PvFluidParticle_new(PvVec3_new(_par_in(0), _par_in(1), _par_in(2)), 1.0);
+        var pb: PvFluidParticle = PvFluidParticle_new(PvVec3_new(_par_in(3), _par_in(4), _par_in(5)), 1.0);
+        *_par_pk(two, 0) = pa;
+        *_par_pk(two, 1) = pb;
+        var s: PvParticleSoa;
+        if (PvParticleSoa_from_aos(&s, _par_pk(two, 0), 2) == 0) { return 0 - 1; }
+        var ds: f64 = s.distance_squared(0, 1);
+        _par_got_f(_pv_bits(ds));
+        PvParticleSoa_drop(&s);
+        fl_free(two);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidConfig::water_2d") == 1) {
+        var c: PvFluidConfig = PvFluidConfig_water_2d();
+        _par_config_out(&c);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidConfig::validate") == 1) {
+        var cv: PvFluidConfig;
+        _par_config_in(0, &cv);
+        var tv, vv = cv.validate();
+        _par_unit_out(tv, vv);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidConfig::check_cfl") == 1) {
+        var cc: PvFluidConfig;
+        _par_config_in(0, &cc);
+        var tc, vc = cc.check_cfl(_par_in(14));
+        _par_unit_out(tc, vc);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ParticleSoa::roundtrip") == 1) {
+        var one = fl_alloc(sizeof(PvFluidParticle));
+        _par_particle_in(0, _par_pk(one, 0));
+        var s1: PvParticleSoa;
+        if (PvParticleSoa_from_aos(&s1, _par_pk(one, 0), 1) == 0) { return 0 - 1; }
+        var bp, bn = s1.to_aos();
+        if (bn != 1) { return 0 - 1; }
+        _par_particle_out(_par_pk(bp, 0));
+        fl_free(bp);
+        PvParticleSoa_drop(&s1);
+        fl_free(one);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ParticleSoa::consistent_len") == 1) {
+        var six = fl_alloc(6 * sizeof(PvFluidParticle));
+        var base: PvFluidParticle = PvFluidParticle_new_2d(1.0, 2.0, 1.0);
+        for (var i = 0; i < 6; i = i + 1) { *_par_pk(six, i) = base; }
+        var s6: PvParticleSoa;
+        if (PvParticleSoa_from_aos(&s6, _par_pk(six, 0), 6) == 0) { return 0 - 1; }
+        for (var k = 0; k < 18; k = k + 1) {
+            var col: *PvColumn = _pv_soa_col(&s6, k);
+            col.truncate(_par_in(k));
+        }
+        _par_got_i(s6.len());
+        _par_got_i(s6.consistent_len());
+        _par_got_i(s6.is_consistent());
+        var ap, an = s6.to_aos();
+        _par_got_i(an);
+        if (ap != 0) { fl_free(ap); }
+        PvParticleSoa_drop(&s6);
+        fl_free(six);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ParticleArena::scenario") == 1) { return _par_arena_scenario(); }
+    return 0;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
+    if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;

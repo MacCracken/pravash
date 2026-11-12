@@ -1,0 +1,67 @@
+# error.tcyr — the ported Rust tests of rust-old/src/error.rs (M1 part 3).
+#
+# The Rust tests format each error with its payload (`InvalidGridResolution { nx: 0, ny: 10 }` displays
+# "0x10"). The Cyrius code carries no payload (ADR 0002 #1), so each test is re-expressed against the code: the
+# variant's name and message, and the Result that carries it.
+
+include "tests/lib.cyr"
+
+# 1 when C strings a and b are equal.
+fn cs_eq(a, b): i64 {
+    var n = strlen(a);
+    if (n != strlen(b)) { return 0; }
+    return memeq(a, b, n);
+}
+
+# A function that fails with `code`, as a fallible pravash function does.
+fn fails_with(code): Result {
+    return Err(code);
+}
+
+# Runs the ported error tests.
+fn main() {
+    alloc_init();
+
+    test_group("test_invalid_particle_count");
+    assert(cs_eq(pv_error_name(PV_ERR_INVALID_PARTICLE_COUNT), "InvalidParticleCount") == 1, "name");
+    assert(cs_eq(pv_error_message(PV_ERR_INVALID_PARTICLE_COUNT), "invalid particle count") == 1, "message");
+
+    test_group("test_invalid_grid");
+    assert(cs_eq(pv_error_name(PV_ERR_INVALID_GRID_RESOLUTION), "InvalidGridResolution") == 1, "name");
+    assert(cs_eq(pv_error_message(PV_ERR_INVALID_GRID_RESOLUTION), "invalid grid resolution") == 1, "message");
+
+    test_group("test_cfl_violation");
+    assert(cs_eq(pv_error_name(PV_ERR_CFL_VIOLATION), "CflViolation") == 1, "name");
+    assert(cs_eq(pv_error_message(PV_ERR_CFL_VIOLATION), "CFL condition violated") == 1, "message");
+
+    test_group("test_diverged");
+    assert(cs_eq(pv_error_name(PV_ERR_DIVERGED), "Diverged") == 1, "name");
+    assert(cs_eq(pv_error_message(PV_ERR_DIVERGED), "simulation diverged") == 1, "message");
+
+    test_group("test_diverged_static");
+    # Rust's Cow<'static, str> reason; the code is the same either way.
+    var t, v = fails_with(PV_ERR_DIVERGED);
+    assert(is_err_result(t) == 1 && v == PV_ERR_DIVERGED, "Err(PV_ERR_DIVERGED)");
+
+    test_group("test_result_alias");
+    var t2, v2 = fails_with(PV_ERR_NONE);
+    assert(is_err_result(t2) == 1 && v2 == PV_ERR_NONE, "a Result carries the code");
+
+    test_group("codes_are_append_only");
+    # The values are the Rust variant order, 1 … 9, never renumbered.
+    assert_eq(PV_ERR_INVALID_PARTICLE_COUNT, 1, "InvalidParticleCount = 1");
+    assert_eq(PV_ERR_INVALID_PARAMETER, 9, "InvalidParameter = 9");
+    var named = 0;
+    for (var c = 1; c <= 9; c = c + 1) {
+        if (cs_eq(pv_error_name(c), "Unknown") == 0) { named = named + 1; }
+    }
+    assert_eq(named, 9, "every code 1 … 9 has a Rust name");
+    assert(cs_eq(pv_error_name(10), "Unknown") == 1, "10 is no code");
+    assert(cs_eq(pv_error_message(0 - 1), "unknown error") == 1, "-1 is no code");
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

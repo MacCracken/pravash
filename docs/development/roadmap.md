@@ -41,7 +41,8 @@
 - [x] M1 part 1: `src/mathx.cyr`, the first `[lib]` and `dist/pravash.cyr` (6,371 rows newly gated, bit-exact)
 - [x] M1 part 2: `src/crmath.cyr`, `src/crlog.cyr` and the MPFR-corrected oracle (ADR 0004): every class C math
   row at 0 ulp, 43 rows more accurate than the oracle
-- [ ] M1 part 3: error, vec3, common (with surface parity); then part 4: buoyancy, vortex, bridge, the M1 JSON
+- [x] M1 part 3: error, vec3, common (3,683 rows bit-exact, 47 + 6 Rust tests ported, surface parity in CI)
+- [ ] M1 part 4: buoyancy, vortex, bridge, the M1 JSON (and common's two serde tests)
 
 ### 1.3.0
 

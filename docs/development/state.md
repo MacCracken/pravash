@@ -18,7 +18,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | Milestone | Status |
 |---|---|
 | M0 Initialize | ✅ **done 2026-11-11.** Step 0 (Rust, 2026-11-11): P(-1) gates green; the hidden `oracle` feature (dumps for all eleven stateful types, the SPH neighbour lists, the four pressure-solver hooks, the MLS inverse); `tests/oracle.rs` 14 tests, mutation-checked, green with and without `parallel`; `Cargo.lock` tracked; glibc 2.44. Step 1 (2026-11-11): `cyrius port` scaffold, with the Rust crate in `rust-old/`, which still passes there (351 unit, 33 integration, 14 oracle). Step 2: repairs done (CLAUDE.md, CI, docs, ADRs 0001–0003). Step 3: `cyrius.cyml`, with hisab 3.4.1 test-scoped; `build`, `test`, `test --bounds`, `bench`, `fuzz`, `lint`, `fmt`, `vet`, `deps --locked` and `audit` all green. Step 4: the semantics probe ([`port-parity.md`](port-parity.md) §1), with the helpers it calls for in ledger L2. Step 5: the golden-value generator (`scripts/oracle/`): constants 29 + math 33,239 rows, deterministic, reproduced by the parallel build, all recomputed by `validate.py`; the oracle's cbrt is compiler_builtins' (port-parity §3). Step 6: `src/constants.cyr` (14 public + 6 std float constants, both lists proven complete), every value compiled and compared by `probe_tables.py`. Step 7: the parity harness (`tests/parity.tcyr`): 5,149 ok, 0 failed, 18,493 measured, 9,632 pending; ganita's cbrt equals the oracle's. Step 8: the cross-target baselines: digests identical on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt; gated **21,852 ok, 0 failed** (port-parity §2.2). Step 9: the eight probes (port-parity §4): every hisab/ganita return leaks on the step path (the hash rebuild 4.1 MB per 1,000-particle step); AoS + f64 locals fastest, struct values 2.5×; f32 keys 10⁶/10⁶ on 3 targets; the neighbour order is (cell offset, insertion); a stable sort replaces ipnsort's tie order; serial = parallel in Rust, and a Cyrius persistent pool gives the serial bits at T = 1–8 (3.9× at 8); one bundle with DCE; hisab's DST is another algorithm (L6 transcribes), ganita's `mat_inv` gives the oracle's bits (L7 for memory only). Step 10: nine upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) with verified repros; pravash's numbers in four open issues; the conversion ledger seeded (11 open, 1 conditional) and checked by `scripts/upstream_ledger.py` in CI |
-| M1 Foundation | ⏳ **in progress.** Part 1 (2026-11-11): `src/mathx.cyr` (Rust-semantics min / max / clamp, predicates, to_radians, powi, saturating casts; `UPSTREAM(L2)`), the first `[lib]` and `dist/pravash.cyr`; 6,371 rows newly gated, bit-exact on three targets. Part 2 (2026-11-11, ADR 0004): the correctly rounded primitives, `src/crmath.cyr` (impetus's exp, sin, cos, sin_cos, hypot, pow, atan2) and `src/crlog.cyr` (kimiya's ln, log10), with generated tables (`UPSTREAM(L1)`); the MPFR-corrected oracle `tests/golden/math.cr.tsv` (the 43 rows glibc misrounds); K = 0 for every class C math function, all 43 corrected rows accepted, identical on three targets; `tests/crmath.tcyr`; the first benchmark record. Part 3 next: error, vec3, common |
+| M1 Foundation | ⏳ **in progress.** Part 1 (2026-11-11): `src/mathx.cyr` (Rust-semantics min / max / clamp, predicates, to_radians, powi, saturating casts; `UPSTREAM(L2)`), the first `[lib]` and `dist/pravash.cyr`; 6,371 rows newly gated, bit-exact on three targets. Part 2 (2026-11-11, ADR 0004): the correctly rounded primitives, `src/crmath.cyr` (impetus's exp, sin, cos, sin_cos, hypot, pow, atan2) and `src/crlog.cyr` (kimiya's ln, log10), with generated tables (`UPSTREAM(L1)`); the MPFR-corrected oracle `tests/golden/math.cr.tsv` (the 43 rows glibc misrounds); K = 0 for every class C math function, all 43 corrected rows accepted, identical on three targets; `tests/crmath.tcyr`; the first benchmark record. Part 3 (2026-11-11): `src/error.cyr`, `src/vec3.cyr` (L3), `src/column.cyr` (L13) and `src/common.cyr` (materials, particles, config, SoA, arena); 3,683 common rows bit-exact on three targets; 47 + 6 Rust tests ported; surface parity in CI (98 items); L12 closed. Part 4 next: buoyancy, vortex, bridge, JSON |
 | M2–M8 | not started |
 
 ## Toolchain
@@ -32,33 +32,42 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 
 - **Rust oracle**: 6,882 library code lines in `rust-old/src/` (16 modules, 193 `pub fn`s) plus the `oracle`
   hooks. Frozen; never edited.
-- **Cyrius**: `[lib]` = `src/constants.cyr` (generated), `src/crmath_data.cyr` (generated), `src/crmath.cyr`,
-  `src/crlog_data.cyr` (generated), `src/crlog.cyr` and `src/mathx.cyr`, bundled as `dist/pravash.cyr` (4,009
-  lines); the scaffold's `src/main.cyr` stub.
+- **Cyrius**: `[lib]` = `src/error.cyr`, `src/constants.cyr` (generated), `src/crmath_data.cyr` (generated),
+  `src/crmath.cyr`, `src/crlog_data.cyr` (generated), `src/crlog.cyr`, `src/mathx.cyr`, `src/vec3.cyr`,
+  `src/column.cyr` and `src/common.cyr`, bundled as `dist/pravash.cyr`; the scaffold's `src/main.cyr` stub.
 
 ## Tests
 
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
 - **Cyrius**:
-  - `tests/parity.tcyr` replays the corpus: 2 modules, 0 failing; 30,771 ok, 43 accepted (ADR 4), 0 failed,
+  - `tests/parity.tcyr` replays the corpus: 3 modules, 0 failing; 34,454 ok, 43 accepted (ADR 4), 0 failed,
     0 measured, 2,460 pending (the SPH cell key until M4). Bits are identical on x86_64 ELF, x86_64 PE and aarch64.
   - `tests/crmath.tcyr`: 85 checks in 18 groups.
+  - `tests/common.tcyr`: 47 of `common.rs`'s 49 Rust tests (108 checks); the 2 serde tests wait for part 4.
+    `tests/error.tcyr`: the 6 error tests (15 checks).
+  - `scripts/surface_parity.py`: error and common, 98 items ok, 0 missing.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
-- **Golden corpus** (`tests/golden/`): constants 35, math 33,239 rows, and the corrected oracle `math.cr.tsv`
-  (43 rows, MPFR 4.2.2). `validate.py` 0 failures; `probe_tables.py` 35 of 35.
+- **Golden corpus** (`tests/golden/`): common 3,683, constants 35, math 33,239 rows, and the corrected oracle
+  `math.cr.tsv` (43 rows, MPFR 4.2.2). `validate.py` recomputes all 36,957 rows: 0 failures; `probe_tables.py` 35 of
+  35.
 - **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)): the
   10 primitives against Rust's glibc, on shared seeded arguments. The correctly rounded functions run 58 ns (ln) to
-  1.41 µs (atan2, whose mean comes from a rare slow path), 11–103× glibc.
+  1.41 µs (atan2, whose mean comes from a rare slow path), 11–103× glibc. The `common` bodies run 4–13× Rust 1.3.0
+  for validation, energy and the SoA / arena (36 µs to 206 µs per 1,000 particles), and 86× for building one
+  particle (a call and a 144-byte struct return, against rustc's inlining).
 
 ## Upstream requests and stand-ins
 
-The conversion ledger is in the port plan, §8: 12 rows, 11 open and 1 conditional (L12, memcpy, waiting on M1's
-numbers). Each open row names its filed request. The stand-ins so far:
+The conversion ledger is in the port plan, §8: 13 rows, 12 open and 1 closed (L12: struct assignment already copies
+records word-wise, so no record copy of pravash's own is needed). Each open row names its filed request. The
+stand-ins so far:
 - L1: `src/crmath.cyr`, `src/crlog.cyr` and their two table files;
-- L2: `src/mathx.cyr` and `src/constants.cyr`'s std float constants.
+- L2: `src/mathx.cyr` and `src/constants.cyr`'s std float constants;
+- L3: `src/vec3.cyr`;
+- L13: `src/column.cyr`.
 
-Each is marked. `scripts/upstream_ledger.py --check`: 6 notes, 0 failures.
+Each is marked. `scripts/upstream_ledger.py --check`: 8 notes, 0 failures.
 
 Filed 2026-11-11:
 - **hisab:** `2026-11-11-spatial-hash-per-step-rebuild-allocates.md`, `2026-11-11-no-matrix-free-linear-cg.md`,
@@ -68,6 +77,9 @@ Filed 2026-11-11:
   `2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md`,
   `2026-11-11-struct-values-and-f64v4-lanes-cost-in-pair-loops.md`;
 - **sakshi:** `2026-11-11-no-chrome-trace-export.md`;
+- **M1 part 3, cyrius:** `2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md` (L13, with a repro) and
+  `2026-11-11-freelist-maps-every-block-over-4k.md` (a performance finding, no stand-in); pravash's numbers on
+  `2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md`;
 - **pravash's numbers added to:** ganita `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`, hisab
   `2026-11-09-allocator-scoped-calls.md`, cyrius `2026-11-09-no-scoped-allocator-for-alloc.md`, and cyrius
   `2026-11-08-cyrius-port-clobbers-project-docs-and-omits-bench.md`.
@@ -92,5 +104,5 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M1 part 3: `src/error.cyr` (`PV_ERR_*`), `src/vec3.cyr` and `src/common.cyr` (`FluidParticle`, `FluidConfig`,
-`FluidMaterial`, `ParticleArena`, `ParticleSoa`), with surface parity against `rust-old/src/` from here on.
+M1 part 4: `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr` and `src/json.cyr` (the serde-compatible codecs
+for the M1 types, with `DVec3`'s `[x, y, z]` hand codec, ledger L10), and the two serde tests of `common.rs`.
