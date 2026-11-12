@@ -1,0 +1,125 @@
+# mathx.cyr — pravash's math helpers: Rust std semantics on top of the Cyrius builtins.
+#
+# Port plan §7.1; docs/development/port-parity.md §1–§2. Each helper mirrors one std f64 operation as rustc
+# 1.99.1 compiles it, and is pinned by tests/golden/math.tsv:
+# - min / max / clamp ignore a NaN operand as Rust does (the stdlib f64_min / f64_max ignore a NaN only as the
+#   first operand);
+# - the predicates have no public stdlib counterpart;
+# - to_radians and the literal-exponent powi are Rust's exact operation order;
+# - the casts saturate as Rust's `as` does (f64_to is the i64 conversion: no saturation to i32 / u32, and a
+#   negative stays negative).
+# The correctly rounded transcendentals arrive in M1a part 2 (src/crmath.cyr, ledger L1).
+#
+# UPSTREAM(L2): cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md
+#   replace each helper with the stdlib's minNum / maxNum, predicates and saturating converts once they ship;
+#   parity: the f64::min, max, clamp, is_nan, is_finite, as_usize, as_u32 rows of tests/golden/math.tsv (class A).
+# Adapted from impetus's src/mathx.cyr (its `_im_` helpers).
+
+# π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
+var _PV_RADS_PER_DEG: f64 = 0.017453292519943295;
+
+# The bits of an f64 as an integer word: an untyped parameter, an i64 return.
+#must_use
+fn _pv_bits(x): i64 {
+    return x;
+}
+
+# 1 when x is NaN. Mirrors `f64::is_nan`.
+#must_use
+fn _pv_is_nan(x: f64): i64 {
+    if (x != x) { return 1; }
+    return 0;
+}
+
+# 1 when x is neither infinite nor NaN (x − x is 0 only then). Mirrors `f64::is_finite`.
+#must_use
+fn _pv_is_finite(x: f64): i64 {
+    var d: f64 = x - x;
+    if (d == 0.0) { return 1; }
+    return 0;
+}
+
+# The smaller of x and y, ignoring a NaN operand (NaN only when both are). Equal operands, +0 and −0 included,
+# give y, as rustc 1.99.1's `x.min(y)` does. Mirrors `f64::min`.
+#must_use
+fn _pv_min(x: f64, y: f64): f64 {
+    if (x != x) { return y; }
+    if (y != y) { return x; }
+    if (x < y) { return x; }
+    return y;
+}
+
+# The larger of x and y, ignoring a NaN operand (NaN only when both are). Equal operands give y. Mirrors
+# `f64::max`.
+#must_use
+fn _pv_max(x: f64, y: f64): f64 {
+    if (x != x) { return y; }
+    if (y != y) { return x; }
+    if (x > y) { return x; }
+    return y;
+}
+
+# x restricted to [lo, hi]: lo when x < lo, hi when x > hi, else x (a NaN x stays NaN). Rust panics on lo > hi
+# or a NaN bound; every caller passes valid bounds. Mirrors `f64::clamp`.
+#must_use
+fn _pv_clamp(x: f64, lo: f64, hi: f64): f64 {
+    var r: f64 = x;
+    if (r < lo) { r = lo; }
+    if (r > hi) { r = hi; }
+    return r;
+}
+
+# Degrees to radians: one multiply by the folded π/180. Mirrors `f64::to_radians`.
+#must_use
+fn _pv_to_radians(x: f64): f64 {
+    var r: f64 = x * _PV_RADS_PER_DEG;
+    return r;
+}
+
+# x², as LLVM expands a literal `x.powi(2)`.
+#must_use
+fn _pv_powi2(x: f64): f64 {
+    var r: f64 = x * x;
+    return r;
+}
+
+# x⁸, as LLVM expands a literal `x.powi(8)`: three squarings, ((x²)²)².
+#must_use
+fn _pv_powi8(x: f64): f64 {
+    var x2: f64 = x * x;
+    var x4: f64 = x2 * x2;
+    var r: f64 = x4 * x4;
+    return r;
+}
+
+# `x as i32`: toward zero, saturating at i32::MIN / i32::MAX, NaN → 0. The result as a sign-extended word.
+#must_use
+fn _pv_as_i32(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x >= 2147483647.0) { return 2147483647; }
+    if (x <= -2147483648.0) { return 0 - 2147483648; }
+    return f64_to(x);
+}
+
+# `x as u32`: toward zero, saturating at 0 and u32::MAX, NaN → 0.
+#must_use
+fn _pv_as_u32(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x <= 0.0) { return 0; }
+    if (x >= 4294967295.0) { return 4294967295; }
+    return f64_to(x);
+}
+
+# `x as usize` on a 64-bit target: toward zero, saturating at 0 and u64::MAX, NaN → 0. The result is the 64-bit
+# word, so a value at or above 2^63 reads negative as an i64.
+#must_use
+fn _pv_as_usize(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x <= 0.0) { return 0; }
+    if (x >= 18446744073709551616.0) { return 0 - 1; }
+    if (x >= 9223372036854775808.0) {
+        var hi: f64 = x - 9223372036854775808.0;
+        return f64_to(hi) | 0x8000000000000000;
+    }
+    return f64_to(x);
+}

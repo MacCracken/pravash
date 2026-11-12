@@ -20,7 +20,7 @@
 # never gated. The exit code is the number of modules with a failure.
 
 include "tests/ulp.cyr"
-include "src/constants.cyr"
+include "tests/lib.cyr"
 
 alloc_init();
 
@@ -126,14 +126,13 @@ fn _par_constants(fp, fl): i64 {
     return _par_constant_row(load64(_par_in_v), load64(_par_in_l));
 }
 
-# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched: the counterparts the
-# port can use today, the polyfill forms where the builtin's bits are per-target (port-parity §1).
-# Pending until M1's src/mathx.cyr and src/crmath.cyr (ledger L1, L2):
-# - min, max, clamp: f64_min / f64_max ignore a NaN only as the FIRST operand (port-parity §1);
-# - is_nan, is_finite: no public stdlib predicate;
-# - as_usize, as_u32, and the SPH cell key's `as i32`: f64_to doesn't saturate (port-parity §1);
-# - to_radians, powi2, powi8: pravash's own one-line helpers in Rust's operation order;
-# - log10: no counterpart in the stdlib or ganita (the correctly rounded one is L1).
+# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched:
+# - the builtins (sqrt, abs, floor, ceil) and `as f32` (f32_from, f32_to);
+# - src/mathx.cyr's Rust-semantics helpers (M1a part 1): min, max, clamp, is_nan, is_finite, to_radians, powi2,
+#   powi8, and the saturating `as usize` / `as u32`;
+# - the transcendentals through today's counterparts, the polyfill forms where the builtin's bits are
+#   per-target (port-parity §1). M1a part 2 replaces them with src/crmath.cyr's correctly rounded ones (L1).
+# Pending: log10 (no counterpart until crmath, L1) and the SPH cell key (src/neighbor.cyr, M4).
 # sin_cos is the pair (f64_sin, f64_cos): there is no stdlib sin_cos.
 fn _par_math(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -141,6 +140,13 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::abs") == 1) { var r: f64 = f64_abs(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::floor") == 1) { var r: f64 = f64_floor(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::ceil") == 1) { var r: f64 = f64_ceil(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::is_nan") == 1) { _par_got_i(_pv_is_nan(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::is_finite") == 1) { _par_got_i(_pv_is_finite(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::as_usize") == 1) { _par_got_i(_pv_as_usize(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::as_u32") == 1) { _par_got_i(_pv_as_u32(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::to_radians") == 1) { var r: f64 = _pv_to_radians(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powi2") == 1) { var r: f64 = _pv_powi2(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powi8") == 1) { var r: f64 = _pv_powi8(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::as_f32") == 1) {
         var n: f32 = f32_from(x);
         var w: f64 = f32_to(n);
@@ -165,6 +171,11 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_cand_atan2_poly(_par_in(0), _par_in(1))); return 1; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = ganita_f64_hypot(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = ganita_f64_pow(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _pv_max(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _pv_min(x, y); _par_got_f(r); return 1; }
+    if (_par_in_n < 3) { return 0; }
+    var z: f64 = _par_in(2);
+    if (_par_eq(fp, fl, "f64::clamp") == 1) { var r: f64 = _pv_clamp(x, y, z); _par_got_f(r); return 1; }
     return 0;
 }
 

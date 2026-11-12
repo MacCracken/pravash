@@ -317,3 +317,23 @@ call. What a large bundle costs is compile time, about 0.8 s per 70k lines, whic
   evaluation and is not per-step. Its reverse pass accumulates in a different order from 1.4.0's (3 ulp at most on
   arithmetic-only gradients), so its rows are **class D**: plan §5's library-backed path, set here before their
   first comparison.
+
+## 5. M1a part 1: the Rust-semantics helpers (2026-11-11)
+
+`src/mathx.cyr`, the first `[lib]` module after `src/constants.cyr` (bundle `dist/pravash.cyr`; tests include
+`tests/lib.cyr`, which mirrors `[lib]`). It holds the helpers the probe (§1) called for:
+- `_pv_min`, `_pv_max`, `_pv_clamp`, `_pv_is_nan`, `_pv_is_finite`;
+- `_pv_to_radians`, `_pv_powi2`, `_pv_powi8`;
+- the saturating `_pv_as_i32`, `_pv_as_u32`, `_pv_as_usize`.
+
+It is a stand-in, marked `UPSTREAM(L2)`.
+
+**Result:** every one of the **6,371** rows newly dispatched passes on the first run, all bit-exact (the class B
+rows `to_radians`, `powi2` and `powi8` at 0 ulp on all 2,801). The replay, identical on x86_64 ELF, `--bounds`,
+x86_64 PE and aarch64, warning-free, is **2 modules, 0 failing | rows: 28,223 ok, 0 failed, 1,790 measured, 3,261
+pending**. The pending rows are now only the SPH cell key (2,460, M4's `src/neighbor.cyr`) and log10 (801, part 2's
+`crmath`). The class A/B digest, now covering the helper rows, is `0xeba4c9735da7855` on all three targets.
+
+**Mutation checks:**
+- `_pv_max` returning x on equal operands fails exactly the 2 rows that pin Rust's ±0 rule;
+- `_pv_as_usize` keeping negatives fails 111 rows.

@@ -37,7 +37,9 @@
 - [x] M0 step 8: the cross-target baselines (identical bits on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt)
 - [x] M0 step 9: the eight probes (port-parity §4)
 - [x] M0 step 10: upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) and the conversion ledger seeded and checked in CI
-- [x] **M0 done 2026-11-11.** Next: M1, Foundation
+- [x] **M0 done 2026-11-11.**
+- [x] M1 part 1: `src/mathx.cyr`, the first `[lib]` and `dist/pravash.cyr` (6,371 rows newly gated, bit-exact)
+- [ ] M1 part 2: `src/crmath.cyr` and the MPFR-corrected oracle (ADR 0004); then parts 3–4
 
 ### 1.3.0
 

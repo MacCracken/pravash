@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (Cyrius)
+- **mathx** (M1 part 1): `src/mathx.cyr`, the library's first module after the generated constants. It holds
+  pravash's Rust-semantics f64 helpers: `_pv_min` / `_pv_max` / `_pv_clamp` (NaN-ignoring, Rust's ±0 rule),
+  `_pv_is_nan` / `_pv_is_finite`, `_pv_to_radians`, `_pv_powi2` / `_pv_powi8` in LLVM's order, and the saturating
+  `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`. It is a marked stand-in (`UPSTREAM(L2)`).
+  - **Build:** the first `[lib]` in `cyrius.cyml` (constants, mathx), the bundle `dist/pravash.cyr`, and
+    `tests/lib.cyr` for test compiles.
+  - **Parity:** 6,371 golden rows newly gated, all bit-exact. The replay is 28,223 ok, 0 failed, identical on
+    x86_64 ELF, x86_64 PE and aarch64. Mutation checks: the ±0 rule fails 2 rows, unsaturated negatives 111.
+
 ### Changed
 - **The Cyrius port begins** (port plan M0 steps 1–3; ADRs 0001–0003). `cyrius port` moved the Rust 1.3.0 crate,
   with its `oracle` hooks and `Cargo.lock`, into `rust-old/` as the frozen parity oracle (commit `a88bc4e`); it
