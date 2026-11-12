@@ -12,15 +12,16 @@
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
 > ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–5 are done:
+> published to crates.io. M0 steps 0–6 are done:
 > - the frozen oracle;
 > - the scaffold and its repairs;
 > - ADRs 0001–0003;
 > - `cyrius.cyml`;
 > - the semantics probe;
-> - the golden-value generator (`constants` and `math`).
+> - the golden-value generator;
+> - `src/constants.cyr`.
 >
-> Next is step 6, `src/constants.cyr`.
+> Next is step 7, the parity harness.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -425,7 +426,20 @@ function, so nothing leaves parity entirely.
      call's arguments; its outputs are the dump at k + 1 plus the iteration counts;
    - a JSON table: serde_json documents for each of the 22 derived types, from seeded values, including NaN-free
      edge values and every enum variant.
-6. **Table and constant generator** (the same crate), producing `src/constants.cyr` through the oracle's API, never
+6. ✅ **Table and constant generator. Done 2026-11-11** (`scripts/oracle/src/t_constants.rs`, `cyr.rs`).
+   - **`src/constants.cyr`** (94 lines) holds the 14 public constants (the 5 `FluidMaterial` presets as 20 field
+     consts, 5 drag and 4 added-mass coefficients) and the 6 Rust std float constants the code names: `f64::MAX`,
+     `INFINITY`, `NEG_INFINITY`, `NAN`, `consts::PI` and `f32::EPSILON`.
+   - **Proofs:** both lists are proven complete against `rust-old/src`, and `constants.tsv` grew to 35 rows.
+   - **Form:** an f64 is a `const` with Rust's `Display` digits (positional, round-trip). ±∞, NaN and `f64::MAX`
+     are typed `f64` globals holding their bits, and `f32::EPSILON` is an `f32` global with an exact decimal.
+   - **Check:** `scripts/oracle/probe_tables.py` compiles every value and compares its bits with the golden rows:
+     35 of 35. A 2-ulp change to one literal fails both it and `--check`.
+   - **Not yet:** the **private** constants (`MIN_DENSITY`, `MIN_SINGULAR_VALUE`, the solver limits, …) are
+     extracted and proven at the milestone whose module uses them, as impetus did. Their rows come with that
+     module's golden grid.
+
+   As planned, producing `src/constants.cyr` through the oracle's API, never
    by retyping. It covers:
    - the public constants: the `FluidMaterial` presets (`WATER`, `OIL`, `HONEY`, `AIR`, `LAVA`) and the drag
      coefficients in `buoyancy` and `coupling`;
@@ -683,7 +697,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | # | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
 |---|---|---|---|---|---|
 | L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2) | ganita has no correctly rounded tier | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln, log10 and cbrt to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
-| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, typed `MAX` / `INFINITY` / `NAN` / `f32::EPSILON`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize` | the stdlib's `f64_min` / `f64_max` NaN rules, missing names, and no saturating float→int convert (port-parity §1) | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
+| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`; the typed std float constants are generated into `src/constants.cyr` (`PV_F64_MAX`, …, `PV_F32_EPSILON`) | the stdlib's `f64_min` / `f64_max` NaN rules, missing names, and no saturating float→int convert (port-parity §1) | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
 | L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
 | L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
 | L5 | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | **hisab P1 (new)**: an operator as a closure, a relative tolerance, the iteration count returned | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
@@ -716,7 +730,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | constants 29 + math 33,239 (validated, deterministic, parallel-checked) | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published to crates.io. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`). Step 4 done (the semantics probe, port-parity §1). Step 5 done (`scripts/oracle/`, port-parity §3: the oracle's cbrt is compiler_builtins'). Next: step 6, `src/constants.cyr` |
+| M0 Initialize | ⏳ in progress | constants 35 + math 33,239 (validated, deterministic, parallel-checked); `src/constants.cyr` 35 values compiled and compared | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`). Step 4 done (semantics probe). Step 5 done (`scripts/oracle/`; the oracle's cbrt is compiler_builtins'). Step 6 done (`src/constants.cyr`, `probe_tables.py`). Next: step 7, the parity harness |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

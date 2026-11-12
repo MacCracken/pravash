@@ -7,7 +7,7 @@ the Rust oracle, so it catches a generator that records the wrong thing:
 - every `tests/golden/*.tsv` parses: the five-line header, the row count, five tab fields per
   row, a class in A–D, well-formed tokens; `modules.txt` lists exactly the files present;
 - `constants.tsv` matches the literals in `rust-old/src` (the `pub const` items, and the fields of
-  the `FluidMaterial` presets);
+  the `FluidMaterial` presets) and Rust's std float constants (`f64::MAX`, …, `f32::EPSILON`);
 - every class-A and class-B row of `math.tsv` is recomputed in Python, in Rust's operation order:
   sqrt, abs, floor, ceil, min, max, clamp, is_nan, is_finite, the saturating casts (`as usize`,
   `as u32`), `as f32`, the SPH cell key, to_radians, powi2, powi8;
@@ -134,8 +134,19 @@ def rust_constants(root):
     return out
 
 
+# The Rust std float constants pravash's code uses, as Rust defines them.
+STD_CONSTANTS = {
+    "f64::MAX": sys.float_info.max,
+    "f64::INFINITY": math.inf,
+    "f64::NEG_INFINITY": -math.inf,
+    "f64::NAN": math.nan,
+    "f64::consts::PI": math.pi,
+    "f32::EPSILON": 2.0**-23,
+}
+
+
 def check_constants(root, rows):
-    want = rust_constants(root)
+    want = {**rust_constants(root), **STD_CONSTANTS}
     seen = set()
     for func, cls, ins, outs, where in rows:
         path = unpct(ins[0][2:])
@@ -373,7 +384,7 @@ def main():
         total += len(rows)
         if path.stem == "constants":
             n = check_constants(root, rows)
-            print(f"constants: {n} rows checked against the Rust literals")
+            print(f"constants: {n} rows checked against the Rust literals and std")
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

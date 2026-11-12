@@ -13,6 +13,7 @@ cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml          
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check             # verify; exit 1 on any difference
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # rayon on: must match
 python3 -I -B scripts/oracle/validate.py .                                                    # independent re-check
+python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
 ```
 
 The format, the comparison rules and the generator's structure are impetus's
@@ -44,7 +45,7 @@ same files. This README records what is specific to pravash.
 
 | Module | Milestone | Golden rows | Golden emitter | Generated Cyrius |
 |---|---|---|---|---|
-| `constants` | M0 | 29 | `src/m_constants.rs` (the list and its completeness proof: `src/t_constants.rs`) | `src/constants.cyr` (step 6) |
+| `constants` | M0 | 35 | `src/m_constants.rs` (the lists and their completeness proofs: `src/t_constants.rs`) | `src/constants.cyr`: 14 public constants and the 6 std float constants pravash uses |
 | `math` | M0 | 33,239 | `src/m_math.rs` | — |
 
 ## Format 1
@@ -82,3 +83,10 @@ Standard library only. It never runs the Rust oracle:
 - it proves every `cbrt` row correctly rounded, with exact rationals.
 
 A tampered row fails it, and fails `--check`; a header naming another glibc is refused by `--check` with the reason.
+
+## probe_tables.py
+
+The step between the generator and the harness. For every `constants.tsv` row it derives the Cyrius name
+(`t_constants::cyr_name`'s rule), writes `build/probe_tables.cyr`, which includes `src/constants.cyr` and prints each
+value's bits, builds it with the project's `[deps]`, runs it, and compares with the row. A row with no generated
+value, a value with no row, a build warning, or one differing bit fails it.

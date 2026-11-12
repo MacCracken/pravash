@@ -46,6 +46,7 @@ cargo test --manifest-path rust-old/Cargo.toml --features oracle,coupling --test
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check        # golden corpus up to date
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # ... and thread-count free
 python3 -I -B scripts/oracle/validate.py .                                               # independent check of the corpus
+python3 -I -B scripts/oracle/probe_tables.py .                                           # generated constants compile to the oracle's bits
 ```
 
 The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI (the

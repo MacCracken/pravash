@@ -32,7 +32,8 @@
   - `cyrius.cyml`, with every Cyrius gate green.
 - [x] M0 step 4: the semantics probe (port-parity §1)
 - [x] M0 step 5: the golden-value generator (`scripts/oracle/`: constants 29 + math 33,239 rows, validated)
-- [ ] M0 steps 6–10: constants, the parity harness, the baselines, the probes, and filing the upstream requests
+- [x] M0 step 6: `src/constants.cyr` (public + std float constants, compiled and compared by `probe_tables.py`)
+- [ ] M0 steps 7–10: the parity harness, the baselines, the probes, and filing the upstream requests
 
 ### 1.3.0
 

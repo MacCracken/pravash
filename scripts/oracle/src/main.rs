@@ -22,6 +22,7 @@
 //! and tanmatra's. Modules are added at the start of their milestone, with the golden grid from
 //! the port plan §6: `constants` and `math` (M0); …
 
+mod cyr;
 mod glibc;
 mod grids;
 mod m_constants;
@@ -40,6 +41,22 @@ const PARALLEL: bool = cfg!(feature = "parallel");
 /// Every golden emitter, in file-name order.
 fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
     Ok(vec![m_constants::emit(root)?, m_math::emit()])
+}
+
+/// Every generated Cyrius source, in file-name order.
+fn cyrius_outputs(root: &Path, prov: &str) -> Result<Vec<Output>, String> {
+    let files = vec![("src/constants.cyr", t_constants::emit(root, prov)?)];
+    Ok(files
+        .into_iter()
+        .map(|(rel, text)| {
+            let lines = text.lines().count();
+            Output {
+                rel: rel.to_string(),
+                text,
+                summary: format!("{lines} lines"),
+            }
+        })
+        .collect())
 }
 
 /// One generated file: its path from the repo root, its contents, and a summary.
@@ -208,6 +225,9 @@ fn run() -> Result<bool, String> {
         summary: format!("{} modules", emitted.len()),
         text: index,
     });
+    // The generated .cyr files hold only the oracle's constants, so they name the oracle alone
+    // and don't change with the platform.
+    outputs.extend(cyrius_outputs(&root, &oracle)?);
 
     for out in &outputs {
         ok &= emit(&root, check, out)?;
