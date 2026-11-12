@@ -1416,6 +1416,72 @@ fn _bench_block_n(n, iters) {
     return 0;
 }
 
+# ── sph, M5 part a ──
+# solver_step/<count>_particles and solver_step_st/<count>_particles: Rust's criterion groups (one solver; the block
+# at (0.1, 0.3), size 0.5, spacing 1/√n, copied in before each step; water_2d at water's viscosity; σ 0.072 for _st).
+# sph_m5a/*: against scripts/probes/rust/src/bin/bench_sph_m5a.rs, a dense 25 × 25 block at spacing 0.02.
+
+# One solver row: `iters` steps of one solver (σ, Verlet as given) on a fresh copy of the block (origin (ox, oy), size
+# 0.5, spacing sp) before each, named by `name` or, for 0, by the criterion group and the count.
+fn _bench_solver(name, group, sp: f64, ox: f64, oy: f64, st: f64, verlet, iters) {
+    var bp, bn = create_particle_block(ox, oy, 0.5, 0.5, sp, 0.001);
+    var src: *PvFluidParticle = _pv_as_particles(bp);
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(bn * sizeof(PvFluidParticle)));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var s: PvSphSolver = PvSphSolver_with_surface_tension(st);
+    s.use_verlet = verlet;
+    var label = name;
+    if (name == 0) { label = _bench_name_n(group, bn, "_particles"); }
+    var b = bench_new(label);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        for (var c = 0; c < bn; c = c + 1) {
+            var d: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *d = *e;
+        }
+        var t, v = s.step(work, bn, &cfg, mu);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvSphSolver_drop(&s);
+    fl_free(work);
+    fl_free(bp);
+    return 0;
+}
+
+# The spacing 1/√n of Rust's criterion blocks.
+fn _bench_inv_sqrt(n): f64 {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var sp: f64 = 1.0 / rt;
+    return sp;
+}
+
+# The M5 part a benches: Rust's criterion `solver_step` and `solver_step_st`, and the bench_sph_m5a.rs twins.
+fn bench_sph_m5a() {
+    var ns[40];
+    store64(&ns, 25);
+    store64(&ns + 8, 100);
+    store64(&ns + 16, 225);
+    store64(&ns + 24, 625);
+    store64(&ns + 32, 1000);
+    for (var i = 0; i < 5; i = i + 1) {
+        var n = load64(&ns + i * 8);
+        _bench_solver(0, "solver_step/", _bench_inv_sqrt(n), 0.1, 0.3, 0.0, 0, 2000);
+    }
+    for (var j = 1; j < 4; j = j + 1) {
+        var n2 = load64(&ns + j * 8);
+        _bench_solver(0, "solver_step_st/", _bench_inv_sqrt(n2), 0.1, 0.3, 0.072, 0, 2000);
+    }
+    _bench_solver("sph_m5a/dense_625", 0, 0.02, 0.1, 0.1, 0.0, 0, 100);
+    _bench_solver("sph_m5a/dense_625_st", 0, 0.02, 0.1, 0.1, 0.072, 0, 100);
+    _bench_solver("sph_m5a/dense_625_verlet", 0, 0.02, 0.1, 0.1, 0.0, 1, 100);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1445,6 +1511,7 @@ fn main(): i64 {
     bench_sph_b();
     bench_sph_c();
     bench_sph_d();
+    bench_sph_m5a();
     return 0;
 }
 

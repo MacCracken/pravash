@@ -1198,9 +1198,50 @@ fn _par_sph_listed(fp, fl): i64 {
     return 1;
 }
 
+# The solver rows (M5): 1 handled, 0 another function.
+fn _par_sph_solver(fp, fl): i64 {
+    if (_par_eq(fp, fl, "SphSolver::step") == 1) {
+        # `steps` steps of one fresh solver, stopping at the first error.
+        var sc: PvFluidConfig;
+        _par_config_in(0, &sc);
+        var mu: f64 = _par_in(14);
+        var sv: PvSphSolver = PvSphSolver_with_surface_tension(_par_in(15));
+        sv.use_verlet = _par_in(16);
+        var steps = _par_in(17);
+        var buf, n, k = _par_particles_in(18);
+        var ps: *PvFluidParticle = _pv_as_particles(buf);
+        var failed = 0;
+        for (var t = 0; t < steps; t = t + 1) {
+            if (failed == 0) {
+                var rt, rv = sv.step(ps, n, &sc, mu);
+                if (is_err_result(rt) == 1) {
+                    _par_got_err(rv);
+                    failed = 1;
+                }
+            }
+        }
+        if (failed == 0) {
+            for (var j = 0; j < n; j = j + 1) { _par_particle_out(ps + j); }
+        }
+        PvSphSolver_drop(&sv);
+        fl_free(buf);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "SphSolver::adaptive_dt") == 1) {
+        var ab, an, ak = _par_particles_in(5);
+        var aps: *PvFluidParticle = _pv_as_particles(ab);
+        var dt: f64 = PvSphSolver_adaptive_dt(aps, an, _par_in(0), _par_in(1), _par_in(2), _par_in(3), _par_in(4));
+        _par_got_f(_pv_bits(dt));
+        fl_free(ab);
+        return 1;
+    }
+    return 0;
+}
+
 # The other part d rows (M4 part d): 1 handled, 0 another function.
 fn _par_sph_d(fp, fl): i64 {
     if (_par_sph_listed(fp, fl) == 1) { return 1; }
+    if (_par_sph_solver(fp, fl) == 1) { return 1; }
     if (_par_eq(fp, fl, "oracle::invert_3x3") == 1) {
         var m[72];
         var out[72];
@@ -2452,6 +2493,9 @@ fn _par_c_bound(fp, fl): i64 {
     # M4 part d: the contact angle's cosine is correctly rounded and the rest is Rust's arithmetic in order, so each
     # row equals the corrected oracle bit for bit.
     if (_par_eq(fp, fl, "apply_contact_angle") == 1) { return 0; }
+    # M5 part a: the solver's step (class S) is +, −, ×, ÷, √ and part b's f32 keys in Rust's order, so every
+    # particle of every row is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "SphSolver::step") == 1) { return 0; }
     return 0 - 1;
 }
 

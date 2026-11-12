@@ -5,8 +5,8 @@
 # grid sections, then grid_invalid_dx_rejected from its edge cases; `is_err()` is the `PV_ERR_*` code Rust's path
 # returns), and serde_roundtrip_all_types, whose four types all read and write JSON now (serde_json is `to_json` /
 # `Pv*_from_json`). M4 part c: the four free-function SPH tests, in `test_sph` (Rust's `sph::step` is `sph_step`,
-# ADR 0002 #17; `.unwrap()` asserts every step was Ok). The rest arrive with their milestones:
-# - the solver tests: M5;
+# ADR 0002 #17; `.unwrap()` asserts every step was Ok). M5 part a: the five solver tests, in `test_solver`. The rest
+# arrive with their milestones:
 # - the coupling and FLIP tests: M6.
 
 include "tests/lib.cyr"
@@ -83,6 +83,124 @@ fn test_sph() {
     var y0: f64 = one.position.y;
     var oe, ok, of = sph_run(&one, 1, 10, 0.001, 0);
     assert(oe == 0 && one.position.y < y0, "it falls under gravity");
+    return 0;
+}
+
+# `steps` solver steps of the n particles at ps under cfg at viscosity mu by *s: the number that returned Err; with
+# `ke` 1 also the largest total kinetic energy (as bits) and whether every one was finite.
+fn solver_steps(s: *PvSphSolver, ps: *PvFluidParticle, n, steps, cfg: *PvFluidConfig, mu: f64, ke) {
+    var errs = 0;
+    var max_ke: f64 = 0.0;
+    var finite = 1;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = s.step(ps, n, cfg, mu);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+        if (ke == 1) {
+            var e: f64 = total_kinetic_energy(ps, n);
+            if (_pv_is_finite(e) == 0) { finite = 0; }
+            max_ke = _pv_max(max_ke, e);
+        }
+    }
+    return (errs, _pv_bits(max_ke), finite);
+}
+
+# 1 when every position of the n particles at ps is finite.
+fn positions_ok(ps: *PvFluidParticle, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        if (_pv_is_finite(p.position.x) == 0 || _pv_is_finite(p.position.y) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# The five solver tests (M5 part a), in Rust's order.
+fn test_solver() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+
+    test_group("solver_dam_break_energy_bounded");
+    var dp, dn = create_particle_block(0.1, 0.3, 0.2, 0.3, 0.02, 0.001);
+    var d: *PvFluidParticle = _pv_as_particles(dp);
+    var s1: PvSphSolver = PvSphSolver_new();
+    var de, dk, df = solver_steps(&s1, d, dn, 200, &cfg, mu, 1);
+    var max_ke: f64 = dk;
+    assert(de == 0 && df == 1, "200 steps, every one Ok, the energy finite");
+    assert(max_ke < 1000000.0, "the kinetic energy stays bounded");
+    PvSphSolver_drop(&s1);
+    fl_free(dp);
+
+    test_group("solver_particles_stay_in_bounds");
+    var bp, bn = create_particle_block(0.1, 0.5, 0.3, 0.3, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var s2: PvSphSolver = PvSphSolver_new();
+    var be, bk, bf = solver_steps(&s2, b, bn, 500, &cfg, mu, 0);
+    assert_eq(be, 0, "500 steps, every one Ok");
+    var out = 0;
+    for (var i = 0; i < bn; i = i + 1) {
+        var p: *PvFluidParticle = b + i;
+        var x: f64 = p.position.x;
+        var y: f64 = p.position.y;
+        if (x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0) {} else { out = out + 1; }
+    }
+    assert_eq(out, 0, "every particle inside [0, 1]²");
+    PvSphSolver_drop(&s2);
+    fl_free(bp);
+
+    test_group("solver_surface_tension_keeps_blob_compact");
+    var np, nn = create_particle_block(0.3, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var tp, tn = create_particle_block(0.3, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var no_st: *PvFluidParticle = _pv_as_particles(np);
+    var with_st: *PvFluidParticle = _pv_as_particles(tp);
+    var s3: PvSphSolver = PvSphSolver_new();
+    var s4: PvSphSolver = PvSphSolver_with_surface_tension(0.072);
+    var ne, nk, nf = solver_steps(&s3, no_st, nn, 50, &cfg, mu, 0);
+    var te, tk, tf = solver_steps(&s4, with_st, tn, 50, &cfg, mu, 0);
+    var spread: f64 = 0.0;
+    for (var j = 0; j < nn; j = j + 1) {
+        var q: *PvFluidParticle = no_st + j;
+        var sq: f64 = q.speed_squared();
+        spread = spread + sq;
+    }
+    assert(ne == 0 && te == 0 && _pv_is_finite(spread) == 1, "both runs Ok, the spread finite");
+    assert_eq(positions_ok(with_st, tn), 1, "with surface tension every position stays finite");
+    PvSphSolver_drop(&s3);
+    PvSphSolver_drop(&s4);
+    fl_free(np);
+    fl_free(tp);
+
+    test_group("solver_multi_step_consistency");
+    var mp, mn = create_particle_block(0.2, 0.5, 0.3, 0.3, 0.03, 0.001);
+    var m: *PvFluidParticle = _pv_as_particles(mp);
+    var s5: PvSphSolver = PvSphSolver_new();
+    var bad = 0;
+    for (var k = 0; k < 1000; k = k + 1) {
+        var t, v = s5.step(m, mn, &cfg, 0.001);
+        if (is_err_result(t) == 1) { bad = bad + 1; }
+        if (k % 100 == 0 && positions_ok(m, mn) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "1,000 steps, every one Ok and finite");
+    PvSphSolver_drop(&s5);
+    fl_free(mp);
+
+    test_group("solver_symmetric_pressure_conserves_momentum");
+    var zg: PvFluidConfig = PvFluidConfig_water_2d();
+    zg.gravity = PvVec3_zero();
+    var pp, pn = create_particle_block(0.4, 0.4, 0.2, 0.2, 0.02, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(pp);
+    var s6: PvSphSolver = PvSphSolver_new();
+    var pe, pk, pf = solver_steps(&s6, ps, pn, 1, &zg, 0.001, 0);
+    var px: f64 = 0.0;
+    var py: f64 = 0.0;
+    for (var c = 0; c < pn; c = c + 1) {
+        var w: *PvFluidParticle = ps + c;
+        px = px + (w.velocity.x * w.mass);
+        py = py + (w.velocity.y * w.mass);
+    }
+    var apx: f64 = f64_abs(px);
+    var apy: f64 = f64_abs(py);
+    assert(pe == 0 && apx < 0.00000001 && apy < 0.00000001, "the net momentum stays near 0");
+    PvSphSolver_drop(&s6);
+    fl_free(pp);
     return 0;
 }
 
@@ -409,6 +527,7 @@ fn main() {
     var c2: PvFluidConfig = c1;
     c2.dt = 1.0;
     assert(near(c1.dt, 0.001, 0.0000000001) == 1, "a copy, not an alias");
+    test_solver();
     return assert_summary();
 }
 

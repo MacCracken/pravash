@@ -11653,6 +11653,448 @@ fn update_secondary_particles(ss: *PvSecondaryParticle, n, gravity: PvVec3, dt: 
     return kept;
 }
 
+# --- sph.cyr ---
+
+# sph.cyr — `SphSolver` of rust-old/src/sph.rs (M5): the stateful SPH solver on part b's neighbour grid.
+#
+# M5 part a: the solver's state and constructors, its WCSPH `step` (symplectic Euler or velocity Verlet, with the CSF
+# surface tension), the neighbour lists it leaves for M4 part d's functions, and `adaptive_dt`. PCISPH, DFSPH and the
+# multiphase step are parts b–d; part e runs the three parallel loops on the worker pool and switches the neighbour
+# keys to f64 (D3). Until then the keys are hisab 1.4.0's f32 ones, bit for bit (`src/neighbor.cyr`).
+#
+# Every buffer is the solver's and reused across steps: the grid's columns, the densities, the snapshot the forces
+# read, the accelerations (a per-step `Vec` in Rust, port plan §7.5), and Verlet's previous accelerations. A step
+# grows them all before it changes a particle, so `PV_ERR_OUT_OF_MEMORY` (where Rust aborts) leaves the particles as
+# they were.
+
+# The SPH solver: the neighbour grid (first, so its address is the solver's), the densities (one word a particle), the
+# snapshot (18 words a particle), the accelerations and Verlet's previous ones (3 words a particle), the surface
+# tension coefficient (0 disables it) and whether to integrate by velocity Verlet. Mirrors `SphSolver`; its
+# `surface_tension` and `use_verlet` are public, as Rust's.
+struct PvSphSolver {
+    grid: PvNeighborGrid;
+    densities: PvColumn;
+    snapshot: PvColumn;
+    accels: PvColumn;
+    prev_accel: PvColumn;
+    surface_tension: f64;
+    use_verlet;
+}
+
+# The solver's neighbour grid, at offset 0.
+#must_use
+fn _pv_sph_grid(s): *PvNeighborGrid {
+    return _pv_addr(s);
+}
+
+# Column k of a solver (0 densities, 1 snapshot, 2 accels, 3 prev_accel), by its byte offset after the 224-byte grid
+# (tests/sph.tcyr pins the layout, 336 bytes).
+#must_use
+fn _pv_sph_col(s, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(s) + 224 + k * 24);
+}
+
+# A fresh solver into *s: an empty grid of cell size 1, no buffers, no surface tension, symplectic Euler. Nothing is
+# allocated.
+fn PvSphSolver_init(s: *PvSphSolver) {
+    PvNeighborGrid_init(_pv_sph_grid(s));
+    for (var k = 0; k < 4; k = k + 1) {
+        var c: *PvColumn = _pv_sph_col(s, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    s.surface_tension = 0.0;
+    s.use_verlet = 0;
+    return 0;
+}
+
+# A new solver (nothing allocated until its first step). Mirrors `SphSolver::new`.
+#must_use
+fn PvSphSolver_new(): PvSphSolver {
+    var s: PvSphSolver;
+    PvSphSolver_init(&s);
+    return s;
+}
+
+# A new solver with surface tension σ. Mirrors `SphSolver::with_surface_tension`.
+#must_use
+fn PvSphSolver_with_surface_tension(surface_tension: f64): PvSphSolver {
+    var s: PvSphSolver;
+    PvSphSolver_init(&s);
+    s.surface_tension = surface_tension;
+    return s;
+}
+
+# `SphSolver::new()`. Mirrors `impl Default for SphSolver`.
+#must_use
+fn PvSphSolver_default(): PvSphSolver {
+    var s: PvSphSolver;
+    PvSphSolver_init(&s);
+    return s;
+}
+
+# Releases the solver's buffers; it is a fresh solver again, keeping its settings (and its grid's cell size).
+fn PvSphSolver_drop(s: *PvSphSolver) {
+    PvNeighborGrid_drop(_pv_sph_grid(s));
+    for (var k = 0; k < 4; k = k + 1) {
+        var c: *PvColumn = _pv_sph_col(s, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# The CSR neighbour lists of a solver's last step: offsets (n_off words) and indices (n_idx words), the forms M4 part
+# d's functions take. Rust's `(&[u32], &[usize])`.
+struct PvNeighborLists {
+    offsets;
+    n_off;
+    indices;
+    n_idx;
+}
+
+impl PvSphSolver {
+    # Forgets Verlet's previous accelerations, so a step after the particles were reordered, split or merged starts
+    # the integrator afresh. Mirrors `reset_integrator`.
+    fn reset_integrator(self) {
+        self.prev_accel.truncate(0);
+        return 0;
+    }
+
+    # The neighbour lists from the most recent step: particle i's neighbours are indices[offsets[i] .. offsets[i + 1]]
+    # (empty before a first step). Mirrors `neighbor_lists`.
+    #must_use
+    fn neighbor_lists(self): PvNeighborLists {
+        var g: *PvNeighborGrid = _pv_sph_grid(self);
+        var l: PvNeighborLists;
+        l.offsets = g.offsets.data;
+        l.n_off = g.offsets.len;
+        l.indices = g.indices.data;
+        l.n_idx = g.indices.len;
+        return l;
+    }
+
+    # One WCSPH step of the n particles at ps, in Rust's order:
+    # - the config is validated (its error returned, nothing changed); n = 0 is Ok; h as f32 must be finite and > 0
+    #   (PV_ERR_INVALID_SMOOTHING_RADIUS, for h beyond f32's range either side);
+    # - the neighbour lists (`_pv_nb_build`: hisab's f32 grid, D3);
+    # - each density, Σ over its list (itself included) of mⱼ·poly6(r²) for r² ≤ h², then each pressure by the linear
+    #   equation of state;
+    # - from a snapshot, each acceleration: gravity, the symmetric pressure and viscosity terms of the free step over
+    #   the list (j ≠ i, 1e-20 ≤ r² ≤ h²), and, for σ > 0, the CSF term from the colour field (its Laplacian starting
+    #   at the self term (mᵢ/ρᵢ)·∇²W(0)), always added (+0 when off, as Rust's `+ DVec3::ZERO`);
+    # - PV_ERR_DIVERGED at the first non-finite acceleration (those before it written, as Rust's);
+    # - symplectic Euler, or velocity Verlet (vₙ = ṽₙ + (½(aₙ − aₙ₋₁))·dt once started, x += v·dt + ((½a)·dt)·dt,
+    #   v += a·dt), the previous accelerations restarted (zero) when their count isn't n;
+    # - the free step's walls.
+    # Ok(0); the errors above; or PV_ERR_OUT_OF_MEMORY when a buffer can't grow, before any particle changes (Rust
+    # aborts). Mirrors `step` (ADR 0002 #19).
+    #must_use
+    fn step(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+        var ct, cv = config.validate();
+        if (is_err_result(ct) == 1) { return Err(cv); }
+        if (n <= 0) { return Ok(0); }
+        var h: f64 = config.smoothing_radius;
+        var h32: f32 = f32_from(h);
+        var hw: f64 = f32_to(h32);
+        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
+        if (self.use_verlet != 0) { ok = ok & self.prev_accel.reserve(3 * n); }
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var g: *PvNeighborGrid = _pv_sph_grid(self);
+        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var kc: PvKernelCoeffs;
+        _pv_kc_init(&kc, h);
+        var h2: f64 = kc.h2;
+        var off = g.offsets.data;
+        var idx = g.indices.data;
+        var dens = self.densities.data;
+
+        # The densities, then the pressures.
+        for (var i = 0; i < n; i = i + 1) {
+            var pi: *PvFluidParticle = ps + i;
+            var px: f64 = pi.position.x;
+            var py: f64 = pi.position.y;
+            var pz: f64 = pi.position.z;
+            var d: f64 = 0.0;
+            var a = load64(off + i * 8);
+            var b = load64(off + (i + 1) * 8);
+            for (var k = a; k < b; k = k + 1) {
+                var pj: *PvFluidParticle = ps + load64(idx + k * 8);
+                var dx: f64 = px - pj.position.x;
+                var dy: f64 = py - pj.position.y;
+                var dz: f64 = pz - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if (r2 <= h2) {
+                    var w: f64 = _pv_kc_poly6(&kc, r2);
+                    var mw: f64 = pj.mass * w;
+                    d = d + mw;
+                }
+            }
+            store64(dens + i * 8, _pv_bits(d));
+        }
+        var rest: f64 = config.rest_density;
+        var gas: f64 = config.gas_constant;
+        var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var p: *PvFluidParticle = ps + i2;
+            p.density = load64(dens + i2 * 8);
+            var pr: f64 = equation_of_state(p.density, rest, gas);
+            p.pressure = pr;
+            var sq: *PvFluidParticle = snap + i2;
+            *sq = *p;
+        }
+
+        # The accelerations, from the snapshot, into the solver's buffer.
+        var acc = self.accels.data;
+        var st: f64 = self.surface_tension;
+        var csf = 0;
+        if (st > 0.0) { csf = 1; }
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = _PV_SPH_MIN_DENSITY;
+        var lap0: f64 = _pv_kc_poly6_lap(&kc, 0.0);
+        for (var q = 0; q < n; q = q + 1) {
+            var si: *PvFluidParticle = snap + q;
+            var ax: f64 = config.gravity.x;
+            var ay: f64 = config.gravity.y;
+            var az: f64 = config.gravity.z;
+            var rho: f64 = _pv_max(si.density, lo);
+            var api: f64 = si.pressure / (rho * rho);
+            var sx: f64 = si.position.x;
+            var sy: f64 = si.position.y;
+            var sz: f64 = si.position.z;
+            var vx: f64 = si.velocity.x;
+            var vy: f64 = si.velocity.y;
+            var vz: f64 = si.velocity.z;
+            var cnx: f64 = 0.0;
+            var cny: f64 = 0.0;
+            var cnz: f64 = 0.0;
+            var lapc: f64 = 0.0;
+            if (csf == 1) { lapc = (si.mass / rho) * lap0; }
+            var a2 = load64(off + q * 8);
+            var b2 = load64(off + (q + 1) * 8);
+            for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
+                var j = load64(idx + k2 * 8);
+                if (j != q) {
+                    var sj: *PvFluidParticle = snap + j;
+                    var ex: f64 = sx - sj.position.x;
+                    var ey: f64 = sy - sj.position.y;
+                    var ez: f64 = sz - sj.position.z;
+                    var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                    if ((s2 > h2 || s2 < tiny) == 0) {
+                        var r: f64 = f64_sqrt(s2);
+                        var rho_j: f64 = _pv_max(sj.density, lo);
+                        var bj: f64 = sj.pressure / (rho_j * rho_j);
+                        var sym: f64 = api + bj;
+                        var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                        var mj: f64 = sj.mass;
+                        var nmj: f64 = -mj;
+                        var p_scale: f64 = ((nmj * sym) * grad) / r;
+                        ax = ax + (p_scale * ex);
+                        ay = ay + (p_scale * ey);
+                        az = az + (p_scale * ez);
+                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                        var v_scale: f64 = (((viscosity * mj) * lap) / rho_j) / rho;
+                        var ux: f64 = sj.velocity.x - vx;
+                        var uy: f64 = sj.velocity.y - vy;
+                        var uz: f64 = sj.velocity.z - vz;
+                        ax = ax + (v_scale * ux);
+                        ay = ay + (v_scale * uy);
+                        az = az + (v_scale * uz);
+                        if (csf == 1) {
+                            var mor: f64 = mj / rho_j;
+                            var pg: f64 = _pv_kc_poly6_grad(&kc, s2);
+                            var mpg: f64 = mor * pg;
+                            cnx = cnx + (mpg * ex);
+                            cny = cny + (mpg * ey);
+                            cnz = cnz + (mpg * ez);
+                            var pl: f64 = _pv_kc_poly6_lap(&kc, s2);
+                            lapc = lapc + (mor * pl);
+                        }
+                    }
+                }
+            }
+            var ast: PvVec3 = _pv_csf_acceleration(cnx, cny, cnz, lapc, st, rho, kc.h);
+            var fx: f64 = ax + ast.x;
+            var fy: f64 = ay + ast.y;
+            var fz: f64 = az + ast.z;
+            store64(acc + q * 24, _pv_bits(fx));
+            store64(acc + q * 24 + 8, _pv_bits(fy));
+            store64(acc + q * 24 + 16, _pv_bits(fz));
+        }
+        for (var c = 0; c < n; c = c + 1) {
+            var gx: f64 = load64(acc + c * 24);
+            var gy: f64 = load64(acc + c * 24 + 8);
+            var gz: f64 = load64(acc + c * 24 + 16);
+            if (_pv_is_finite(gx) == 0 || _pv_is_finite(gy) == 0 || _pv_is_finite(gz) == 0) {
+                return Err(PV_ERR_DIVERGED);
+            }
+            var w: *PvFluidParticle = ps + c;
+            w.acceleration = PvVec3_new(gx, gy, gz);
+        }
+
+        # Integrate.
+        var dt: f64 = config.dt;
+        if (self.use_verlet != 0) {
+            var started = 0;
+            if (self.prev_accel.len == 3 * n) { started = 1; }
+            if (started == 0) {
+                self.prev_accel.truncate(0);
+                var grown = self.prev_accel.resize(3 * n, zw);
+            }
+            var prev = self.prev_accel.data;
+            for (var v = 0; v < n; v = v + 1) {
+                var pv: *PvFluidParticle = ps + v;
+                var aax: f64 = pv.acceleration.x;
+                var aay: f64 = pv.acceleration.y;
+                var aaz: f64 = pv.acceleration.z;
+                var wx: f64 = pv.velocity.x;
+                var wy: f64 = pv.velocity.y;
+                var wz: f64 = pv.velocity.z;
+                if (started == 1) {
+                    var qx: f64 = load64(prev + v * 24);
+                    var qy: f64 = load64(prev + v * 24 + 8);
+                    var qz: f64 = load64(prev + v * 24 + 16);
+                    wx = wx + ((0.5 * (aax - qx)) * dt);
+                    wy = wy + ((0.5 * (aay - qy)) * dt);
+                    wz = wz + ((0.5 * (aaz - qz)) * dt);
+                }
+                var mx: f64 = pv.position.x + ((wx * dt) + (((0.5 * aax) * dt) * dt));
+                var my: f64 = pv.position.y + ((wy * dt) + (((0.5 * aay) * dt) * dt));
+                var mz: f64 = pv.position.z + ((wz * dt) + (((0.5 * aaz) * dt) * dt));
+                pv.position.x = mx;
+                pv.position.y = my;
+                pv.position.z = mz;
+                pv.velocity.x = wx + (aax * dt);
+                pv.velocity.y = wy + (aay * dt);
+                pv.velocity.z = wz + (aaz * dt);
+                store64(prev + v * 24, _pv_bits(aax));
+                store64(prev + v * 24 + 8, _pv_bits(aay));
+                store64(prev + v * 24 + 16, _pv_bits(aaz));
+            }
+        } else {
+            for (var e = 0; e < n; e = e + 1) {
+                var pe: *PvFluidParticle = ps + e;
+                var nvx: f64 = pe.velocity.x + (pe.acceleration.x * dt);
+                var nvy: f64 = pe.velocity.y + (pe.acceleration.y * dt);
+                var nvz: f64 = pe.velocity.z + (pe.acceleration.z * dt);
+                pe.velocity.x = nvx;
+                pe.velocity.y = nvy;
+                pe.velocity.z = nvz;
+                pe.position.x = pe.position.x + (nvx * dt);
+                pe.position.y = pe.position.y + (nvy * dt);
+                pe.position.z = pe.position.z + (nvz * dt);
+            }
+        }
+        _pv_sph_walls(ps, n, config);
+        return Ok(0);
+    }
+}
+
+# The CSF surface-tension acceleration (Müller et al. 2003): −σ·∇²c·n̂/ρ, i.e. n·(((−σ)·∇²c)/(ρ·|n|)) for the colour
+# normal n = (nx, ny, nz); 0 for σ not finite and > 0, |n| NaN, or |n| ≤ 0.1/h (an interior particle). Mirrors the
+# private `csf_acceleration`.
+#must_use
+fn _pv_csf_acceleration(nx: f64, ny: f64, nz: f64, laplacian: f64, sigma: f64, rho: f64, h: f64): PvVec3 {
+    var l2: f64 = ((nx * nx) + (ny * ny)) + (nz * nz);
+    var mag: f64 = f64_sqrt(l2);
+    var thr: f64 = _PV_SPH_CSF_NORMAL_THRESHOLD / h;
+    if (_pv_is_positive(sigma) == 0 || mag != mag || mag <= thr) { return PvVec3_zero(); }
+    var ns: f64 = -sigma;
+    var s: f64 = (ns * laplacian) / (rho * mag);
+    return PvVec3_new(nx * s, ny * s, nz * s);
+}
+
+# The domain's walls on the n particles: per axis, below the low corner the position clamped to it and the velocity
+# times −damping; else above the high corner (when it is above the low one), the same at the high corner. The free
+# step's and the solver's.
+fn _pv_sph_walls(ps: *PvFluidParticle, n, config: *PvFluidConfig) {
+    var damp: f64 = config.boundary_damping;
+    var nd: f64 = -damp;
+    var lx: f64 = config.bounds_min.x;
+    var ly: f64 = config.bounds_min.y;
+    var lz: f64 = config.bounds_min.z;
+    var hx: f64 = config.bounds_max.x;
+    var hy: f64 = config.bounds_max.y;
+    var hz: f64 = config.bounds_max.z;
+    for (var m = 0; m < n; m = m + 1) {
+        var w: *PvFluidParticle = ps + m;
+        if (w.position.x < lx) {
+            w.position.x = lx;
+            w.velocity.x = w.velocity.x * nd;
+        } elif (w.position.x > hx && hx > lx) {
+            w.position.x = hx;
+            w.velocity.x = w.velocity.x * nd;
+        }
+        if (w.position.y < ly) {
+            w.position.y = ly;
+            w.velocity.y = w.velocity.y * nd;
+        } elif (w.position.y > hy && hy > ly) {
+            w.position.y = hy;
+            w.velocity.y = w.velocity.y * nd;
+        }
+        if (w.position.z < lz) {
+            w.position.z = lz;
+            w.velocity.z = w.velocity.z * nd;
+        } elif (w.position.z > hz && hz > lz) {
+            w.position.z = hz;
+            w.velocity.z = w.velocity.z * nd;
+        }
+    }
+    return 0;
+}
+
+# The CFL-limited timestep cfl·min(h/v_max, √(h/a_max), h²/(6ν)) over the n particles, each term only where its
+# denominator exceeds 1e-20 (from f64::MAX, NaN-ignoring), clamped to [dt_min, dt_max] (swapped when inverted; a NaN
+# stays NaN). max(dt_max, dt_min) for h or cfl not finite and > 0, or a bound not finite. Mirrors
+# `SphSolver::adaptive_dt` (an associated fn).
+#must_use
+fn PvSphSolver_adaptive_dt(ps: *PvFluidParticle, n, smoothing_radius: f64, viscosity: f64, cfl_factor: f64,
+  dt_min: f64, dt_max: f64): f64 {
+    var h: f64 = smoothing_radius;
+    if (_pv_is_positive(h) == 0 || _pv_is_positive(cfl_factor) == 0 || _pv_is_finite(dt_min) == 0
+      || _pv_is_finite(dt_max) == 0) {
+        var both: f64 = _pv_max(dt_max, dt_min);
+        return both;
+    }
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var dt_cfl: f64 = PV_F64_MAX;
+    var max_v: f64 = max_speed(ps, n);
+    if (max_v > tiny) {
+        var t1: f64 = h / max_v;
+        dt_cfl = _pv_min(dt_cfl, t1);
+    }
+    var m2: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var a2: f64 = ((p.acceleration.x * p.acceleration.x) + (p.acceleration.y * p.acceleration.y))
+        + (p.acceleration.z * p.acceleration.z);
+        m2 = _pv_max(m2, a2);
+    }
+    var max_a: f64 = f64_sqrt(m2);
+    if (max_a > tiny) {
+        var q: f64 = h / max_a;
+        var t2: f64 = f64_sqrt(q);
+        dt_cfl = _pv_min(dt_cfl, t2);
+    }
+    if (viscosity > tiny) {
+        var t3: f64 = (h * h) / (6.0 * viscosity);
+        dt_cfl = _pv_min(dt_cfl, t3);
+    }
+    var lo: f64 = dt_min;
+    var hi: f64 = dt_max;
+    if ((dt_min <= dt_max) == 0) {
+        lo = dt_max;
+        hi = dt_min;
+    }
+    var raw: f64 = cfl_factor * dt_cfl;
+    var r: f64 = _pv_clamp(raw, lo, hi);
+    return r;
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust

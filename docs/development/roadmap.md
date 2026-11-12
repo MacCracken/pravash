@@ -66,8 +66,12 @@
 - [x] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7, the
   oracle's own LU), implicit viscosity, secondary particles (318 rows, 1 against the corrected oracle; 11 Rust tests)
 - [x] **M4 done 2026-11-12.**
-- [ ] M5: the `SphSolver` (WCSPH, PCISPH, DFSPH and multiphase steps, surface tension, adaptive dt, Verlet) on part
-  b's neighbour grid, with the five part d tests that build their lists with `SphSolver::step`
+- [x] M5 part a: the `SphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension), `adaptive_dt` (66 rows,
+  every one bit-exact on the first replay; 19 Rust tests and 5 integration tests)
+- [ ] M5 part b: PCISPH
+- [ ] M5 part c: DFSPH
+- [ ] M5 part d: the multiphase step (`PhaseProperties`, `MultiPhaseConfig`)
+- [ ] M5 part e: the three parallel SPH loops on the worker pool, then the D3 switch to f64 keys (the rows remapped)
 
 ### 1.3.0
 

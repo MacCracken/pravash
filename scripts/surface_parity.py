@@ -57,10 +57,13 @@ FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
+    "SphSolver::step_pcisph": "M5 part b",
+    "SphSolver::step_dfsph": "M5 part c",
+    "SphSolver::step_multiphase": "M5 part d",
 }
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
 PENDING_TYPES = {
-    **{f"sph::{t}": "M5" for t in ("PhaseProperties", "MultiPhaseConfig", "SphSolver")},
+    **{f"sph::{t}": "M5 part d" for t in ("PhaseProperties", "MultiPhaseConfig")},
 }
 EXCEPTIONS = {
     "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "

@@ -118,6 +118,377 @@ fn test_part_c_block_and_step() {
     return 0;
 }
 
+# `steps` WCSPH steps of the n particles at ps by *s under cfg at viscosity mu: the number that returned Err.
+fn solver_run(s: *PvSphSolver, ps: *PvFluidParticle, n, steps, cfg: *PvFluidConfig, mu: f64): i64 {
+    var errs = 0;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = s.step(ps, n, cfg, mu);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+    }
+    return errs;
+}
+
+# 1 when every position of the n particles at ps is finite.
+fn positions_finite(ps: *PvFluidParticle, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        if (_pv_is_finite(p.position.x) == 0 || _pv_is_finite(p.position.y) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# The solver tests between test_kernel_negative_r and test_poly6_kernels_consistent, in Rust's order (M5 part a).
+fn test_solver_basics() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+
+    test_group("test_solver_empty");
+    var s0: PvSphSolver = PvSphSolver_new();
+    var et, ev = s0.step(0, 0, &cfg, 0.001);
+    assert_eq(is_ok(et), 1, "no particles: Ok");
+
+    test_group("test_solver_single_particle_falls");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    one.density = 1000.0;
+    var s1: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&s1, &one, 1, 1, &cfg, 0.001), 0, "Ok");
+    assert(one.velocity.y < 0.0, "gravity pulls it down");
+    PvSphSolver_drop(&s1);
+
+    test_group("test_solver_particles_stay_in_bounds");
+    var bp, bn = create_particle_block(0.1, 0.5, 0.3, 0.3, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var s2: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&s2, b, bn, 100, &cfg, 0.001), 0, "100 steps, every one Ok");
+    var out = 0;
+    for (var i = 0; i < bn; i = i + 1) {
+        var q: *PvFluidParticle = b + i;
+        if (q.position.x >= 0.0 && q.position.x <= 1.0 && q.position.y >= 0.0 && q.position.y <= 1.0) {} else {
+            out = out + 1;
+        }
+    }
+    assert_eq(out, 0, "every particle inside the bounds");
+    PvSphSolver_drop(&s2);
+    fl_free(bp);
+
+    test_group("test_solver_surface_tension");
+    var tp, tn = create_particle_block(0.3, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var tps: *PvFluidParticle = _pv_as_particles(tp);
+    var s3: PvSphSolver = PvSphSolver_with_surface_tension(0.072);
+    assert_eq(solver_run(&s3, tps, tn, 10, &cfg, 0.001), 0, "10 steps, every one Ok");
+    assert_eq(positions_finite(tps, tn), 1, "every position finite");
+    PvSphSolver_drop(&s3);
+    fl_free(tp);
+
+    test_group("test_solver_reuses_buffers");
+    var rp, rn = create_particle_block(0.1, 0.1, 0.2, 0.2, 0.05, 0.001);
+    var rps: *PvFluidParticle = _pv_as_particles(rp);
+    var s4: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&s4, rps, rn, 1, &cfg, 0.001), 0, "Ok");
+    var cap_d = s4.densities.cap;
+    var cap_s = s4.snapshot.cap;
+    assert_eq(solver_run(&s4, rps, rn, 1, &cfg, 0.001), 0, "Ok again");
+    assert(s4.densities.cap == cap_d && s4.snapshot.cap == cap_s, "the buffers are reused, not regrown");
+    PvSphSolver_drop(&s4);
+    fl_free(rp);
+
+    test_group("test_solver_neighbor_cache_used");
+    var np, nn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var nps: *PvFluidParticle = _pv_as_particles(np);
+    var s5: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&s5, nps, nn, 1, &cfg, 0.001), 0, "Ok");
+    var l: PvNeighborLists = s5.neighbor_lists();
+    assert_eq(l.n_off, nn + 1, "n + 1 offsets");
+    var empty = 0;
+    for (var k = 0; k < nn; k = k + 1) {
+        if (load64(l.offsets + (k + 1) * 8) == load64(l.offsets + k * 8)) { empty = empty + 1; }
+    }
+    assert_eq(empty, 0, "every particle lists at least itself");
+    PvSphSolver_drop(&s5);
+    fl_free(np);
+
+    test_group("test_solver_grid_clear_reuse");
+    var gp, gn = create_particle_block(0.1, 0.1, 0.2, 0.2, 0.05, 0.001);
+    var gps: *PvFluidParticle = _pv_as_particles(gp);
+    var s6: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&s6, gps, gn, 1, &cfg, 0.001), 0, "Ok");
+    var g: *PvNeighborGrid = _pv_sph_grid(&s6);
+    var h32: f32 = f32_from(cfg.smoothing_radius);
+    var hw: f64 = f32_to(h32);
+    var dc: f64 = g.cell_size - hw;
+    var adc: f64 = f64_abs(dc);
+    var eps: f64 = f32_to(PV_F32_EPSILON);
+    assert(adc < eps, "the cell size is h as f32");
+    PvSphSolver_drop(&s6);
+    fl_free(gp);
+    return 0;
+}
+
+# test_solver_step_deterministic and test_solver_large_particle_count, after test_poly6_kernels_consistent.
+fn test_solver_more() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+
+    test_group("test_solver_step_deterministic");
+    var ap, an = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var bp, bn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var a: *PvFluidParticle = _pv_as_particles(ap);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var sa: PvSphSolver = PvSphSolver_new();
+    var sb: PvSphSolver = PvSphSolver_new();
+    assert(solver_run(&sa, a, an, 5, &cfg, 0.001) == 0 && solver_run(&sb, b, bn, 5, &cfg, 0.001) == 0, "Ok");
+    var diff = 0;
+    for (var i = 0; i < an; i = i + 1) {
+        var pa: *PvFluidParticle = a + i;
+        var pb: *PvFluidParticle = b + i;
+        if (near(pa.position.x, pb.position.x, EPS) == 0) { diff = diff + 1; }
+    }
+    assert_eq(diff, 0, "two runs agree");
+    PvSphSolver_drop(&sa);
+    PvSphSolver_drop(&sb);
+    fl_free(ap);
+    fl_free(bp);
+
+    test_group("test_solver_large_particle_count");
+    var lp, ln = create_particle_block(0.1, 0.1, 0.5, 0.5, 0.01, 0.0001);
+    var lps: *PvFluidParticle = _pv_as_particles(lp);
+    var sl: PvSphSolver = PvSphSolver_new();
+    assert_eq(solver_run(&sl, lps, ln, 1, &cfg, 0.001), 0, "Ok");
+    assert(ln == 2500 && positions_finite(lps, ln) == 1, "2,500 particles stay finite");
+    PvSphSolver_drop(&sl);
+    fl_free(lp);
+    return 0;
+}
+
+# The block of the heat, viscoelastic and MLS tests ((0.2, 0.3), size 0.2, spacing 0.02: 100 particles), after one
+# solver step under water_2d at viscosity 0.001: (buffer, count); the solver into *s.
+fn stepped_block(s: *PvSphSolver, hot, deformed) {
+    var bp, bn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    if (hot == 1) {
+        var mid: *PvFluidParticle = ps + bn / 2;
+        mid.temperature = 500.0;
+    }
+    if (deformed == 1) {
+        for (var i = 0; i < bn; i = i + 1) {
+            var q: *PvFluidParticle = ps + i;
+            q.density = 1000.0;
+            q.conformation = (2.0, 0.5, 1.5);
+        }
+    }
+    PvSphSolver_init(s);
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var t, v = s.step(ps, bn, &cfg, 0.001);
+    return (bp, bn);
+}
+
+# The heat and viscoelastic tests after the combustion ones, and the two adaptive-dt tests before the Wendland ones, in
+# Rust's order (M5 part a: their lists come from the solver's step).
+fn test_heat_visco_adaptive() {
+    var s: PvSphSolver;
+
+    test_group("test_heat_uniform_no_change");
+    var up, un = stepped_block(&s, 0, 0);
+    var u: *PvFluidParticle = _pv_as_particles(up);
+    var before: f64 = u.temperature;
+    var l: PvNeighborLists = s.neighbor_lists();
+    var hc: PvHeatConfig = PvHeatConfig_new(0.0000001);
+    assert_eq(update_heat(u, un, l.offsets, l.n_off, l.indices, l.n_idx, 0.05, &hc, 0.001), 1, "applied");
+    var moved = 0;
+    for (var i = 0; i < un; i = i + 1) {
+        var q: *PvFluidParticle = u + i;
+        if (near(q.temperature, before, EPS) == 0) { moved = moved + 1; }
+    }
+    assert_eq(moved, 0, "a uniform temperature doesn't change");
+    PvSphSolver_drop(&s);
+    fl_free(up);
+
+    test_group("test_heat_conducts_from_hot_to_cold");
+    var hp, hn = stepped_block(&s, 1, 0);
+    var hps: *PvFluidParticle = _pv_as_particles(hp);
+    var mid: *PvFluidParticle = hps + hn / 2;
+    var t_hot: f64 = mid.temperature;
+    var l2: PvNeighborLists = s.neighbor_lists();
+    var hk: PvHeatConfig = PvHeatConfig_new(0.01);
+    for (var k = 0; k < 50; k = k + 1) {
+        var r = update_heat(hps, hn, l2.offsets, l2.n_off, l2.indices, l2.n_idx, 0.05, &hk, 0.001);
+    }
+    var ex_before: f64 = t_hot - 293.15;
+    var ex_after: f64 = mid.temperature - 293.15;
+    assert(ex_after < 0.9 * ex_before && ex_after > 0.0, "the hot particle cools noticeably");
+    var hotter = 0;
+    for (var j = 0; j < hn; j = j + 1) {
+        var w: *PvFluidParticle = hps + j;
+        if (w.temperature > 500.000000001) { hotter = hotter + 1; }
+    }
+    assert_eq(hotter, 0, "the maximum principle holds");
+    PvSphSolver_drop(&s);
+    fl_free(hp);
+
+    test_group("test_viscoelastic_relaxes_to_identity");
+    var vp, vn = stepped_block(&s, 0, 1);
+    var vps: *PvFluidParticle = _pv_as_particles(vp);
+    var l3: PvNeighborLists = s.neighbor_lists();
+    var ve: PvViscoelasticConfig = PvViscoelasticConfig_new(100.0, 0.01);
+    for (var k2 = 0; k2 < 50; k2 = k2 + 1) {
+        var r2 = update_viscoelastic(vps, vn, l3.offsets, l3.n_off, l3.indices, l3.n_idx, 0.05, &ve, 0.001);
+    }
+    var vm: *PvFluidParticle = vps + vn / 2;
+    var cxx: f64 = vm.conformation.0;
+    assert_eq(near(cxx, 1.0, 0.5), 1, "C_xx relaxes toward 1");
+    PvSphSolver_drop(&s);
+    fl_free(vp);
+
+    test_group("test_viscoelastic_elastic_stress_finite");
+    var fp, fn2 = stepped_block(&s, 0, 0);
+    var fps: *PvFluidParticle = _pv_as_particles(fp);
+    var l4: PvNeighborLists = s.neighbor_lists();
+    var ve2: PvViscoelasticConfig = PvViscoelasticConfig_new(500.0, 0.1);
+    assert_eq(update_viscoelastic(fps, fn2, l4.offsets, l4.n_off, l4.indices, l4.n_idx, 0.05, &ve2, 0.001), 1,
+      "applied");
+    var bad = 0;
+    for (var k3 = 0; k3 < fn2; k3 = k3 + 1) {
+        var z: *PvFluidParticle = fps + k3;
+        if (_pv_is_finite(z.acceleration.x) == 0 || _pv_is_finite(z.conformation.0) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "the stress and the conformation stay finite");
+    PvSphSolver_drop(&s);
+    fl_free(fp);
+
+    test_group("test_adaptive_dt_stationary");
+    var ap, an = create_particle_block(0.1, 0.1, 0.2, 0.2, 0.05, 0.001);
+    var aps: *PvFluidParticle = _pv_as_particles(ap);
+    var dt: f64 = PvSphSolver_adaptive_dt(aps, an, 0.05, 0.001, 0.4, 0.0001, 0.01);
+    assert_eq(near(dt, 0.01, EPS), 1, "at rest: dt_max");
+
+    test_group("test_adaptive_dt_fast_particles");
+    aps.velocity = PvVec3_new(100.0, 0.0, 0.0);
+    var dt2: f64 = PvSphSolver_adaptive_dt(aps, an, 0.05, 0.001, 0.4, 0.0001, 0.01);
+    assert(dt2 < 0.001 && dt2 >= 0.0001, "a fast particle shortens dt, within the bounds");
+    fl_free(ap);
+    return 0;
+}
+
+# test_mls_correction_interior, before test_apply_gradient_correction_identity.
+fn test_mls_interior() {
+    test_group("test_mls_correction_interior");
+    var s: PvSphSolver;
+    var bp, bn = stepped_block(&s, 0, 0);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var l: PvNeighborLists = s.neighbor_lists();
+    var cp, cn = compute_gradient_corrections(ps, bn, l.offsets, l.n_off, l.indices, l.n_idx, 0.05);
+    assert_eq(cn, bn, "one correction a particle");
+    var c = cp + (cn / 2) * 72;
+    var c0: f64 = load64(c);
+    var c4: f64 = load64(c + 32);
+    var c8: f64 = load64(c + 64);
+    assert(_pv_is_finite(c0) == 1 && _pv_is_finite(c4) == 1 && _pv_is_finite(c8) == 1, "an interior one is finite");
+    fl_free(cp);
+    PvSphSolver_drop(&s);
+    fl_free(bp);
+    return 0;
+}
+
+# test_verlet_exact_under_constant_gravity, test_adaptive_dt_inverted_bounds_no_panic and
+# test_surface_tension_zero_for_interior_particle, between the implicit-viscosity and degenerate-input tests.
+fn test_verlet_dt_and_interior() {
+    test_group("test_verlet_exact_under_constant_gravity");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    cfg.bounds_min = PvVec3_new(-100.0, -100.0, 0.0);
+    cfg.bounds_max = PvVec3_new(100.0, 100.0, 0.0);
+    var p: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 0.001);
+    var s: PvSphSolver = PvSphSolver_new();
+    s.use_verlet = 1;
+    assert_eq(solver_run(&s, &p, 1, 20, &cfg, 0.0), 0, "20 steps, every one Ok");
+    var t: f64 = 20.0 * cfg.dt;
+    var exact: f64 = ((0.5 * cfg.gravity.y) * t) * t;
+    var vt: f64 = cfg.gravity.y * t;
+    assert_eq(near(p.position.y, exact, 0.000000000001), 1, "y = ½gt², exactly");
+    assert_eq(near(p.velocity.y, vt, 0.000000000001), 1, "v = gt");
+    PvSphSolver_drop(&s);
+
+    test_group("test_adaptive_dt_inverted_bounds_no_panic");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var dt: f64 = PvSphSolver_adaptive_dt(&one, 1, 0.05, 0.001, 0.5, 0.1, 0.01);
+    assert(dt >= 0.01 && dt <= 0.1, "inverted bounds are swapped");
+
+    test_group("test_surface_tension_zero_for_interior_particle");
+    var zg: PvFluidConfig = PvFluidConfig_water_2d();
+    zg.gravity = PvVec3_zero();
+    var ap, an = create_particle_block(0.2, 0.2, 0.4, 0.4, 0.02, 0.001);
+    var bp, bn = create_particle_block(0.2, 0.2, 0.4, 0.4, 0.02, 0.001);
+    var a: *PvFluidParticle = _pv_as_particles(ap);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var mid = 0 - 1;
+    for (var i = 0; i < an; i = i + 1) {
+        var q: *PvFluidParticle = a + i;
+        if (near(q.position.x, 0.4, 0.000000001) == 1 && near(q.position.y, 0.4, 0.000000001) == 1) { mid = i; }
+    }
+    var plain: PvSphSolver = PvSphSolver_new();
+    var tension: PvSphSolver = PvSphSolver_with_surface_tension(0.5);
+    assert(solver_run(&plain, a, an, 1, &zg, 0.0) == 0 && solver_run(&tension, b, bn, 1, &zg, 0.0) == 0, "Ok");
+    var qa: *PvFluidParticle = a + mid;
+    var qb: *PvFluidParticle = b + mid;
+    var dx: f64 = qa.acceleration.x - qb.acceleration.x;
+    var dy: f64 = qa.acceleration.y - qb.acceleration.y;
+    var dz: f64 = qa.acceleration.z - qb.acceleration.z;
+    var d2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+    var d: f64 = f64_sqrt(d2);
+    assert(mid >= 0 && d < 0.000000001, "an interior particle feels no surface tension");
+    PvSphSolver_drop(&plain);
+    PvSphSolver_drop(&tension);
+    fl_free(ap);
+    fl_free(bp);
+    return 0;
+}
+
+# Column k's storage pointer through `_pv_sph_col`'s byte offsets.
+fn sph_col_data(s: *PvSphSolver, k): i64 {
+    var c: *PvColumn = _pv_sph_col(s, k);
+    return c.data;
+}
+
+# 1 when the n particles at a and b agree bit for bit in every field.
+fn same_particles(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
+    var wa = _pv_addr(a);
+    var wb = _pv_addr(b);
+    for (var i = 0; i < n * 18; i = i + 1) {
+        if (load64(wa + i * 8) != load64(wb + i * 8)) { return 0; }
+    }
+    return 1;
+}
+
+# Cyrius-only: the solver's layout, and `reset_integrator` (a reset solver's next Verlet step is a fresh solver's).
+fn test_solver_layout() {
+    test_group("solver_layout_matches_column_offsets");
+    assert_eq(sizeof(PvSphSolver), 336, "336 bytes");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var bp, bn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var s: PvSphSolver = PvSphSolver_new();
+    s.use_verlet = 1;
+    assert_eq(solver_run(&s, ps, bn, 1, &cfg, 0.001), 0, "a Verlet step sizes every column");
+    assert_eq(_pv_addr(_pv_sph_grid(&s)), _pv_addr(&s), "the grid is at offset 0");
+    assert_eq(sph_col_data(&s, 0), s.densities.data, "0: densities");
+    assert_eq(sph_col_data(&s, 1), s.snapshot.data, "1: snapshot");
+    assert_eq(sph_col_data(&s, 2), s.accels.data, "2: accels");
+    assert_eq(sph_col_data(&s, 3), s.prev_accel.data, "3: prev_accel");
+
+    test_group("solver_reset_integrator_restarts_verlet");
+    var cp, cn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
+    var c: *PvFluidParticle = _pv_as_particles(cp);
+    for (var i = 0; i < cn * 18; i = i + 1) { store64(cp + i * 8, load64(bp + i * 8)); }
+    s.reset_integrator();
+    assert_eq(s.prev_accel.len, 0, "the previous accelerations are forgotten");
+    var fresh: PvSphSolver = PvSphSolver_new();
+    fresh.use_verlet = 1;
+    assert(solver_run(&s, ps, bn, 1, &cfg, 0.001) == 0 && solver_run(&fresh, c, cn, 1, &cfg, 0.001) == 0, "Ok");
+    assert_eq(same_particles(ps, c, bn), 1, "the next step is a fresh solver's, bit for bit");
+    PvSphSolver_drop(&s);
+    PvSphSolver_drop(&fresh);
+    fl_free(bp);
+    fl_free(cp);
+    return 0;
+}
+
 # The equation-of-state and totals tests (with part c's between them), test_step_invalid_config,
 # test_kernel_negative_r and test_poly6_kernels_consistent, in Rust's order.
 fn test_eos_and_totals() {
@@ -164,6 +535,8 @@ fn test_eos_and_totals() {
     var n3: f64 = kernel_viscosity_laplacian(-1.0, 1.0);
     assert(tiny(n1) == 1 && tiny(n2) == 1 && tiny(n3) == 1, "0 for a negative r");
 
+    test_solver_basics();
+
     test_group("test_poly6_kernels_consistent");
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, 1.0);
@@ -176,6 +549,8 @@ fn test_eos_and_totals() {
     var o2: f64 = _pv_kc_poly6_grad(&kc, 1.1);
     var o3: f64 = _pv_kc_poly6_lap(&kc, 1.1);
     assert(tiny(o1) == 1 && tiny(o2) == 1 && tiny(o3) == 1, "all 0 beyond h²");
+
+    test_solver_more();
     return 0;
 }
 
@@ -348,6 +723,8 @@ fn brute_lists(ps: *PvFluidParticle, n, h: f64) {
 # through test_degenerate_inputs_no_panic. (test_heat_*, two viscoelastic tests and test_mls_correction_interior build
 # their lists with `SphSolver::step`: they arrive with M5.)
 fn test_part_d() {
+    test_mls_interior();
+
     test_group("test_apply_gradient_correction_identity");
     var ident[72];
     for (var e = 0; e < 9; e = e + 1) {
@@ -466,6 +843,8 @@ fn test_part_d() {
     fl_free(io);
     fl_free(ii);
     fl_free(ip);
+
+    test_verlet_dt_and_interior();
 
     test_group("test_degenerate_inputs_no_panic");
     var e1, n1 = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.0, 1.0);
@@ -707,6 +1086,7 @@ fn main() {
     test_kernels();
     test_eos_and_totals();
     test_combustion();
+    test_heat_visco_adaptive();
     test_wendland_and_viscosity();
     test_sort_blocks();
     test_part_d();
@@ -715,6 +1095,7 @@ fn main() {
     test_lists();
     test_layout();
     test_part_c_paths();
+    test_solver_layout();
     return assert_summary();
 }
 

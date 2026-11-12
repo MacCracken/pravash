@@ -1385,3 +1385,77 @@ Surface parity: 349 items ok, 22 pending, all of them M5's solver types. It now 
 `pub trait X` must be a `trait PvX`, and an `impl X for T` an `impl PvX for PvT`.
 
 **M4 is complete:** `sph.tsv` has 1,370 rows, every one passing, 22 of them against the corrected oracle.
+
+## 19. M5 part a: the SPH solver's WCSPH step (2026-11-12)
+
+M5 follows the plan of record: parts by step variant, then parallel.
+- **a:** the solver and its WCSPH step;
+- **b:** PCISPH;
+- **c:** DFSPH;
+- **d:** the multiphase step;
+- **e:** the three parallel loops on `src/par.cyr`, then the D3 switch to f64 keys, with the rows remapped.
+
+**`src/sph.cyr`:**
+- **`PvSphSolver`** owns every buffer and reuses them across steps (port plan §7.5):
+  - part b's `PvNeighborGrid`, embedded first. Cyrius has no `&s.f`, so the grid's address is the solver's;
+  - the densities and the snapshot, as Rust's;
+  - the accelerations, which Rust allocates per step;
+  - Verlet's previous accelerations.
+- **The step,** in Rust's order:
+  - the neighbour lists (part b's f32 grid, so D3's probe drift is in the rows);
+  - the densities over the lists, self included;
+  - the pressures;
+  - the accelerations from the snapshot: the free step's terms, plus the CSF surface tension from the colour field,
+    whose Laplacian starts at the self term. The CSF vector is always added, +0 when it is off, as Rust's
+    `+ DVec3::ZERO` is;
+  - the divergence check;
+  - symplectic Euler or velocity Verlet. Verlet restarts from zero when its stored count isn't n;
+  - the walls.
+- **Errors leave Rust's state.** Every buffer grows before a particle changes. Verlet's buffer is only reserved up
+  front, so a step that fails leaves it as Rust's would.
+- **`PvSphSolver_adaptive_dt`** is Rust's associated fn. `neighbor_lists()` returns a `PvNeighborLists`, the form part d
+  of M4 takes.
+
+**The rows** (`m_sph.rs`, M5 part a's seed 0x0_5f5a): 66.
+
+| Function | Rows | What they cover |
+|---|---|---|
+| `SphSolver::step` (class S) | 49 | each a fresh solver run from the start to a frame, so Verlet's state never needs to be an input: a hydrostatic tank (frames 1, 2, 10, 60, 300), a dam break by Euler and by Verlet (the same frames), a droplet in zero gravity with surface tension 0.5 by both integrators (to 60), a 3D cube in a closed box with surface tension (to 60), a splash through every wall by both, a block at x ≈ 10⁶ where the f32 keys drift (D3), the Rust tests' single particles, n = 0, σ negative, NaN and ∞, μ 0 and negative, and the errors (dt 0, h whose `as f32` is ∞ or 0, an ∞ mass beside a neighbour, an ∞ x velocity that diverges one axis) |
+| `SphSolver::adaptive_dt` | 17 | each term binding (speed, acceleration, viscosity), none binding, inverted bounds, every early return, NaN speeds and accelerations, n = 0 |
+
+A NaN position doesn't diverge here, as it does in the brute-force step. It keys to cell 0, its list holds only
+itself, and its acceleration stays gravity. The oracle shows exactly that, and so does the row.
+
+`validate.py` transcribes the step on part b's grid transcription. Trajectory rows share their inputs except the
+step count, so it continues each scene from its longest cached state. Result: 49,870 rows, 0 failures, in 26 s.
+
+**Result:**
+- Every row passed on the first replay, the 300-step trajectories by both integrators included. The replay is
+  **12 modules, 0 failing | rows: 49,753 ok, 0 failed, 0 measured, 3 pending, 114 accepted (ADR 4: 114)**.
+- **The mutation tests:** 19 of 22 port mutations failed rows on the first run. Of the three survivors:
+  - dividing only on all three axes was the gap part c's free step had: no solver row diverged on one axis. The
+    ∞-x-velocity row closes it (no random numbers drawn) and the mutant then fails it;
+  - `r² ≤ h²` written `<` in the density is equivalent. At r² = h² the kernel is exactly 0, and a non-finite mass
+    there diverges the step either way;
+  - the CSF threshold's `≤` written `<` is an untested tie: no row's colour normal is exactly 0.1/h.
+- **Mutations of the transcription:** 5 of 5 caught (the CSF sign and self term, the Verlet half-step, the density's
+  self term, the adaptive-dt swap).
+
+**Tests** (`tests/sph.tcyr`, 144 checks):
+- 19 Rust tests in Rust's order: the nine `test_solver_*`, the five part d tests that make their lists with the solver
+  (the heat, viscoelastic and MLS ones), the three adaptive-dt tests, the Verlet test and the interior surface-tension
+  test. That makes 63 of the 79;
+- two Cyrius-only groups: the solver's layout (336 bytes), and `reset_integrator`, whose next Verlet step must equal a
+  fresh solver's, bit for bit.
+
+`tests/integration.tcyr` adds the five solver integration tests (29 of 33, 74 checks). Surface parity: 349 items ok,
+12 pending (parts b–d).
+
+**Speed** (benchmarks-rust-v-cyrius, M5 part a):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| criterion `solver_step`, 9 to 256 particles (sparse) | 1.27–2.3× |
+| criterion `solver_step_st`, 25 to 169 | 1.24–2.0× |
+| a dense 625-particle block, by Euler or Verlet | 3.2× |
+| the dense block with surface tension | 3.6× |

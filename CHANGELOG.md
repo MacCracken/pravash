@@ -3,6 +3,33 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M5 part a): `src/sph.cyr`, the SPH solver.
+  - **`PvSphSolver`.** All its buffers are its own and reused: part b's neighbour grid, embedded, plus the densities,
+    the snapshot, the accelerations (Rust allocates these per step) and Verlet's previous accelerations. It is built
+    with `PvSphSolver_new`, `_with_surface_tension` or `_default`, and released with `_drop`.
+  - **`s.step(ps, n, config, viscosity)`:** the WCSPH step on part b's f32 neighbour lists, with CSF surface tension
+    and symplectic Euler or velocity Verlet (`use_verlet`, `reset_integrator`). It grows every buffer before changing
+    a particle, so `PV_ERR_OUT_OF_MEMORY` leaves the particles as they were. `s.neighbor_lists()` returns a
+    `PvNeighborLists` for M4 part d's functions. ADR 0002 #19.
+  - **`PvSphSolver_adaptive_dt`,** the CFL timestep.
+  - **Parity:** 66 new `sph.tsv` rows, 1,436 in all.
+    - 49 class S step rows: a hydrostatic tank, a dam break by both integrators, a droplet with surface tension, a
+      3D box, a splash, a block at x ≈ 10⁶ (the f32 keys, D3) and the errors. They include trajectories to 300 steps.
+    - 17 adaptive-dt rows.
+    - Every row passed on the first replay. `validate.py` transcribes the step on part b's grid transcription,
+      caching each scene's trajectory: 49,870 rows, 0 failures.
+  - **Tests:** 19 Rust tests, among them the five part d tests that build their lists with the solver, so 63 of
+    `sph.rs`'s 79. Also the five solver integration tests (29 of 33), and two Cyrius-only groups: the solver's layout,
+    and `reset_integrator`.
+
+### Performance
+- **The solver step** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part a).
+  - Against Rust's criterion `solver_step` and `solver_step_st`, whose blocks are sparse at h 0.05: 1.24–2.3×.
+  - Against a twin on a dense 625-particle block: 3.2× by Euler or Verlet, 3.6× with surface tension. A third of
+    Cyrius's step is the neighbour build.
+  - Writing the force loop's three small helpers out was measured at about 6% and not kept.
+
+### Added (Cyrius)
 - **sph** (M4 part d, which completes M4): the physics extensions, in `src/sph_fns.cyr`.
   - **On caller CSR lists:** `update_viscoelastic` (Oldroyd-B), `update_heat`, `apply_delta_sph`,
     `apply_implicit_viscosity` and `compute_gradient_corrections`, with `apply_gradient_correction`.

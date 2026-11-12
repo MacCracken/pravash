@@ -594,3 +594,40 @@ twin, but Rust's suite has groups for both. Pinned, criterion one run, Cyrius tw
 
 They agree with part c's twins (8.0× and 24×). Even the 100-particle block is 14 KB, so it too is a block mapped and
 unmapped per call.
+
+## M5 part a: the solver's WCSPH step (2026-11-12)
+
+Pinned to core 15.
+- **Rust:** its criterion groups `solver_step/<count>_particles` and `solver_step_st/<count>_particles` (σ 0.072),
+  one run. Each is one solver on the block at (0.1, 0.3), size 0.5, spacing 1/√n, under `water_2d` at water's
+  viscosity. At spacing 0.03 or more against h 0.05, few pairs interact. The twin
+  `scripts/probes/rust/src/bin/bench_sph_m5a.rs` runs a dense 25 × 25 block at spacing 0.02 (about 21 neighbours a
+  particle), two runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_m5a`, interleaved with the twin. Criterion clones the particles
+  outside its timing; here each step copies them in by assignment, about 12 ns a particle.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `solver_step/9_particles` | 7.96 µs | 9.95–10.1 µs | 1.27× |
+| `solver_step/25_particles` | 22.0 µs | 28.0–28.9 µs | 1.3× |
+| `solver_step/64_particles` | 59.7 µs | 89.2–90.0 µs | 1.5× |
+| `solver_step/169_particles` | 168 µs | 337–339 µs | 2.0× |
+| `solver_step/256_particles` | 271 µs | 634–635 µs | 2.3× |
+| `solver_step_st/25_particles` | 22.9 µs | 28.2–28.6 µs | 1.24× |
+| `solver_step_st/64_particles` | 59.8 µs | 89.6–89.9 µs | 1.5× |
+| `solver_step_st/169_particles` | 177 µs | 355–357 µs | 2.0× |
+| `sph_m5a/dense_625` | 798–817 µs | 2.55–2.56 ms | 3.2× |
+| `sph_m5a/dense_625_st` | 823–825 µs | 2.93–3.02 ms | 3.6× |
+| `sph_m5a/dense_625_verlet` | 808–817 µs | 2.61–2.63 ms | 3.2× |
+
+**Reading it.**
+- **On the sparse blocks the two are close,** where little but the neighbour build happens: Rust rebuilds a
+  `HashMap` and allocates a `Vec` per cell. The ratio grows with n (1.27× at 9 particles, 2.3× at 256); this record
+  doesn't split why.
+- **On the dense block the step is a third grid, two thirds sums.** Timed apart, the neighbour build takes 0.86 ms of
+  the 2.57 ms. The rest is the density and force loops over about 30,000 list entries, roughly 21 of them within h
+  per particle.
+- **A measured, declined change.** Writing the force loop's three small helpers out (`_pv_max`, the spiky gradient,
+  the viscosity Laplacian), with their guards kept, gained about 6%: 2.53–2.67 → 2.37–2.46 ms, consistent over three
+  interleaved runs. That is too little for the duplication, so the helper calls stay; the inlining request is filed
+  (`cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md`).

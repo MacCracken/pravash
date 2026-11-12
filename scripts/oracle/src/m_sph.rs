@@ -55,6 +55,12 @@
 //! - `generate_secondary_particles` takes the threshold, the lifetime, `<ps>` and gives `v:<k>` secondaries (8
 //!   tokens: position, velocity, lifetime, `e:SecondaryType.<Kind>`); `update_secondary_particles` takes gravity,
 //!   dt, `v:<k>` secondaries and gives the survivors (class B).
+//!
+//! M5 part a (from its own seed, after part d's rows): the solver's WCSPH step.
+//! - `SphSolver::step` takes a config (14), μ, σ (its `surface_tension`), `i:` use_verlet, `i:<steps>` and `<ps>`,
+//!   and gives the particles after that many steps of one fresh solver, or the first error (class S trajectories:
+//!   the frames 1, 2, 10, 60 and 300 of each scene, each a row from the start);
+//! - `SphSolver::adaptive_dt` takes h, μ, the CFL factor, dt_min, dt_max and `<ps>` (class B).
 
 use hisab::DVec3;
 use pravash::sph::SphSolver;
@@ -1918,6 +1924,212 @@ fn secondary_rows(m: &mut Module, rng: &mut Rng) {
     upd_row(m, g, 0.01, &[]);
 }
 
+// ── M5 part a ───────────────────────────────────────────────────────────────────────
+
+/// One solver row: `steps` steps of a fresh solver with σ and Verlet as given, stopping at the first error.
+#[allow(clippy::too_many_arguments)]
+fn solver_row(
+    m: &mut Module,
+    ps: &[FluidParticle],
+    cfg: &FluidConfig,
+    mu: f64,
+    sigma: f64,
+    verlet: bool,
+    steps: usize,
+) {
+    let mut ins = config(cfg);
+    ins.extend([f(mu), f(sigma), i(i64::from(verlet)), usz(steps)]);
+    ins.extend(ptoks(ps));
+    let mut solver = SphSolver::with_surface_tension(sigma);
+    solver.use_verlet = verlet;
+    let mut s = ps.to_vec();
+    let mut out = None;
+    for _ in 0..steps {
+        if let Err(x) = solver.step(&mut s, cfg, mu) {
+            out = Some(vec![err(&x)]);
+            break;
+        }
+    }
+    let out = out.unwrap_or_else(|| s.iter().flat_map(particle).collect());
+    m.row("SphSolver::step", Class::S, &ins, &out);
+}
+
+fn trajectory_rows(
+    m: &mut Module,
+    ps: &[FluidParticle],
+    cfg: &FluidConfig,
+    mu: f64,
+    sigma: f64,
+    verlet: bool,
+    frames: &[usize],
+) {
+    for &k in frames {
+        solver_row(m, ps, cfg, mu, sigma, verlet, k);
+    }
+}
+
+/// A disc of particles at spacing sp around (cx, cy), radius r, mass set for ρ₀ at its centre.
+fn droplet(cx: f64, cy: f64, r: f64, sp: f64, h: f64) -> Vec<FluidParticle> {
+    let n = (2.0 * r / sp).ceil() as i64;
+    let mut ps = Vec::new();
+    for y in -n..=n {
+        for x in -n..=n {
+            let (dx, dy) = (x as f64 * sp, y as f64 * sp);
+            if dx * dx + dy * dy <= r * r {
+                ps.push(FluidParticle::new_2d(cx + dx, cy + dy, 1.0));
+            }
+        }
+    }
+    let mid = ps
+        .iter()
+        .position(|p| p.position.x == cx && p.position.y == cy)
+        .unwrap_or(0);
+    let mass = 1000.0 / compute_density(mid, &ps, h);
+    for p in &mut ps {
+        p.mass = mass;
+    }
+    ps
+}
+
+fn solver_rows(m: &mut Module, rng: &mut Rng) {
+    let frames = [1, 2, 10, 60, 300];
+    let water = FluidConfig::water_2d();
+    // A hydrostatic tank: a 10 × 6 block resting on the floor (density ρ₀ at its middle).
+    let tank = water_block(10, 6, 0.025, 0.0125, 0.0125, 0.05);
+    trajectory_rows(m, &tank, &water, 0.001, 0.0, false, &frames);
+    // A dam break in the left corner, by symplectic Euler and by velocity Verlet.
+    let dam = water_block(6, 10, 0.025, 0.0125, 0.0125, 0.05);
+    trajectory_rows(m, &dam, &water, 0.001, 0.0, false, &frames);
+    trajectory_rows(m, &dam, &water, 0.001, 0.0, true, &frames);
+    // A droplet in zero gravity with surface tension (the CSF term), both integrators.
+    let mut zero_g = FluidConfig::water_2d();
+    zero_g.gravity = DVec3::ZERO;
+    let drop = droplet(0.5, 0.5, 0.075, 0.025, 0.05);
+    trajectory_rows(m, &drop, &zero_g, 0.01, 0.5, false, &[1, 2, 10, 60]);
+    trajectory_rows(m, &drop, &zero_g, 0.01, 0.5, true, &[1, 2, 10, 60]);
+    // A 3D cube in a closed box, viscous, with surface tension.
+    let mut cube_cfg = FluidConfig::water_2d();
+    cube_cfg.bounds_max = DVec3::new(0.5, 0.5, 0.5);
+    cube_cfg.smoothing_radius = 0.06;
+    let mut cube = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut p = FluidParticle::new_2d(
+                    0.1 + crate::m_grid::fx(x) * 0.03,
+                    0.1 + crate::m_grid::fx(y) * 0.03,
+                    0.02,
+                );
+                p.position.z = 0.1 + crate::m_grid::fx(z) * 0.03;
+                cube.push(p);
+            }
+        }
+    }
+    trajectory_rows(m, &cube, &cube_cfg, 0.5, 0.2, false, &[1, 10, 60]);
+    // A random splash through every wall (z off the plane), Euler and Verlet.
+    let mut splash = cloud(rng, 24, 0.9, 0.05, false, 0.01);
+    for (j, p) in splash.iter_mut().enumerate() {
+        p.velocity = DVec3::new(rng.uniform(-40.0, 40.0), rng.uniform(-40.0, 40.0), 0.0);
+        if j % 6 == 0 {
+            p.position.z = [0.2, -0.2, 0.0, -0.0][(j / 6) % 4];
+        }
+    }
+    trajectory_rows(m, &splash, &water, 0.01, 0.0, false, &[1, 5, 30]);
+    trajectory_rows(m, &splash, &water, 0.01, 0.0, true, &[1, 5, 30]);
+    // Far from the origin, where the f32 keys and probes lose cells (D3): a block at x ≈ 1e6.
+    let mut far_cfg = FluidConfig::water_2d();
+    far_cfg.bounds_min = DVec3::new(-2e6, -1.0, 0.0);
+    far_cfg.bounds_max = DVec3::new(2e6, 2.0, 0.0);
+    let mut far = water_block(6, 4, 0.025, 0.0125, 0.0125, 0.05);
+    for p in &mut far {
+        p.position.x += 1e6;
+    }
+    trajectory_rows(m, &far, &far_cfg, 0.001, 0.0, false, &[1, 10]);
+    // The Rust tests' single particles, n = 0, σ negative and NaN (no CSF), viscosity 0 and negative.
+    let mut one = FluidParticle::new_2d(0.5, 0.5, 0.01);
+    one.density = 1000.0;
+    solver_row(m, &[one], &water, 0.001, 0.0, false, 1);
+    solver_row(m, &[one], &water, 0.0, 0.0, true, 20);
+    let mut below = FluidParticle::new_2d(0.5, -0.1, 0.01);
+    below.density = 1000.0;
+    solver_row(m, &[below], &water, 0.001, 0.0, false, 1);
+    solver_row(m, &[], &water, 0.001, 0.0, false, 1);
+    for sigma in [-0.5, f64::NAN, f64::INFINITY] {
+        solver_row(m, &drop, &zero_g, 0.01, sigma, false, 2);
+    }
+    solver_row(m, &dam, &water, 0.0, 0.0, false, 5);
+    solver_row(m, &dam, &water, -0.01, 0.0, false, 5);
+    // The errors: the config's checks, h beyond f32 either way (its `as f32` is ∞ or 0), and divergence.
+    let small = cloud(rng, 5, 0.2, 0.3, false, 0.01);
+    let mut bad = FluidConfig::water_2d();
+    bad.dt = 0.0;
+    solver_row(m, &small, &bad, 0.001, 0.0, false, 1);
+    for h in [1e39, 1e-46] {
+        let mut c = FluidConfig::water_2d();
+        c.smoothing_radius = h;
+        solver_row(m, &small, &c, 0.001, 0.0, false, 1);
+    }
+    let mut nan = small.clone();
+    nan[2].position.y = f64::NAN;
+    solver_row(m, &nan, &water, 0.001, 0.0, false, 1);
+    let mut inf = small.clone();
+    inf[4].mass = f64::INFINITY;
+    inf[4].position = inf[1].position;
+    inf[4].position.x += 0.01;
+    solver_row(m, &inf, &water, 0.001, 0.0, true, 1);
+    // One component diverging alone (an ∞ x velocity, through viscosity, into a neighbour's x acceleration). No RNG.
+    let mut one_axis = small.clone();
+    one_axis[0].position = one_axis[1].position;
+    one_axis[0].position.x += 0.01;
+    one_axis[0].velocity = DVec3::new(f64::INFINITY, 0.0, 0.0);
+    solver_row(m, &one_axis, &water, 0.001, 0.0, false, 1);
+}
+
+fn adaptive_dt_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, ps: &[FluidParticle], v: [f64; 5]| {
+        let mut ins: Vec<Tok> = v.iter().map(|&x| f(x)).collect();
+        ins.extend(ptoks(ps));
+        let dt = SphSolver::adaptive_dt(ps, v[0], v[1], v[2], v[3], v[4]);
+        m.row("SphSolver::adaptive_dt", Class::B, &ins, &[f(dt)]);
+    };
+    let mut ps = rich_cloud(rng, 20, 0.5, true);
+    let base = [0.05, 0.001, 0.4, 1e-5, 0.01];
+    row(m, &ps, base);
+    // Each term binding: fast particles, a large acceleration, a large viscosity; at rest (none binds: f64::MAX).
+    let mut fast = ps.clone();
+    fast[3].velocity.x = 300.0;
+    row(m, &fast, base);
+    let mut hard = ps.clone();
+    hard[5].acceleration.y = -1e6;
+    row(m, &hard, base);
+    row(m, &ps, [0.05, 50.0, 0.4, 1e-9, 0.01]);
+    let mut rest = ps.clone();
+    for p in &mut rest {
+        p.velocity = DVec3::ZERO;
+        p.acceleration = DVec3::ZERO;
+    }
+    row(m, &rest, [0.05, 0.0, 0.4, 1e-5, 0.01]);
+    row(m, &rest, [0.05, 0.0, 0.4, 1e-5, 1e300]);
+    // Inverted bounds (swapped), each early return, NaN speeds and accelerations, n = 0.
+    row(m, &ps, [0.05, 0.001, 0.4, 0.1, 0.01]);
+    for v in [
+        [0.0, 0.001, 0.4, 1e-5, 0.01],
+        [f64::NAN, 0.001, 0.4, 1e-5, 0.01],
+        [0.05, 0.001, 0.0, 1e-5, 0.01],
+        [0.05, 0.001, f64::INFINITY, 1e-5, 0.01],
+        [0.05, 0.001, 0.4, f64::NAN, 0.01],
+        [0.05, 0.001, 0.4, 1e-5, f64::NEG_INFINITY],
+        [0.05, f64::NAN, 0.4, 1e-5, 0.01],
+        [0.05, -1.0, 0.4, 1e-5, 0.01],
+    ] {
+        row(m, &ps, v);
+    }
+    ps[2].velocity.y = f64::NAN;
+    ps[7].acceleration.x = f64::INFINITY;
+    row(m, &ps, base);
+    row(m, &[], base);
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -1950,5 +2162,9 @@ pub fn emit() -> Module {
     combustion_rows(&mut m, &mut rng);
     contact_angle_rows(&mut m, &mut rng);
     secondary_rows(&mut m, &mut rng);
+    // M5 part a's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f5a);
+    solver_rows(&mut m, &mut rng);
+    adaptive_dt_rows(&mut m, &mut rng);
     m
 }

@@ -3642,6 +3642,204 @@ def sph_d_want(func, x, P):
         ss = [list(x[5 + 8 * j:13 + 8 * j]) for j in range(n)]
         out = r_upd_secondary(ss, x[0:3], x[3])
         return [("v", len(out))] + [v for s in out for v in s]
+    return sph_m5_want(func, x, P)
+
+
+# ── sph M5 part a: the solver's WCSPH step ──
+
+def kc_h9(kc):
+    h = kc[0]
+    h2 = h * h
+    h3 = h2 * h
+    h6 = h3 * h3
+    return h6 * h3
+
+
+def kc_poly6_grad(kc, r2):
+    """`KernelCoeffs::poly6_grad_scalar`: (−945/((32π)·h⁹))·d·d, d = h² − r²."""
+    if r2 > kc[1]:
+        return 0.0
+    d = kc[1] - r2
+    return fdiv(-945.0, 32.0 * PI * kc_h9(kc)) * d * d
+
+
+def kc_poly6_lap(kc, r2):
+    """`KernelCoeffs::poly6_laplacian`: (−945/((32π)·h⁹))·d·(3h² − 7r²)."""
+    if r2 > kc[1]:
+        return 0.0
+    d = kc[1] - r2
+    return fdiv(-945.0, 32.0 * PI * kc_h9(kc)) * d * (3.0 * kc[1] - 7.0 * r2)
+
+
+def r_csf(n, lap, sigma, rho, h):
+    mag = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+    if not (fin(sigma) and sigma > 0.0) or mag != mag or mag <= fdiv(0.1, h):
+        return [0.0, 0.0, 0.0]
+    sc = fdiv(-sigma * lap, rho * mag)
+    return [n[0] * sc, n[1] * sc, n[2] * sc]
+
+
+SOLVER_CACHE = {}
+
+
+def r_solver_step(ps, c, mu, sigma, verlet, prev):
+    """One `SphSolver::step` on ps (lists, in place); prev is Verlet's state (a list, or None before a first step).
+    Returns (error token or None, prev)."""
+    e = r_validate(c)
+    if e:
+        return e, prev
+    n = len(ps)
+    if n == 0:
+        return None, prev
+    h = c[4]
+    hw = f32(h)
+    if not (fin(hw) and hw > 0.0):
+        return "E:InvalidSmoothingRadius", prev
+    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    kc = kc_new(h)
+    dens = []
+    for i in range(n):
+        d = 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            r2 = pd2(ps[i], ps[j])
+            if r2 <= kc[1]:
+                d += ps[j][11] * kc_poly6(kc, r2)
+        dens.append(d)
+    for p, d in zip(ps, dens):
+        p[9] = d
+        p[10] = c[5] * (d - c[6])
+    snap = [list(p) for p in ps]
+    csf = sigma > 0.0
+    lap0 = kc_poly6_lap(kc, 0.0)
+    accs = []
+    for i, pi in enumerate(snap):
+        acc = [c[1], c[2], c[3]]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        cn = [0.0, 0.0, 0.0]
+        lapc = fdiv(pi[11], rho) * lap0 if csf else 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+            dd = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+            sym = fdiv(pi[10], rho * rho) + fdiv(pj[10], rho_j * rho_j)
+            psc = fdiv(-pj[11] * sym * kc_spiky(kc, r), r)
+            for a in range(3):
+                acc[a] += psc * dd[a]
+            vs = fdiv(fdiv(mu * pj[11] * kc_visc(kc, r), rho_j), rho)
+            for a in range(3):
+                acc[a] += vs * (pj[3 + a] - pi[3 + a])
+            if csf:
+                mor = fdiv(pj[11], rho_j)
+                pg = kc_poly6_grad(kc, r2)
+                for a in range(3):
+                    cn[a] += mor * pg * dd[a]
+                lapc += mor * kc_poly6_lap(kc, r2)
+        st = r_csf(cn, lapc, sigma, rho, kc[0])
+        accs.append([acc[a] + st[a] for a in range(3)])
+    for i, a in enumerate(accs):
+        if not all(fin(x) for x in a):
+            return "E:Diverged", prev
+        ps[i][6:9] = a
+    dt = c[0]
+    if verlet:
+        started = prev is not None and len(prev) == n
+        if not started:
+            prev = [[0.0, 0.0, 0.0] for _ in range(n)]
+        for i, p in enumerate(ps):
+            a = list(p[6:9])
+            v = list(p[3:6])
+            if started:
+                v = [v[k] + (0.5 * (a[k] - prev[i][k])) * dt for k in range(3)]
+            for k in range(3):
+                p[k] = p[k] + ((v[k] * dt) + ((0.5 * a[k]) * dt) * dt)
+                p[3 + k] = v[k] + a[k] * dt
+            prev[i] = a
+    else:
+        for p in ps:
+            for k in range(3):
+                p[3 + k] = p[3 + k] + p[6 + k] * dt
+            for k in range(3):
+                p[k] = p[k] + p[3 + k] * dt
+    lo, hi, damp = c[7:10], c[10:13], c[13]
+    for p in ps:
+        for a in range(3):
+            if p[a] < lo[a]:
+                p[a] = lo[a]
+                p[3 + a] *= -damp
+            elif p[a] > hi[a] and hi[a] > lo[a]:
+                p[a] = hi[a]
+                p[3 + a] *= -damp
+    return None, prev
+
+
+def _copy_state(st):
+    ps, prev, err_ = st
+    return [list(p) for p in ps], (None if prev is None else [list(q) for q in prev]), err_
+
+
+def r_solver_run(c, mu, sigma, verlet, steps, ps0, key):
+    """`steps` steps of one fresh solver, continuing from the longest cached state of the same scene (the trajectory
+    rows share their inputs but for the step count)."""
+    best = None
+    for k, st in SOLVER_CACHE.get(key, []):
+        if k <= steps and (best is None or k > best[0]):
+            best = (k, st)
+    if best is None:
+        at, ps, prev, err_ = 0, [list(p) for p in ps0], None, None
+    else:
+        at = best[0]
+        ps, prev, err_ = _copy_state(best[1])
+    while at < steps and err_ is None:
+        err_, prev = r_solver_step(ps, c, mu, sigma, verlet, prev)
+        at += 1
+    SOLVER_CACHE.setdefault(key, []).append((steps, _copy_state((ps, prev, err_))))
+    return [err_] if err_ else [v for p in ps for v in p]
+
+
+def r_adaptive_dt(ps, h, mu, cfl, lo, hi):
+    if not (fin(h) and h > 0.0) or not (fin(cfl) and cfl > 0.0) or not fin(lo) or not fin(hi):
+        return r_max(hi, lo)
+    dtc = sys.float_info.max
+    mv = 0.0
+    for p in ps:
+        mv = r_max(mv, sum_sq(p[3], p[4], p[5]))
+    mv = math.sqrt(mv) if mv == mv and mv >= 0.0 else mv
+    if mv > 1e-20:
+        dtc = r_min(dtc, fdiv(h, mv))
+    ma = 0.0
+    for p in ps:
+        ma = r_max(ma, p[6] * p[6] + p[7] * p[7] + p[8] * p[8])
+    ma = math.sqrt(ma) if ma == ma and ma >= 0.0 else ma
+    if ma > 1e-20:
+        q = fdiv(h, ma)
+        dtc = r_min(dtc, math.sqrt(q))
+    if mu > 1e-20:
+        dtc = r_min(dtc, fdiv(h * h, 6.0 * mu))
+    a, b = (lo, hi) if lo <= hi else (hi, lo)
+    return r_clamp(cfl * dtc, a, b)
+
+
+def sph_m5_want(func, x, P):
+    """An M5 sph row's recomputed outputs, or None for another function."""
+    def parts(k):
+        n = x[k]
+        return [list(x[k + 1 + 18 * j:k + 19 + 18 * j]) for j in range(n)]
+
+    def frozen(v):
+        return tuple(bits(t) if isinstance(t, float) else t for t in v)
+
+    if func == "SphSolver::step":
+        c, mu, sigma, verlet, steps = list(x[0:14]), x[14], x[15], x[16], x[17]
+        key = (frozen(x[0:17]), frozen(x[18:]))
+        return r_solver_run(c, mu, sigma, verlet, steps, parts(18), key)
+    if func == "SphSolver::adaptive_dt":
+        return [r_adaptive_dt(parts(5), *x[0:5])]
     return None
 
 
