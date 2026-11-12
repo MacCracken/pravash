@@ -1530,6 +1530,47 @@ fn bench_sph_m5b() {
     return 0;
 }
 
+# ── sph, M5 part c ──
+# sph_m5c/*: against scripts/probes/rust/src/bin/bench_sph_m5c.rs (bodies in its header): DFSPH on the solver_step
+# bench's 64-particle block and on the dense 625-particle block, at most 3 rounds of each solver.
+
+# One DFSPH row: `iters` DFSPH steps of one solver on a fresh copy of the block (origin (ox, oy), size 0.5, spacing
+# sp) before each.
+fn _bench_dfsph(name, sp: f64, ox: f64, oy: f64, max_err: f64, iters) {
+    var bp, bn = create_particle_block(ox, oy, 0.5, 0.5, sp, 0.001);
+    var src: *PvFluidParticle = _pv_as_particles(bp);
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(bn * sizeof(PvFluidParticle)));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var s: PvSphSolver = PvSphSolver_new();
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        for (var c = 0; c < bn; c = c + 1) {
+            var d: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *d = *e;
+        }
+        var t, v = s.step_dfsph(work, bn, &cfg, mu, 3, max_err);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvSphSolver_drop(&s);
+    fl_free(work);
+    fl_free(bp);
+    return 0;
+}
+
+# The M5 part c benches: the bench_sph_m5c.rs twins.
+fn bench_sph_m5c() {
+    var third: f64 = 1.0 / 15.0;
+    _bench_dfsph("sph_m5c/dfsph_sparse_64", third, 0.1, 0.3, 0.01, 2000);
+    _bench_dfsph("sph_m5c/dfsph_dense_625", 0.02, 0.1, 0.1, 0.01, 50);
+    _bench_dfsph("sph_m5c/dfsph_dense_625_3it", 0.02, 0.1, 0.1, 0.0, 50);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1561,6 +1602,7 @@ fn main(): i64 {
     bench_sph_d();
     bench_sph_m5a();
     bench_sph_m5b();
+    bench_sph_m5c();
     return 0;
 }
 

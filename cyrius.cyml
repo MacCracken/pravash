@@ -78,5 +78,6 @@ modules = [
     "src/sph_fns.cyr",
     "src/sph.cyr",
     "src/sph_pcisph.cyr",
+    "src/sph_dfsph.cyr",
     "src/json.cyr",
 ]

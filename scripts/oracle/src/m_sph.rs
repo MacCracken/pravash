@@ -65,6 +65,10 @@
 //! M5 part b (from its own seed): `SphSolver::step_pcisph` takes a config (14), μ, σ, `i:<max_iterations>`, the
 //! density-error threshold, `i:<steps>` and `<ps>`, and gives the particles after that many PCISPH steps of one fresh
 //! solver, or the first error (class S trajectories, as the WCSPH rows).
+//!
+//! M5 part c (from its own seed): `SphSolver::step_dfsph` takes a config (14), μ, `i:<max_iterations>`, the error
+//! threshold, `i:<steps>` and `<ps>`, and gives the particles after that many DFSPH steps of one fresh solver, or the
+//! first error (class S trajectories).
 
 use hisab::DVec3;
 use pravash::sph::SphSolver;
@@ -2257,6 +2261,139 @@ fn pcisph_rows(m: &mut Module, rng: &mut Rng) {
     pcisph_row(m, &[one, lone], &water, 0.001, 0.0, 5, 0.01, 1);
 }
 
+// ── M5 part c ───────────────────────────────────────────────────────────────────────
+
+/// One DFSPH row: `steps` DFSPH steps of a fresh solver, stopping at the first error.
+fn dfsph_row(
+    m: &mut Module,
+    ps: &[FluidParticle],
+    cfg: &FluidConfig,
+    mu: f64,
+    iters: usize,
+    max_err: f64,
+    steps: usize,
+) {
+    let mut ins = config(cfg);
+    ins.extend([f(mu), usz(iters), f(max_err), usz(steps)]);
+    ins.extend(ptoks(ps));
+    let mut solver = SphSolver::new();
+    let mut s = ps.to_vec();
+    let mut out = None;
+    for _ in 0..steps {
+        if let Err(x) = solver.step_dfsph(&mut s, cfg, mu, iters, max_err) {
+            out = Some(vec![err(&x)]);
+            break;
+        }
+    }
+    let out = out.unwrap_or_else(|| s.iter().flat_map(particle).collect());
+    m.row("SphSolver::step_dfsph", Class::S, &ins, &out);
+}
+
+fn dfsph_rows(m: &mut Module, rng: &mut Rng) {
+    let water = FluidConfig::water_2d();
+    let tank = water_block(10, 6, 0.025, 0.0125, 0.0125, 0.05);
+    for k in [1, 2, 10, 60, 300] {
+        dfsph_row(m, &tank, &water, 0.001, 3, 0.01, k);
+    }
+    let dam = water_block(6, 10, 0.025, 0.0125, 0.0125, 0.05);
+    for k in [1, 2, 10, 60, 300] {
+        dfsph_row(m, &dam, &water, 0.001, 3, 0.01, k);
+    }
+    // Iteration counts (0 runs neither solver) and thresholds every round meets, none meets, NaN, negative.
+    for &(iters, max_err) in &[
+        (0, 0.01),
+        (1, 0.01),
+        (20, 1e-4),
+        (3, 1e9),
+        (3, 0.0),
+        (3, f64::NAN),
+        (3, -1.0),
+    ] {
+        dfsph_row(m, &dam, &water, 0.001, iters, max_err, 10);
+    }
+    // Rust's compression test: a block at spacing 0.012 against the rest density of one at 0.02, no gravity, 20
+    // rounds to 1e-3.
+    let mut comp = FluidConfig::water_2d();
+    comp.gravity = DVec3::ZERO;
+    comp.dt = 1e-3;
+    let lattice = create_particle_block([0.4, 0.4], [0.2, 0.2], 0.02, 0.001);
+    comp.rest_density = compute_density(lattice.len() / 2 + 5, &lattice, comp.smoothing_radius);
+    let squeezed = create_particle_block([0.4, 0.4], [0.12, 0.12], 0.012, 0.001);
+    for k in [1, 5] {
+        dfsph_row(m, &squeezed, &comp, 0.0, 20, 1e-3, k);
+    }
+    let mut zero_g = FluidConfig::water_2d();
+    zero_g.gravity = DVec3::ZERO;
+    let drop = droplet(0.5, 0.5, 0.075, 0.025, 0.05);
+    for k in [1, 10] {
+        dfsph_row(m, &drop, &zero_g, 0.01, 3, 0.01, k);
+    }
+    let mut cube_cfg = FluidConfig::water_2d();
+    cube_cfg.bounds_max = DVec3::new(0.5, 0.5, 0.5);
+    cube_cfg.smoothing_radius = 0.06;
+    let mut cube = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut p = FluidParticle::new_2d(
+                    0.1 + crate::m_grid::fx(x) * 0.03,
+                    0.1 + crate::m_grid::fx(y) * 0.03,
+                    0.02,
+                );
+                p.position.z = 0.1 + crate::m_grid::fx(z) * 0.03;
+                cube.push(p);
+            }
+        }
+    }
+    for k in [1, 10, 60] {
+        dfsph_row(m, &cube, &cube_cfg, 0.5, 3, 0.01, k);
+    }
+    let mut splash = cloud(rng, 24, 0.9, 0.05, false, 0.01);
+    for (j, p) in splash.iter_mut().enumerate() {
+        p.velocity = DVec3::new(rng.uniform(-40.0, 40.0), rng.uniform(-40.0, 40.0), 0.0);
+        if j % 6 == 0 {
+            p.position.z = [0.2, -0.2, 0.0, -0.0][(j / 6) % 4];
+        }
+    }
+    for k in [1, 5, 30] {
+        dfsph_row(m, &splash, &water, 0.01, 3, 0.01, k);
+    }
+    // Rust's test shapes: n = 0, one particle (α 0), the dense block.
+    let mut one = FluidParticle::new_2d(0.5, 0.5, 0.01);
+    one.density = 1000.0;
+    dfsph_row(m, &[], &water, 0.001, 3, 0.01, 1);
+    dfsph_row(m, &[one], &water, 0.001, 3, 0.01, 1);
+    let dense = create_particle_block([0.2, 0.3], [0.2, 0.2], 0.02, 0.001);
+    dfsph_row(m, &dense, &water, 0.001, 3, 0.01, 5);
+    // The errors: the config, h whose `as f32` is ∞, and states that diverge. DFSPH advects before its second neighbour
+    // build, so a position that went ±∞ would saturate its key and overflow the build's `cx + 1` (a panic in the
+    // oracle's overflow-checked build): the diverging rows use NaN, whose key is 0. A NaN x velocity beside a
+    // neighbour (one axis), and a lone particle's NaN y velocity.
+    let small = cloud(rng, 5, 0.2, 0.3, false, 0.01);
+    let mut bad = FluidConfig::water_2d();
+    bad.dt = 0.0;
+    dfsph_row(m, &small, &bad, 0.001, 3, 0.01, 1);
+    let mut big_h = FluidConfig::water_2d();
+    big_h.smoothing_radius = 1e39;
+    dfsph_row(m, &small, &big_h, 0.001, 3, 0.01, 1);
+    let mut one_axis = small.clone();
+    one_axis[0].position = one_axis[1].position;
+    one_axis[0].position.x += 0.01;
+    one_axis[0].velocity = DVec3::new(f64::NAN, 0.0, 0.0);
+    dfsph_row(m, &one_axis, &water, 0.001, 3, 0.01, 1);
+    let mut lone = FluidParticle::new_2d(0.5, 0.5, 0.01);
+    lone.velocity = DVec3::new(0.0, f64::NAN, 0.0);
+    dfsph_row(m, &[one, lone], &water, 0.001, 3, 0.01, 1);
+    // Densities under α's 1e-10 floor while still compressed: masses of 1e-15 against a rest density of 1e-12. No RNG.
+    let mut faint = dam.clone();
+    for p in &mut faint {
+        p.mass = 1e-15;
+    }
+    let mut faint_cfg = FluidConfig::water_2d();
+    faint_cfg.rest_density = 1e-12;
+    dfsph_row(m, &faint, &faint_cfg, 0.001, 3, 0.01, 2);
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -2296,5 +2433,8 @@ pub fn emit() -> Module {
     // M5 part b's rows, from their own seed.
     let mut rng = Rng::new(0x0_5f5b);
     pcisph_rows(&mut m, &mut rng);
+    // M5 part c's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f5c);
+    dfsph_rows(&mut m, &mut rng);
     m
 }

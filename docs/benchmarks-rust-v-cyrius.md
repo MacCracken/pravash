@@ -655,3 +655,22 @@ Pinned to core 15.
 - **Forcing five iterations costs 2.4× the 1% row in Cyrius and 1.8× in Rust,** so the iterations' sums are where
   the gap widens. This record doesn't count how many iterations the 1% row ran.
 - **The per-pair arithmetic is part a's,** where writing the helpers out was measured at about 6%.
+
+## M5 part c: DFSPH (2026-11-12)
+
+Pinned to core 15. Rust's criterion suite has no DFSPH group.
+- **Rust:** the twin `scripts/probes/rust/src/bin/bench_sph_m5c.rs` (bodies in its header), two runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_m5c`, interleaved with it. One solver, the block copied in before each
+  step, at most 3 rounds of each solver.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_m5c/dfsph_sparse_64` (to 1%) | 115–116 µs | 167–171 µs | 1.46× |
+| `sph_m5c/dfsph_dense_625` (to 1%) | 1.65–1.71 ms | 6.28–6.36 ms | 3.8× |
+| `sph_m5c/dfsph_dense_625_3it` (threshold 0) | 2.69 ms | 14.4 ms | 5.35× |
+
+**Reading it.**
+- **DFSPH builds its neighbour lists twice a step,** so the sparse block, where little but the builds happens, sits
+  close to Rust, as part a's and b's do.
+- **On the dense block the solver rounds widen the gap,** as PCISPH's iterations do. Running every round costs 2.3×
+  the 1% row in Cyrius and 1.6× in Rust. Each round is a density-rate sum and a κ application over every list.

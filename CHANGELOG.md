@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M5 part c): `src/sph_dfsph.cyr`, the solver's DFSPH step.
+  - **`s.step_dfsph(ps, n, config, viscosity, max_iterations, max_error)`** in Bender & Koschier's order:
+    - the densities and α, the non-pressure velocity, the density solver;
+    - the advection, a second neighbour build and α at the new positions;
+    - the divergence solver, the diagnostic pressures, the divergence check, the walls.
+
+    `max_iterations` = 0 runs neither solver, as in Rust. α and κ are solver columns. The second build's lists may need
+    more room after the advection, so only an out-of-memory there leaves a partial step. ADR 0002 #21.
+  - **Parity:** 35 new class S rows, 1,508 in all. They cover M5 part a's scenes and Rust's compressed-block test,
+    iteration counts 0 to 20, and threshold edge cases. They also cover tiny masses against a tiny rest density, which
+    reach α's 1e-10 floor, and the errors.
+    - All 34 rows of the first set passed on the first replay. `validate.py` transcribes DFSPH: 49,942 rows,
+      0 failures.
+    - No row advects a position to ±∞. Its saturated key would overflow the second build's `cx + 1`, which panics in
+      the oracle's build; the diverging rows use NaN instead.
+  - **Tests:** the four DFSPH Rust tests, and `test_grid_cfl_dt` and `test_shallow_cfl_dt`, two grid and shallow-water
+    tests that live in `sph.rs` and had been missed. That makes 74 of the 79; the last five are the multiphase step's.
+    Part a ported 23 tests, not the 22 its record says, so the counts since then were one short (68 after M5 part b).
+
+### Performance
+- **DFSPH** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part c; Rust's criterion
+  suite has no DFSPH group, so against a twin): 1.46× on a sparse 64-particle block. On a dense 625-particle block it
+  is 3.8× to 1% and 5.35× with every round run.
+
+### Added (Cyrius)
 - **sph** (M5 part b): `src/sph_pcisph.cyr`, the solver's PCISPH step.
   - **`s.step_pcisph(ps, n, config, viscosity, max_iterations, max_density_error)`,** in Rust's order: the densities;
     the non-pressure accelerations; δ from the prototype particle with the fullest neighbourhood; at least one
@@ -15,8 +40,8 @@
       0 failures.
     - The mutation tests found one gap, closed by a row that draws no random numbers: no zero-iteration row needed
       its one forced iteration.
-  - **Tests:** the four PCISPH Rust tests (67 of `sph.rs`'s 79), and the solver layout test now pins all eight
-    columns.
+  - **Tests:** the four PCISPH Rust tests (68 of `sph.rs`'s 79, as recounted at part c), and the solver layout
+    test now pins all eight columns.
 
 ### Performance
 - **PCISPH** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part b): 1.34–1.75× Rust's

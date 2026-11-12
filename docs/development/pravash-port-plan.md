@@ -11,7 +11,8 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M5 part b complete** (2026-11-12); M5 part c (DFSPH) is next. Part b ported PCISPH
+> ⏳ **Status: M5 part c complete** (2026-11-12); M5 part d (the multiphase step) is next. Part c ported DFSPH
+> (`src/sph_dfsph.cyr`): 35 rows, bit-exact on the first replay (port-parity §21). Part b ported PCISPH
 > (`src/sph_pcisph.cyr`): 37 rows, bit-exact on the first replay (port-parity §20). Part a ported the `SphSolver` and its
 > WCSPH step (`src/sph.cyr`): 66 rows, every one bit-exact on the first replay, 300-step trajectories by both
 > integrators included (port-parity §19). M4 is complete. Part d ported the physics extensions
@@ -952,13 +953,15 @@ port-parity §15 (part a):
 - surface parity adds `sph`, the rest pending by part.
 
 **Next:** M5 part a, the `SphSolver`'s WCSPH step |
-| M5 SPH solvers | 🟡 **parts a and b done 2026-11-12**; parts c–e next | sph 1,473. Part b: 37 class S PCISPH rows (part a's scenes, iteration counts 0–20, thresholds every iteration meets, none meets, NaN, negative; the Rust tests' shapes; both divergence paths). Part a: 49 class S solver rows (a hydrostatic tank, a dam break by Euler and Verlet, a droplet with surface tension, a 3D box, a splash, a block at x ≈ 10⁶, the errors; trajectories at frames 1, 2, 10, 60, 300) and 17 adaptive-dt rows | 67 of the 79 Rust tests of `sph.rs`; 29 of 33 integration tests | criterion `pcisph_step` 1.34–1.75×, a dense block 4.7× (to 1%) and 6.3× (5 iterations); criterion `solver_step` 1.27–2.3×, `solver_step_st` 1.24–2.0×; a dense 625-particle block 3.2× (Euler, Verlet), 3.6× (surface tension) | port-parity §20 (part b): `src/sph_pcisph.cyr`; ADR 0002 #20; one gap (a zero-iteration row needing its forced iteration), closed.
+| M5 SPH solvers | 🟡 **parts a–c done 2026-11-12**; parts d and e next | sph 1,508. Part c: 35 class S DFSPH rows (part a's scenes, Rust's compressed block, iteration counts 0–20, threshold edges, densities under α's floor, the errors). Part b: 37 class S PCISPH rows (part a's scenes, iteration counts 0–20, thresholds every iteration meets, none meets, NaN, negative; the Rust tests' shapes; both divergence paths). Part a: 49 class S solver rows (a hydrostatic tank, a dam break by Euler and Verlet, a droplet with surface tension, a 3D box, a splash, a block at x ≈ 10⁶, the errors; trajectories at frames 1, 2, 10, 60, 300) and 17 adaptive-dt rows | 74 of the 79 Rust tests of `sph.rs` (the five left are the multiphase step's); 29 of 33 integration tests | DFSPH (a twin) 1.46× sparse, 3.8× dense to 1%, 5.35× with every round; criterion `pcisph_step` 1.34–1.75×, a dense block 4.7× (to 1%) and 6.3× (5 iterations); criterion `solver_step` 1.27–2.3×, `solver_step_st` 1.24–2.0×; a dense 625-particle block 3.2× (Euler, Verlet), 3.6× (surface tension) | port-parity §21 (part c): `src/sph_dfsph.cyr`; ADR 0002 #21; one gap (α's density floor), closed; the test counts corrected (part a ported 23).
+
+port-parity §20 (part b): `src/sph_pcisph.cyr`; ADR 0002 #20; one gap (a zero-iteration row needing its forced iteration), closed.
 
 port-parity §19 (part a):
 - `src/sph.cyr`; ADR 0002 #19 (the solver-owned buffers, `PvNeighborLists`, the Verlet reserve);
 - the mutation tests found one gap (a one-axis divergence), closed by a row drawing no random numbers.
 
-**Next:** M5 part c, DFSPH |
+**Next:** M5 part d, the multiphase step |
 | M6 Coupling and MPM | — | — | — | — | |
 | M7 Compute, logging and ai | — | — | — | — | |
 | M8 Release 2.0.0 | — | — | — | — | |

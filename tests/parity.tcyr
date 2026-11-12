@@ -1255,6 +1255,34 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(pb);
         return 1;
     }
+    if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) {
+        # `steps` DFSPH steps of one fresh solver, stopping at the first error (M5 part c).
+        var dc: PvFluidConfig;
+        _par_config_in(0, &dc);
+        var dmu: f64 = _par_in(14);
+        var dsv: PvSphSolver = PvSphSolver_new();
+        var diters = _par_in(15);
+        var derr: f64 = _par_in(16);
+        var dsteps = _par_in(17);
+        var db, dn, dk = _par_particles_in(18);
+        var dps: *PvFluidParticle = _pv_as_particles(db);
+        var dfail = 0;
+        for (var t3 = 0; t3 < dsteps; t3 = t3 + 1) {
+            if (dfail == 0) {
+                var et, ev = dsv.step_dfsph(dps, dn, &dc, dmu, diters, derr);
+                if (is_err_result(et) == 1) {
+                    _par_got_err(ev);
+                    dfail = 1;
+                }
+            }
+        }
+        if (dfail == 0) {
+            for (var j3 = 0; j3 < dn; j3 = j3 + 1) { _par_particle_out(dps + j3); }
+        }
+        PvSphSolver_drop(&dsv);
+        fl_free(db);
+        return 1;
+    }
     if (_par_eq(fp, fl, "SphSolver::adaptive_dt") == 1) {
         var ab, an, ak = _par_particles_in(5);
         var aps: *PvFluidParticle = _pv_as_particles(ab);
@@ -2526,6 +2554,8 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "SphSolver::step") == 1) { return 0; }
     # M5 part b: PCISPH (class S) is the same arithmetic in Rust's order, so every particle is the oracle's bit for bit.
     if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) { return 0; }
+    # M5 part c: DFSPH (class S), likewise.
+    if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) { return 0; }
     return 0 - 1;
 }
 

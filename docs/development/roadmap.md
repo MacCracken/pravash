@@ -69,7 +69,7 @@
 - [x] M5 part a: the `SphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension), `adaptive_dt` (66 rows,
   every one bit-exact on the first replay; 19 Rust tests and 5 integration tests)
 - [x] M5 part b: PCISPH (37 rows, bit-exact on the first replay; 4 Rust tests)
-- [ ] M5 part c: DFSPH
+- [x] M5 part c: DFSPH (35 rows, bit-exact on the first replay; 4 Rust tests, and the 2 CFL tests of `sph.rs`)
 - [ ] M5 part d: the multiphase step (`PhaseProperties`, `MultiPhaseConfig`)
 - [ ] M5 part e: the three parallel SPH loops on the worker pool, then the D3 switch to f64 keys (the rows remapped)
 

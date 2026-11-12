@@ -2,9 +2,9 @@
 #
 # M5 part a: the solver's state and constructors, its WCSPH `step` (symplectic Euler or velocity Verlet, with the CSF
 # surface tension), the neighbour lists it leaves for M4 part d's functions, and `adaptive_dt`. PCISPH (part b) is in
-# src/sph_pcisph.cyr; DFSPH and the multiphase step are parts c and d; part e runs the three parallel loops on the
-# worker pool and switches the neighbour keys to f64 (D3). Until then the keys are hisab 1.4.0's f32 ones, bit for bit
-# (`src/neighbor.cyr`).
+# src/sph_pcisph.cyr and DFSPH (part c) in src/sph_dfsph.cyr; the multiphase step is part d; part e runs the three
+# parallel loops on the worker pool and switches the neighbour keys to f64 (D3). Until then the keys are hisab 1.4.0's
+# f32 ones, bit for bit (`src/neighbor.cyr`).
 #
 # Every buffer is the solver's and reused across steps: the grid's columns, the densities, the snapshot the forces
 # read, the accelerations (a per-step `Vec` in Rust, port plan §7.5), and Verlet's previous accelerations. A step
@@ -13,9 +13,9 @@
 
 # The SPH solver: the neighbour grid (first, so its address is the solver's), the densities (one word a particle), the
 # snapshot (18 words a particle), the accelerations and Verlet's previous ones (3 words a particle), PCISPH's
-# non-pressure accelerations, pressures, predicted positions and velocities (M5 part b), the surface tension
-# coefficient (0 disables it) and whether to integrate by velocity Verlet. Mirrors `SphSolver`; its
-# `surface_tension` and `use_verlet` are public, as Rust's.
+# non-pressure accelerations, pressures, predicted positions and velocities (M5 part b), DFSPH's α and κ factors (part
+# c), the surface tension coefficient (0 disables it) and whether to integrate by velocity Verlet. Mirrors `SphSolver`;
+# its `surface_tension` and `use_verlet` are public, as Rust's.
 struct PvSphSolver {
     grid: PvNeighborGrid;
     densities: PvColumn;
@@ -26,12 +26,14 @@ struct PvSphSolver {
     pcisph_pressures: PvColumn;
     pcisph_pred_pos: PvColumn;
     pcisph_pred_vel: PvColumn;
+    dfsph_alpha: PvColumn;
+    dfsph_kappa: PvColumn;
     surface_tension: f64;
     use_verlet;
 }
 
 # The solver's column count after its grid.
-const _PV_SOLVER_COLUMNS = 8;
+const _PV_SOLVER_COLUMNS = 10;
 
 # The solver's neighbour grid, at offset 0.
 #must_use
@@ -40,8 +42,8 @@ fn _pv_sph_grid(s): *PvNeighborGrid {
 }
 
 # Column k of a solver (0 densities, 1 snapshot, 2 accels, 3 prev_accel, 4 pcisph_accel, 5 pcisph_pressures,
-# 6 pcisph_pred_pos, 7 pcisph_pred_vel), by its byte offset after the 224-byte grid (tests/sph.tcyr pins the layout,
-# 432 bytes).
+# 6 pcisph_pred_pos, 7 pcisph_pred_vel, 8 dfsph_alpha, 9 dfsph_kappa), by its byte offset after the 224-byte grid
+# (tests/sph.tcyr pins the layout, 480 bytes).
 #must_use
 fn _pv_sph_col(s, k): *PvColumn {
     return _pv_as_columns(_pv_addr(s) + 224 + k * 24);

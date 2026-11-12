@@ -1503,7 +1503,7 @@ are. Result: 49,907 rows, 0 failures, in 39 s.
   the pressure clamp).
 
 **Tests** (`tests/sph.tcyr`, 157 checks): the four PCISPH Rust tests in Rust's order (`test_pcisph_empty`,
-`_single_particle_falls`, `_density_bounded`, `_zero_and_one_iteration`), so 67 of the 79. The layout test pins all
+`_single_particle_falls`, `_density_bounded`, `_zero_and_one_iteration`), so 68 of the 79 (recounted at part c: §21). The layout test pins all
 eight solver columns, after a PCISPH step sizes the last four. Surface parity: 349 items ok, 11 pending (parts c–d).
 
 **Speed** (benchmarks-rust-v-cyrius, M5 part b):
@@ -1513,3 +1513,66 @@ eight solver columns, after a PCISPH step sizes the last four. Surface parity: 3
 | criterion `pcisph_step`, 9 to 64 particles (sparse) | 1.34–1.75× |
 | a dense 625-particle block, at most 5 iterations to 1% | 4.7× |
 | the dense block, 5 iterations always (threshold 0) | 6.3× |
+
+## 21. M5 part c: DFSPH (2026-11-12)
+
+**`src/sph_dfsph.cyr`** is `step_dfsph`, a third `impl PvSphSolver` block. It follows Bender & Koschier's order, as
+Rust does:
+- the neighbour lists, then each density and stiffness factor α = max(ρ, 1e-10)/(|Σgⱼ|² + Σ|gⱼ|²) with
+  gⱼ = (xᵢ − xⱼ)·((mⱼ·W')/r), or 0 when that denominator isn't above 1e-20;
+- the non-pressure velocity v* from a snapshot (gravity, viscosity);
+- the density solver: κᵢ = (max(ρ*ᵢ − ρ₀, 0)/dt²)·αᵢ with ρ* = ρ + dt·Dρ/Dt, stopping once Σerr/(n·ρ₀) is under the
+  threshold, each round applied to the velocities;
+- the advection, then a second neighbour build and α at the new positions;
+- the divergence solver: κᵛᵢ = (max(Dρᵢ/Dt, 0)/dt)·αᵢ, its test on (Σ·dt)/(n·ρ₀);
+- the diagnostic pressures by the linear equation of state, the divergence check, the walls.
+
+Unlike PCISPH, `max_iterations` = 0 runs neither solver. α and κ are solver columns, grown before any particle
+changes. The second build's lists may need more room after the advection, so an out-of-memory there is the one that
+leaves a partial step (ADR 0002 #21).
+
+**The rows** (`m_sph.rs`, M5 part c's seed 0x0_5f5c): 35, class S.
+- part a's scenes (the tank and the dam break to 300 steps, the droplet, the cube, the splash);
+- Rust's compression test: a block at spacing 0.012 against the rest density of one at 0.02, no gravity, 20 rounds to
+  1e-3;
+- iteration counts 0, 1, 3 and 20, and thresholds every round meets, none meets, NaN and negative;
+- the Rust tests' shapes, among them one particle, whose α is 0;
+- masses of 1e-15 against a rest density of 1e-12, so densities sit under α's 1e-10 floor while still compressed;
+- the errors: the config, an h whose `as f32` is ∞, and two divergences.
+
+DFSPH advects before its second build. A position that went ±∞ would saturate its key, and the build's `cx + 1` would
+overflow, which panics in the oracle's overflow-checked build. The generator met that panic on its first run, so the
+diverging rows use NaN velocities, whose key is 0.
+
+`validate.py` transcribes DFSPH from the Rust source, its trajectories cached as before. Result: 49,942 rows,
+0 failures, now in about 70 s.
+
+**Result:**
+- All 34 rows of the first set passed on the first replay. The replay is **12 modules, 0 failing | rows: 49,825 ok,
+  0 failed, 0 measured, 3 pending, 114 accepted (ADR 4: 114)**.
+- **The mutation tests found one gap.** On the first run 15 of 18 port mutations failed rows. Of the three survivors:
+  - dropping α's density floor was a gap. Every row's densities are far above 1e-10 whenever the particles are
+    compressed, the only time α is used. The faint-mass row closes it (no random numbers drawn) and the mutant then
+    fails it;
+  - letting α's gradient include the particle itself is equivalent: its own r² is 0, under the 1e-20 cut;
+  - stopping the density solver on `≤` is equivalent: at the tie, Rust applies an all-zero κ, which changes no
+    velocity.
+- **Mutations of the transcription:** 5 of 5 caught.
+
+**Tests** (`tests/sph.tcyr`, 171 checks): the four DFSPH Rust tests in Rust's order. Also `test_grid_cfl_dt` and
+`test_shallow_cfl_dt`, two tests of the grid's and shallow water's `cfl_dt` that live in `sph.rs` and were missed when
+M2 and M3 ported their modules. The layout test pins all ten solver columns.
+
+**The test count, corrected.** A recount from the source shows 74 of the 79 ported, the last five the multiphase
+step's. M4 part a ported 23 tests, not the 22 its record says, so each count since then was one short: 68 after M5
+part b, not 67.
+
+Surface parity: 349 items ok, 10 pending (part d).
+
+**Speed** (benchmarks-rust-v-cyrius, M5 part c; criterion has no DFSPH group):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the `solver_step` bench's 64-particle block (sparse), to 1% | 1.46× |
+| a dense 625-particle block, to 1% | 3.8× |
+| the dense block, every round (threshold 0) | 5.35× |

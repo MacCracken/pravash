@@ -3999,6 +3999,170 @@ def r_pcisph_run(c, mu, sigma, iters, max_err, steps, ps0, key):
     return [err_] if err_ else [v for p in ps for v in p]
 
 
+# ── sph M5 part c: DFSPH ──
+
+def r_dfsph_alpha(ps, offsets, indices, kc):
+    """`dfsph_density_alpha`: the densities (written to ps) and the α factors."""
+    alphas = []
+    for i, pi in enumerate(ps):
+        d = 0.0
+        sg = [0.0, 0.0, 0.0]
+        sq = 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            pj = ps[j]
+            df = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+            r2 = df[0] * df[0] + df[1] * df[1] + df[2] * df[2]
+            if r2 > kc[1]:
+                continue
+            d += pj[11] * kc_poly6(kc, r2)
+            if j == i or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            sc = fdiv(pj[11] * kc_spiky(kc, r), r)
+            gw = [df[a] * sc for a in range(3)]
+            for a in range(3):
+                sg[a] += gw[a]
+            sq += gw[0] * gw[0] + gw[1] * gw[1] + gw[2] * gw[2]
+        pi[9] = d
+        denom = (sg[0] * sg[0] + sg[1] * sg[1] + sg[2] * sg[2]) + sq
+        alphas.append(fdiv(r_max(d, SPH_MIN_DENSITY), denom) if denom > 1e-20 else 0.0)
+    return alphas
+
+
+def r_dfsph_rate(ps, offsets, indices, kc, i):
+    pi = ps[i]
+    rate = 0.0
+    for j in indices[offsets[i]:offsets[i + 1]]:
+        if j == i:
+            continue
+        pj = ps[j]
+        df = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+        r2 = df[0] * df[0] + df[1] * df[1] + df[2] * df[2]
+        if r2 > kc[1] or r2 < 1e-20:
+            continue
+        r = math.sqrt(r2)
+        gr = fdiv(kc_spiky(kc, r), r)
+        gw = [df[a] * gr for a in range(3)]
+        u = [pi[3 + a] - pj[3 + a] for a in range(3)]
+        rate += pj[11] * (u[0] * gw[0] + u[1] * gw[1] + u[2] * gw[2])
+    return rate
+
+
+def r_dfsph_apply(ps, offsets, indices, kc, kappa, dt):
+    for i, pi in enumerate(ps):
+        ki = fdiv(kappa[i], r_max(pi[9], SPH_MIN_DENSITY))
+        dv = [0.0, 0.0, 0.0]
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = ps[j]
+            df = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+            r2 = df[0] * df[0] + df[1] * df[1] + df[2] * df[2]
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            kj = fdiv(kappa[j], r_max(pj[9], SPH_MIN_DENSITY))
+            sc = fdiv(pj[11] * (ki + kj) * kc_spiky(kc, r), r)
+            for a in range(3):
+                dv[a] += df[a] * sc
+        for a in range(3):
+            pi[3 + a] = pi[3 + a] - dv[a] * dt
+
+
+def r_dfsph_step(ps, c, mu, iters, max_err):
+    """One `SphSolver::step_dfsph` on ps (lists, in place): None or the error token."""
+    e = r_validate(c)
+    if e:
+        return e
+    n = len(ps)
+    if n == 0:
+        return None
+    h = c[4]
+    if not (fin(f32(h)) and f32(h) > 0.0):
+        return "E:InvalidSmoothingRadius"
+    kc = kc_new(h)
+    dt, rest = c[0], c[6]
+    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    alphas = r_dfsph_alpha(ps, offsets, indices, kc)
+    snap = [list(p) for p in ps]
+    for i, pi in enumerate(snap):
+        acc = [c[1], c[2], c[3]]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            vs = fdiv(fdiv(mu * pj[11] * kc_visc(kc, r), r_max(pj[9], SPH_MIN_DENSITY)), rho)
+            for a in range(3):
+                acc[a] += (pj[3 + a] - pi[3 + a]) * vs
+        for a in range(3):
+            ps[i][3 + a] = ps[i][3 + a] + acc[a] * dt
+    kappa = [0.0] * n
+    scale = float(n) * rest
+    for _ in range(iters):
+        err_sum = 0.0
+        for i in range(n):
+            rho_star = ps[i][9] + dt * r_dfsph_rate(ps, offsets, indices, kc, i)
+            er = r_max(rho_star - rest, 0.0)
+            err_sum += er
+            kappa[i] = fdiv(er, dt * dt) * alphas[i]
+        if fdiv(err_sum, scale) < max_err:
+            break
+        r_dfsph_apply(ps, offsets, indices, kc, kappa, dt)
+    for p in ps:
+        for a in range(3):
+            p[a] = p[a] + p[3 + a] * dt
+    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    alphas = r_dfsph_alpha(ps, offsets, indices, kc)
+    for _ in range(iters):
+        err_sum = 0.0
+        for i in range(n):
+            rate = r_max(r_dfsph_rate(ps, offsets, indices, kc, i), 0.0)
+            err_sum += rate
+            kappa[i] = fdiv(rate, dt) * alphas[i]
+        if fdiv(err_sum * dt, scale) < max_err:
+            break
+        r_dfsph_apply(ps, offsets, indices, kc, kappa, dt)
+    for p in ps:
+        p[10] = c[5] * (p[9] - rest)
+    if any(not fin(x) for p in ps for x in p[0:6]):
+        return "E:Diverged"
+    lo, hi, damp = c[7:10], c[10:13], c[13]
+    for p in ps:
+        for a in range(3):
+            if p[a] < lo[a]:
+                p[a] = lo[a]
+                p[3 + a] *= -damp
+            elif p[a] > hi[a] and hi[a] > lo[a]:
+                p[a] = hi[a]
+                p[3 + a] *= -damp
+    return None
+
+
+DFSPH_CACHE = {}
+
+
+def r_dfsph_run(c, mu, iters, max_err, steps, ps0, key):
+    """`steps` DFSPH steps of one fresh solver, continuing from the longest cached state of the same scene."""
+    best = None
+    for k, st in DFSPH_CACHE.get(key, []):
+        if k <= steps and (best is None or k > best[0]):
+            best = (k, st)
+    if best is None:
+        at, ps, err_ = 0, [list(p) for p in ps0], None
+    else:
+        at, ps, err_ = best[0], [list(p) for p in best[1][0]], best[1][1]
+    while at < steps and err_ is None:
+        err_ = r_dfsph_step(ps, c, mu, iters, max_err)
+        at += 1
+    DFSPH_CACHE.setdefault(key, []).append((steps, ([list(p) for p in ps], err_)))
+    return [err_] if err_ else [v for p in ps for v in p]
+
+
 def sph_m5_want(func, x, P):
     """An M5 sph row's recomputed outputs, or None for another function."""
     def parts(k):
@@ -4018,6 +4182,10 @@ def sph_m5_want(func, x, P):
         c, mu, sigma, iters, max_err, steps = list(x[0:14]), x[14], x[15], x[16], x[17], x[18]
         key = (frozen(x[0:18]), frozen(x[19:]))
         return r_pcisph_run(c, mu, sigma, iters, max_err, steps, parts(19), key)
+    if func == "SphSolver::step_dfsph":
+        c, mu, iters, max_err, steps = list(x[0:14]), x[14], x[15], x[16], x[17]
+        key = (frozen(x[0:17]), frozen(x[18:]))
+        return r_dfsph_run(c, mu, iters, max_err, steps, parts(18), key)
     return None
 
 

@@ -57,7 +57,6 @@ FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    "SphSolver::step_dfsph": "M5 part c",
     "SphSolver::step_multiphase": "M5 part d",
 }
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.

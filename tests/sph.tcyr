@@ -324,6 +324,107 @@ fn test_pcisph_iterations() {
     return 0;
 }
 
+# `steps` DFSPH steps (3 rounds to 1%, viscosity 0.001) of the n particles at ps by *s under water_2d: the number that
+# failed.
+fn dfsph_run(s: *PvSphSolver, ps: *PvFluidParticle, n, steps): i64 {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var errs = 0;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = s.step_dfsph(ps, n, &cfg, 0.001, 3, 0.01);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+    }
+    return errs;
+}
+
+# test_grid_cfl_dt and test_shallow_cfl_dt (the grid's and shallow water's, among sph.rs's tests), then the three DFSPH
+# tests, between test_sort_by_zorder_preserves_data and test_mls_correction_interior in Rust's order (M5 part c).
+fn test_cfl_and_dfsph() {
+    test_group("test_grid_cfl_dt");
+    var g: PvFluidGrid;
+    var gt, gv = PvFluidGrid_new(10, 10, 0.1, &g);
+    assert_eq(is_ok(gt), 1, "a 10 × 10 grid");
+    var i = g.idx(5, 5);
+    var one: f64 = 1.0;
+    var set = g.vx.set_f(i, one);
+    var dt: f64 = g.cfl_dt(0.001, 0.5);
+    var lim: f64 = (0.5 * 0.1) / 1.0;
+    assert(dt > 0.0 && _pv_is_finite(dt) == 1 && dt <= lim, "0 < dt ≤ CFL·dx/v");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_shallow_cfl_dt");
+    var sw: PvShallowWater;
+    var st, sv = PvShallowWater_new(10, 10, 0.1, 1.0, &sw);
+    assert_eq(is_ok(st), 1, "a 10 × 10 lake");
+    var sdt: f64 = sw.cfl_dt(0.5);
+    assert(sdt > 0.0 && _pv_is_finite(sdt) == 1 && sdt < 0.1, "0 < dt < 0.1");
+    PvShallowWater_drop(&sw);
+
+    test_group("test_dfsph_empty");
+    var s0: PvSphSolver = PvSphSolver_new();
+    assert_eq(dfsph_run(&s0, 0, 0, 1), 0, "no particles: Ok");
+
+    test_group("test_dfsph_single_particle_falls");
+    var p: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    p.density = 1000.0;
+    var s1: PvSphSolver = PvSphSolver_new();
+    assert_eq(dfsph_run(&s1, &p, 1, 1), 0, "Ok");
+    assert(p.velocity.y < 0.0, "it falls under gravity");
+    PvSphSolver_drop(&s1);
+
+    test_group("test_dfsph_particles_finite");
+    var bp, bn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var s2: PvSphSolver = PvSphSolver_new();
+    assert_eq(dfsph_run(&s2, b, bn, 5), 0, "5 steps, every one Ok");
+    var bad = 0;
+    for (var k = 0; k < bn; k = k + 1) {
+        var q: *PvFluidParticle = b + k;
+        if (_pv_is_finite(q.position.x) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every position finite");
+    PvSphSolver_drop(&s2);
+    fl_free(bp);
+    return 0;
+}
+
+# The largest density of the n particles at ps by brute force (`compute_density`), folded from 0 (NaN-ignoring).
+fn max_density(ps: *PvFluidParticle, n, h: f64): f64 {
+    var m: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var d: f64 = compute_density(i, ps, n, h);
+        m = _pv_max(m, d);
+    }
+    return m;
+}
+
+# test_dfsph_reduces_compression, after test_pcisph_zero_and_one_iteration: a pre-compressed block without gravity
+# expands.
+fn test_dfsph_compression() {
+    test_group("test_dfsph_reduces_compression");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    cfg.gravity = PvVec3_zero();
+    cfg.dt = 0.001;
+    var lp, ln = create_particle_block(0.4, 0.4, 0.2, 0.2, 0.02, 0.001);
+    var rest: f64 = compute_density(ln / 2 + 5, _pv_as_particles(lp), ln, cfg.smoothing_radius);
+    cfg.rest_density = rest;
+    fl_free(lp);
+    var bp, bn = create_particle_block(0.4, 0.4, 0.12, 0.12, 0.012, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var before: f64 = max_density(b, bn, cfg.smoothing_radius);
+    assert(before > rest, "the block starts compressed");
+    var s: PvSphSolver = PvSphSolver_new();
+    var errs = 0;
+    for (var k = 0; k < 5; k = k + 1) {
+        var t, v = s.step_dfsph(b, bn, &cfg, 0.0, 20, 0.001);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+    }
+    var after: f64 = max_density(b, bn, cfg.smoothing_radius);
+    assert(errs == 0 && after < before, "DFSPH relieves the compression");
+    PvSphSolver_drop(&s);
+    fl_free(bp);
+    return 0;
+}
+
 # The block of the heat, viscoelastic and MLS tests ((0.2, 0.3), size 0.2, spacing 0.02: 100 particles), after one
 # solver step under water_2d at viscosity 0.001: (buffer, count); the solver into *s.
 fn stepped_block(s: *PvSphSolver, hot, deformed) {
@@ -527,7 +628,7 @@ fn same_particles(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
 # Cyrius-only: the solver's layout, and `reset_integrator` (a reset solver's next Verlet step is a fresh solver's).
 fn test_solver_layout() {
     test_group("solver_layout_matches_column_offsets");
-    assert_eq(sizeof(PvSphSolver), 432, "432 bytes");
+    assert_eq(sizeof(PvSphSolver), 480, "480 bytes");
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
     var bp, bn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
     var ps: *PvFluidParticle = _pv_as_particles(bp);
@@ -545,6 +646,10 @@ fn test_solver_layout() {
     assert_eq(sph_col_data(&s, 5), s.pcisph_pressures.data, "5: pcisph_pressures");
     assert_eq(sph_col_data(&s, 6), s.pcisph_pred_pos.data, "6: pcisph_pred_pos");
     assert_eq(sph_col_data(&s, 7), s.pcisph_pred_vel.data, "7: pcisph_pred_vel");
+    var dt, dv = s.step_dfsph(ps, bn, &cfg, 0.001, 3, 0.01);
+    assert_eq(is_ok(dt), 1, "a DFSPH step sizes its two");
+    assert_eq(sph_col_data(&s, 8), s.dfsph_alpha.data, "8: dfsph_alpha");
+    assert_eq(sph_col_data(&s, 9), s.dfsph_kappa.data, "9: dfsph_kappa");
 
     test_group("solver_reset_integrator_restarts_verlet");
     var cp, cn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
@@ -797,6 +902,7 @@ fn brute_lists(ps: *PvFluidParticle, n, h: f64) {
 # through test_degenerate_inputs_no_panic. (test_heat_*, two viscoelastic tests and test_mls_correction_interior build
 # their lists with `SphSolver::step`: they arrive with M5.)
 fn test_part_d() {
+    test_cfl_and_dfsph();
     test_mls_interior();
 
     test_group("test_apply_gradient_correction_identity");
@@ -884,6 +990,7 @@ fn test_part_d() {
     assert(nw.acceleration.y > 0.0, "non-wetting pushes away");
 
     test_pcisph_iterations();
+    test_dfsph_compression();
 
     test_group("test_implicit_viscosity_large_dt_is_stable");
     var ip, inn = create_particle_block(0.0, 0.0, 0.1, 0.1, 0.02, 0.001);

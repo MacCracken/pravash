@@ -1,0 +1,330 @@
+# sph_dfsph.cyr — `SphSolver::step_dfsph` of rust-old/src/sph.rs (M5 part c): Divergence-Free SPH (Bender & Koschier
+# 2015), on the solver of src/sph.cyr.
+#
+# The paper's order, as Rust's:
+# - the neighbour lists, then each density and stiffness factor α at xₙ (`_pv_dfsph_density_alpha`);
+# - from a snapshot, the non-pressure acceleration (gravity, viscosity) into the predicted velocity v*;
+# - the density solver: up to `max_iterations` rounds of κᵢ = (max(ρ*ᵢ − ρ₀, 0)/dt²)·αᵢ with ρ* = ρ + dt·Dρ/Dt,
+#   stopping once the average error over n·ρ₀ is below `max_error`, each round applied to the velocities;
+# - the positions advected, the lists and α rebuilt at x_{n+1};
+# - the divergence solver: up to `max_iterations` rounds of κᵛᵢ = (max(Dρᵢ/Dt, 0)/dt)·αᵢ, the same stopping test on
+#   (Σ·dt)/(n·ρ₀);
+# - the pressures by the linear equation of state (a diagnostic), the divergence check, the walls.
+# Unlike PCISPH, `max_iterations` = 0 runs no round of either solver. α and κ are solver columns, grown with the others
+# before any particle changes.
+
+# Each of the n particles' density and DFSPH stiffness factor at its current position, over the lists: ρᵢ = Σ mⱼ·W(r²)
+# for r² ≤ h² (itself included), and αᵢ = max(ρᵢ, 1e-10)/(|Σ gⱼ|² + Σ |gⱼ|²), gⱼ = (xᵢ − xⱼ)·((mⱼ·W'(r))/r) over j ≠ i
+# with 1e-20 ≤ r² ≤ h²; α = 0 when that denominator is not above 1e-20. The densities are written to the particles as
+# they go (the sums read only positions and masses). Mirrors the private `dfsph_density_alpha`.
+fn _pv_dfsph_density_alpha(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs) {
+    var g: *PvNeighborGrid = _pv_sph_grid(s);
+    var off = g.offsets.data;
+    var idx = g.indices.data;
+    var alphas = s.dfsph_alpha.data;
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        var px: f64 = pi.position.x;
+        var py: f64 = pi.position.y;
+        var pz: f64 = pi.position.z;
+        var d: f64 = 0.0;
+        var sgx: f64 = 0.0;
+        var sgy: f64 = 0.0;
+        var sgz: f64 = 0.0;
+        var sq: f64 = 0.0;
+        var a = load64(off + i * 8);
+        var b = load64(off + (i + 1) * 8);
+        for (var k = a; k < b; k = k + 1) {
+            var j = load64(idx + k * 8);
+            var pj: *PvFluidParticle = ps + j;
+            var dx: f64 = px - pj.position.x;
+            var dy: f64 = py - pj.position.y;
+            var dz: f64 = pz - pj.position.z;
+            var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+            if ((r2 > h2) == 0) {
+                var w: f64 = _pv_kc_poly6(kc, r2);
+                var mw: f64 = pj.mass * w;
+                d = d + mw;
+                if (j != i && (r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var sc: f64 = (pj.mass * grad) / r;
+                    var gx: f64 = dx * sc;
+                    var gy: f64 = dy * sc;
+                    var gz: f64 = dz * sc;
+                    sgx = sgx + gx;
+                    sgy = sgy + gy;
+                    sgz = sgz + gz;
+                    var g2: f64 = ((gx * gx) + (gy * gy)) + (gz * gz);
+                    sq = sq + g2;
+                }
+            }
+        }
+        pi.density = d;
+        var s2: f64 = ((sgx * sgx) + (sgy * sgy)) + (sgz * sgz);
+        var denom: f64 = s2 + sq;
+        var alpha: f64 = 0.0;
+        if (denom > tiny) {
+            var dm: f64 = _pv_max(d, lo);
+            alpha = dm / denom;
+        }
+        store64(alphas + i * 8, _pv_bits(alpha));
+    }
+    return 0;
+}
+
+# Particle i's density change rate Dρᵢ/Dt = Σⱼ mⱼ·((vᵢ − vⱼ)·gⱼ), gⱼ = (xᵢ − xⱼ)·(W'(r)/r), over j ≠ i with
+# 1e-20 ≤ r² ≤ h², from +0. Mirrors the private `dfsph_density_rate`.
+#must_use
+fn _pv_dfsph_density_rate(s: *PvSphSolver, ps: *PvFluidParticle, kc: *PvKernelCoeffs, i): f64 {
+    var g: *PvNeighborGrid = _pv_sph_grid(s);
+    var off = g.offsets.data;
+    var idx = g.indices.data;
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var pi: *PvFluidParticle = ps + i;
+    var rate: f64 = 0.0;
+    var a = load64(off + i * 8);
+    var b = load64(off + (i + 1) * 8);
+    for (var k = a; k < b; k = k + 1) {
+        var j = load64(idx + k * 8);
+        if (j != i) {
+            var pj: *PvFluidParticle = ps + j;
+            var dx: f64 = pi.position.x - pj.position.x;
+            var dy: f64 = pi.position.y - pj.position.y;
+            var dz: f64 = pi.position.z - pj.position.z;
+            var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+            if ((r2 > h2 || r2 < tiny) == 0) {
+                var r: f64 = f64_sqrt(r2);
+                var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                var gr: f64 = grad / r;
+                var gx: f64 = dx * gr;
+                var gy: f64 = dy * gr;
+                var gz: f64 = dz * gr;
+                var ux: f64 = pi.velocity.x - pj.velocity.x;
+                var uy: f64 = pi.velocity.y - pj.velocity.y;
+                var uz: f64 = pi.velocity.z - pj.velocity.z;
+                var dot: f64 = ((ux * gx) + (uy * gy)) + (uz * gz);
+                var term: f64 = pj.mass * dot;
+                rate = rate + term;
+            }
+        }
+    }
+    return rate;
+}
+
+# vᵢ −= dvᵢ·dt with dvᵢ = Σⱼ (xᵢ − xⱼ)·(((mⱼ·(κᵢ/ρᵢ + κⱼ/ρⱼ))·W'(r))/r) over j ≠ i with 1e-20 ≤ r² ≤ h², each ρ floored
+# at 1e-10, for each of the n particles (the sums read positions, densities and κ, never the velocities, so the order
+# doesn't matter). Mirrors the private `dfsph_apply_kappa`.
+fn _pv_dfsph_apply_kappa(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs, dt: f64) {
+    var g: *PvNeighborGrid = _pv_sph_grid(s);
+    var off = g.offsets.data;
+    var idx = g.indices.data;
+    var kappa = s.dfsph_kappa.data;
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        var px: f64 = pi.position.x;
+        var py: f64 = pi.position.y;
+        var pz: f64 = pi.position.z;
+        var kpi: f64 = load64(kappa + i * 8);
+        var rho_i: f64 = _pv_max(pi.density, lo);
+        var ki: f64 = kpi / rho_i;
+        var dvx: f64 = 0.0;
+        var dvy: f64 = 0.0;
+        var dvz: f64 = 0.0;
+        var a = load64(off + i * 8);
+        var b = load64(off + (i + 1) * 8);
+        for (var k = a; k < b; k = k + 1) {
+            var j = load64(idx + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = ps + j;
+                var dx: f64 = px - pj.position.x;
+                var dy: f64 = py - pj.position.y;
+                var dz: f64 = pz - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var kpj: f64 = load64(kappa + j * 8);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var kj: f64 = kpj / rho_j;
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var sc: f64 = ((pj.mass * (ki + kj)) * grad) / r;
+                    dvx = dvx + (dx * sc);
+                    dvy = dvy + (dy * sc);
+                    dvz = dvz + (dz * sc);
+                }
+            }
+        }
+        pi.velocity.x = pi.velocity.x - (dvx * dt);
+        pi.velocity.y = pi.velocity.y - (dvy * dt);
+        pi.velocity.z = pi.velocity.z - (dvz * dt);
+    }
+    return 0;
+}
+
+impl PvSphSolver {
+    # One DFSPH step of the n particles at ps (the file's header gives the order). Ok(0); the config's error (nothing
+    # changed); PV_ERR_INVALID_SMOOTHING_RADIUS for h as f32 not finite and > 0; PV_ERR_OUT_OF_MEMORY when a buffer
+    # can't grow (Rust aborts): before any particle changes, except at the second neighbour build, after the advection,
+    # whose lists may need more room; PV_ERR_DIVERGED when a position or velocity is not finite at the end (before the
+    # walls), the state then the step's. Mirrors `step_dfsph` (ADR 0002 #21).
+    #must_use
+    fn step_dfsph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
+      max_error: f64): Result {
+        var ct, cv = config.validate();
+        if (is_err_result(ct) == 1) { return Err(cv); }
+        if (n <= 0) { return Ok(0); }
+        var h: f64 = config.smoothing_radius;
+        var h32: f32 = f32_from(h);
+        var hw: f64 = f32_to(h32);
+        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        var ok = self.dfsph_alpha.resize(n, zw) & self.dfsph_kappa.resize(n, zw) & self.snapshot.resize(18 * n, 0);
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var g: *PvNeighborGrid = _pv_sph_grid(self);
+        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var kc: PvKernelCoeffs;
+        _pv_kc_init(&kc, h);
+        var h2: f64 = kc.h2;
+        var dt: f64 = config.dt;
+        var rest: f64 = config.rest_density;
+        var kappa = self.dfsph_kappa.data;
+        var alphas = self.dfsph_alpha.data;
+        _pv_dfsph_density_alpha(self, ps, n, &kc);
+
+        # The non-pressure acceleration (gravity, viscosity) into v*, from the snapshot.
+        var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
+        for (var c = 0; c < n; c = c + 1) {
+            var sq: *PvFluidParticle = snap + c;
+            var sp: *PvFluidParticle = ps + c;
+            *sq = *sp;
+        }
+        var off = g.offsets.data;
+        var idx = g.indices.data;
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = _PV_SPH_MIN_DENSITY;
+        for (var i = 0; i < n; i = i + 1) {
+            var si: *PvFluidParticle = snap + i;
+            var ax: f64 = config.gravity.x;
+            var ay: f64 = config.gravity.y;
+            var az: f64 = config.gravity.z;
+            var rho: f64 = _pv_max(si.density, lo);
+            var a = load64(off + i * 8);
+            var b = load64(off + (i + 1) * 8);
+            for (var k = a; k < b; k = k + 1) {
+                var j = load64(idx + k * 8);
+                if (j != i) {
+                    var sj: *PvFluidParticle = snap + j;
+                    var dx: f64 = si.position.x - sj.position.x;
+                    var dy: f64 = si.position.y - sj.position.y;
+                    var dz: f64 = si.position.z - sj.position.z;
+                    var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                    if ((r2 > h2 || r2 < tiny) == 0) {
+                        var r: f64 = f64_sqrt(r2);
+                        var rho_j: f64 = _pv_max(sj.density, lo);
+                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                        var v_scale: f64 = (((viscosity * sj.mass) * lap) / rho_j) / rho;
+                        var ux: f64 = sj.velocity.x - si.velocity.x;
+                        var uy: f64 = sj.velocity.y - si.velocity.y;
+                        var uz: f64 = sj.velocity.z - si.velocity.z;
+                        ax = ax + (ux * v_scale);
+                        ay = ay + (uy * v_scale);
+                        az = az + (uz * v_scale);
+                    }
+                }
+            }
+            var pi: *PvFluidParticle = ps + i;
+            pi.velocity.x = pi.velocity.x + (ax * dt);
+            pi.velocity.y = pi.velocity.y + (ay * dt);
+            pi.velocity.z = pi.velocity.z + (az * dt);
+        }
+
+        # The density solver.
+        var nf: f64 = f64_from(n);
+        var scale: f64 = nf * rest;
+        var dt2: f64 = dt * dt;
+        var done = 0;
+        for (var it = 0; it < max_iterations; it = it + 1) {
+            if (done == 0) {
+                var err_sum: f64 = 0.0;
+                for (var q = 0; q < n; q = q + 1) {
+                    var pq: *PvFluidParticle = ps + q;
+                    var rate: f64 = _pv_dfsph_density_rate(self, ps, &kc, q);
+                    var rho_star: f64 = pq.density + (dt * rate);
+                    var over: f64 = rho_star - rest;
+                    var err: f64 = _pv_max(over, zero);
+                    err_sum = err_sum + err;
+                    var al: f64 = load64(alphas + q * 8);
+                    var kq: f64 = (err / dt2) * al;
+                    store64(kappa + q * 8, _pv_bits(kq));
+                }
+                var avg: f64 = err_sum / scale;
+                if (avg < max_error) {
+                    done = 1;
+                } else {
+                    _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
+                }
+            }
+        }
+
+        # Advect, then the lists and α at the new positions.
+        for (var e = 0; e < n; e = e + 1) {
+            var pe: *PvFluidParticle = ps + e;
+            pe.position.x = pe.position.x + (pe.velocity.x * dt);
+            pe.position.y = pe.position.y + (pe.velocity.y * dt);
+            pe.position.z = pe.position.z + (pe.velocity.z * dt);
+        }
+        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        _pv_dfsph_density_alpha(self, ps, n, &kc);
+
+        # The divergence solver.
+        var done2 = 0;
+        for (var it2 = 0; it2 < max_iterations; it2 = it2 + 1) {
+            if (done2 == 0) {
+                var div_sum: f64 = 0.0;
+                for (var u = 0; u < n; u = u + 1) {
+                    var ru: f64 = _pv_dfsph_density_rate(self, ps, &kc, u);
+                    var rate2: f64 = _pv_max(ru, zero);
+                    div_sum = div_sum + rate2;
+                    var au: f64 = load64(alphas + u * 8);
+                    var ku: f64 = (rate2 / dt) * au;
+                    store64(kappa + u * 8, _pv_bits(ku));
+                }
+                var avg2: f64 = (div_sum * dt) / scale;
+                if (avg2 < max_error) {
+                    done2 = 1;
+                } else {
+                    _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
+                }
+            }
+        }
+
+        # The diagnostic pressures, the divergence check, the walls.
+        var gas: f64 = config.gas_constant;
+        var bad = 0;
+        for (var m = 0; m < n; m = m + 1) {
+            var pm: *PvFluidParticle = ps + m;
+            var pr: f64 = equation_of_state(pm.density, rest, gas);
+            pm.pressure = pr;
+        }
+        for (var v = 0; v < n; v = v + 1) {
+            var pv: *PvFluidParticle = ps + v;
+            if (_pv_is_finite(pv.position.x) == 0 || _pv_is_finite(pv.position.y) == 0
+              || _pv_is_finite(pv.position.z) == 0 || _pv_is_finite(pv.velocity.x) == 0
+              || _pv_is_finite(pv.velocity.y) == 0 || _pv_is_finite(pv.velocity.z) == 0) {
+                bad = 1;
+            }
+        }
+        if (bad == 1) { return Err(PV_ERR_DIVERGED); }
+        _pv_sph_walls(ps, n, config);
+        return Ok(0);
+    }
+}
