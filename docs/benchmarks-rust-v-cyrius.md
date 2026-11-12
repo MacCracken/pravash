@@ -631,3 +631,27 @@ Pinned to core 15.
   the viscosity Laplacian), with their guards kept, gained about 6%: 2.53–2.67 → 2.37–2.46 ms, consistent over three
   interleaved runs. That is too little for the duplication, so the helper calls stay; the inlining request is filed
   (`cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md`).
+
+## M5 part b: PCISPH (2026-11-12)
+
+Pinned to core 15.
+- **Rust:** its criterion group `pcisph_step/<count>_particles` (the `solver_step` blocks, at most 5 iterations to 1%),
+  one run. The twin `scripts/probes/rust/src/bin/bench_sph_m5b.rs` runs the dense 25 × 25 block at spacing 0.02, two
+  runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_m5b`, interleaved with the twin. Each step copies the block in by
+  assignment.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `pcisph_step/9_particles` | 7.67 µs | 10.2–10.3 µs | 1.34× |
+| `pcisph_step/25_particles` | 21.0 µs | 28.9–29.6 µs | 1.4× |
+| `pcisph_step/64_particles` | 58.2 µs | 101–103 µs | 1.75× |
+| `sph_m5b/pcisph_dense_625` (to 1%) | 939–953 µs | 4.40–4.52 ms | 4.7× |
+| `sph_m5b/pcisph_dense_625_5it` (threshold 0) | 1.66–1.71 ms | 10.6–10.8 ms | 6.3× |
+
+**Reading it.**
+- **The two dense rows differ only in how many correction iterations run.** Each iteration repeats the prediction
+  (the symmetric pressure sum over every list) and the predicted-density sum.
+- **Forcing five iterations costs 2.4× the 1% row in Cyrius and 1.8× in Rust,** so the iterations' sums are where
+  the gap widens. This record doesn't count how many iterations the 1% row ran.
+- **The per-pair arithmetic is part a's,** where writing the helpers out was measured at about 6%.

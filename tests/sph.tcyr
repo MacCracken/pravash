@@ -258,6 +258,72 @@ fn test_solver_more() {
     return 0;
 }
 
+# `steps` PCISPH steps (5 iterations at most, 1% compression) of the n particles at ps by *s: the number that failed.
+fn pcisph_run(s: *PvSphSolver, ps: *PvFluidParticle, n, steps, iters): i64 {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var errs = 0;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = s.step_pcisph(ps, n, &cfg, 0.001, iters, 0.01);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+    }
+    return errs;
+}
+
+# The three PCISPH tests between the viscoelastic and adaptive-dt ones, in Rust's order (M5 part b).
+fn test_pcisph_basics() {
+    test_group("test_pcisph_empty");
+    var s0: PvSphSolver = PvSphSolver_new();
+    assert_eq(pcisph_run(&s0, 0, 0, 1, 5), 0, "no particles: Ok");
+
+    test_group("test_pcisph_single_particle_falls");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    one.density = 1000.0;
+    var s1: PvSphSolver = PvSphSolver_new();
+    assert_eq(pcisph_run(&s1, &one, 1, 1, 5), 0, "Ok");
+    assert(one.velocity.y < 0.0, "gravity pulls it down");
+    PvSphSolver_drop(&s1);
+
+    test_group("test_pcisph_density_bounded");
+    var bp, bn = create_particle_block(0.2, 0.3, 0.2, 0.2, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var s2: PvSphSolver = PvSphSolver_new();
+    assert_eq(pcisph_run(&s2, b, bn, 20, 5), 0, "20 steps, every one Ok");
+    var bad = 0;
+    for (var i = 0; i < bn; i = i + 1) {
+        var q: *PvFluidParticle = b + i;
+        if (_pv_is_finite(q.density) == 0 || q.density < 0.0 || _pv_is_finite(q.position.x) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every density finite and ≥ 0, every position finite");
+    PvSphSolver_drop(&s2);
+    fl_free(bp);
+    return 0;
+}
+
+# test_pcisph_zero_and_one_iteration, after the contact-angle test: 0 iterations runs one, and neither teleports.
+fn test_pcisph_iterations() {
+    test_group("test_pcisph_zero_and_one_iteration");
+    var bp, bn = create_particle_block(0.3, 0.3, 0.1, 0.1, 0.02, 0.001);
+    var block: *PvFluidParticle = _pv_as_particles(bp);
+    var far = 0;
+    for (var iters = 0; iters < 2; iters = iters + 1) {
+        var cp, cn = create_particle_block(0.3, 0.3, 0.1, 0.1, 0.02, 0.001);
+        var c: *PvFluidParticle = _pv_as_particles(cp);
+        var s: PvSphSolver = PvSphSolver_new();
+        assert_eq(pcisph_run(&s, c, cn, 1, iters), 0, "Ok");
+        for (var i = 0; i < cn; i = i + 1) {
+            var p: *PvFluidParticle = c + i;
+            var p0: *PvFluidParticle = block + i;
+            var d: f64 = p.distance_to(p0);
+            if ((d < 0.01) == 0) { far = far + 1; }
+        }
+        PvSphSolver_drop(&s);
+        fl_free(cp);
+    }
+    assert_eq(far, 0, "no particle teleports, at 0 or 1 iterations");
+    fl_free(bp);
+    return 0;
+}
+
 # The block of the heat, viscoelastic and MLS tests ((0.2, 0.3), size 0.2, spacing 0.02: 100 particles), after one
 # solver step under water_2d at viscosity 0.001: (buffer, count); the solver into *s.
 fn stepped_block(s: *PvSphSolver, hot, deformed) {
@@ -352,6 +418,8 @@ fn test_heat_visco_adaptive() {
     assert_eq(bad, 0, "the stress and the conformation stay finite");
     PvSphSolver_drop(&s);
     fl_free(fp);
+
+    test_pcisph_basics();
 
     test_group("test_adaptive_dt_stationary");
     var ap, an = create_particle_block(0.1, 0.1, 0.2, 0.2, 0.05, 0.001);
@@ -459,7 +527,7 @@ fn same_particles(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
 # Cyrius-only: the solver's layout, and `reset_integrator` (a reset solver's next Verlet step is a fresh solver's).
 fn test_solver_layout() {
     test_group("solver_layout_matches_column_offsets");
-    assert_eq(sizeof(PvSphSolver), 336, "336 bytes");
+    assert_eq(sizeof(PvSphSolver), 432, "432 bytes");
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
     var bp, bn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
     var ps: *PvFluidParticle = _pv_as_particles(bp);
@@ -471,6 +539,12 @@ fn test_solver_layout() {
     assert_eq(sph_col_data(&s, 1), s.snapshot.data, "1: snapshot");
     assert_eq(sph_col_data(&s, 2), s.accels.data, "2: accels");
     assert_eq(sph_col_data(&s, 3), s.prev_accel.data, "3: prev_accel");
+    var pt, pv = s.step_pcisph(ps, bn, &cfg, 0.001, 5, 0.01);
+    assert_eq(is_ok(pt), 1, "a PCISPH step sizes its four");
+    assert_eq(sph_col_data(&s, 4), s.pcisph_accel.data, "4: pcisph_accel");
+    assert_eq(sph_col_data(&s, 5), s.pcisph_pressures.data, "5: pcisph_pressures");
+    assert_eq(sph_col_data(&s, 6), s.pcisph_pred_pos.data, "6: pcisph_pred_pos");
+    assert_eq(sph_col_data(&s, 7), s.pcisph_pred_vel.data, "7: pcisph_pred_vel");
 
     test_group("solver_reset_integrator_restarts_verlet");
     var cp, cn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
@@ -808,6 +882,8 @@ fn test_part_d() {
     var three: f64 = 3.0 * quarter;
     apply_contact_angle(&nw, 1, &cfg, three, 0.07);
     assert(nw.acceleration.y > 0.0, "non-wetting pushes away");
+
+    test_pcisph_iterations();
 
     test_group("test_implicit_viscosity_large_dt_is_stable");
     var ip, inn = create_particle_block(0.0, 0.0, 0.1, 0.1, 0.02, 0.001);

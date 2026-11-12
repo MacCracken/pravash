@@ -1459,3 +1459,57 @@ step count, so it continues each scene from its longest cached state. Result: 49
 | criterion `solver_step_st`, 25 to 169 | 1.24–2.0× |
 | a dense 625-particle block, by Euler or Verlet | 3.2× |
 | the dense block with surface tension | 3.6× |
+
+## 20. M5 part b: PCISPH (2026-11-12)
+
+**`src/sph_pcisph.cyr`** is `step_pcisph`, a second `impl PvSphSolver` block. Rust's order throughout:
+- the densities over the lists, then the pressures zeroed;
+- from a snapshot, the non-pressure accelerations (gravity, viscosity, CSF), checked one particle at a time;
+- the pressure factor δ = 1/(β·(|Σ∇W|² + Σ|∇W|²)), β = 2·((dt·m)/ρ₀)², from the prototype particle. That is the
+  first one with the most neighbours, and among those the largest denominator. Rust's `powi(2)` is a square;
+- at least one correction iteration. Each predicts velocities and positions from the snapshot and the current
+  pressures, then measures the predicted compression max(ρ* − ρ₀, 0)/ρ₀; if that isn't under the threshold, it raises
+  the pressures, clamped at 0. A last prediction uses the final pressures when the loop didn't converge;
+- the predicted velocities, positions and pressures applied, each position checked. The accelerations are not written,
+  as in Rust;
+- the walls.
+
+The four buffers (non-pressure accelerations, pressures, predicted positions and velocities) are solver columns,
+grown with the others before any particle changes.
+
+**The rows** (`m_sph.rs`, M5 part b's seed 0x0_5f5b): 37, class S.
+- M5 part a's scenes: the tank and the dam break to 300 steps, the droplet with surface tension, the 3D cube, the
+  splash;
+- iteration counts 0 (one runs), 1, 5 and 20, and thresholds every prediction meets (1e9), none meets (0, negative),
+  and NaN;
+- the Rust tests' shapes, among them a single particle with no neighbour, whose δ is 0;
+- the errors: the config, an h whose `as f32` is ∞, a non-pressure acceleration diverging on one axis, and a
+  predicted position diverging (an ∞ velocity on a lone particle).
+
+`validate.py` transcribes PCISPH from the Rust source on the grid transcription, its trajectories cached as part a's
+are. Result: 49,907 rows, 0 failures, in 39 s.
+
+**Result:**
+- All 36 rows of the first set passed on the first replay. The replay is **12 modules, 0 failing | rows: 49,790 ok,
+  0 failed, 0 measured, 3 pending, 114 accepted (ADR 4: 114)**.
+- **The mutation tests:** 13 of 16 port mutations failed rows on the first run. Of the three survivors:
+  - running no iteration at max_iterations = 0 was a gap. Every zero-iteration row converged in its one forced
+    iteration, which then changes nothing. A zero-iteration row with a threshold of −1, which no iteration meets,
+    closes it (no random numbers drawn), and the mutant then fails it;
+  - preferring the later of two equal (count, denominator) prototypes is equivalent: δ is the same;
+  - counting expansion as error is equivalent: the running maximum starts at 0, so a negative relative error never
+    wins. Rust's inner `max(err, 0)` is redundant.
+- **Mutations of the transcription:** 4 of 4 caught (β's factor 2, the prototype ties, the convergence test's `<`,
+  the pressure clamp).
+
+**Tests** (`tests/sph.tcyr`, 157 checks): the four PCISPH Rust tests in Rust's order (`test_pcisph_empty`,
+`_single_particle_falls`, `_density_bounded`, `_zero_and_one_iteration`), so 67 of the 79. The layout test pins all
+eight solver columns, after a PCISPH step sizes the last four. Surface parity: 349 items ok, 11 pending (parts c–d).
+
+**Speed** (benchmarks-rust-v-cyrius, M5 part b):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| criterion `pcisph_step`, 9 to 64 particles (sparse) | 1.34–1.75× |
+| a dense 625-particle block, at most 5 iterations to 1% | 4.7× |
+| the dense block, 5 iterations always (threshold 0) | 6.3× |

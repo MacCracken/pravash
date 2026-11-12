@@ -1,0 +1,367 @@
+# sph_pcisph.cyr — `SphSolver::step_pcisph` of rust-old/src/sph.rs (M5 part b): Predictive-Corrective Incompressible
+# SPH (Solenthaler & Pajarola 2009), on the solver of src/sph.cyr.
+#
+# Rust's order throughout:
+# - the densities over the neighbour lists, the pressures zeroed;
+# - from a snapshot, the non-pressure accelerations (gravity, viscosity, the CSF surface tension; no pressure term);
+# - the pressure factor δ = 1/(β·(|Σ∇W|² + Σ|∇W|²)), β = 2·((dt·m)/ρ₀)², from the prototype particle with the fullest
+#   neighbourhood (ties to the larger denominator, the first kept);
+# - at least one correction iteration: predict, measure the compression, raise the pressures; a last prediction with
+#   the final pressures when it didn't converge;
+# - the predicted velocities and positions and the pressures applied (the accelerations are not written), then the
+#   walls.
+# The four PCISPH buffers are the solver's, grown with the others before any particle changes.
+
+# The PCISPH prediction for each of the n snapshot particles: the symmetric pressure acceleration of `pressures` over
+# the lists (j ≠ i, 1e-20 ≤ r² ≤ h², each ρ floored at 1e-10), then v* = v + (a_np + a_p)·dt and x* = x + v*·dt from the
+# snapshot's velocity and position. Mirrors the private `pcisph_predict`.
+fn _pv_pcisph_predict(s: *PvSphSolver, n, kc: *PvKernelCoeffs, dt: f64) {
+    var g: *PvNeighborGrid = _pv_sph_grid(s);
+    var off = g.offsets.data;
+    var idx = g.indices.data;
+    var snap: *PvFluidParticle = _pv_as_particles(s.snapshot.data);
+    var pres = s.pcisph_pressures.data;
+    var npa = s.pcisph_accel.data;
+    var pos = s.pcisph_pred_pos.data;
+    var vel = s.pcisph_pred_vel.data;
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = snap + i;
+        var rho: f64 = _pv_max(pi.density, lo);
+        var pri: f64 = load64(pres + i * 8);
+        var ai: f64 = pri / (rho * rho);
+        var pax: f64 = 0.0;
+        var pay: f64 = 0.0;
+        var paz: f64 = 0.0;
+        var a = load64(off + i * 8);
+        var b = load64(off + (i + 1) * 8);
+        for (var k = a; k < b; k = k + 1) {
+            var j = load64(idx + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = snap + j;
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var prj: f64 = load64(pres + j * 8);
+                    var bj: f64 = prj / (rho_j * rho_j);
+                    var sym: f64 = ai + bj;
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var mj: f64 = pj.mass;
+                    var nmj: f64 = -mj;
+                    var sc: f64 = ((nmj * sym) * grad) / r;
+                    pax = pax + (dx * sc);
+                    pay = pay + (dy * sc);
+                    paz = paz + (dz * sc);
+                }
+            }
+        }
+        var nx: f64 = load64(npa + i * 24);
+        var ny: f64 = load64(npa + i * 24 + 8);
+        var nz: f64 = load64(npa + i * 24 + 16);
+        var vx: f64 = pi.velocity.x + ((nx + pax) * dt);
+        var vy: f64 = pi.velocity.y + ((ny + pay) * dt);
+        var vz: f64 = pi.velocity.z + ((nz + paz) * dt);
+        store64(vel + i * 24, _pv_bits(vx));
+        store64(vel + i * 24 + 8, _pv_bits(vy));
+        store64(vel + i * 24 + 16, _pv_bits(vz));
+        var xx: f64 = pi.position.x + (vx * dt);
+        var xy: f64 = pi.position.y + (vy * dt);
+        var xz: f64 = pi.position.z + (vz * dt);
+        store64(pos + i * 24, _pv_bits(xx));
+        store64(pos + i * 24 + 8, _pv_bits(xy));
+        store64(pos + i * 24 + 16, _pv_bits(xz));
+    }
+    return 0;
+}
+
+# The PCISPH pressure factor δ over the n snapshot particles: for each with a neighbour (j ≠ i, 1e-20 ≤ r² ≤ h²),
+# denom = β·(|Σ∇W|² + Σ|∇W|²) with ∇W = (W'(r)/r)·(xᵢ − xⱼ) and β = 2·((dt·mᵢ)/ρ₀)² (`powi(2)`, a square); the
+# prototype is the first with the most neighbours and, among those, the largest denom, counting only |denom| > 1e-20.
+# 1/denom of the prototype, or 0 without one. Mirrors `step_pcisph`'s δ block.
+#must_use
+fn _pv_pcisph_delta(s: *PvSphSolver, n, kc: *PvKernelCoeffs, dt: f64, rest_density: f64): f64 {
+    var g: *PvNeighborGrid = _pv_sph_grid(s);
+    var off = g.offsets.data;
+    var idx = g.indices.data;
+    var snap: *PvFluidParticle = _pv_as_particles(s.snapshot.data);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var found = 0;
+    var best_count = 0;
+    var best_denom: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = snap + i;
+        var sgx: f64 = 0.0;
+        var sgy: f64 = 0.0;
+        var sgz: f64 = 0.0;
+        var sq: f64 = 0.0;
+        var count = 0;
+        var a = load64(off + i * 8);
+        var b = load64(off + (i + 1) * 8);
+        for (var k = a; k < b; k = k + 1) {
+            var j = load64(idx + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = snap + j;
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    count = count + 1;
+                    var r: f64 = f64_sqrt(r2);
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var gr: f64 = grad / r;
+                    var gx: f64 = gr * dx;
+                    var gy: f64 = gr * dy;
+                    var gz: f64 = gr * dz;
+                    sgx = sgx + gx;
+                    sgy = sgy + gy;
+                    sgz = sgz + gz;
+                    var g2: f64 = ((gx * gx) + (gy * gy)) + (gz * gz);
+                    sq = sq + g2;
+                }
+            }
+        }
+        if (count > 0) {
+            var dot: f64 = ((sgx * sgx) + (sgy * sgy)) + (sgz * sgz);
+            var q: f64 = (dt * pi.mass) / rest_density;
+            var beta: f64 = 2.0 * (q * q);
+            var denom: f64 = beta * (dot + sq);
+            var ad: f64 = f64_abs(denom);
+            if (ad > tiny) {
+                var better = 0;
+                if (found == 0 || count > best_count) {
+                    better = 1;
+                } elif (count == best_count && denom > best_denom) {
+                    better = 1;
+                }
+                if (better == 1) {
+                    found = 1;
+                    best_count = count;
+                    best_denom = denom;
+                }
+            }
+        }
+    }
+    if (found == 0) {
+        var zero: f64 = 0.0;
+        return zero;
+    }
+    var delta: f64 = 1.0 / best_denom;
+    return delta;
+}
+
+impl PvSphSolver {
+    # One PCISPH step of the n particles at ps (the file's header gives the order): at most max(max_iterations, 1)
+    # correction iterations, converging when the largest relative compression max(ρ* − ρ₀, 0)/ρ₀ (NaN-ignoring) is
+    # below `max_density_error`; each raises pᵢ to max(pᵢ + (ρ*ᵢ − ρ₀)·δ, 0) (NaN-ignoring). Ok(0); the config's error
+    # (nothing changed); PV_ERR_INVALID_SMOOTHING_RADIUS for h as f32 not finite and > 0; PV_ERR_OUT_OF_MEMORY when a
+    # buffer can't grow, before any particle changes (Rust aborts); PV_ERR_DIVERGED at the first non-finite
+    # non-pressure acceleration (the densities set, the pressures 0) or predicted position (the particles before it
+    # moved), as Rust's. Mirrors `step_pcisph` (ADR 0002 #20).
+    #must_use
+    fn step_pcisph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
+      max_density_error: f64): Result {
+        var ct, cv = config.validate();
+        if (is_err_result(ct) == 1) { return Err(cv); }
+        if (n <= 0) { return Ok(0); }
+        var h: f64 = config.smoothing_radius;
+        var h32: f32 = f32_from(h);
+        var hw: f64 = f32_to(h32);
+        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var zero: f64 = 0.0;
+        var zw = _pv_bits(zero);
+        var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0);
+        ok = ok & self.pcisph_accel.resize(3 * n, zw) & self.pcisph_pressures.resize(n, zw);
+        ok = ok & self.pcisph_pred_pos.resize(3 * n, zw) & self.pcisph_pred_vel.resize(3 * n, zw);
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var g: *PvNeighborGrid = _pv_sph_grid(self);
+        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var kc: PvKernelCoeffs;
+        _pv_kc_init(&kc, h);
+        var h2: f64 = kc.h2;
+        var dt: f64 = config.dt;
+        var rest: f64 = config.rest_density;
+        var off = g.offsets.data;
+        var idx = g.indices.data;
+        var dens = self.densities.data;
+
+        # The densities; the pressures start at 0.
+        for (var i = 0; i < n; i = i + 1) {
+            var pi: *PvFluidParticle = ps + i;
+            var d: f64 = 0.0;
+            var a = load64(off + i * 8);
+            var b = load64(off + (i + 1) * 8);
+            for (var k = a; k < b; k = k + 1) {
+                var pj: *PvFluidParticle = ps + load64(idx + k * 8);
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if (r2 <= h2) {
+                    var w: f64 = _pv_kc_poly6(&kc, r2);
+                    var mw: f64 = pj.mass * w;
+                    d = d + mw;
+                }
+            }
+            store64(dens + i * 8, _pv_bits(d));
+        }
+        var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var p: *PvFluidParticle = ps + i2;
+            p.density = load64(dens + i2 * 8);
+            p.pressure = 0.0;
+            var sq: *PvFluidParticle = snap + i2;
+            *sq = *p;
+        }
+
+        # The non-pressure accelerations: gravity, viscosity, surface tension.
+        var npa = self.pcisph_accel.data;
+        var st: f64 = self.surface_tension;
+        var csf = 0;
+        if (st > 0.0) { csf = 1; }
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var lo: f64 = _PV_SPH_MIN_DENSITY;
+        var lap0: f64 = _pv_kc_poly6_lap(&kc, 0.0);
+        for (var q = 0; q < n; q = q + 1) {
+            var si: *PvFluidParticle = snap + q;
+            var ax: f64 = config.gravity.x;
+            var ay: f64 = config.gravity.y;
+            var az: f64 = config.gravity.z;
+            var rho: f64 = _pv_max(si.density, lo);
+            var cnx: f64 = 0.0;
+            var cny: f64 = 0.0;
+            var cnz: f64 = 0.0;
+            var lapc: f64 = 0.0;
+            if (csf == 1) { lapc = (si.mass / rho) * lap0; }
+            var a2 = load64(off + q * 8);
+            var b2 = load64(off + (q + 1) * 8);
+            for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
+                var j = load64(idx + k2 * 8);
+                if (j != q) {
+                    var sj: *PvFluidParticle = snap + j;
+                    var ex: f64 = si.position.x - sj.position.x;
+                    var ey: f64 = si.position.y - sj.position.y;
+                    var ez: f64 = si.position.z - sj.position.z;
+                    var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                    if ((s2 > h2 || s2 < tiny) == 0) {
+                        var r: f64 = f64_sqrt(s2);
+                        var rho_j: f64 = _pv_max(sj.density, lo);
+                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                        var v_scale: f64 = (((viscosity * sj.mass) * lap) / rho_j) / rho;
+                        var ux: f64 = sj.velocity.x - si.velocity.x;
+                        var uy: f64 = sj.velocity.y - si.velocity.y;
+                        var uz: f64 = sj.velocity.z - si.velocity.z;
+                        ax = ax + (v_scale * ux);
+                        ay = ay + (v_scale * uy);
+                        az = az + (v_scale * uz);
+                        if (csf == 1) {
+                            var mor: f64 = sj.mass / rho_j;
+                            var pg: f64 = _pv_kc_poly6_grad(&kc, s2);
+                            var mpg: f64 = mor * pg;
+                            cnx = cnx + (mpg * ex);
+                            cny = cny + (mpg * ey);
+                            cnz = cnz + (mpg * ez);
+                            var pl: f64 = _pv_kc_poly6_lap(&kc, s2);
+                            lapc = lapc + (mor * pl);
+                        }
+                    }
+                }
+            }
+            var ast: PvVec3 = _pv_csf_acceleration(cnx, cny, cnz, lapc, st, rho, kc.h);
+            ax = ax + ast.x;
+            ay = ay + ast.y;
+            az = az + ast.z;
+            if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
+                return Err(PV_ERR_DIVERGED);
+            }
+            store64(npa + q * 24, _pv_bits(ax));
+            store64(npa + q * 24 + 8, _pv_bits(ay));
+            store64(npa + q * 24 + 16, _pv_bits(az));
+        }
+
+        # The pressure correction.
+        var delta: f64 = _pv_pcisph_delta(self, n, &kc, dt, rest);
+        var pres = self.pcisph_pressures.data;
+        for (var z = 0; z < n; z = z + 1) { store64(pres + z * 8, zw); }
+        var pos = self.pcisph_pred_pos.data;
+        var err = dens;   # Rust's `density_err` is the densities buffer
+        var iterations = max_iterations;
+        if (iterations < 1) { iterations = 1; }
+        var converged = 0;
+        for (var it = 0; it < iterations; it = it + 1) {
+            _pv_pcisph_predict(self, n, &kc, dt);
+            var max_error: f64 = 0.0;
+            for (var c = 0; c < n; c = c + 1) {
+                var cx: f64 = load64(pos + c * 24);
+                var cy: f64 = load64(pos + c * 24 + 8);
+                var cz: f64 = load64(pos + c * 24 + 16);
+                var pd: f64 = 0.0;
+                var a3 = load64(off + c * 8);
+                var b3 = load64(off + (c + 1) * 8);
+                for (var k3 = a3; k3 < b3; k3 = k3 + 1) {
+                    var j3 = load64(idx + k3 * 8);
+                    var jx: f64 = load64(pos + j3 * 24);
+                    var jy: f64 = load64(pos + j3 * 24 + 8);
+                    var jz: f64 = load64(pos + j3 * 24 + 16);
+                    var fx: f64 = cx - jx;
+                    var fy: f64 = cy - jy;
+                    var fz: f64 = cz - jz;
+                    var f2: f64 = ((fx * fx) + (fy * fy)) + (fz * fz);
+                    if (f2 <= h2) {
+                        var sm: *PvFluidParticle = snap + j3;
+                        var w3: f64 = _pv_kc_poly6(&kc, f2);
+                        var mw3: f64 = sm.mass * w3;
+                        pd = pd + mw3;
+                    }
+                }
+                var e: f64 = pd - rest;
+                store64(err + c * 8, _pv_bits(e));
+                var comp: f64 = _pv_max(e, zero);
+                var rel: f64 = comp / rest;
+                max_error = _pv_max(max_error, rel);
+            }
+            if (max_error < max_density_error) {
+                converged = 1;
+                it = iterations;
+            } else {
+                for (var u = 0; u < n; u = u + 1) {
+                    var pu: f64 = load64(pres + u * 8);
+                    var eu: f64 = load64(err + u * 8);
+                    var raised: f64 = pu + (eu * delta);
+                    var clamped: f64 = _pv_max(raised, zero);
+                    store64(pres + u * 8, _pv_bits(clamped));
+                }
+            }
+        }
+        if (converged == 0) { _pv_pcisph_predict(self, n, &kc, dt); }
+
+        # Apply, checking each predicted position, then the walls.
+        var vel = self.pcisph_pred_vel.data;
+        for (var m = 0; m < n; m = m + 1) {
+            var mx: f64 = load64(pos + m * 24);
+            var my: f64 = load64(pos + m * 24 + 8);
+            var mz: f64 = load64(pos + m * 24 + 16);
+            if (_pv_is_finite(mx) == 0 || _pv_is_finite(my) == 0 || _pv_is_finite(mz) == 0) {
+                return Err(PV_ERR_DIVERGED);
+            }
+            var pm: *PvFluidParticle = ps + m;
+            pm.velocity.x = load64(vel + m * 24);
+            pm.velocity.y = load64(vel + m * 24 + 8);
+            pm.velocity.z = load64(vel + m * 24 + 16);
+            pm.position.x = mx;
+            pm.position.y = my;
+            pm.position.z = mz;
+            pm.pressure = load64(pres + m * 8);
+        }
+        _pv_sph_walls(ps, n, config);
+        return Ok(0);
+    }
+}

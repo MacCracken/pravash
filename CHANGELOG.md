@@ -3,6 +3,27 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M5 part b): `src/sph_pcisph.cyr`, the solver's PCISPH step.
+  - **`s.step_pcisph(ps, n, config, viscosity, max_iterations, max_density_error)`,** in Rust's order: the densities;
+    the non-pressure accelerations; δ from the prototype particle with the fullest neighbourhood; at least one
+    correction iteration; the final prediction; then the walls. Its four buffers are the solver's, grown before any
+    particle changes. ADR 0002 #20.
+  - **Parity:** 37 new class S rows, 1,473 in all. They cover M5 part a's scenes and iteration counts (0, 1, 5, 20),
+    with thresholds every iteration meets, none meets, NaN and negative. They also cover the Rust tests' shapes and
+    both divergence paths.
+    - All 36 rows of the first set passed on the first replay. `validate.py` transcribes PCISPH: 49,907 rows,
+      0 failures.
+    - The mutation tests found one gap, closed by a row that draws no random numbers: no zero-iteration row needed
+      its one forced iteration.
+  - **Tests:** the four PCISPH Rust tests (67 of `sph.rs`'s 79), and the solver layout test now pins all eight
+    columns.
+
+### Performance
+- **PCISPH** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part b): 1.34–1.75× Rust's
+  criterion `pcisph_step` on its sparse blocks. On a dense 625-particle block it is 4.7× at 1% compression and 6.3×
+  through five iterations, since each iteration repeats the prediction and the predicted-density sums.
+
+### Added (Cyrius)
 - **sph** (M5 part a): `src/sph.cyr`, the SPH solver.
   - **`PvSphSolver`.** All its buffers are its own and reused: part b's neighbour grid, embedded, plus the densities,
     the snapshot, the accelerations (Rust allocates these per step) and Verlet's previous accelerations. It is built

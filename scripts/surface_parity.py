@@ -57,7 +57,6 @@ FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    "SphSolver::step_pcisph": "M5 part b",
     "SphSolver::step_dfsph": "M5 part c",
     "SphSolver::step_multiphase": "M5 part d",
 }

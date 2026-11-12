@@ -3825,6 +3825,180 @@ def r_adaptive_dt(ps, h, mu, cfl, lo, hi):
     return r_clamp(cfl * dtc, a, b)
 
 
+# ── sph M5 part b: PCISPH ──
+
+def r_pcisph_predict(snap, offsets, indices, kc, dt, pres, npa):
+    pos, vel = [], []
+    for i, pi in enumerate(snap):
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        pa = [0.0, 0.0, 0.0]
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            d = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+            r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+            sym = fdiv(pres[i], rho * rho) + fdiv(pres[j], rho_j * rho_j)
+            sc = fdiv(-pj[11] * sym * kc_spiky(kc, r), r)
+            for a in range(3):
+                pa[a] += d[a] * sc
+        v = [pi[3 + a] + (npa[i][a] + pa[a]) * dt for a in range(3)]
+        vel.append(v)
+        pos.append([pi[a] + v[a] * dt for a in range(3)])
+    return pos, vel
+
+
+def r_pcisph_step(ps, c, mu, sigma, iters, max_err):
+    """One `SphSolver::step_pcisph` on ps (lists, in place): None or the error token."""
+    e = r_validate(c)
+    if e:
+        return e
+    n = len(ps)
+    if n == 0:
+        return None
+    h = c[4]
+    if not (fin(f32(h)) and f32(h) > 0.0):
+        return "E:InvalidSmoothingRadius"
+    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    kc = kc_new(h)
+    dt, rest = c[0], c[6]
+    dens = []
+    for i in range(n):
+        d = 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            r2 = pd2(ps[i], ps[j])
+            if r2 <= kc[1]:
+                d += ps[j][11] * kc_poly6(kc, r2)
+        dens.append(d)
+    for p, d in zip(ps, dens):
+        p[9] = d
+        p[10] = 0.0
+    snap = [list(p) for p in ps]
+    csf = sigma > 0.0
+    lap0 = kc_poly6_lap(kc, 0.0)
+    npa = []
+    for i, pi in enumerate(snap):
+        acc = [c[1], c[2], c[3]]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        cn = [0.0, 0.0, 0.0]
+        lapc = fdiv(pi[11], rho) * lap0 if csf else 0.0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+            vs = fdiv(fdiv(mu * pj[11] * kc_visc(kc, r), rho_j), rho)
+            for a in range(3):
+                acc[a] += vs * (pj[3 + a] - pi[3 + a])
+            if csf:
+                dd = [pi[0] - pj[0], pi[1] - pj[1], pi[2] - pj[2]]
+                mor = fdiv(pj[11], rho_j)
+                pg = kc_poly6_grad(kc, r2)
+                for a in range(3):
+                    cn[a] += mor * pg * dd[a]
+                lapc += mor * kc_poly6_lap(kc, r2)
+        st = r_csf(cn, lapc, sigma, rho, kc[0])
+        acc = [acc[a] + st[a] for a in range(3)]
+        if not all(fin(x) for x in acc):
+            return "E:Diverged"
+        npa.append(acc)
+    # δ from the prototype with the fullest neighbourhood.
+    best = None
+    for i, pi in enumerate(snap):
+        sg = [0.0, 0.0, 0.0]
+        sq = 0.0
+        count = 0
+        for j in indices[offsets[i]:offsets[i + 1]]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            count += 1
+            r = math.sqrt(r2)
+            gr = fdiv(kc_spiky(kc, r), r)
+            gw = [gr * (pi[a] - snap[j][a]) for a in range(3)]
+            for a in range(3):
+                sg[a] += gw[a]
+            sq += gw[0] * gw[0] + gw[1] * gw[1] + gw[2] * gw[2]
+        if count == 0:
+            continue
+        dot = sg[0] * sg[0] + sg[1] * sg[1] + sg[2] * sg[2]
+        q = fdiv(dt * pi[11], rest)
+        denom = 2.0 * (q * q) * (dot + sq)
+        if abs(denom) > 1e-20 and (best is None or count > best[0] or (count == best[0] and denom > best[1])):
+            best = (count, denom)
+    delta = 0.0 if best is None else fdiv(1.0, best[1])
+    pres = [0.0] * n
+    converged = False
+    pos = vel = None
+    for _ in range(max(iters, 1)):
+        pos, vel = r_pcisph_predict(snap, offsets, indices, kc, dt, pres, npa)
+        mx = 0.0
+        errs = []
+        for i in range(n):
+            pd = 0.0
+            for j in indices[offsets[i]:offsets[i + 1]]:
+                d = [pos[i][a] - pos[j][a] for a in range(3)]
+                r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+                if r2 <= kc[1]:
+                    pd += snap[j][11] * kc_poly6(kc, r2)
+            er = pd - rest
+            errs.append(er)
+            mx = r_max(mx, fdiv(r_max(er, 0.0), rest))
+        if mx < max_err:
+            converged = True
+            break
+        pres = [r_max(pres[i] + errs[i] * delta, 0.0) for i in range(n)]
+    if not converged:
+        pos, vel = r_pcisph_predict(snap, offsets, indices, kc, dt, pres, npa)
+    for i in range(n):
+        if not all(fin(x) for x in pos[i]):
+            return "E:Diverged"
+        ps[i][3:6] = vel[i]
+        ps[i][0:3] = pos[i]
+        ps[i][10] = pres[i]
+    lo, hi, damp = c[7:10], c[10:13], c[13]
+    for p in ps:
+        for a in range(3):
+            if p[a] < lo[a]:
+                p[a] = lo[a]
+                p[3 + a] *= -damp
+            elif p[a] > hi[a] and hi[a] > lo[a]:
+                p[a] = hi[a]
+                p[3 + a] *= -damp
+    return None
+
+
+PCISPH_CACHE = {}
+
+
+def r_pcisph_run(c, mu, sigma, iters, max_err, steps, ps0, key):
+    """`steps` PCISPH steps of one fresh solver, continuing from the longest cached state of the same scene."""
+    best = None
+    for k, st in PCISPH_CACHE.get(key, []):
+        if k <= steps and (best is None or k > best[0]):
+            best = (k, st)
+    if best is None:
+        at, ps, err_ = 0, [list(p) for p in ps0], None
+    else:
+        at, ps, err_ = best[0], [list(p) for p in best[1][0]], best[1][1]
+    while at < steps and err_ is None:
+        err_ = r_pcisph_step(ps, c, mu, sigma, iters, max_err)
+        at += 1
+    PCISPH_CACHE.setdefault(key, []).append((steps, ([list(p) for p in ps], err_)))
+    return [err_] if err_ else [v for p in ps for v in p]
+
+
 def sph_m5_want(func, x, P):
     """An M5 sph row's recomputed outputs, or None for another function."""
     def parts(k):
@@ -3840,6 +4014,10 @@ def sph_m5_want(func, x, P):
         return r_solver_run(c, mu, sigma, verlet, steps, parts(18), key)
     if func == "SphSolver::adaptive_dt":
         return [r_adaptive_dt(parts(5), *x[0:5])]
+    if func == "SphSolver::step_pcisph":
+        c, mu, sigma, iters, max_err, steps = list(x[0:14]), x[14], x[15], x[16], x[17], x[18]
+        key = (frozen(x[0:18]), frozen(x[19:]))
+        return r_pcisph_run(c, mu, sigma, iters, max_err, steps, parts(19), key)
     return None
 
 

@@ -77,5 +77,6 @@ modules = [
     "src/neighbor.cyr",
     "src/sph_fns.cyr",
     "src/sph.cyr",
+    "src/sph_pcisph.cyr",
     "src/json.cyr",
 ]

@@ -1482,6 +1482,54 @@ fn bench_sph_m5a() {
     return 0;
 }
 
+# ── sph, M5 part b ──
+# pcisph_step/<count>_particles: Rust's criterion group (the solver_step blocks, at most 5 iterations to 1%).
+# sph_m5b/*: against scripts/probes/rust/src/bin/bench_sph_m5b.rs, the dense 25 × 25 block at spacing 0.02.
+
+# One PCISPH row: `iters` PCISPH steps of one solver on a fresh copy of the block before each, as `_bench_solver`.
+fn _bench_pcisph(name, group, sp: f64, ox: f64, oy: f64, max_err: f64, iters) {
+    var bp, bn = create_particle_block(ox, oy, 0.5, 0.5, sp, 0.001);
+    var src: *PvFluidParticle = _pv_as_particles(bp);
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(bn * sizeof(PvFluidParticle)));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var s: PvSphSolver = PvSphSolver_new();
+    var label = name;
+    if (name == 0) { label = _bench_name_n(group, bn, "_particles"); }
+    var b = bench_new(label);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        for (var c = 0; c < bn; c = c + 1) {
+            var d: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *d = *e;
+        }
+        var t, v = s.step_pcisph(work, bn, &cfg, mu, 5, max_err);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvSphSolver_drop(&s);
+    fl_free(work);
+    fl_free(bp);
+    return 0;
+}
+
+# The M5 part b benches: Rust's criterion `pcisph_step` and the bench_sph_m5b.rs twins.
+fn bench_sph_m5b() {
+    var ns[24];
+    store64(&ns, 25);
+    store64(&ns + 8, 100);
+    store64(&ns + 16, 225);
+    for (var i = 0; i < 3; i = i + 1) {
+        var n = load64(&ns + i * 8);
+        _bench_pcisph(0, "pcisph_step/", _bench_inv_sqrt(n), 0.1, 0.3, 0.01, 2000);
+    }
+    _bench_pcisph("sph_m5b/pcisph_dense_625", 0, 0.02, 0.1, 0.1, 0.01, 50);
+    _bench_pcisph("sph_m5b/pcisph_dense_625_5it", 0, 0.02, 0.1, 0.1, 0.0, 50);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1512,6 +1560,7 @@ fn main(): i64 {
     bench_sph_c();
     bench_sph_d();
     bench_sph_m5a();
+    bench_sph_m5b();
     return 0;
 }
 
