@@ -11,20 +11,16 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–9 are done:
-> - the frozen oracle;
-> - the scaffold and its repairs;
-> - ADRs 0001–0003;
-> - `cyrius.cyml`;
-> - the semantics probe;
-> - the golden-value generator;
-> - `src/constants.cyr`;
-> - the parity harness;
-> - the cross-target baselines;
-> - the eight probes.
+> ⏳ **Status: M0 done; M1 next** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
+> published to crates.io.
 >
-> Next is step 10, the upstream requests and the conversion ledger.
+> M0 is complete (§4, the tracking table):
+> - the oracle, the scaffold, ADRs 0001–0003;
+> - the generator and the corpus: 21,852 rows gated, identical on three targets;
+> - the harness, the probes, the upstream requests and the conversion ledger.
+>
+> M1 (Foundation) starts with `src/mathx.cyr` and `src/crmath.cyr` (L1, L2), which settle the 9,632 pending math
+> rows and gate powf.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -535,7 +531,23 @@ function, so nothing leaves parity entirely.
    9. **JSON.** `#derive(Serialize)` on each derived type's Cyrius struct, fed the oracle's serde_json documents:
       decoded bits, round trips, and how often bayan's Grisu2 digits differ from serde_json's. Write hand codecs
       for `DVec3` fields (serde writes `[x, y, z]`) and for the data-carrying enums.
-10. **File the upstream requests** (§8), with the probes' numbers:
+10. ✅ **File the upstream requests. Done 2026-11-11.** Nine new requests, each with a self-proving repro
+    verified from its repo's root where the gap can be shown:
+    - **hisab:** the spatial-hash query leak, a matrix-free linear CG, the per-call DST allocation;
+    - **ganita:** `mat_inv_into`;
+    - **cyrius:** min / max NaN plus the Rust f64 surface, a stable sort, the `#derive` array and tagged shapes,
+      and the struct-value and `f64v4` costs;
+    - **sakshi:** a chrome://tracing export.
+
+    pravash's numbers went into four open issues: ganita's correctly rounded tier (as its third consumer, adding
+    ln and log10, and reporting that ganita's cbrt is already exact), hisab H9, cyrius S1, and the `cyrius port`
+    clobber issue (three new findings). All of these are new or untracked issue files; nothing else in those repos
+    was touched. The open memcpy issue is being edited elsewhere, so L12 stays conditional on M1's numbers. The
+    ledger (§8) is seeded: 11 open rows and 1 conditional, each naming its request file. `scripts/upstream_ledger.py
+    --check` passes, is mutation-checked three ways, and runs in CI. The generator now writes the `UPSTREAM(L2)`
+    note above `src/constants.cyr`'s std constants, which are a stand-in themselves.
+
+    As planned, file the upstream requests (§8), with the probes' numbers:
     - new requests where none is open;
     - pravash's numbers added to the open ones.
 
@@ -716,8 +728,8 @@ a local stand-in. Nothing waits on the request.
 **Filing.** Requests go in the owning repo's `docs/development/issues/`, as the siblings file them: a
 self-proving repro where one is possible, and the probe or benchmark numbers that show the gap. Where a request
 is already open (impetus or kimiya filed it), pravash adds itself as a consumer with its own numbers instead of
-filing a second one. The first batch goes in at M0 step 10, once the probes have produced numbers. Later gaps
-are filed in the milestone that finds them.
+filing a second one. The first batch went in at M0 step 10 (2026-11-11). Later gaps are filed in the milestone
+that finds them, and a request found already being edited elsewhere waits for its milestone's numbers (L12).
 
 **Marking.** Every stand-in function, or the head of every stand-in file, carries a note of this form:
 
@@ -737,22 +749,26 @@ in `src/` has a row below, and that every open row has at least one note. It run
    the corrected oracle. Or it is a defect, which is filed upstream, and the stand-in stays;
 4. close the row here, remove the notes, and add a CHANGELOG entry.
 
-**The ledger.** Rows marked *conditional* exist only if their probe says so.
+**The ledger.** Seeded at M0 step 10 (2026-11-11), when every request below was filed with pravash's numbers.
+`scripts/upstream_ledger.py` reads this table, so keep its shape:
+- the status is `open`, `conditional` (no request until its milestone measures a need) or `closed`;
+- each stand-in file is a backticked `src/…` path;
+- each request is a backticked `<repo>:<path>` (from `/home/macro/Repos`).
 
-| # | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
-|---|---|---|---|---|---|
-| L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2); **not cbrt**, whose ganita version equals the oracle's on every row (port-parity §2.1) | ganita has no correctly rounded tier (except cbrt) | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln and log10 to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
-| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`; the typed std float constants are generated into `src/constants.cyr` (`PV_F64_MAX`, …, `PV_F32_EPSILON`) | the stdlib's `f64_min` / `f64_max` NaN rules, missing names, and no saturating float→int convert (port-parity §1) | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
-| L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
-| L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
-| L5 | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | **hisab P1 (new)**: an operator as a closure, a relative tolerance, the iteration count returned | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
-| L6 | `src/grid_solve.cyr`: 1.4.0's direct DST and IDST, transcribed, on the correctly rounded `sin` (L1) | `num_dst` / `num_idst` are another algorithm (up to 67,000 ulp from 1.4.0's on the FFT path) and allocate 10–20 KB per call (port-parity §4.1, §4.8) | **hisab**: an allocation-free DST into a caller's buffer; the direct form as an option, or a fast one the DST rows can be re-bounded for | `num_dst`, `num_idst` | the DST pressure rows |
-| L7 | `src/sph_fns.cyr`: the MLS 3×3 inverse, an allocation-free copy of ganita's `mat_inv` algorithm (the same bits as the oracle's on all 300 probe matrices) | ganita `mat_inv` allocates 248 B per call, one per particle per step (port-parity §4.1, §4.8) | **ganita**: an allocation-free `mat_inv_into` (caller output) | ganita `mat_inv_into` | the MLS gradient-correction rows |
-| L8 | the step-path rule itself: solver-owned storage and a step arena, hisab kept off the step | cyrius S1, hisab H9 | as L3 | hisab back on the step path: L3, L4 and L6 convert together | every step row, plus the soak test |
-| L9 | a stable merge sort on (key, input index) in `src/sph_fns.cyr` (ADR 0002 #3; port-parity §4.5) | `vec_sort_by` is introsort (unstable) | **stdlib**: a stable sort (impetus asked for one too) | the stdlib's stable sort | the z-order rows (class A) |
-| L10 | `src/json.cyr`: hand codecs for `DVec3` fields (`[x, y, z]`) and the data-carrying enums | `#derive` has no array form for a vector struct and no externally tagged data variants | **cyrius stdlib**: `#derive` support for those shapes (impetus listed them, unfiled), with pravash's types as the cases | `#derive(Serialize)` / `#derive(Deserialize)` | the JSON table (class A) |
-| L11 | *conditional (M7)*: a Chrome-trace writer in `src/logging.cyr` | sakshi may have no Chrome-trace exporter | **sakshi** (stdlib): an exporter | sakshi | the logging test |
-| L12 | *conditional (M1 benchmarks)*: an 8-byte-chunk record copy for particles | `memcpy` copies a byte at a time | **cyrius**: the open S5 / `2026-11-02` memcpy issue; pravash adds its particle-record numbers | stdlib `memcpy` | none (it moves bytes); the benchmark rows |
+| # | Status | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
+|---|---|---|---|---|---|---|
+| L1 | open | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2), vendored from impetus's crmath and kimiya's ln / log10. Not cbrt: ganita's already equals the oracle's on every row (port-parity §2.1, §3) | ganita has no correctly rounded tier, and no log10 at all | `ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md` (pravash joined as the third consumer, adding ln and log10) | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
+| L2 | open | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`. The typed std float constants are generated into `src/constants.cyr` | `f64_min` / `f64_max` ignore a NaN only as the first operand; no public predicates, typed constants or saturating converts (port-parity §1) | `cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md` | the stdlib's `f64_*` | the M0 math sweep, class A |
+| L3 | open | `src/vec3.cyr`: `DVec3` arithmetic on `f64` locals | every `hvec3_*` result allocates, 24 B (port-parity §4.1) | `hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md`; `cyrius:docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md` (pravash's numbers added to both) | hisab's vector forms, once a call's allocation can be scoped | the class B rows of every module that uses vectors |
+| L4 | open | `src/neighbor.cyr`: the neighbour grid on sorted arrays (f32 keys until the D3 switch) | `spatial_hash_query_cell` allocates a vec per query: 4.1 MB per 1,000-particle step (port-parity §4.1) | `hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md` | `spatial_hash_*` with a non-allocating query | neighbour lists (class A) and every SPH and coupling step row |
+| L5 | open | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | `hisab:docs/development/issues/2026-11-11-no-matrix-free-linear-cg.md` | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
+| L6 | open | `src/grid_solve.cyr`: 1.4.0's direct DST and IDST, transcribed, on the correctly rounded `sin` (L1) | `num_dst` / `num_idst` allocate 10–20 KB per call, and are another algorithm (up to 67,000 ulp from 1.4.0's) (port-parity §4.1, §4.8) | `hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md` | `num_dst` / `num_idst` into caller scratch, with the DST rows re-bounded for their algorithm | the DST pressure rows |
+| L7 | open | `src/sph_fns.cyr`: the MLS 3×3 inverse, an allocation-free copy of ganita's `mat_inv` algorithm (the oracle's bits on all 300 probe matrices) | ganita `mat_inv` allocates 248 B per call, once per particle per step (port-parity §4.1, §4.8) | `ganita:docs/development/issues/2026-11-11-mat-inv-allocates-per-call.md` | ganita `mat_inv_into` | the MLS gradient-correction rows |
+| L8 | open | the step-path rule itself: solver-owned storage on freelist, step scratch in an arena, hisab off the step | any library call that returns a value leaks on the bump heap | `hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md`; `cyrius:docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md` | hisab back on the step path: L3, L4 and L6 convert together | every step row, plus the soak test |
+| L9 | open | `src/sph_fns.cyr`: a stable merge sort on (key, input index) (ADR 0002 #3; port-parity §4.5) | `vec_sort_by` is introsort; no stable sort exists | `cyrius:docs/development/issues/2026-11-11-no-stable-sort.md` | the stdlib's stable sort | the z-order rows (class A) |
+| L10 | open | `src/json.cyr`: hand codecs for `DVec3` fields (`[x, y, z]`) and the data-carrying enums | `#derive` has no array form for a vector struct and no externally tagged data variants | `cyrius:docs/development/issues/2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md` | `#derive(Serialize)` / `#derive(Deserialize)` | the JSON table (class A) |
+| L11 | open | `src/logging.cyr`: a chrome://tracing writer over sakshi's spans (M7) | sakshi 2.5.10 has spans and text outputs, but no Trace Event export (checked at M0 step 10) | `sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md` | sakshi's exporter | the logging test |
+| L12 | conditional | an 8-byte-chunk record copy for particles, if M1's benchmarks show `memcpy` dominating | `memcpy` copies a byte at a time | the open `cyrius:docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` (being edited elsewhere; pravash adds its numbers at M1, with the measurement) | stdlib `memcpy` | none (it moves bytes); the benchmark rows |
 
 **Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
@@ -775,7 +791,15 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. Gated: 21,852 ok, 0 failed, 1,790 measured (powf), 9,632 pending (M1 helpers), identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 3 probe benches (layout, pool, the memory probe) | D1–D6 decided 2026-11-11. Steps 0–8 done. Step 9 done: eight probes (port-parity §4); L6, L7 and L9 definite; single bundle; persistent pool; autodiff on hisab (class D). Next: step 10, the upstream requests and the ledger |
+| M0 Initialize | ✅ **done 2026-11-11** | constants 35 + math 33,239. Gated: **21,852 ok, 0 failed, 1,790 measured (powf, until M1), 9,632 pending (the M1 helpers)**, identical on x86_64 ELF, x86_64 PE and aarch64 | — | 3 probe benches (layout, pool, memory) | Steps 0–10, recorded in §4 and port-parity §1–§4:
+  - the oracle frozen at `a88bc4e` (1.3.0 published), with the scaffold and repairs, ADRs 0001–0003 and `cyrius.cyml`;
+  - the semantics probe;
+  - `scripts/oracle/` (validated, deterministic, parallel-checked), `src/constants.cyr` and `tests/parity.tcyr`;
+  - the cross-target digests and K bounds;
+  - the eight probes;
+  - nine upstream requests filed, four open issues extended, and the ledger seeded and checked in CI.
+
+  Next: M1 |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

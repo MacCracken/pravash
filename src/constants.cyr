@@ -74,6 +74,8 @@ const PV_ADDED_MASS_COEFFICIENT_CYLINDER = 1.0;
 const PV_ADDED_MASS_COEFFICIENT_FLAT_PLATE = 1.0;
 
 # Rust std float constants pravash uses (port-parity §1: the stdlib has no typed names).
+# UPSTREAM(L2): cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md
+#   replace with the stdlib's typed F64_* / F32_* constants once it has them; parity: the constants rows (class A)
 
 # Rust: f64::MAX
 var PV_F64_MAX: f64 = 0x7FEFFFFFFFFFFFFF;

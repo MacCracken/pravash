@@ -390,7 +390,11 @@ pub fn emit(root: &Path, provenance: &str) -> Result<String, String> {
         }
         out.push('\n');
     }
-    out.push_str("# Rust std float constants pravash uses (port-parity §1: the stdlib has no typed names).\n\n");
+    out.push_str(
+        "# Rust std float constants pravash uses (port-parity §1: the stdlib has no typed names).\n\
+         # UPSTREAM(L2): cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md\n\
+         #   replace with the stdlib's typed F64_* / F32_* constants once it has them; parity: the constants rows (class A)\n\n",
+    );
     for c in std_all() {
         let _ = writeln!(out, "# Rust: {}", c.path);
         match c.form {

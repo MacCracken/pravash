@@ -70,6 +70,20 @@
   - **Libraries vs hisab 1.4.0:** hisab 3.4.1's DST is another algorithm, so ledger L6 transcribes 1.4.0's.
     ganita's `mat_inv` gives the oracle's bits on all 300 matrices, so L7 is needed for memory only. The
     autodiff tape is within 3 ulp, so it stays on hisab as class D.
+- **Upstream requests and the conversion ledger** (port plan M0 step 10; ADR 0003). Each request was filed with
+  pravash's numbers and, where the gap can be shown, a self-proving repro verified from the owning repo's root:
+  - **hisab:** a non-allocating spatial-hash query (4.1 MB per 1,000-particle step today), a matrix-free linear CG,
+    and an allocation-free DST;
+  - **ganita:** `mat_inv_into`;
+  - **cyrius:** NaN-ignoring min / max with the Rust f64 surface, a stable sort, `#derive` array and tagged
+    shapes, and the struct-value / `f64v4` costs;
+  - **sakshi:** a chrome://tracing export;
+  - **existing issues:** pravash's numbers added to ganita's correctly rounded tier, hisab H9, cyrius S1 and the
+    `cyrius port` clobber issue.
+
+  The ledger (plan §8) is seeded with 11 open rows and 1 conditional. `scripts/upstream_ledger.py --check`, run in
+  CI, ties every `UPSTREAM(Ln)` note in `src/` to an open row, every existing stand-in to its note, and every row
+  to its filed request. **M0 is complete.**
 
 ## [1.3.0] - 2026-11-09
 

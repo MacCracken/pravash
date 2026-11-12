@@ -36,7 +36,8 @@
 - [x] M0 step 7: the parity harness (`tests/parity.tcyr`: 5,149 ok, 0 failed; the rest measured or pending)
 - [x] M0 step 8: the cross-target baselines (identical bits on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt)
 - [x] M0 step 9: the eight probes (port-parity §4)
-- [ ] M0 step 10: the parity harness, the baselines, the probes, and filing the upstream requests
+- [x] M0 step 10: upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) and the conversion ledger seeded and checked in CI
+- [x] **M0 done 2026-11-11.** Next: M1, Foundation
 
 ### 1.3.0
 
