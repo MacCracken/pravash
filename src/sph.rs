@@ -31,6 +31,10 @@ use tracing::trace_span;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+pub(crate) mod oracle;
+
 /// Minimum density floor to prevent division-by-zero in pressure/force calculations.
 const MIN_DENSITY: f64 = 1e-10;
 

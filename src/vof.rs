@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{PravashError, Result};
 use tracing::trace_span;
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+mod oracle;
+
 /// Volume of Fluid state on a 2D grid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]

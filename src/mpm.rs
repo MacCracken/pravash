@@ -11,6 +11,10 @@ use tracing::trace_span;
 use crate::common::FluidParticle;
 use crate::error::{PravashError, Result};
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+mod oracle;
+
 /// Constitutive model for MPM particles.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[non_exhaustive]

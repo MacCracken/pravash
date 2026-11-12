@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test audit deny bench coverage build doc clean
+.PHONY: check fmt clippy test test-oracle audit deny bench coverage build doc clean
 
-check: fmt clippy test audit
+check: fmt clippy test test-oracle audit
 
 fmt:
 	cargo fmt --all -- --check
@@ -10,6 +10,10 @@ clippy:
 
 test:
 	cargo test --all-features
+
+# The oracle hooks without `parallel` (--all-features above runs them with it).
+test-oracle:
+	cargo test --features oracle,coupling --test oracle
 
 audit:
 	cargo audit

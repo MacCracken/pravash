@@ -61,6 +61,11 @@ pub mod logging;
 #[cfg(feature = "ai")]
 pub mod ai;
 
+/// Oracle hooks for the Cyrius port. Hidden, read-only, not public API.
+#[cfg(feature = "oracle")]
+#[doc(hidden)]
+pub mod oracle;
+
 pub use common::{
     ArenaHandle, FluidConfig, FluidMaterial, FluidParticle, ParticleArena, ParticleSoa,
 };

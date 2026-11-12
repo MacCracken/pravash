@@ -80,6 +80,16 @@ upgrading. No public signatures were removed or changed.
 - `SphSolver::neighbor_lists()` (the free neighbour-list functions were unusable without it), `SphSolver::reset_integrator()`.
 - Constructors for `#[non_exhaustive]` configs that external crates could not build: `HeatConfig::new`, `ViscoelasticConfig::new`, `PhaseChangeConfig::new` / `water_ice`, and `Default` for `SphKernelParams`/`GridKernelParams`/`ShallowKernelParams`.
 - `ShallowWater::interior_volume()` (the conserved quantity), `ParticleSoa::is_consistent`/`consistent_len`, `BodyShape::bounding_radius`/`projected_area`.
+- **oracle** (Cyrius port tooling, not public API): a hidden, non-default `oracle` feature, kept out of `full`, gives `scripts/oracle/` read-only access to state the public API doesn't expose (port plan M0 step 0). It covers:
+  - `oracle_dump()` on every stateful type: `ParticleArena`, `ArenaHandle`, `ShallowWater`, `FluidGrid`, `KEpsilon`, `MacGrid`, `VofField`, `PhaseField`, `FlipSolver`, `MpmSolver` and `SphSolver`. The `SphSolver` dump includes the f32 positions and the neighbour lists in summation order;
+  - `oracle::sph_cell_key`;
+  - the four grid pressure solvers on a caller's system (`pressure_solve_gauss_seidel`, `_dst`, `_cg`, `_multigrid`);
+  - `oracle::invert_3x3`, which is hisab 1.4.0's `matrix_inverse` as the MLS correction calls it.
+
+  The dumps live in child modules (`src/<module>/oracle.rs`), so each audited source gains only a `mod oracle;` declaration. `tests/oracle.rs` (14 tests) runs every solver variant 300 steps plain and 300 steps dumping after each step, and requires bit-identical final states. Its harness was mutation-checked: one extra step in the dumped run fails all 10 solver checks. CI runs it with and without `parallel`. Simulation behaviour is unchanged.
+
+### Changed (port tooling)
+- `Cargo.lock` is tracked for the Cyrius port's freeze: the oracle's bits depend on hisab 1.4.0 and glam 0.29.3. This is an exception to the library-crate rule, to be recorded in the port's ADR 0001. The oracle host's glibc is 2.44.
 
 ### Security
 - `DaimonConfig`'s `Debug` redacts `api_key`.

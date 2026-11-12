@@ -14,6 +14,10 @@ use tracing::trace_span;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+pub(crate) mod oracle;
+
 /// Boundary condition type for the grid solver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

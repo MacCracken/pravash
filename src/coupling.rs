@@ -13,6 +13,10 @@ use crate::error::{PravashError, Result};
 
 use tracing::trace_span;
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+mod oracle;
+
 // ── Rigid Body ──────────────────────────────────────────────────────────────
 
 /// Shape for a rigid body, with signed distance function.

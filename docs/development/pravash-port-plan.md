@@ -11,8 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: planned, decisions made** (2026-11-11). Nothing has moved yet. §0.2 records the maintainer's
-> decisions. Next is M0 step 0: the Rust oracle hooks, before anything moves to `rust-old/`.
+> ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. M0 steps 0.1–0.4 are
+> done: the Rust `oracle` hooks and their proof, the tracked lockfile, and glibc recorded. Next is step 0.5,
+> the commit and the 1.3.0 tag. Nothing has moved to `rust-old/` yet.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -227,33 +228,60 @@ function, so nothing leaves parity entirely.
 
 ## 4. M0: the prep, then initialize with `cyrius port`
 
-0. **Freeze a green oracle (Rust, before the move).** This is maintainer work and ends with D1.
-   1. **Re-run the P(-1) gates** on HEAD:
+0. **Freeze a green oracle (Rust, before the move).** Steps 0.1–0.4 were done 2026-11-11. Step 0.5, the commit
+   and the tag, is the maintainer's (D1).
+   1. ✅ **Re-run the P(-1) gates** on HEAD (`f481c25` + the plan commits), all green on rustc 1.99.1:
       - fmt;
       - clippy `-D warnings` with `--all-features`, with the defaults, with `--no-default-features`, and with each
-        feature alone (1.2 shipped a `compute` that didn't build on its own);
-      - rustdoc `-D warnings`, `cargo audit`, `cargo deny`, and the tests.
-   2. **The `oracle` feature** (non-default, `#[doc(hidden)] pub mod oracle`, as impetus's `src/oracle.rs`). It is
-      read-only and provides:
-      - `oracle_dump()` for each stateful type in §2 item 1. A dump covers every private field, the scratch
-        buffers whose contents carry from one step to the next (Verlet's previous acceleration, the PCISPH and
-        DFSPH buffers, the FLIP and MPM grids, ghost cells), and the last step's iteration counts and residuals;
-      - the SPH neighbour hash: each particle's cell key and its candidate list, in the order the solver sums them;
-      - each pressure solver (Gauss–Seidel, DST, CG, multigrid) on one given system, returning the solution,
-        the iteration count and the residual;
-      - the hisab 1.4.0 calls exactly as pravash makes them (`dst`, `idst`, `conjugate_gradient`,
-        `matrix_inverse`, `reverse_gradient`), so every transcription or ganita substitute is compared against
-        the oracle's own bits.
+        of the 10 features alone;
+      - rustdoc `-D warnings`, `cargo audit`, `cargo deny`;
+      - tests: 351 unit and 33 integration (the 7 doc tests are `ignore`d).
+   2. ✅ **The `oracle` feature** (non-default, kept out of `full`, `#[doc(hidden)] pub mod oracle`, as impetus's
+      `src/oracle.rs`). It is read-only. The dump types live in `src/oracle.rs`, and child modules
+      (`src/<module>/oracle.rs`) fill them, because a child module can read its parent's private fields and call
+      its private functions. So each of the eight audited sources gains only a four-line `mod oracle;`
+      declaration. It provides:
+      - `oracle_dump()` on each stateful type in §2 item 1, returning its **private** fields; public fields are
+        read directly. That covers the scratch buffers whose contents can carry from one step to the next:
+        Verlet's previous acceleration, the PCISPH and DFSPH buffers, FLIP's grid and APIC matrices, MPM's grid,
+        multigrid's level buffers;
+      - the SPH neighbour hash: the f32 positions, and the candidate lists in the order the solver sums them
+        (CSR). `oracle::sph_cell_key(pos, h as f32)` gives each particle's cell key by `build_neighbors`'
+        expression. hisab's `SpatialHash` is rebuilt at every neighbour build, so only its size is recorded;
+      - `oracle::pressure_solve_{gauss_seidel,dst,cg,multigrid}`: `FluidGrid`'s private pressure solvers on a
+        caller's system. They cover hisab 1.4.0's `dst`, `idst` and `conjugate_gradient` exactly as pravash calls
+        them, and the multigrid hook also returns its level buffers;
+      - `oracle::invert_3x3`, which is hisab 1.4.0's `matrix_inverse` as the MLS correction calls it.
+        `reverse_gradient` is already public through `KernelDerivatives::autodiff_gradient`.
 
-      `tests/oracle.rs` proves that dumping every frame leaves a 300-step run of each solver bit-identical, with
-      and without `parallel`. The gates are those of step 0.1, plus clippy on `oracle` together with each solver
-      feature. serde_json is already a dev-dependency, so the generator writes each derived type's documents
-      with no change to `src/`.
-   3. **Track the lockfile for the freeze.** `Cargo.lock` is gitignored under the library-crate rule, but the
-      oracle's bits depend on hisab 1.4.0 and glam 0.29.3. Commit it; it moves to `rust-old/Cargo.lock`. ADR 0001
-      records the exception. The generator crate's own lock is seeded from it (as kimiya).
-   4. **Record glibc 2.44** (`ldd --version`). Every TSV header carries it, and `--check` refuses a corpus from another glibc.
-   5. **Commit, then tag 1.3.0** as D1 decides. Nothing in `src/` changes after this point.
+      **Iteration counts are not dumped** (a deviation from the first version of this step). Recording them would
+      mean writes inside the audited solver loops, and the oracle stays read-only. A bit-identical solution
+      implies the same iteration count. PCISPH's `sph::pcisph_iter` tracing span lets the generator count its
+      iterations through a tracing subscriber, with no code change.
+
+      `tests/oracle.rs` (14 tests) proves the hooks are read-only. Every solver variant runs 300 steps plain and
+      300 steps fingerprinting its state after each step, and the final states must be identical:
+      - variants: SPH ×5, the grid ×6 (each pressure solver, MacCormack, BFECC), shallow water ×3, FLIP ×2,
+        MPM ×3, MacGrid, KEpsilon, VOF, the phase field, the arena;
+      - a fingerprint is the `Debug` text, which is exact for every non-NaN value, and the harness refuses any
+        state that holds a NaN.
+
+      The file also checks:
+      - that `sph_cell_key` names the cell hisab stores each particle in;
+      - that the four pressure hooks are deterministic and agree with the DST solution;
+      - the 3×3 inverse.
+
+      Its harness was **mutation-checked**: one extra step in the dumped run fails all 10 solver checks. It passes
+      with `parallel` (`--all-features`) and without it (CI's `oracle,coupling` matrix entry, `make test-oracle`).
+      Gates on the change: fmt; clippy on every set in step 0.1, plus `oracle` alone and with `sph`, `grid`,
+      `shallow`, `coupling` and `compute`; rustdoc; audit; deny; all tests.
+   3. ✅ **Track the lockfile for the freeze.** `.gitignore` no longer ignores `Cargo.lock`, because the oracle's
+      bits depend on hisab 1.4.0 and glam 0.29.3. It moves to `rust-old/Cargo.lock` at step 1, and ADR 0001 records
+      the exception. The generator crate's own lock is seeded from it (as kimiya).
+   4. ✅ **glibc 2.44** recorded (`ldd --version`, 2026-11-11). Every TSV header carries it, and `--check` refuses
+      a corpus from another glibc.
+   5. ⏳ **Commit, then tag 1.3.0** (D1). The tag runs `release.yml`, which publishes 1.3.0 to crates.io. Nothing
+      in `src/` changes after this point.
 1. **Scaffold.** Run `cargo clean` first (`target/` is 3.3 GB). Then run `cyrius port --dry-run .`, then `cyrius port .`.
    - Expect these to move into `rust-old/`: `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`, `benches/`, `examples/`,
      `Makefile`, `deny.toml`, `codecov.yml`, `rust-toolchain.toml`. `--dry-run` doesn't list them by name.
@@ -442,6 +470,9 @@ Rules:
   - the surface-tension gate |∇c| > 0.1/h;
   - the non-Newtonian saturation cap;
   - shallow water's `dry_thr`, its Riemann ε (1e-8) and its `breaking_threshold`;
+  - the SPH hash's cell-size reuse: `build_neighbors` keeps the old hash when |h_f32 − cell_size| ≤ `f32::EPSILON`
+    (absolute, 1.19e-7), but computes its probe keys from the new h_f32. So within that band the hash's cells and
+    the keys use different sizes (found in step 0.2; the port reproduces it, and it is a candidate for D3's switch);
   - the Reynolds thresholds in `classify_flow`;
   - MPM's det(F) clamp and the Drucker–Prager yield;
   - the phase-field |φ| > 1.5 warning;
@@ -632,7 +663,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ planned | — | — | — | D1–D6 decided 2026-11-11; next: step 0 (Rust oracle hooks, lockfile, tag 1.3.0); step 10 files the upstream requests and seeds the ledger |
+| M0 Initialize | ⏳ in progress | — | — | — | D1–D6 decided 2026-11-11; step 0.1–0.4 done 2026-11-11 (gates green, `oracle` feature + `tests/oracle.rs` 14 tests, mutation-checked, lockfile tracked, glibc 2.44); next: step 0.5, the commit and the 1.3.0 tag (maintainer) (Rust oracle hooks, lockfile, tag 1.3.0); step 10 files the upstream requests and seeds the ledger |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

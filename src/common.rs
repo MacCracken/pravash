@@ -8,6 +8,10 @@ use hisab::DVec3;
 
 use crate::error::{PravashError, Result};
 
+/// Oracle dumps for the Cyrius port (see `crate::oracle`).
+#[cfg(feature = "oracle")]
+mod oracle;
+
 /// Physical properties of a fluid material.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[non_exhaustive]

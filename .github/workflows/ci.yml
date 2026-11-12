@@ -68,6 +68,7 @@ jobs:
           - "sph,grid,shallow"
           - "sph,coupling"
           - "sph,parallel"
+          - "oracle,coupling"   # tests/oracle.rs without parallel (--all-features covers it with)
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

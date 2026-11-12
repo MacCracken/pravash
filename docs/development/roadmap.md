@@ -18,8 +18,13 @@
   - **D4:** JSON that decodes compatibly, with no text identity required.
   - **D5:** no deferred audit physics in 2.0.
   - **D6:** `parallel` as a runtime thread count.
-- [ ] M0 step 0 (Rust, before the freeze): the hidden `oracle` feature with state dumps for every solver, the
-  tracked lockfile, glibc recorded, the 1.3.0 tag
+- [x] M0 steps 0.1–0.4 (Rust, before the freeze), done 2026-11-11:
+  - P(-1) gates green;
+  - the hidden `oracle` feature, with state dumps for every stateful type, the neighbour lists, the
+    pressure-solver hooks and the MLS inverse;
+  - `tests/oracle.rs`: 14 tests, mutation-checked, run with and without `parallel`;
+  - `Cargo.lock` tracked, glibc 2.44 recorded.
+- [ ] M0 step 0.5: commit, then tag 1.3.0. The tag publishes 1.3.0 to crates.io (D1)
 
 ### 1.3.0
 
