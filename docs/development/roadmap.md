@@ -1,6 +1,15 @@
 # Pravash Roadmap
 
-> Last updated: 2026-11-09
+> Last updated: 2026-11-11
+
+### 2.0.0 — Cyrius port (planned)
+
+- [ ] Port to Cyrius with Rust 1.3.0 as the frozen oracle in `rust-old/`: the plan of record is
+  [pravash-port-plan.md](pravash-port-plan.md). It follows tanmatra, kimiya and impetus.
+- [ ] Before M0: the maintainer decides D1–D6 (plan §0.2): tag/publish 1.3.0, the source of the correctly rounded
+  math, the neighbour-hash keys, serde, the deferred audit items, and the Rust-only features
+- [ ] M0 step 0 (Rust, before the freeze): the hidden `oracle` feature with state dumps for every solver, the
+  tracked lockfile, glibc recorded, the 1.3.0 tag
 
 ### 1.3.0
 
