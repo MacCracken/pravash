@@ -48,7 +48,8 @@
 - [x] **M2 done 2026-11-11.**
 - [x] M3 part a: `FluidGrid` (569 rows, 188 class S step rows on the periodic and multigrid projections, all
   bit-exact; 44 of 49 + 5 Rust tests), the DST / IDST / CG transcriptions, the exact fmod (L14)
-- [ ] M3 part b: the DST, IDST and CG rows (corrected oracle), the step on those projections, the sine table
+- [x] M3 part b: the DST and CG rows (21 + 49, the corrected oracle's `grid.cr.tsv` 20), 188 step rows on those
+  projections, the DST plans (the 63 × 63 DST step 719 ms → 8.6 ms, the bits unchanged)
 - [ ] M3 part c: `MacGrid` and k-ε (the last 5 Rust tests of `grid.rs`)
 - [ ] M3 part d: VOF and the phase field
 - [ ] M3 part e: `src/par.cyr` and the grid's parallel loops

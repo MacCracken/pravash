@@ -122,6 +122,7 @@ fn count_differ(pa, pb, n, tol: f64): i64 {
 
 # ── basics ──────────────────────────────────────────────────────────────────────────
 
+# Construction, the cell reads, the disturbance and a flat-water step.
 fn test_basics() {
     var sw: PvShallowWater;
     var sw2: PvShallowWater;
@@ -235,6 +236,7 @@ fn test_basics() {
     return 0;
 }
 
+# Wave reflection, convective transport and the dam break.
 fn test_flow() {
     var sw: PvShallowWater;
     var pi: f64 = PV_F64_PI;
@@ -315,6 +317,7 @@ fn friction_flow(n: f64): f64 {
     return s;
 }
 
+# Manning friction: deceleration, its roughness scaling, and none at zero.
 fn test_friction() {
     var sw: PvShallowWater;
     var sw_b: PvShallowWater;
@@ -370,6 +373,7 @@ fn test_friction() {
 
 # ── wetting and drying ──────────────────────────────────────────────────────────────
 
+# Wetting and drying: dry cells, depth never negative, an advancing front.
 fn test_wetting() {
     var sw: PvShallowWater;
     var one: f64 = 1.0;
@@ -454,6 +458,7 @@ fn breaking_ke(breaking): f64 {
     return ke;
 }
 
+# Wave breaking: detection, dissipation, and the zero threshold.
 fn test_breaking() {
     var sw: PvShallowWater;
     var pi: f64 = PV_F64_PI;
@@ -516,6 +521,7 @@ fn disp_profile(disp: f64, out): i64 {
     return 1;
 }
 
+# Dispersion: off by default, its effect on a wave, a long stable run.
 fn test_dispersion() {
     var sw: PvShallowWater;
     var sw_b: PvShallowWater;
@@ -569,6 +575,7 @@ fn test_dispersion() {
 
 # ── terrain-following / well-balanced ───────────────────────────────────────────────
 
+# Terrain: a lake at rest over a slope, flow over a bump.
 fn test_terrain() {
     var sw: PvShallowWater;
     var one: f64 = 1.0;
@@ -687,6 +694,7 @@ fn wave_peak_after(use_riemann, t_end: f64): f64 {
     return r;
 }
 
+# The audit tests of wave speed, volume conservation and the HLL lake at rest.
 fn test_audit_waves() {
     var sw: PvShallowWater;
 
@@ -778,6 +786,7 @@ fn sed_total(sw: *PvShallowWater, conc): f64 {
     return t;
 }
 
+# The audit tests of breaking at the shoreline, sediment volume and invalid states.
 fn test_audit_state() {
     var sw: PvShallowWater;
     var three: f64 = 3.0;
@@ -838,6 +847,7 @@ fn col_data(sw: *PvShallowWater, k): i64 {
     return c.data;
 }
 
+# Cyrius-only: the record layout the column offsets assume.
 fn test_layout() {
     var sw: PvShallowWater;
 

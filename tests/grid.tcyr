@@ -20,8 +20,8 @@
 # - `capacity()` is the column's `cap`, and its storage pointer is checked not to move either: the four scratch
 #   columns (4–7) across a later step;
 # - serde_json is `to_json` / `PvFluidGrid_from_json`.
-# One Cyrius-only group, `fg_layout_matches_column_offsets`, pins the record layouts that src/grid.cyr's `_pv_fg_col`
-# and `_pv_mg_col` offsets assume.
+# Two Cyrius-only groups: `fg_layout_matches_column_offsets` pins the record layouts that src/grid.cyr's `_pv_fg_col`
+# and `_pv_mg_col` offsets assume, and `fg_dst_plan_is_kept_per_length` the DST plans' reuse (M3 part b).
 
 include "tests/lib.cyr"
 
@@ -239,8 +239,12 @@ fn solve(k, p, rhs, nx, ny, iters): i64 {
     var c: PvColumn = PvColumn_new();
     var ok = 1;
     if (k == 1) {
-        var t1, e1 = _pv_fg_pressure_dst(p, nx * ny, rhs, nx, ny, &a, &b, &c);
+        var tx: PvColumn = PvColumn_new();
+        var ty: PvColumn = PvColumn_new();
+        var t1, e1 = _pv_fg_pressure_dst(p, nx * ny, rhs, nx, ny, &a, &b, &c, &tx, &ty);
         if (is_err_result(t1) == 1) { ok = 0; }
+        tx.drop();
+        ty.drop();
     } elif (k == 2) {
         var t2, e2 = _pv_fg_pressure_mg(p, rhs, nx, ny, 4, iters, &a);
         if (is_err_result(t2) == 1) { ok = 0; }
@@ -318,6 +322,7 @@ fn small_dx_msg(k, which): i64 {
 
 # ── basics ──────────────────────────────────────────────────────────────────────────
 
+# Construction, its refusals, idx and velocity_at.
 fn test_basics() {
     var g: PvFluidGrid;
     var g2: PvFluidGrid;
@@ -412,6 +417,7 @@ fn test_basics() {
 
 # ── advection ───────────────────────────────────────────────────────────────────────
 
+# The sampler and the semi-Lagrangian advection.
 fn test_advection() {
     test_group("test_sample_center");
     var fc = zeros(4 * 4);
@@ -456,6 +462,7 @@ fn test_advection() {
 
 # ── pressure projection ─────────────────────────────────────────────────────────────
 
+# The divergence, the zero-right-hand-side solve, and the projection's effect.
 fn test_projection() {
     test_group("test_divergence_zero_field");
     var nx = 8;
@@ -515,6 +522,7 @@ fn test_projection() {
 
 # ── boundary conditions ─────────────────────────────────────────────────────────────
 
+# The no-slip and free-slip wall rules.
 fn test_boundary() {
     test_group("test_no_slip_boundary");
     var nx = 8;
@@ -552,6 +560,7 @@ fn test_boundary() {
 
 # ── full steps ──────────────────────────────────────────────────────────────────────
 
+# The step: an empty grid, a smoke plume, an invalid time step.
 fn test_step() {
     var g: PvFluidGrid;
     var c: PvGridConfig = PvGridConfig_smoke();
@@ -619,6 +628,7 @@ fn test_step() {
 
 # ── MacCormack ──────────────────────────────────────────────────────────────────────
 
+# MacCormack advection: still fluid, less diffusion than semi-Lagrangian, a stable step.
 fn test_maccormack() {
     var g: PvFluidGrid;
     var c: PvGridConfig = PvGridConfig_smoke();
@@ -670,6 +680,7 @@ fn test_maccormack() {
 
 # ── periodic walls ──────────────────────────────────────────────────────────────────
 
+# Periodic walls: the ghost copies, a stable step, the wrapping sampler.
 fn test_periodic() {
     var g: PvFluidGrid;
     var c: PvGridConfig = PvGridConfig_smoke();
@@ -707,6 +718,7 @@ fn test_periodic() {
 
 # ── state: scratch, serde, determinism ──────────────────────────────────────────────
 
+# The scratch that persists across steps, and JSON keeping the state.
 fn test_state() {
     var g: PvFluidGrid;
     var g2: PvFluidGrid;
@@ -789,6 +801,7 @@ fn test_state() {
 
 # ── audit regressions (1.3.0): the solvers ──────────────────────────────────────────
 
+# The audit tests of the four pressure solvers: dx scaling and agreement.
 fn test_audit_solvers() {
     test_group("test_projection_all_solvers_dx_scaled");
     var nx = 33;
@@ -908,6 +921,7 @@ fn test_audit_solvers() {
 
 # ── audit regressions (1.3.0): the state ────────────────────────────────────────────
 
+# The audit tests of the step's refusals and the size mismatches it survives.
 fn test_audit_state() {
     var g: PvFluidGrid;
     var c: PvGridConfig = PvGridConfig_smoke();
@@ -991,19 +1005,20 @@ fn mg_col_data(lv, k): i64 {
     return c.data;
 }
 
+# Cyrius-only: the record layouts the column offsets assume.
 fn test_layout() {
     var g: PvFluidGrid;
     var c: PvGridConfig = PvGridConfig_smoke();
 
     test_group("fg_layout_matches_column_offsets");
-    assert_eq(sizeof(PvFluidGrid), 312, "PvFluidGrid: 312 bytes");
+    assert_eq(sizeof(PvFluidGrid), 360, "PvFluidGrid: 360 bytes");
     assert_eq(sizeof(PvGridConfig), 104, "PvGridConfig: 104 bytes");
     assert_eq(sizeof(PvMgLevel), 72, "PvMgLevel: 72 bytes");
-    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
-    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a DST step sizes solve_a … solve_c");
+    assert_eq(fresh(&g, 8, 9, 0.1), 1, "new");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a DST step sizes solve_a … solve_c and both plans");
     c.use_multigrid = 1;
     assert_eq(step_err(&g, &c), PV_ERR_NONE, "a multigrid step pushes a level");
-    assert(g.solve_a.data != 0 && g.mg_levels.len > 0, "every column has storage");
+    assert(g.solve_a.data != 0 && g.mg_levels.len > 0 && g.dst_y.data != 0, "every column has storage");
     assert_eq(fg_col_data(&g, 0), g.vx.data, "0: vx");
     assert_eq(fg_col_data(&g, 1), g.vy.data, "1: vy");
     assert_eq(fg_col_data(&g, 2), g.pressure.data, "2: pressure");
@@ -1016,6 +1031,9 @@ fn test_layout() {
     assert_eq(fg_col_data(&g, 9), g.solve_a.data, "9: solve_a");
     assert_eq(fg_col_data(&g, 10), g.solve_b.data, "10: solve_b");
     assert_eq(fg_col_data(&g, 11), g.solve_c.data, "11: solve_c");
+    assert_eq(fg_col_data(&g, 12), g.dst_x.data, "12: dst_x");
+    assert_eq(fg_col_data(&g, 13), g.dst_y.data, "13: dst_y");
+    assert(g.dst_x.len == 6 * 6 + 6 && g.dst_y.len == 7 * 7 + 7, "the plans of lengths 6 and 7");
     var lv = load64(g.mg_levels.data);
     var level: *PvMgLevel = _pv_as_mg_level(lv);
     assert(level.residual.data != 0 && level.coarse_rhs.data != 0 && level.coarse_p.data != 0,
@@ -1024,6 +1042,59 @@ fn test_layout() {
     assert_eq(mg_col_data(lv, 1), level.coarse_rhs.data, "level column 1: coarse_rhs");
     assert_eq(mg_col_data(lv, 2), level.coarse_p.data, "level column 2: coarse_p");
     PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# 1 when the plan in *t is word for word a fresh plan of length n.
+fn plan_matches(t: *PvColumn, n): i64 {
+    var f: PvColumn = PvColumn_new();
+    var ok = _pv_fg_dst_plan(n, &f);
+    if (ok == 1 && f.len != t.len) { ok = 0; }
+    for (var i = 0; ok == 1 && i < f.len; i = i + 1) {
+        if (load64(f.data + i * 8) != load64(t.data + i * 8)) { ok = 0; }
+    }
+    f.drop();
+    return ok;
+}
+
+# Cyrius-only: the DST plans are kept per transform length, per side, and across a clone.
+fn test_dst_plan() {
+    test_group("fg_dst_plan_is_kept_per_length");
+    var t: PvColumn = PvColumn_new();
+    assert_eq(_pv_fg_dst_plan(6, &t), 1, "plan 6");
+    assert_eq(t.len, 42, "n² + n words");
+    var s0: f64 = load64(t.data);
+    assert_eq(_pv_bits(s0), 0x3FDBC4C04D71ABC1, "sin(π/7)");
+    var l5: f64 = load64(t.data + 41 * 8);
+    assert_eq(_pv_bits(l5), 0xC00E6A5E54E5AE38, "2cos(6π/7) − 2");
+    var keep = t.data;
+    store64(t.data, 0);
+    assert_eq(_pv_fg_dst_plan(6, &t), 1, "plan 6 again");
+    assert(t.data == keep && load64(t.data) == 0, "a plan of the same length is kept, not rebuilt");
+    assert_eq(_pv_fg_dst_plan(7, &t), 1, "plan 7");
+    assert_eq(plan_matches(&t, 7), 1, "another length rebuilds every word");
+    assert_eq(_pv_fg_dst_plan(6, &t), 1, "plan 6 once more");
+    assert_eq(plan_matches(&t, 6), 1, "and back");
+    t.drop();
+    # A grid's plans follow its interior: a square grid uses dst_x for both sides, a stepped clone carries them.
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a DST step");
+    assert(g.dst_x.len == 72 && g.dst_y.len == 0, "square: one plan, of length 8");
+    var h: PvFluidGrid;
+    assert_eq(PvFluidGrid_clone(&h, &g), 1, "clone");
+    assert(h.dst_x.len == 72 && h.dst_x.data != g.dst_x.data, "the clone has its own copy of the plan");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a second step reuses the plan");
+    assert_eq(step_err(&h, &c), PV_ERR_NONE, "and so does the clone's");
+    var same = 1;
+    for (var i = 0; i < 100; i = i + 1) {
+        if (load64(g.vx.data + i * 8) != load64(h.vx.data + i * 8)) { same = 0; }
+        if (load64(g.pressure.data + i * 8) != load64(h.pressure.data + i * 8)) { same = 0; }
+    }
+    assert_eq(same, 1, "the same bits either way");
+    PvFluidGrid_drop(&g);
+    PvFluidGrid_drop(&h);
     return 0;
 }
 
@@ -1041,6 +1112,7 @@ fn main() {
     test_audit_solvers();
     test_audit_state();
     test_layout();
+    test_dst_plan();
     return assert_summary();
 }
 

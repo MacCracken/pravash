@@ -11,9 +11,11 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M3 part a complete** (2026-11-11); M3 part b (the DST and CG rows) is next. M3 part a delivered
-> `src/grid.cyr` and `src/grid_solve.cyr`: 569 rows bit-exact (188 class S step rows on the periodic and multigrid
-> projections), 44 of 49 + 5 Rust tests (port-parity §10). M0 is complete (§4). M2 delivered `src/shallow.cyr`, the
+> ⏳ **Status: M3 part b complete** (2026-11-12); M3 part c (`MacGrid`, k-ε, the ghost fluid) is next. Part b put
+> the DST and CG projections under parity: 827 grid rows, 20 of them against the corrected oracle where glibc
+> misrounds a DST sine, and the DST plans that keep the bits and take the 63 × 63 DST step from 719 ms to 8.6 ms
+> (port-parity §11). M3 part a delivered `src/grid.cyr` and `src/grid_solve.cyr`: 569 rows bit-exact (188 class S
+> step rows on the periodic and multigrid projections), 44 of 49 + 5 Rust tests (port-parity §10). M0 is complete (§4). M2 delivered `src/shallow.cyr`, the
 > first stateful solver: 888 rows bit-exact (142 class S step rows among them), all 44 + 3 Rust tests ported
 > (port-parity §9). M1 delivered, in four parts:
 > - `src/mathx.cyr`, the first `[lib]` and the bundle;
@@ -771,7 +773,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | L3 | open | `src/vec3.cyr`: `DVec3` arithmetic on `f64` locals | every `hvec3_*` result allocates, 24 B (port-parity §4.1) | `hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md`; `cyrius:docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md` (pravash's numbers added to both) | hisab's vector forms, once a call's allocation can be scoped | the class B rows of every module that uses vectors |
 | L4 | open | `src/neighbor.cyr`: the neighbour grid on sorted arrays (f32 keys until the D3 switch) | `spatial_hash_query_cell` allocates a vec per query: 4.1 MB per 1,000-particle step (port-parity §4.1) | `hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md` | `spatial_hash_*` with a non-allocating query | neighbour lists (class A) and every SPH and coupling step row |
 | L5 | open | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | `hisab:docs/development/issues/2026-11-11-no-matrix-free-linear-cg.md` | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
-| L6 | open | `src/grid_solve.cyr`: 1.4.0's direct DST and IDST, transcribed, on the correctly rounded `sin` (L1) | `num_dst` / `num_idst` allocate 10–20 KB per call, and are another algorithm (up to 67,000 ulp from 1.4.0's) (port-parity §4.1, §4.8) | `hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md` | `num_dst` / `num_idst` into caller scratch, with the DST rows re-bounded for their algorithm | the DST pressure rows |
+| L6 | open | `src/grid_solve.cyr`: 1.4.0's direct DST and IDST, transcribed, on the correctly rounded `sin` (L1), with the sines from a caller-kept table (the grid's DST plans, M3 part b) | `num_dst` / `num_idst` allocate 10–20 KB per call, and are another algorithm (up to 67,000 ulp from 1.4.0's) (port-parity §4.1, §4.8) | `hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md` (pravash's plan numbers appended at M3 part b) | `num_dst` / `num_idst` into caller scratch from a caller-kept plan, with the DST rows re-bounded for their algorithm | the DST pressure rows and the DST step rows, with `grid.cr.tsv` |
 | L7 | open | `src/sph_fns.cyr`: the MLS 3×3 inverse, an allocation-free copy of ganita's `mat_inv` algorithm (the oracle's bits on all 300 probe matrices) | ganita `mat_inv` allocates 248 B per call, once per particle per step (port-parity §4.1, §4.8) | `ganita:docs/development/issues/2026-11-11-mat-inv-allocates-per-call.md` | ganita `mat_inv_into` | the MLS gradient-correction rows |
 | L8 | open | the step-path rule itself: solver-owned storage on freelist, step scratch in an arena, hisab off the step | any library call that returns a value leaks on the bump heap | `hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md`; `cyrius:docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md` | hisab back on the step path: L3, L4 and L6 convert together | every step row, plus the soak test |
 | L9 | open | `src/sph_fns.cyr`: a stable merge sort on (key, input index) (ADR 0002 #3; port-parity §4.5) | `vec_sort_by` is introsort; no stable sort exists | `cyrius:docs/development/issues/2026-11-11-no-stable-sort.md` | the stdlib's stable sort | the z-order rows (class A) |
@@ -785,6 +787,10 @@ in `src/` has a row below, and that every open row has at least one note. It run
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
 
 **Also filed at M1 part 4, outside the ledger:** `bayan:docs/development/issues/2026-11-11-json-integer-negative-zero-loses-its-sign.md` (the integer `-0` reads as +0, where serde_json reads −0.0; one pending JSON row, with impetus's S3 and S4).
+
+**Also filed at M3 part b, on a ledger row:** pravash's DST-plan numbers (the step 14–84× faster with the bits
+unchanged; a plan-taking DST into caller scratch asked for), appended to the L6 request
+`hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md`.
 
 **Also filed at M3 part a, outside the ledger:** pravash's measurements of the correctly rounded sin and cos at
 fl(k·π/2) (18.4 µs a call, against 165 ns elsewhere; the DST's arguments land there), appended to the L1 request
@@ -860,7 +866,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - surface parity 165.
 
 **Next:** M3, grid |
-| M3 Grid | 🟡 **part a done 2026-11-11**; parts b–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
+| M3 Grid | 🟡 **parts a–b done 2026-11-11 / 12**; parts c–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
 - `src/grid.cyr` (every advection, diffusion, Smagorinsky, the forces, the four projections, the wall rules) and `src/grid_solve.cyr` (L5, L6);
 - ADR 0002 #12 (the private solver buffers, the boundary refusal, `PvFluidGrid_diffuse`'s flag);
 - `_pv_fmod`, ledger L14, requested at ganita with a repro;
@@ -868,7 +874,18 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - the sin / cos slow path appended to the L1 request;
 - surface parity 227 (24 pending part c).
 
-**Next:** M3 part b: the DST, IDST and CG rows on the corrected oracle, the step on those projections, the per-length sine table |
+Part b (2026-11-12, port-parity §11):
+- grid 827 rows: 21 DST rows (class C, bound 0), 49 CG rows (class B), and 188 more class S step rows on the DST
+  and CG projections;
+- `grid.cr.tsv`, 20 rows, where glibc misrounds a DST sine or cosine (lengths 12–60, 0.16% of their calls);
+- every row bit-exact against the oracle or the corrected oracle, on three targets, under `--bounds` and with rayon
+  on;
+- the DST plans (`dst_x`, `dst_y`; ADR 0002 #12 amended), with the same bits; `grid_step` 28.5 ms → 760 µs at 15 ×
+  15 and 719 → 8.6 ms at 63 × 63 (Rust 127 µs, 10.1 ms), and later steps 0.56–1.5× Rust;
+- 8 of 9 port mutations and 3 of 3 transcription mutations caught (the ninth equivalent);
+- `cyrius audit` made clean (44 test and bench functions documented).
+
+**Next:** M3 part c: `MacGrid`, `KEpsilon` and `apply_ghost_fluid`, their rows, and the last 5 Rust tests of `grid.rs` |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |

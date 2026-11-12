@@ -121,6 +121,7 @@ var _T_LN_HARD: i64[42] = {
     0, 0x3FEFE9360A3A6228, 0xBF66D216F8365EE9      # ln(0.9972181510702898): the fast test fails (1 in 14.4M)
 };
 
+# ln and log10: specials, exact powers of ten, hard cases, and the fast path against the accurate one.
 fn test_ln_log10() {
     test_group("ln_log10_specials");
     assert_eq(crl_table(&_T_LN_SPECIAL, 16), 0, "ln and log10 specials, by the full function and the accurate path");

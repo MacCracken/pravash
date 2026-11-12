@@ -1736,6 +1736,164 @@ def fg_multigrid(p, div, nx, ny, nu, cycles, levels):
         fg_vcycle(p, div, nx, ny, nu, levels, 0)
 
 
+# The DST's transcendentals, per transform length n: the n² sines sin(((π·(i+1))·(k+1))/(n+1)) (row k, entry i,
+# hisab 1.4.0 `dst`'s argument) and the n eigenvalue terms 2·cos((π·(k+1))/(n+1)) − 2 of `pressure_solve_dst`.
+# Each depends only on (i, k, n), so one table per length gives the same values as the solver's per-call ones.
+# glibc's (the oracle's own calls) and MPFR's correctly rounded ones, each cached; for MPFR's, the calls glibc
+# rounds otherwise, by argument.
+_DST_GLIBC = {}
+_DST_CR = {}
+
+
+def _dst_args(n):
+    np1 = float(n + 1)
+    sines = [[((PI * float(i + 1)) * float(k + 1)) / np1 for i in range(n)] for k in range(n)]
+    coses = [(PI * float(k + 1)) / np1 for k in range(n)]
+    return sines, coses
+
+
+def dst_glibc(n):
+    """(sines, eigenvalue terms) for length n from glibc's sin and cos, as the oracle calls them."""
+    if n not in _DST_GLIBC:
+        sa, ca = _dst_args(n)
+        _DST_GLIBC[n] = ([[_libm.sin(a) for a in row] for row in sa], [2.0 * _libm.cos(a) - 2.0 for a in ca])
+    return _DST_GLIBC[n]
+
+
+def dst_cr(n):
+    """(sines, eigenvalue terms, the misrounded calls) for length n from MPFR's correctly rounded sin and cos."""
+    if n not in _DST_CR:
+        sa, ca = _dst_args(n)
+        miss = {}
+        sines = []
+        for row in sa:
+            out = []
+            for a in row:
+                want = MPFR.cr("sin", a)
+                got = _libm.sin(a)
+                if not same(got, want):
+                    miss[f"sin(f:{bits(a):016x})"] = f"glibc f:{bits(got):016x} correctly rounded f:{bits(want):016x}"
+                out.append(want)
+            sines.append(out)
+        terms = []
+        for a in ca:
+            want = MPFR.cr("cos", a)
+            got = _libm.cos(a)
+            if not same(got, want):
+                miss[f"cos(f:{bits(a):016x})"] = f"glibc f:{bits(got):016x} correctly rounded f:{bits(want):016x}"
+            terms.append(2.0 * want - 2.0)
+        _DST_CR[n] = (sines, terms, [f"{k} {v}" for k, v in miss.items()])
+    return _DST_CR[n]
+
+
+def dst_cr_logged(log):
+    """MPFR's tables, each length's misrounded calls recorded into `log` when the length is used."""
+    def tables(n):
+        sines, terms, miss = dst_cr(n)
+        log.extend(miss)
+        return sines, terms
+    return tables
+
+
+def fg_dst(x, n, sines):
+    """hisab 1.4.0 `dst` of x (length n): each sum from +0 in index order."""
+    out = []
+    for row in sines:
+        s = 0.0
+        for xi, si in zip(x, row):
+            s += xi * si
+        out.append(s)
+    return out
+
+
+def fg_idst(x, n, sines):
+    """hisab 1.4.0 `idst`: the DST, each value then × 2/(n+1)."""
+    scale = 2.0 / float(n + 1)
+    return [v * scale for v in fg_dst(x, n, sines)]
+
+
+def fg_pressure_dst(p, div, nx, ny, tables):
+    """The private `pressure_solve_dst` (`tables(n)` gives a length's sines and eigenvalue terms)."""
+    inx, iny = nx - 2, ny - 2
+    if inx == 0 or iny == 0:
+        return
+    sx, lx = tables(inx)
+    sy, ly = tables(iny)
+    rhs = [div[(iy + 1) * nx + ix + 1] for iy in range(iny) for ix in range(inx)]
+
+    def rows(f, s):
+        for iy in range(iny):
+            rhs[iy * inx:(iy + 1) * inx] = f(rhs[iy * inx:(iy + 1) * inx], inx, s)
+
+    def cols(f, s):
+        for ix in range(inx):
+            t = f([rhs[iy * inx + ix] for iy in range(iny)], iny, s)
+            for iy in range(iny):
+                rhs[iy * inx + ix] = t[iy]
+
+    rows(fg_dst, sx)
+    cols(fg_dst, sy)
+    for ky in range(iny):
+        for kx in range(inx):
+            eig = -(lx[kx] + ly[ky])
+            if abs(eig) > 1e-12:
+                rhs[ky * inx + kx] /= eig
+    rows(fg_idst, sx)
+    cols(fg_idst, sy)
+    p[:] = [0.0] * len(p)
+    for iy in range(iny):
+        for ix in range(inx):
+            p[(iy + 1) * nx + ix + 1] = rhs[iy * inx + ix]
+
+
+def fg_cg(p, div, nx, ny, iters):
+    """The private `pressure_solve_cg`, on hisab 1.4.0 `conjugate_gradient`: None, or the failure's token."""
+    n = nx * ny
+
+    def dot(v, w):
+        s = -0.0
+        for a, b in zip(v, w):
+            s += a * b
+        return s
+
+    def a_mul(v):
+        out = [0.0] * n
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                out[i] = 4.0 * v[i] - (((v[i - 1] + v[i + 1]) + v[i - nx]) + v[i + nx])
+        return out
+
+    tol = r_max(1e-6 * math.sqrt(dot(div, div)), 1e-14)
+    nb = len(div)
+    if nb == 0 or len(p) != nb:
+        return "E:Diverged"
+    x = list(p)
+    ax = a_mul(x)
+    r = [div[i] - ax[i] for i in range(nb)]
+    q = list(r)
+    rs_old = dot(r, r)
+    tol_sq = tol * tol
+    if rs_old >= tol_sq:
+        for _ in range(iters):
+            ap = a_mul(q)
+            pap = dot(q, ap)
+            if abs(pap) < 1e-12:
+                break
+            alpha = fdiv(rs_old, pap)
+            for i in range(nb):
+                x[i] += alpha * q[i]
+                r[i] -= alpha * ap[i]
+            rs_new = dot(r, r)
+            if rs_new < tol_sq:
+                break
+            beta = fdiv(rs_new, rs_old)
+            q = [r[i] + beta * q[i] for i in range(nb)]
+            rs_old = rs_new
+    p[:] = x
+    return None
+
+
 def fg_project(vx, vy, p, nx, ny, inv_2dx):
     for y in range(1, ny - 1):
         for x in range(1, nx - 1):
@@ -1842,8 +2000,9 @@ def fg_advect_by(dst, src, g, c, sc, drhs):
         fg_advect(dst, src, g["vx"], g["vy"], nx, ny, c["dt"], inv_dx)
 
 
-def fg_step(g, c):
-    """One FluidGrid::step: None, or the failure's token. The multigrid levels persist in g["mg"]."""
+def fg_step(g, c, tables=dst_glibc):
+    """One FluidGrid::step: None, or the failure's token. The multigrid levels persist in g["mg"]; `tables` gives
+    the DST's sines and eigenvalue terms per length (glibc's, or MPFR's for the corrected oracle)."""
     dt = c["dt"]
     if not fin(dt) or dt <= 0.0:
         return "E:InvalidTimestep"
@@ -1865,8 +2024,8 @@ def fg_step(g, c):
     inv_dx = 1.0 / dx
     inv_2dx = 0.5 * inv_dx
     bc = c["boundary"]
-    if bc not in BCS or c["use_cg"] or (not c["use_multigrid"] and bc != "Periodic"):
-        raise ValueError("a part b path (DST or CG)")
+    if bc not in BCS:
+        raise ValueError(f"no boundary condition {bc}")
     sa, sb, sc, drhs = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
     vx, vy, rho = g["vx"], g["vy"], g["density"]
     fg_advect_by(sa, vx, g, c, sc, drhs)
@@ -1907,10 +2066,16 @@ def fg_step(g, c):
     fg_enforce(vx, vy, nx, ny, bc)
     sa = [0.0] * n
     fg_divergence(sa, vx, vy, nx, ny, 0.5 * dx)
-    if c["use_multigrid"]:
+    if c["use_cg"]:
+        bad = fg_cg(g["pressure"], sa, nx, ny, c["pressure_iterations"])
+        if bad:
+            return bad
+    elif c["use_multigrid"]:
         fg_multigrid(g["pressure"], sa, nx, ny, 4, -(-c["pressure_iterations"] // 10), g["mg"])
-    else:
+    elif bc == "Periodic":
         fg_gs(g["pressure"], sa, nx, ny, c["pressure_iterations"])
+    else:
+        fg_pressure_dst(g["pressure"], sa, nx, ny, tables)
     fg_project(vx, vy, g["pressure"], nx, ny, inv_2dx)
     fg_enforce(vx, vy, nx, ny, bc)
     if not all(fin(v) for v in vx + vy):
@@ -1923,14 +2088,14 @@ def fg_step(g, c):
     return None
 
 
-def fg_run(x):
+def fg_run(x, tables=dst_glibc):
     """A step row's outputs: the state and the scratch dump after its nsteps steps, or the first failure."""
     g, k = fg_read(x)
     c = gc_read(x, k)
     steps = x[k + 13]
     g["mg"] = []
     for _ in range(steps):
-        bad = fg_step(g, c)
+        bad = fg_step(g, c, tables)
         if bad:
             return [bad]
     n = g["nx"] * g["ny"]
@@ -2029,6 +2194,12 @@ def check_grid(rows):
             if short == "pressure_solve_gauss_seidel":
                 fg_gs(p, div, nx, ny, x[k + 2])
                 want = [("v", n)] + p
+            elif short == "pressure_solve_dst":
+                fg_pressure_dst(p, div, nx, ny, dst_glibc)
+                want = [("v", n)] + p
+            elif short == "pressure_solve_cg":
+                bad = fg_cg(p, div, nx, ny, x[k + 2])
+                want = [bad] if bad else [("v", n)] + p
             else:
                 levels = []
                 fg_multigrid(p, div, nx, ny, x[k + 2], x[k + 3], levels)
@@ -2106,6 +2277,34 @@ def mpfr_logged(log):
     return {"exp": unary("exp", "exp"), "log": unary("log", "log"), "log10": unary("log10", "log10"), "pow": pw}
 
 
+def tokens_text(vals):
+    """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
+    return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
+                    else (w if isinstance(w, str) else f"i:{w}")) for w in vals)
+
+
+def grid_misrounds(fn, x):
+    """Whether a grid row's DST calls a sine or cosine glibc misrounds: only such rows change under MPFR (the DST's
+    are the grid's only transcendentals). A step takes the DST without CG or multigrid on walls, once its checks pass."""
+    if fn == "oracle::pressure_solve_dst":
+        n = x[0][1]
+        k = 2 + n + x[1 + n][1]
+        nx, ny = x[k], x[k + 1]
+    elif fn == "FluidGrid::step":
+        g, k = fg_read(x)
+        c = gc_read(x, k)
+        if c["use_cg"] or c["use_multigrid"] or c["boundary"] == "Periodic":
+            return False
+        nx, ny = g["nx"], g["ny"]
+        if nx * ny != len(g["vx"]):
+            return False   # refused before the projection
+    else:
+        return False
+    if nx < 3 or ny < 3:
+        return False
+    return bool(dst_cr(nx - 2)[2] or dst_cr(ny - 2)[2])
+
+
 def corrections(module, rows):
     """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
     when every transcendental result is correctly rounded."""
@@ -2118,10 +2317,28 @@ def corrections(module, rows):
             got = [tok_val(t) for t in outs]
             if same_list(got, want):
                 continue
-            new = " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
-                           else (w if isinstance(w, str) else f"i:{w}")) for w in want)
             seen = list(dict.fromkeys(log))
-            out.append((fn, " ".join(ins), new, "oracle (state); " + "; ".join(seen)))
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
+            continue
+        if module == "grid":
+            x = [tok_val(t) for t in ins]
+            if not grid_misrounds(fn, x):
+                continue
+            if fn == "FluidGrid::step":
+                want = fg_run(x, dst_cr_logged(log))
+            else:
+                n = x[0][1]
+                p = list(x[1:1 + n])
+                m = x[1 + n][1]
+                div = list(x[2 + n:2 + n + m])
+                k = 2 + n + m
+                fg_pressure_dst(p, div, x[k], x[k + 1], dst_cr_logged(log))
+                want = [("v", n)] + p
+            got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            seen = list(dict.fromkeys(log))
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
             continue
         if module in ("vortex", "bridge") and fn in M1B_C:
             x = [tok_val(t) for t in ins]
@@ -2309,6 +2526,7 @@ def main():
             counts = check_grid(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"grid: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "grid", path, rows)
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

@@ -75,7 +75,8 @@ fn <TAB> class <TAB> inputs <TAB> outputs <TAB> note
 - **Classes** (port plan §5): A exact (NaN matches any NaN), B ≤ 2 ulp, C an ulp bound per function set by the
   step 8 baselines, D relative ≤ 1e-12 or a bound set before the first comparison, S a solver step from a state
   (per field the bound of its path: the harness's `_par_c_bound` gives it per function, 0 for the shallow-water
-  step and for the grid step on its periodic and multigrid projections). Reference (R) checks are the ported tests' own tolerances, not golden rows.
+  step and for the grid step on every projection, the DST's against the corrected oracle where glibc misrounds a
+  sine or cosine). Reference (R) checks are the ported tests' own tolerances, not golden rows.
 - **The note** is a human rendering of the same call, for review only; the harness ignores it.
 
 ## The corrected oracle (ADR 0004)
@@ -116,6 +117,10 @@ oracle:
 - it recomputes every `common` row in Python, in Rust's and glam's order: the validation rules, the defaults, the
   vector arithmetic, and the particle arena through a transcription of its free-list logic (the token layouts
   and the arena's op codes are in `src/m_common.rs`'s module comment);
+- it recomputes every `shallow` and `grid` row through Python transcriptions of the solvers: the shallow-water step,
+  and the grid's samplers, advections, diffusion, forces, walls and four pressure solves (hisab 1.4.0's DST, IDST
+  and CG among them), with glibc's transcendentals for the record and MPFR's for the corrected oracle
+  (`grid.cr.tsv`: the rows whose DST uses a sine or cosine glibc misrounds);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;

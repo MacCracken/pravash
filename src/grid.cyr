@@ -105,15 +105,17 @@ struct PvFluidGrid {
     solve_a: PvColumn;
     solve_b: PvColumn;
     solve_c: PvColumn;
+    dst_x: PvColumn;
+    dst_y: PvColumn;
 }
 
 # The number of columns in a `PvFluidGrid`: the 4 public fields, the 4 scratch buffers, `mg_levels` (column 8, whose
-# words are `*PvMgLevel`s) and the 3 solver buffers.
-const _PV_FG_COLUMNS = 12;
+# words are `*PvMgLevel`s), the 3 solver buffers and the 2 DST plans (`_pv_fg_dst_plan`).
+const _PV_FG_COLUMNS = 14;
 
 # Column k of a grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_a, 5 scratch_b, 6 scratch_c, 7 diffuse_rhs,
-# 8 mg_levels, 9 … 11 solve_a … solve_c), by its byte offset (a field's address can't be taken; tests/grid.tcyr pins
-# the layout: nx, ny, dx, then the twelve columns, 312 bytes).
+# 8 mg_levels, 9 … 11 solve_a … solve_c, 12 dst_x, 13 dst_y), by its byte offset (a field's address can't be taken;
+# tests/grid.tcyr pins the layout: nx, ny, dx, then the fourteen columns, 360 bytes).
 #must_use
 fn _pv_fg_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
@@ -648,13 +650,38 @@ fn _pv_fg_pressure_gs(p, div, nx, ny, iterations) {
     return 0;
 }
 
+# The DST plan of transform length n (≥ 1) in *tab: the n² sines of `_pv_dst_sines`, then the n eigenvalue terms
+# 2·cos((π·(k+1))/(n+1)) − 2 of `pressure_solve_dst`. Each value depends only on n, and n² + n words name n, so a
+# column already that long holds the plan and is kept; else it is rebuilt. 1, or 0 when the memory isn't there.
+#must_use
+fn _pv_fg_dst_plan(n, tab: *PvColumn): i64 {
+    var words = n * n + n;
+    if (tab.len == words) { return 1; }
+    if (tab.resize(words, 0) == 0) { return 0; }
+    _pv_dst_sines(n, tab.data);
+    var pi: f64 = PV_F64_PI;
+    var np1: f64 = f64_from(n + 1);
+    var terms = tab.data + n * n * 8;
+    for (var k = 0; k < n; k = k + 1) {
+        var kf: f64 = f64_from(k + 1);
+        var a: f64 = (pi * kf) / np1;
+        var c: f64 = _pv_cos(a);
+        var l: f64 = (2.0 * c) - 2.0;
+        store64(terms + k * 8, _pv_bits(l));
+    }
+    return 1;
+}
+
 # The DST pressure solve of 4p − Σp = div with p = 0 on the ring: the interior divergence transformed by DST-I rows
 # then columns, divided by the eigenvalues μ = −((2cos(π(kx+1)/(inx+1)) − 2) + (2cos(π(ky+1)/(iny+1)) − 2)) where
 # |μ| > 1e-12, transformed back by IDST-I rows then columns; then all `plen` words of p zeroed and the interior
-# written. ra, rb and rc are scratch columns (inx·iny, and the longer side twice). Ok(0) (also when the interior is
-# empty), or Err(PV_ERR_OUT_OF_MEMORY) when the scratch can't grow. Mirrors the private `pressure_solve_dst`.
+# written. ra, rb and rc are scratch columns (inx·iny, and the longer side twice); tx and ty hold the plans of the
+# two transform lengths (tx alone when they are equal), kept for the next call. Ok(0) (also when the interior is
+# empty), or Err(PV_ERR_OUT_OF_MEMORY) when the scratch can't grow. Mirrors the private `pressure_solve_dst`, with
+# its per-term sines and per-cell cosines read from the plans (the same values).
 #must_use
-fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn): Result {
+fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn, tx: *PvColumn,
+  ty: *PvColumn): Result {
     var inx = nx - 2;
     var iny = ny - 2;
     if (inx <= 0 || iny <= 0) { return Ok(0); }
@@ -663,6 +690,14 @@ fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *
     if (ra.resize(inx * iny, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
     if (rb.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
     if (rc.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (_pv_fg_dst_plan(inx, tx) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var py: *PvColumn = tx;
+    if (iny != inx) {
+        if (_pv_fg_dst_plan(iny, ty) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        py = ty;
+    }
+    var sx = tx.data;
+    var sy = py.data;
     var rhs = ra.data;
     var col = rb.data;
     var tr = rc.data;
@@ -672,29 +707,22 @@ fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *
     # The forward transform: rows, then columns.
     for (var r = 0; r < iny; r = r + 1) {
         var row = rhs + r * inx * 8;
-        _pv_dst(row, inx, tr);
+        _pv_dst(row, inx, sx, tr);
         _pv_fg_copy(row, tr, inx);
     }
     for (var cx = 0; cx < inx; cx = cx + 1) {
         for (var cy = 0; cy < iny; cy = cy + 1) { store64(col + cy * 8, load64(rhs + (cy * inx + cx) * 8)); }
-        _pv_dst(col, iny, tr);
+        _pv_dst(col, iny, sy, tr);
         for (var cy2 = 0; cy2 < iny; cy2 = cy2 + 1) { store64(rhs + (cy2 * inx + cx) * 8, load64(tr + cy2 * 8)); }
     }
-    # The eigenvalues of the unit-stencil operator.
-    var pi: f64 = PV_F64_PI;
-    var ix1: f64 = f64_from(inx + 1);
-    var iy1: f64 = f64_from(iny + 1);
+    # The eigenvalues of the unit-stencil operator, from the plans' terms.
+    var lxs = sx + inx * inx * 8;
+    var lys = sy + iny * iny * 8;
     var tiny: f64 = 0x3D719799812DEA11;   # 1e-12
     for (var ky = 0; ky < iny; ky = ky + 1) {
-        var kyf: f64 = f64_from(ky + 1);
-        var ay: f64 = (pi * kyf) / iy1;
+        var ly: f64 = load64(lys + ky * 8);
         for (var kx = 0; kx < inx; kx = kx + 1) {
-            var kxf: f64 = f64_from(kx + 1);
-            var ax: f64 = (pi * kxf) / ix1;
-            var cxv: f64 = _pv_cos(ax);
-            var lx: f64 = (2.0 * cxv) - 2.0;
-            var cyv: f64 = _pv_cos(ay);
-            var ly: f64 = (2.0 * cyv) - 2.0;
+            var lx: f64 = load64(lxs + kx * 8);
             var s: f64 = lx + ly;
             var eig: f64 = -s;
             var ae: f64 = f64_abs(eig);
@@ -709,12 +737,12 @@ fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *
     # The inverse transform: rows, then columns.
     for (var r2 = 0; r2 < iny; r2 = r2 + 1) {
         var row2 = rhs + r2 * inx * 8;
-        _pv_idst(row2, inx, tr);
+        _pv_idst(row2, inx, sx, tr);
         _pv_fg_copy(row2, tr, inx);
     }
     for (var dx2 = 0; dx2 < inx; dx2 = dx2 + 1) {
         for (var dy = 0; dy < iny; dy = dy + 1) { store64(col + dy * 8, load64(rhs + (dy * inx + dx2) * 8)); }
-        _pv_idst(col, iny, tr);
+        _pv_idst(col, iny, sy, tr);
         for (var dy2 = 0; dy2 < iny; dy2 = dy2 + 1) { store64(rhs + (dy2 * inx + dx2) * 8, load64(tr + dy2 * 8)); }
     }
     _pv_fg_fill(p, plen, 0);
@@ -1342,7 +1370,7 @@ impl PvFluidGrid {
             _pv_fg_pressure_gs(pd, sa, nx, ny, config.pressure_iterations);
         } else {
             var td, vd2 = _pv_fg_pressure_dst(pd, n, sa, nx, ny, _pv_fg_col(self, 9), _pv_fg_col(self, 10),
-              _pv_fg_col(self, 11));
+              _pv_fg_col(self, 11), _pv_fg_col(self, 12), _pv_fg_col(self, 13));
             if (is_err_result(td) == 1) { return Err(vd2); }
         }
         _pv_fg_project(vx, vy, pd, nx, ny, inv_2dx);

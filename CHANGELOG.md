@@ -3,6 +3,49 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **grid** (M3 part b): the DST and CG projections under parity, and the DST plans.
+  - **Parity:** `tests/golden/grid.tsv` grows to 827 rows. Part b's rows come from their own seed, so part a's 569
+    keep their values. Every row is bit-exact against the oracle, or against the corrected oracle where glibc
+    misrounds one of the DST's sines or cosines:
+    - `oracle::pressure_solve_dst`: 21 rows, class C, bound 0. They cover part a's shared systems, part b's systems
+      at the transform lengths where glibc misrounds (12, 18, 25, 30, 36, 38, 60), and the edges.
+    - `oracle::pressure_solve_cg`: 49 rows, class B, at 1 to 200 iterations, including the empty system hisab
+      refuses.
+    - 188 more `FluidGrid::step` rows on the DST and CG projections: 300-step trajectories of still tanks; single
+      steps of plumes (10 × 10, and 14 × 14 where the DST misrounds), a vortex and a jet under every scheme and
+      force; CG at budgets 1 to 200; random states.
+    - `tests/golden/grid.cr.tsv` (ADR 0004): 20 rows (6 DST solves, 14 steps), written by `validate.py` from MPFR.
+      `validate.py` now transcribes hisab 1.4.0's `dst`, `idst` and `conjugate_gradient` and recomputes every
+      grid row.
+  - **DST plans:** `PvFluidGrid` gains two Cyrius-only private columns, `dst_x` and `dst_y` (ADR 0002 #12,
+    amended), and is now 360 bytes.
+    - Each holds a transform length's n² sines and n eigenvalue terms. The first DST step builds them, and later
+      steps keep them while the interior keeps its size.
+    - Rust computes the same values inside every sum, so the bits are the same.
+    - `src/grid_solve.cyr`'s `_pv_dst` / `_pv_idst` take the sine table, built by `_pv_dst_sines`.
+  - **Tests:** `fg_dst_plan_is_kept_per_length` in `tests/grid.tcyr`, which now has 185 checks.
+  - **Mutation checks:** 8 of 9 port mutations fail rows or the plan test. The ninth is provably equivalent: a
+    factor of 2 commutes with rounding. All 3 mutations of the transcription are caught.
+
+### Performance
+- **The DST step** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M3 part b; pinned,
+  interleaved A/B; the bits unchanged). Rust 1.3.0's numbers are in parentheses.
+  - `grid_step`:
+    - 28.5 ms → 760 µs at 15 × 15 (127 µs);
+    - 15.9 → 1.10 ms at 30 × 30 (1.07 ms);
+    - 719 → 8.6 ms at 63 × 63 (10.1 ms).
+  - A grid's later steps reuse its plans (`grid_step_warm`, Cyrius-only): 190 µs, 965 µs and 5.64 ms, which is
+    0.56–1.5× Rust.
+  - The first 15 × 15 step's plan costs about 570 µs. Most of that is 25 sines on the correctly rounded slow path
+    (ledger L1).
+  - Appended to hisab's L6 request: a DST into caller scratch that takes a plan the caller keeps.
+
+### Fixed
+- **`cyrius audit`** (a CI step) failed on undocumented public functions: 43 test and bench runners and helpers
+  (`main`, the `test_*` groups, `near`, the `bench_*` sections). Each now has its doc comment, and the audit's fmt,
+  lint, docs, tests and bench are clean.
+
+### Added (Cyrius)
 - **grid** (M3 part a): `src/grid.cyr` and `src/grid_solve.cyr`, the port of `rust-old/src/grid.rs`'s `FluidGrid`.
   - **`PvFluidGrid`:**
     - `PvFluidGrid_new`, `PvFluidGrid_clone` and `PvFluidGrid_drop`;

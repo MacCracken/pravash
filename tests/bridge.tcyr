@@ -2,6 +2,7 @@
 
 include "tests/lib.cyr"
 
+# 1 when |a − b| < tol.
 fn near(a: f64, b: f64, tol: f64): i64 {
     var d: f64 = a - b;
     var ad: f64 = f64_abs(d);
@@ -9,6 +10,7 @@ fn near(a: f64, b: f64, tol: f64): i64 {
     return 0;
 }
 
+# Runs the ported bridge tests.
 fn main() {
     alloc_init();
 

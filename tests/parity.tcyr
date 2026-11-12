@@ -1109,7 +1109,8 @@ fn _par_grid(fp, fl): i64 {
         return 1;
     }
     if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1
-      || _par_eq(fp, fl, "oracle::pressure_solve_multigrid") == 1) {
+      || _par_eq(fp, fl, "oracle::pressure_solve_multigrid") == 1
+      || _par_eq(fp, fl, "oracle::pressure_solve_dst") == 1 || _par_eq(fp, fl, "oracle::pressure_solve_cg") == 1) {
         var pc: PvColumn;
         var dc: PvColumn;
         var k1 = _par_vcol_in(0, &pc);
@@ -1121,6 +1122,26 @@ fn _par_grid(fp, fl): i64 {
         if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1) {
             _pv_fg_pressure_gs(pc.data, dc.data, nx, ny, _par_in(k2 + 2));
             _par_col_out(&pc);
+        } elif (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1
+          || _par_eq(fp, fl, "oracle::pressure_solve_cg") == 1) {
+            # Fresh solver scratch per row, as the hooks' callers have none (the grid's persists across steps).
+            var sa: PvColumn = PvColumn_new();
+            var sb: PvColumn = PvColumn_new();
+            var sc: PvColumn = PvColumn_new();
+            if (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1) {
+                var tx: PvColumn = PvColumn_new();
+                var ty: PvColumn = PvColumn_new();
+                var td, vd = _pv_fg_pressure_dst(pc.data, pc.len, dc.data, nx, ny, &sa, &sb, &sc, &tx, &ty);
+                if (is_err_result(td) == 1) { _par_got_err(vd); } else { _par_col_out(&pc); }
+                tx.drop();
+                ty.drop();
+            } else {
+                var tg, vg = _pv_fg_pressure_cg(pc.data, dc.data, nx, ny, _par_in(k2 + 2), &sa, &sb, &sc);
+                if (is_err_result(tg) == 1) { _par_got_err(vg); } else { _par_col_out(&pc); }
+            }
+            sa.drop();
+            sb.drop();
+            sc.drop();
         } else {
             var levels: PvColumn = PvColumn_new();
             var tm, vm = _pv_fg_pressure_mg(pc.data, dc.data, nx, ny, _par_in(k2 + 2), _par_in(k2 + 3), &levels);
@@ -1337,9 +1358,14 @@ fn _par_c_bound(fp, fl): i64 {
     # The shallow-water step (class S): Rust's operations on the correctly rounded damping powf and cbrt, so every
     # field of every step row is bit for bit the oracle's (the corrected oracle's where glibc's pow misrounds).
     if (_par_eq(fp, fl, "ShallowWater::step") == 1) { return 0; }
-    # The grid step (class S), on the paths M3 part a covers (periodic Gauss–Seidel, multigrid): +, −, ×, ÷, √,
-    # floor and the exact fmod in Rust's order, so every field is the oracle's bit for bit.
+    # The grid step (class S), on every projection (periodic Gauss–Seidel, multigrid, DST, CG): +, −, ×, ÷, √,
+    # floor, the exact fmod and the DST's correctly rounded sines and cosines in Rust's order, so every field is the
+    # oracle's bit for bit (the corrected oracle's where glibc misrounds one of the DST's sines or cosines).
     if (_par_eq(fp, fl, "FluidGrid::step") == 1) { return 0; }
+    # M3 part b: the DST pressure solve's sines and cosines are correctly rounded (src/crmath.cyr) and everything
+    # else is +, −, ×, ÷ in Rust's order, so each row equals the corrected oracle bit for bit (the oracle's own row
+    # where glibc rounded every sine and cosine correctly). The DST step rows take the same bound, 0, above.
+    if (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1) { return 0; }
     return 0 - 1;
 }
 

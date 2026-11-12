@@ -4,6 +4,7 @@
 
 include "tests/lib.cyr"
 
+# 1 when |a − b| < tol.
 fn near(a: f64, b: f64, tol: f64): i64 {
     var d: f64 = a - b;
     var ad: f64 = f64_abs(d);
@@ -13,6 +14,7 @@ fn near(a: f64, b: f64, tol: f64): i64 {
 
 var EPS: f64 = 0.0000000001;   # the Rust tests' 1e-10
 
+# Runs the ported vortex tests.
 fn main() {
     alloc_init();
     var two_pi: f64 = 2.0 * PV_F64_PI;

@@ -20,7 +20,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M0 Initialize | ✅ **done 2026-11-11.** Step 0 (Rust, 2026-11-11): P(-1) gates green; the hidden `oracle` feature (dumps for all eleven stateful types, the SPH neighbour lists, the four pressure-solver hooks, the MLS inverse); `tests/oracle.rs` 14 tests, mutation-checked, green with and without `parallel`; `Cargo.lock` tracked; glibc 2.44. Step 1 (2026-11-11): `cyrius port` scaffold, with the Rust crate in `rust-old/`, which still passes there (351 unit, 33 integration, 14 oracle). Step 2: repairs done (CLAUDE.md, CI, docs, ADRs 0001–0003). Step 3: `cyrius.cyml`, with hisab 3.4.1 test-scoped; `build`, `test`, `test --bounds`, `bench`, `fuzz`, `lint`, `fmt`, `vet`, `deps --locked` and `audit` all green. Step 4: the semantics probe ([`port-parity.md`](port-parity.md) §1), with the helpers it calls for in ledger L2. Step 5: the golden-value generator (`scripts/oracle/`): constants 29 + math 33,239 rows, deterministic, reproduced by the parallel build, all recomputed by `validate.py`; the oracle's cbrt is compiler_builtins' (port-parity §3). Step 6: `src/constants.cyr` (14 public + 6 std float constants, both lists proven complete), every value compiled and compared by `probe_tables.py`. Step 7: the parity harness (`tests/parity.tcyr`): 5,149 ok, 0 failed, 18,493 measured, 9,632 pending; ganita's cbrt equals the oracle's. Step 8: the cross-target baselines: digests identical on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt; gated **21,852 ok, 0 failed** (port-parity §2.2). Step 9: the eight probes (port-parity §4): every hisab/ganita return leaks on the step path (the hash rebuild 4.1 MB per 1,000-particle step); AoS + f64 locals fastest, struct values 2.5×; f32 keys 10⁶/10⁶ on 3 targets; the neighbour order is (cell offset, insertion); a stable sort replaces ipnsort's tie order; serial = parallel in Rust, and a Cyrius persistent pool gives the serial bits at T = 1–8 (3.9× at 8); one bundle with DCE; hisab's DST is another algorithm (L6 transcribes), ganita's `mat_inv` gives the oracle's bits (L7 for memory only). Step 10: nine upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) with verified repros; pravash's numbers in four open issues; the conversion ledger seeded (11 open, 1 conditional) and checked by `scripts/upstream_ledger.py` in CI |
 | M1 Foundation | ✅ **done 2026-11-11.** Part 1: `src/mathx.cyr`, the first `[lib]`. Part 2 (ADR 0004): the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`, L1) and the MPFR-corrected oracle. Part 3: `src/error.cyr`, `src/vec3.cyr` (L3), `src/column.cyr` (L13), `src/common.cyr`; surface parity in CI. Part 4: `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr`, `src/json.cyr` (L10; `PV_ERR_DESERIALIZE`, ADR 0002 #10). 45,232 golden rows in seven modules, identical on three targets: 42,697 ok, 72 accepted (ADR 4), 2,463 pending (the M4 cell key; three bayan JSON policies). All 100 Rust unit tests of the M1 modules and 11 integration tests ported |
 | M2 Shallow water | ✅ **done 2026-11-11.** `src/shallow.cyr`: construction, the cell reads, volumes, CFL, the disturbance, sediment, JSON and the step (default, HLL, dispersion, friction, breaking, walls). 888 golden rows bit-exact on three targets, 142 of them class S step rows (the new class), every one recomputed by a Python transcription of the step; all 44 + 3 Rust tests ported. The step runs at 7.2× Rust (call overhead `#inline` declines: filed) |
-| M3 Grid | 🟡 **in progress.** Part a ✅ 2026-11-11: `src/grid_solve.cyr` (the DST, IDST and CG transcriptions, L5 and L6) and `src/grid.cyr` (`PvFluidGrid`, `PvGridConfig`, `PvBoundaryCondition`: construction, the reads, diffuse, all four advections, Smagorinsky, buoyancy, vorticity confinement, the four projections, the wall rules, JSON); `_pv_fmod` (L14). 569 golden rows bit-exact on three targets and with rayon on, 188 of them class S step rows on the periodic and multigrid projections, every one recomputed by a Python transcription; 44 of 49 Rust tests and the 5 grid integration tests ported. Parts b–e next: the DST and CG rows (b), MacGrid and k-ε (c), VOF and the phase field (d), `src/par.cyr` (e) |
+| M3 Grid | 🟡 **in progress.** Part a ✅ 2026-11-11: `src/grid_solve.cyr` (the DST, IDST and CG transcriptions, L5 and L6) and `src/grid.cyr` (`PvFluidGrid`, `PvGridConfig`, `PvBoundaryCondition`: construction, the reads, diffuse, all four advections, Smagorinsky, buoyancy, vorticity confinement, the four projections, the wall rules, JSON); `_pv_fmod` (L14). 569 golden rows bit-exact on three targets and with rayon on, 188 of them class S step rows on the periodic and multigrid projections, every one recomputed by a Python transcription; 44 of 49 Rust tests and the 5 grid integration tests ported. Part b ✅ 2026-11-12: the DST and CG projections under parity (21 DST and 49 CG oracle-hook rows, 188 more step rows; 827 grid rows in all, 20 of them bit-exact against the corrected oracle `grid.cr.tsv`, where glibc misrounds a DST sine or cosine), and the DST plans (`dst_x`, `dst_y`: each transform length's sines and eigenvalue terms, kept across steps; the same bits), which take the 63 × 63 DST step from 719 ms to 8.6 ms (Rust 10.1 ms). Parts c–e next: MacGrid and k-ε (c), VOF and the phase field (d), `src/par.cyr` (e) |
 | M4–M8 | not started |
 
 ## Toolchain
@@ -45,7 +45,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
 - **Cyrius**:
-  - `tests/parity.tcyr` replays the corpus: 9 modules, 0 failing; 44,964 ok, 72 accepted (ADR 4), 0 failed,
+  - `tests/parity.tcyr` replays the corpus: 9 modules, 0 failing; 45,202 ok, 92 accepted (ADR 4), 0 failed,
     0 measured, 2,463 pending (the SPH cell key until M4; three JSON rows on bayan's policies). Bits are identical
     on x86_64 ELF, x86_64 PE and aarch64.
   - `tests/crmath.tcyr`: 85 checks in 18 groups.
@@ -54,15 +54,17 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
     - `tests/error.tcyr`: the 6 (17 checks);
     - `tests/buoyancy.tcyr` (16), `vortex.tcyr` (12), `bridge.tcyr` (17);
     - `tests/shallow.tcyr`: all 44 of `shallow.rs` (155 checks);
-    - `tests/grid.tcyr`: 44 of the 49 of `grid.rs` (164 checks; the other 5 need MacGrid and KEpsilon, part c);
+    - `tests/grid.tcyr`: 44 of the 49 of `grid.rs`, and two Cyrius-only groups (the layouts, the DST plans): 185
+      checks. The other 5 need MacGrid and KEpsilon (part c);
     - `tests/integration.tcyr`: 20 of `rust-old/tests/integration.rs` (59 checks).
   - `scripts/surface_parity.py`: error, common, buoyancy, vortex, bridge, shallow and grid, 227 items ok (24 pending
     part c), 0 missing.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
-- **Golden corpus** (`tests/golden/`): bridge 3,964, buoyancy 1,716, common 3,683, constants 35, grid 569 (188 class
+- **Golden corpus** (`tests/golden/`): bridge 3,964, buoyancy 1,716, common 3,683, constants 35, grid 827 (376 class
   S step rows), json 302, math 34,049, shallow 888 (142 class S step rows) and vortex 2,293 rows, and the corrected
-  oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv` 3 and `bridge.cr.tsv` 26 rows. `validate.py` recomputes all
-  47,499 rows, the shallow-water and grid steps by transcription: 0 failures; `probe_tables.py` 35 of 35.
+  oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv` 3, `bridge.cr.tsv` 26 and `grid.cr.tsv` 20 rows.
+  `validate.py` recomputes all 47,757 rows, the shallow-water and grid steps by transcription: 0 failures;
+  `probe_tables.py` 35 of 35.
 - **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)): the
   10 primitives against Rust's glibc, on shared seeded arguments. The correctly rounded functions run 58 ns (ln) to
   1.41 µs (atan2, whose mean comes from a rare slow path), 11–103× glibc. The `common` bodies run 4–13× Rust 1.3.0
@@ -70,8 +72,10 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   particle (a call and a 144-byte struct return, against rustc's inlining). The part 4 functions run 4–64× Rust
   (pow's cost dominates the water viscosity), and JSON about 20× serde_json. The shallow-water step runs at 7.2×
   Rust's criterion numbers at every size, its volume 6.1–6.5× and the disturbance 1.4–1.6×. The grid's periodic
-  step runs 2.7–4.0× Rust, diffuse 2.5–3.7× and max_speed 16–17×. The DST steps run 15–231×, because the correctly
-  rounded sin takes 18.4 µs at fl(k·π/2) (appended to the L1 request; part b's sine table removes it).
+  step runs 2.7–4.0× Rust, diffuse 2.5–3.7× and max_speed 16–17×. The DST step, with part b's plans, runs 6.0×,
+  1.03× and 0.85× Rust at 15, 30 and 63 cells a side when each step builds its plans (Rust's bench shape), and
+  1.5×, 0.90× and 0.56× once a grid has stepped. The first 15 × 15 step pays 25 sines on the correctly rounded slow
+  path (L1).
 
 ## Upstream requests and stand-ins
 
@@ -96,6 +100,8 @@ Filed 2026-11-11:
   `2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md`,
   `2026-11-11-struct-values-and-f64v4-lanes-cost-in-pair-loops.md`;
 - **sakshi:** `2026-11-11-no-chrome-trace-export.md`;
+- **M3 part b, hisab:** pravash's DST-plan numbers appended to `2026-11-11-dst-allocates-per-call.md` (L6: a DST
+  into caller scratch that takes a caller-kept plan);
 - **M3 part a, ganita:** `2026-11-11-no-fmod.md` (L14, with a repro), and pravash's sin / cos slow-path numbers
   added to `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`;
 - **M2, cyrius:** `2026-11-11-inline-refuses-small-numeric-helpers.md` (the step's call overhead);
@@ -129,6 +135,6 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M3 part b: the DST, IDST and CG pressure rows against the corrected oracle (their sines and cosines), the step rows
-on the DST and CG projections, and a sine table per transform length (the same bits; it removes the sin slow path
-from the DST steps). Then parts c–e: `MacGrid` and k-ε, VOF and the phase field, and `src/par.cyr`, the worker pool.
+M3 part c: `MacGrid` (the staggered grid), `KEpsilon` and `apply_ghost_fluid`, with their rows and the 5 Rust tests
+of `grid.rs` that wait for them (surface parity's 24 pending items). Then parts d–e: VOF and the phase field, and
+`src/par.cyr`, the worker pool.

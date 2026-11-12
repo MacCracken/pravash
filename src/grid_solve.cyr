@@ -5,29 +5,48 @@
 # in index order, the transforms' sines are correctly rounded (src/crmath.cyr, ledger L1, ADR 0004), and nothing
 # allocates. The caller owns every buffer, so the step path stays flat (port plan §7.5).
 #
+# The DST's sines come from a table the caller keeps (`_pv_dst_sines`): hisab computes sin(π·(i+1)·(k+1)/(n+1))
+# inside the sum, n² calls a transform, but each value depends only on (i, k, n), so one table per length gives the
+# same bits with n² calls in all. The grid keeps one per transform length across steps (src/grid.cyr).
+#
 # UPSTREAM(L6): hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md
-#   replace `_pv_dst` / `_pv_idst` with hisab's `num_dst` / `num_idst` once they write into caller scratch, with the
-#   DST rows re-bounded for their algorithm; parity: the DST pressure rows of tests/golden/grid.tsv.
+#   replace `_pv_dst` / `_pv_idst` with hisab's `num_dst` / `num_idst` once they write into caller scratch from a
+#   caller-kept sine table (a plan), with the DST rows re-bounded for their algorithm; parity: the DST pressure rows
+#   of tests/golden/grid.tsv and grid.cr.tsv.
 # UPSTREAM(L5): hisab:docs/development/issues/2026-11-11-no-matrix-free-linear-cg.md
 #   replace `_pv_cg` with hisab's linear CG once it ships; parity: the CG pressure rows of tests/golden/grid.tsv
 #   (iterations class A, solution class B).
 
-# The DST-I of x[0 … n) into out[0 … n) (out must not be x): X[k] = Σ x[i]·sin(π·(i+1)·(k+1)/(n+1)), each sum from
-# +0 in i order, the argument ((π·(i+1))·(k+1))/(n+1). 1, or 0 for n ≤ 0 (hisab's InvalidInput for an empty input).
-# Mirrors hisab 1.4.0 `num::dst`.
-fn _pv_dst(x, n, out): i64 {
-    if (n <= 0) { return 0; }
+# The n² sines of the DST-I of length n into out (row k, entry i): out[k·n + i] = sin(((π·(i+1))·(k+1))/(n+1)), the
+# value and argument of hisab 1.4.0 `num::dst`'s term (i, k), correctly rounded. Nothing for n ≤ 0.
+fn _pv_dst_sines(n, out) {
     var pi: f64 = PV_F64_PI;
     var np1: f64 = f64_from(n + 1);
     for (var k = 0; k < n; k = k + 1) {
         var kf: f64 = f64_from(k + 1);
-        var sum: f64 = 0.0;
+        var row = out + k * n * 8;
         for (var i = 0; i < n; i = i + 1) {
             var xf: f64 = f64_from(i + 1);
             var arg: f64 = ((pi * xf) * kf) / np1;
             var s: f64 = _pv_sin(arg);
+            store64(row + i * 8, _pv_bits(s));
+        }
+    }
+    return 0;
+}
+
+# The DST-I of x[0 … n) into out[0 … n) (out must not be x), with `sines` the length's table (`_pv_dst_sines`):
+# X[k] = Σ x[i]·sines[k·n + i], each sum from +0 in i order. 1, or 0 for n ≤ 0 (hisab's InvalidInput for an empty
+# input). Mirrors hisab 1.4.0 `num::dst`.
+fn _pv_dst(x, n, sines, out): i64 {
+    if (n <= 0) { return 0; }
+    for (var k = 0; k < n; k = k + 1) {
+        var row = sines + k * n * 8;
+        var sum: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
             var xi: f64 = load64(x + i * 8);
-            sum = sum + (xi * s);
+            var si: f64 = load64(row + i * 8);
+            sum = sum + (xi * si);
         }
         store64(out + k * 8, _pv_bits(sum));
     }
@@ -36,8 +55,8 @@ fn _pv_dst(x, n, out): i64 {
 
 # The IDST-I of x[0 … n) into out[0 … n): the DST-I, each value then multiplied by 2/(n+1). 1, or 0 for n ≤ 0.
 # Mirrors hisab 1.4.0 `num::idst`.
-fn _pv_idst(x, n, out): i64 {
-    if (_pv_dst(x, n, out) == 0) { return 0; }
+fn _pv_idst(x, n, sines, out): i64 {
+    if (_pv_dst(x, n, sines, out) == 0) { return 0; }
     var np1: f64 = f64_from(n + 1);
     var scale: f64 = 2.0 / np1;
     for (var k = 0; k < n; k = k + 1) {

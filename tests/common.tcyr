@@ -43,6 +43,7 @@ fn at(p, k): *PvFluidParticle {
     return ps + k;
 }
 
+# The FluidMaterial tests: water, the custom constructor's checks, every preset.
 fn test_materials() {
     test_group("test_water_material");
     var w: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
@@ -95,6 +96,7 @@ fn test_materials() {
     return 0;
 }
 
+# The FluidParticle tests: construction, copies, 2D, speed, kinetic energy, distances.
 fn test_particles() {
     test_group("test_particle_new");
     var p: PvFluidParticle = PvFluidParticle_new(PvVec3_new(1.0, 2.0, 3.0), 0.01);
@@ -136,6 +138,7 @@ fn test_particles() {
     return 0;
 }
 
+# The FluidConfig tests: the presets and every validation refusal.
 fn test_configs() {
     test_group("test_config_water_2d");
     var c: PvFluidConfig = PvFluidConfig_water_2d();
@@ -227,6 +230,7 @@ fn test_configs() {
     return 0;
 }
 
+# The ParticleSoa tests: the round trip to and from AoS and the pair distance.
 fn test_soa() {
     test_group("test_soa_roundtrip");
     var one = fl_alloc(sizeof(PvFluidParticle));
@@ -303,6 +307,7 @@ fn test_soa() {
     return 0;
 }
 
+# The ParticleArena tests: alloc and get, zero, capacity, free and reuse.
 fn test_arena() {
     var h: PvArenaHandle;
     var h1: PvArenaHandle;
@@ -444,6 +449,7 @@ fn test_arena() {
     return 0;
 }
 
+# The JSON tests of the material and the config, and the NaN refusal.
 fn test_serde() {
     test_group("test_material_serde");
     var m: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;

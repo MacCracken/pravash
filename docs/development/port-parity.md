@@ -741,3 +741,94 @@ with Gauss–Seidel to Rust's 1e-3 on the same systems, before part b's rows. Su
 - **The DST steps are 15–231×,** because the correctly rounded sin takes 18.4 µs at fl(k·π/2), where the DST's
   arguments land whenever n + 1 has small factors. Appended to the L1 request. Part b's sine table per transform
   length keeps the bits and removes it.
+
+## 11. M3 part b: the DST and CG projections (2026-11-12)
+
+Part a ported every projection; part b puts the DST and CG ones under parity and adds the DST plans.
+
+**The rows.** Part b's rows come after part a's and from their own seed (0x6_72b), so part a's 569 keep their values.
+`grid.tsv` now holds 827 rows (8.8 MB):
+- `oracle::pressure_solve_dst`, 21 rows in class C (bound 0):
+  - one on each of part a's 10 shared systems;
+  - five at the transform lengths where glibc misrounds a sine or a cosine. Over every DST argument of lengths 1–65,
+    glibc 2.44 misrounds 157 of 95,810 calls (0.16%), none below length 12. The five cover 12, 18, 25, 36, 38 and
+    60 (two eigenvalue cosines at 60), and part a's 32 × 32 system covers 30;
+  - the edges: one-cell sides (sin(π/2), cos(π/2)) and empty interiors, which leave the guess.
+- `oracle::pressure_solve_cg`, 49 rows in class B:
+  - each shared system at 1, 10, 40 and 200 iterations;
+  - part b's smaller systems;
+  - a zero right-hand side, whose first residual is already under the 1e-14 floor;
+  - an empty system, which hisab refuses (Diverged).
+- 188 more `FluidGrid::step` rows, on the DST (the smoke default) and CG projections:
+  - 300-step trajectories of still tanks (DST, free-slip DST, CG, periodic CG);
+  - single steps at frames {0, 1, 2, 10, 60, 300} of the 10 × 10 plume under eight DST and seven CG variants (budgets
+    1, 10 and 200; CG over multigrid, since CG comes first);
+  - a 14 × 14 plume, whose transform length 12 misrounds;
+  - a vortex and a jet;
+  - 24 random states;
+  - 20 × 27 and 14 × 40 random states;
+  - the checks after the solve: an overflowing projection, and a NaN velocity.
+
+**The corrected oracle.** `validate.py` transcribes hisab 1.4.0's `dst`, `idst` and `conjugate_gradient` and the
+two solves. It recomputes every row with glibc's sin and cos, as the oracle calls them. It then writes
+`tests/golden/grid.cr.tsv` with MPFR's, for every row that uses a length with a misrounded call, and only those can
+change. The file has 20 rows: the 6 DST systems at those lengths and 14 steps (the 14 × 14 plume on two DST configs,
+the 20 × 27 and 14 × 40 states). Each note lists the distinct calls glibc misrounds, between 1 and 5 a row.
+
+**Result:**
+
+| Rows | Outcome |
+|---|---|
+| CG, 49 | every row bit-exact against the oracle |
+| DST, 21 | 15 bit-exact against the oracle, 6 bit-exact against the corrected oracle and none equal to glibc's |
+| step, 376 | 362 bit-exact against the oracle, the other 14 against the corrected one: 141,390 field values at 0 ulp |
+
+The replay is **9 modules, 0 failing | rows: 45,202 ok, 0 failed, 0 measured, 2,463 pending, 92 accepted
+(ADR 4: 92)**. Before the corrected oracle existed, the same 20 rows failed and nothing else did.
+
+**The DST plans.** hisab computes sin(((π·(i+1))·(k+1))/(n+1)) inside every sum, which makes 4n³ correctly rounded
+sines per 2D solve. Each value depends only on (i, k, n), so the grid now keeps two Cyrius-only columns, `dst_x`
+and `dst_y` (ADR 0002 #12, amended). Each holds its transform length's n² sines and n eigenvalue terms
+2·cos((π·(k+1))/(n+1)) − 2. The first DST step builds them, and later steps keep them while the interior keeps its
+size: a column n² + n words long is length n's plan. The values are the same, so the bits are the same.
+- The trajectories reuse a plan for up to 300 steps, and every single-step row builds its own; both give the
+  oracle's bits.
+- `PvFluidGrid` is 360 bytes.
+- `fg_dst_plan_is_kept_per_length` (`tests/grid.tcyr`, now 185 checks) checks that a plan is kept for its own
+  length, rebuilt word for word for another, separate per side on a non-square grid, and copied by a clone.
+
+**Mutation checks** (each restored after):
+
+| Mutation | Caught by |
+|---|---|
+| the sine table read transposed (term (k, i) for (i, k)) | 24 rows |
+| IDST's ×(2/(n+1)) as (×2)/(n+1) | 102 |
+| one plan for both sides of a non-square grid | 21 |
+| the DST's ring left unzeroed | 19 |
+| CG's tolerance 1e-6 → 1e-7 | 4 |
+| CG's stencil summed as (l + r) + (d + u) | 102 |
+| CG's residual norm carried with an ulp's error | 98 |
+| a plan kept when the column is longer than the length needs | the plan test (no row changes a grid's size) |
+
+One mutation, (2·c) − 2 → 2·(c − 1) in the eigenvalue term, is equivalent. Multiplying by 2 is exact and commutes
+with rounding, so both forms give the same bits for every c.
+
+Three mutations of the Python transcription are caught as well:
+
+| Mutation of `validate.py` | Rows failed |
+|---|---|
+| the DST argument multiplied in the other order | 25 |
+| CG's tolerance | 4 |
+| IDST's scale order | 103 |
+
+**Speed** (benchmarks-rust-v-cyrius, M3 part b), against part a's sine-in-the-sum:
+
+| Grid | Part a | Plans, first step | Plans, later steps |
+|---|---|---|---|
+| 15 × 15 | 28.5 ms | 760 µs | 190 µs |
+| 30 × 30 | 15.9 ms | 1.10 ms | 965 µs |
+| 63 × 63 | 719 ms | 8.6 ms | 5.64 ms |
+
+Rust's criterion bench steps a fresh clone each time, so its twin builds the plans in every timed step. That step
+is 6.0×, 1.03× and 0.85× Rust; a grid's later steps are 1.5×, 0.90× and 0.56×. The first 15 × 15 step still pays
+25 sines on the correctly rounded slow path (L1). The plan form is appended to hisab's L6 request.

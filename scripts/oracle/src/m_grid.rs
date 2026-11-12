@@ -18,19 +18,26 @@
 //! - `FluidGrid::diffuse` takes `v:<n>` field, nx, ny, diff_rate, dt, dx, iterations, and gives the field;
 //! - `oracle::pressure_solve_gauss_seidel` takes `v:` pressure, `v:` div, nx, ny, iterations and gives the pressure;
 //!   `oracle::pressure_solve_multigrid` takes `v:` pressure, `v:` div, nx, ny, nu_smooth, cycles and gives the
-//!   pressure, `i:` the level count and each level's residual, coarse_rhs and coarse_p. The systems are shared by
-//!   every pressure solver (M3 part b adds DST and CG on the same ones);
+//!   pressure, `i:` the level count and each level's residual, coarse_rhs and coarse_p;
+//!   `oracle::pressure_solve_dst` takes `v:` pressure, `v:` div, nx, ny and gives the pressure (class C: its sines
+//!   and cosines are glibc's, and the corrected oracle rounds them correctly); `oracle::pressure_solve_cg` takes
+//!   `v:` pressure, `v:` div, nx, ny, iterations and gives the pressure, or `E:Diverged`. The systems are shared by
+//!   every pressure solver; part b adds DST systems at the transform lengths where glibc misrounds a sine;
 //! - `FluidGrid::from_json`, `GridConfig::from_json`, `BoundaryCondition::from_json` decode a serde_json document;
 //! - `FluidGrid::step` takes a state, a config and `i:` nsteps, and gives the state and the scratch dump after
-//!   nsteps steps, or `E:<Variant>` from the first that fails. Part a covers the periodic (Gauss–Seidel) and
-//!   multigrid projections; the DST and CG paths' rows arrive with part b. Bit-level trajectories (nsteps ∈ {1, 2,
-//!   10, 60, 300}) for the still tanks, class S single steps at frames {0, 1, 2, 10, 60, 300} for the rest.
+//!   nsteps steps, or `E:<Variant>` from the first that fails. Part a's rows take the periodic (Gauss–Seidel) and
+//!   multigrid projections, part b's (after part a's, from their own seed) the DST and CG ones. Bit-level
+//!   trajectories (nsteps ∈ {1, 2, 10, 60, 300}) for the still tanks, class S single steps at frames {0, 1, 2, 10,
+//!   60, 300} for the rest.
 //!
-//! Scenes are 10 × 10 (16 × 16 for the multigrid levels), so a state is a few hundred tokens. Inputs use only exact
-//! or correctly rounded operations (grids.rs).
+//! Scenes are 10 × 10 (16 × 16 for the multigrid levels, 14 × 14 where the DST's transform length is 12, the first
+//! at which glibc misrounds one of its sines), so a state is a few hundred tokens. Inputs use only exact or
+//! correctly rounded operations (grids.rs).
 
 use pravash::grid::{BoundaryCondition, FluidGrid, GridConfig};
-use pravash::oracle::{pressure_solve_gauss_seidel, pressure_solve_multigrid};
+use pravash::oracle::{
+    pressure_solve_cg, pressure_solve_dst, pressure_solve_gauss_seidel, pressure_solve_multigrid,
+};
 
 use crate::grids::{Rng, specials};
 use crate::tsv::{Class, Module, Tok, b, e, err, f, i, s};
@@ -371,7 +378,95 @@ fn solver_rows(m: &mut Module, rng: &mut Rng) {
             };
             m.row("oracle::pressure_solve_multigrid", Class::B, &row, &out);
         }
+        dst_row(m, &p0, &rhs, nx, ny);
+        for iters in [1, 10, 40, 200] {
+            cg_row(m, &p0, &rhs, nx, ny, iters);
+        }
     }
+}
+
+/// One `oracle::pressure_solve_dst` row.
+fn dst_row(m: &mut Module, p0: &[f64], rhs: &[f64], nx: usize, ny: usize) {
+    let mut ins = Vec::new();
+    col(&mut ins, p0);
+    col(&mut ins, rhs);
+    ins.extend([usz(nx), usz(ny)]);
+    let mut p = p0.to_vec();
+    let out = match pressure_solve_dst(&mut p, rhs, nx, ny) {
+        Ok(()) => {
+            let mut o = Vec::new();
+            col(&mut o, &p);
+            o
+        }
+        Err(x) => vec![err(&x)],
+    };
+    m.row("oracle::pressure_solve_dst", Class::C, &ins, &out);
+}
+
+/// One `oracle::pressure_solve_cg` row.
+fn cg_row(m: &mut Module, p0: &[f64], rhs: &[f64], nx: usize, ny: usize, iters: usize) {
+    let mut ins = Vec::new();
+    col(&mut ins, p0);
+    col(&mut ins, rhs);
+    ins.extend([usz(nx), usz(ny), usz(iters)]);
+    let mut p = p0.to_vec();
+    let out = match pressure_solve_cg(&mut p, rhs, nx, ny, iters) {
+        Ok(()) => {
+            let mut o = Vec::new();
+            col(&mut o, &p);
+            o
+        }
+        Err(x) => vec![err(&x)],
+    };
+    m.row("oracle::pressure_solve_cg", Class::B, &ins, &out);
+}
+
+/// A random right-hand side with a zero ring, and a zero guess or (`warm`) a random interior one.
+fn random_system(rng: &mut Rng, nx: usize, ny: usize, warm: bool) -> (Vec<f64>, Vec<f64>) {
+    let n = nx * ny;
+    let mut rhs = vec![0.0; n];
+    let mut p = vec![0.0; n];
+    for y in 1..ny - 1 {
+        for x in 1..nx - 1 {
+            rhs[y * nx + x] = rng.uniform(-1.0, 1.0) * 0.05;
+            if warm {
+                p[y * nx + x] = rng.uniform(-0.1, 0.1);
+            }
+        }
+    }
+    (p, rhs)
+}
+
+/// Part b's own systems: the DST at the transform lengths where glibc misrounds a sine or a cosine (12: four sines;
+/// 18, 25: two and seven; 38 and 36: eleven and four; 60: two cosines of the eigenvalues), and the edges (an empty
+/// interior, which leaves the guess; a one-cell side, whose sine is sin(π/2) and whose cosine is cos(π/2)). CG
+/// on the smaller ones, on a zero right-hand side, and on an empty system (hisab refuses it: Diverged).
+fn transform_rows(m: &mut Module, rng: &mut Rng) {
+    for (nx, ny, warm) in [
+        (14, 14, false),
+        (20, 27, true),
+        (40, 38, false),
+        (62, 62, false),
+        (14, 6, true),
+    ] {
+        let (p, rhs) = random_system(rng, nx, ny, warm);
+        dst_row(m, &p, &rhs, nx, ny);
+        // CG on the larger two would only repeat the 32 x 32 rows, at 300 KB.
+        if nx * ny < 1000 {
+            cg_row(m, &p, &rhs, nx, ny, 40);
+        }
+    }
+    for (nx, ny) in [(3, 3), (3, 5), (5, 3), (3, 4)] {
+        let (_, rhs) = random_system(rng, nx, ny, false);
+        dst_row(m, &vec![0.5; nx * ny], &rhs, nx, ny);
+        cg_row(m, &vec![0.5; nx * ny], &rhs, nx, ny, 10);
+    }
+    // An empty interior: the DST returns at once, the guess untouched (ring included).
+    dst_row(m, &[0.5; 8], &[0.0; 8], 2, 4);
+    dst_row(m, &[0.5; 8], &[0.0; 8], 4, 2);
+    // A zero right-hand side: CG's first residual is already under its tolerance (1e-14 when ‖b‖ = 0).
+    cg_row(m, &[0.0; 16], &[0.0; 16], 4, 4, 10);
+    cg_row(m, &[], &[], 0, 0, 10);
 }
 
 fn json_rows(m: &mut Module, rng: &mut Rng) {
@@ -761,6 +856,168 @@ fn step_rows(m: &mut Module, rng: &mut Rng) {
     }
 }
 
+/// Configs for the part b paths: the DST (no-slip or free-slip walls, no multigrid) or CG (any walls, multigrid
+/// set or not: CG comes first), each scheme and force on or off.
+fn random_configs_b(rng: &mut Rng, n: usize) -> Vec<GridConfig> {
+    (0..n)
+        .map(|k| {
+            let mut c = GridConfig::smoke();
+            c.dt = [0.1, 0.05, 0.02, 0.01][k % 4];
+            c.viscosity = if rng.unit() < 0.3 {
+                0.0
+            } else {
+                rng.log_uniform(-5.0, -2.0)
+            };
+            c.diffusion_iterations = 1 + (k % 3) * 10;
+            c.pressure_iterations = [1, 10, 25, 40][(k / 2) % 4];
+            c.use_cg = k % 2 == 1;
+            c.boundary = if c.use_cg {
+                [
+                    BoundaryCondition::NoSlip,
+                    BoundaryCondition::FreeSlip,
+                    BoundaryCondition::Periodic,
+                ][(k / 2) % 3]
+            } else {
+                [BoundaryCondition::NoSlip, BoundaryCondition::FreeSlip][(k / 2) % 2]
+            };
+            c.use_multigrid = c.use_cg && rng.unit() < 0.3;
+            c.vorticity_confinement = if rng.unit() < 0.4 {
+                0.0
+            } else {
+                rng.uniform(0.0, 1.0)
+            };
+            c.buoyancy_alpha = rng.uniform(-0.5, 0.5);
+            c.ambient_density = if rng.unit() < 0.5 {
+                0.0
+            } else {
+                rng.uniform(0.0, 1.0)
+            };
+            c.use_maccormack = rng.unit() < 0.4;
+            c.use_bfecc = rng.unit() < 0.3;
+            c.smagorinsky_cs = if rng.unit() < 0.5 {
+                0.0
+            } else {
+                rng.uniform(0.05, 0.2)
+            };
+            c
+        })
+        .collect()
+}
+
+/// Part b's step rows: the DST projection (the smoke default: no-slip walls, no multigrid, no CG) and the CG one.
+fn step_rows_b(m: &mut Module, rng: &mut Rng) {
+    let n = 10;
+    let smoke = GridConfig::smoke();
+    let mut fs = smoke;
+    fs.boundary = BoundaryCondition::FreeSlip;
+    let mut cg = smoke;
+    cg.use_cg = true;
+    let mut cg_fs = cg;
+    cg_fs.boundary = BoundaryCondition::FreeSlip;
+    let mut cg_per = cg;
+    cg_per.boundary = BoundaryCondition::Periodic;
+
+    // Still tanks on each projection.
+    let tank = FluidGrid::new(n, n, 0.1).expect("valid");
+    for c in [&smoke, &fs, &cg, &cg_per] {
+        trajectory(m, &tank, c);
+    }
+
+    // The buoyant plume: the DST on every scheme and force variant, CG at several budgets.
+    let p = plume(n);
+    let mut variants: Vec<GridConfig> = vec![smoke, fs, cg, cg_fs, cg_per];
+    let mut c = smoke;
+    c.use_maccormack = true;
+    c.dt = 0.05;
+    variants.push(c);
+    let mut c = smoke;
+    c.use_bfecc = true;
+    c.dt = 0.05;
+    variants.push(c);
+    let mut c = fs;
+    c.use_bfecc = true;
+    c.use_maccormack = true;
+    variants.push(c);
+    let mut c = smoke;
+    c.smagorinsky_cs = 0.15;
+    variants.push(c);
+    let mut c = smoke;
+    c.vorticity_confinement = 0.0;
+    c.viscosity = 0.0;
+    variants.push(c);
+    let mut c = smoke;
+    c.buoyancy_alpha = -0.2;
+    c.ambient_density = 0.3;
+    variants.push(c);
+    for iters in [1, 10, 200] {
+        let mut c = cg;
+        c.pressure_iterations = iters;
+        variants.push(c);
+    }
+    let mut c = cg;
+    c.use_multigrid = true; // CG comes first
+    c.use_maccormack = true;
+    variants.push(c);
+    for c in &variants {
+        single_steps(m, &p, c);
+    }
+
+    // A plume whose DST length (12) has misrounded sines: the corrected oracle's step rows.
+    let p14 = plume(14);
+    single_steps(m, &p14, &smoke);
+    let mut c = fs;
+    c.use_bfecc = true;
+    single_steps(m, &p14, &c);
+    single_steps(m, &p14, &cg);
+
+    // A vortex and an inflow.
+    let v = vortex(n);
+    let mut c = smoke;
+    c.buoyancy_alpha = 0.0;
+    single_steps(m, &v, &c);
+    let mut c = cg_per;
+    c.vorticity_confinement = 2.0;
+    c.smagorinsky_cs = 0.2;
+    single_steps(m, &v, &c);
+    let jet = inflow(n);
+    single_steps(m, &jet, &smoke);
+    single_steps(m, &jet, &cg_fs);
+
+    // Random states, one step each, on random configs; two at sizes whose transform lengths misround.
+    let configs = random_configs_b(rng, 24);
+    for (k, c) in configs.iter().enumerate() {
+        let g = random_grid(rng, 4 + k % 7, 4 + (k * 3) % 6);
+        step_row(m, &g, c, 1);
+    }
+    for (nx, ny) in [(20, 27), (14, 40)] {
+        let g = random_grid(rng, nx, ny);
+        step_row(m, &g, &smoke, 1);
+        step_row(m, &g, &cg, 1);
+    }
+
+    // The checks after the solve: velocities that overflow in the projection (non-finite after it, Diverged), and
+    // a NaN velocity (Diverged after advection), on each projection.
+    let ok = FluidGrid::new(6, 6, 0.1).expect("valid");
+    let mut bad: Vec<FluidGrid> = Vec::new();
+    let mut g = ok.clone();
+    g.vx[14] = f64::NAN;
+    bad.push(g);
+    let mut g = ok.clone();
+    g.vx[14] = 1.7e308;
+    g.vx[16] = -1.7e308;
+    bad.push(g);
+    let mut g = ok.clone();
+    g.density[21] = 1e308;
+    bad.push(g);
+    let mut g = ok.clone();
+    g.vy[20] = 1e300;
+    bad.push(g);
+    for g in &bad {
+        step_row(m, g, &smoke, 1);
+        step_row(m, g, &cg, 1);
+    }
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("grid");
     let mut rng = Rng::new(0x6_71d);
@@ -770,5 +1027,9 @@ pub fn emit() -> Module {
     solver_rows(&mut m, &mut rng);
     json_rows(&mut m, &mut rng);
     step_rows(&mut m, &mut rng);
+    // Part b's rows, from their own seed, so part a's keep their values.
+    let mut rng = Rng::new(0x6_72b);
+    transform_rows(&mut m, &mut rng);
+    step_rows_b(&mut m, &mut rng);
     m
 }

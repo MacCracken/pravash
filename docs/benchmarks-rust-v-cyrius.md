@@ -237,3 +237,35 @@ f64 store) changed nothing measurable, so it was reverted.
 - **diffuse is 2.5–3.7×:** a Gauss–Seidel sweep is a chain of dependent loads and adds, which neither side
   vectorises. The gap is the codegen's, 18 ns a cell update against 4.8 ns.
 - **max_speed is 16–17× after the A/B.** Rust vectorises the squared-speed fold; the Cyrius loop is scalar.
+
+## M3 part b: the DST plans (2026-11-12)
+
+The DST projection with each transform length's sines and eigenvalue terms kept in a plan the grid owns, against
+part a's sine call inside every term. The bits are unchanged: every DST, CG and step row is bit-exact before and
+after. The A/B is pinned on core 15 and interleaved, three runs of each side on a grid-step-only bench (A: part a's
+tree; B: this one). The runs agree within 1%. The Rust column is part a's criterion record.
+
+| Bench | Rust 1.3.0 | A: sin in the sum | B: plans | B / Rust |
+|---|---|---|---|---|
+| `grid_step/15x15` | 127 µs | 28.5 ms | 760 µs | 6.0× |
+| `grid_step/30x30` | 1.07 ms | 15.9 ms | 1.10 ms | 1.03× |
+| `grid_step/63x63` | 10.1 ms | 719 ms | 8.6 ms | 0.85× |
+| `grid_step_maccormack/15x15` | 134 µs | 28.5 ms | 801 µs | 6.0× |
+| `grid_step_maccormack/30x30` | 1.11 ms | 16.2 ms | 1.36 ms | 1.23× |
+| `grid_step_maccormack/63x63` | 10.5 ms | 724 ms | 9.85 ms | 0.94× |
+| `grid_step_warm/15x15` (Cyrius only; against Rust's `grid_step`) | 127 µs | 29.0 ms | 190 µs | 1.5× |
+| `grid_step_warm/30x30` | 1.07 ms | 16.0 ms | 965 µs | 0.90× |
+| `grid_step_warm/63x63` | 10.1 ms | 721 ms | 5.64 ms | 0.56× |
+
+**Reading it.**
+- **Rust's bench steps a fresh clone of an unstepped grid every time**, and so does its twin. Each timed step
+  therefore builds its plans: n² sines and n cosines per transform length, against part a's 4n³ sines and 2n²
+  cosines. `grid_step_warm` clones a grid that has stepped once, so it carries its plans, as every step after a
+  grid's first does.
+- **The first 15 × 15 step is still 6× Rust**, and the slow path is why. Its plan build costs about 570 µs (760 − 190),
+  and 25 of its 169 sines land on fl(k·π/2), at about 18 µs each on the correctly rounded slow path (ledger L1).
+  A 30 × 30 grid has none (n + 1 = 29 is prime), so its first step costs only 135 µs more than a later one.
+- **A grid's later steps are 0.56–1.5× Rust.** Rust's step still calls glibc's sin 4n³ times, about 900,000 at
+  63 × 63, while the planned DST is a multiply-add per term.
+- Appended to hisab's L6 request (`hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md`): let the
+  into-scratch DST take a plan the caller keeps.

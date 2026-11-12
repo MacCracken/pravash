@@ -10,6 +10,7 @@
 
 include "tests/lib.cyr"
 
+# 1 when |a − b| < tol.
 fn near(a: f64, b: f64, tol: f64): i64 {
     var d: f64 = a - b;
     var ad: f64 = f64_abs(d);
@@ -171,11 +172,13 @@ fn test_serde_all_types() {
     return 0;
 }
 
+# 1 when the config fails validation.
 fn invalid(c: PvFluidConfig): i64 {
     var t, e = c.validate();
     return is_err_result(t);
 }
 
+# 1 when `PvFluidMaterial_custom` refuses the properties.
 fn custom_err(d: f64, v: f64, s: f64, c: f64): i64 {
     var m: PvFluidMaterial;
     var t, e = PvFluidMaterial_custom(d, v, s, c, &m);
@@ -231,6 +234,7 @@ fn test_shallow() {
     return 0;
 }
 
+# Runs the ported integration tests.
 fn main() {
     alloc_init();
     test_grid();

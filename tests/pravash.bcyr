@@ -118,6 +118,7 @@ fn _bench_sin_cos() {
     return 0;
 }
 
+# The primitives' benches (M1 part 2), against Rust's glibc twins on the same arguments.
 fn bench_math() {
     # The dispatch loop alone (an if chain falling through to its end), for the rows' overhead.
     _bench_args(-20.0, 20.0, 0.0, 1.0);
@@ -172,6 +173,7 @@ fn _bench_particles(): i64 {
     return buf;
 }
 
+# The common module's benches (M1 part 3): validation, energy, the SoA and the arena.
 fn bench_common() {
     var buf = _bench_particles();
     var ps: *PvFluidParticle = _pv_as_particles(buf);
@@ -288,6 +290,7 @@ fn bench_common() {
 # ── buoyancy, vortex, bridge, JSON (M1 part 4) ──────────────────────────────────────────────────
 # The bodies of bench_common.rs's m1/* and json/* rows, on the same inputs (k & 1023 scaled per row).
 
+# The buoyancy, vortex, bridge and JSON benches (M1 part 4).
 fn bench_m1b() {
     var b = bench_new("m1/terminal_velocity");
     bench_batch_start(b);
@@ -513,6 +516,7 @@ fn _bench_name(prefix, n): i64 {
     return out;
 }
 
+# The shallow-water benches (M2): Rust's criterion step, volume and disturbance.
 fn bench_shallow() {
     _bench_sw_step(32, 200);
     _bench_sw_step(64, 100);
@@ -576,7 +580,9 @@ fn _bench_fg_max_speed(n, iters) {
     return 0;
 }
 
-# kind 0: grid_step (smoke), 1: grid_step_maccormack (dt 0.01), 2: grid_step_periodic.
+# kind 0: grid_step (smoke), 1: grid_step_maccormack (dt 0.01), 2: grid_step_periodic, 3: grid_step_warm (Cyrius
+# only: the smoke step from a base stepped once, so each clone carries the DST plans, as every step after a grid's
+# first does; kinds 0 and 1 time the first step, which builds them).
 fn _bench_fg_step(n, iters, kind) {
     var base: PvFluidGrid;
     var t, v = PvFluidGrid_new(n, n, 0.1, &base);
@@ -596,6 +602,10 @@ fn _bench_fg_step(n, iters, kind) {
     if (kind == 2) {
         c.boundary = PV_BOUNDARY_CONDITION_PERIODIC;
         name = "grid_step_periodic/";
+    }
+    if (kind == 3) {
+        var tw, vw = base.step(&c);
+        name = "grid_step_warm/";
     }
     var pool = fl_alloc(iters * sizeof(PvFluidGrid));
     for (var k = 0; k < iters; k = k + 1) { var ok = PvFluidGrid_clone(_bench_fg(pool, k), &base); }
@@ -626,6 +636,7 @@ fn _bench_as_fg(p): *PvFluidGrid {
     return p;
 }
 
+# The grid benches (M3): Rust's criterion diffuse, max_speed and steps, and the warm step.
 fn bench_grid() {
     _bench_fg_diffuse(32, 200);
     _bench_fg_diffuse(64, 50);
@@ -633,7 +644,7 @@ fn bench_grid() {
     _bench_fg_max_speed(32, 100000);
     _bench_fg_max_speed(64, 20000);
     _bench_fg_max_speed(128, 5000);
-    for (var kind = 0; kind < 3; kind = kind + 1) {
+    for (var kind = 0; kind < 4; kind = kind + 1) {
         _bench_fg_step(15, 100, kind);
         _bench_fg_step(30, 20, kind);
         _bench_fg_step(63, 5, kind);
@@ -647,6 +658,7 @@ fn _bench_handles(p): *PvArenaHandle {
     return p;
 }
 
+# Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
     _bx = alloc(8192);
