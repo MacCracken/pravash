@@ -412,3 +412,46 @@ pub fn emit(root: &Path, provenance: &str) -> Result<String, String> {
     }
     Ok(out)
 }
+
+/// `tests/constants_rows.cyr`: for each golden path, the generated value it pins. The harness
+/// (`tests/parity.tcyr`) calls `_par_constant_row` for every `constants.tsv` row; the value comes
+/// from the compiled `src/constants.cyr`, so a wrong name or a wrong literal fails the row.
+pub fn emit_rows(provenance: &str) -> String {
+    let mut out = header(
+        "the constants rows' lookup, for tests/parity.tcyr",
+        provenance,
+        &[
+            "For each tests/golden/constants.tsv path, the src/constants.cyr value it pins. Test code\n\
+           only: it needs tests/parity_core.cyr's `_par_eq` and `_par_got_f` in scope.",
+        ],
+    );
+    out.push_str(
+        "# Appends the generated value of the golden path [np, np + nl) to the got list: 1 if the\n\
+         # path is known, -1 (a defect) if not.\n\
+         fn _par_constant_row(np, nl): i64 {\n",
+    );
+    let mut arm = |path: &str, value: &str| {
+        let _ = writeln!(out, "    if (_par_eq(np, nl, \"{path}\") == 1) {{");
+        let _ = writeln!(out, "        {value}");
+        out.push_str("        return 1;\n    }\n");
+    };
+    for c in all() {
+        for (field, _) in &c.values {
+            let path = if field.is_empty() {
+                c.path.to_string()
+            } else {
+                format!("{}.{field}", c.path)
+            };
+            arm(&path, &format!("_par_got_f({});", cyr_name(c.path, field)));
+        }
+    }
+    for c in std_all() {
+        let value = match c.form {
+            StdForm::F32Var => format!("var w: f64 = f32_to({});\n        _par_got_f(w);", c.cyr),
+            _ => format!("_par_got_f({});", c.cyr),
+        };
+        arm(c.path, &value);
+    }
+    out.push_str("    return 0 - 1;\n}\n");
+    out
+}

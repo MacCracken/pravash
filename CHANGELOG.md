@@ -40,6 +40,13 @@
   - **Proofs:** both lists are proven complete against `rust-old/src`, and `constants.tsv` pins all 35 values.
   - **`scripts/oracle/probe_tables.py`:** compiles each value and confirms its bits; a 2-ulp change to one literal
     fails it.
+- **Parity harness** (port plan M0 step 7): `tests/parity.tcyr` replays `tests/golden/` against the port, with
+  impetus's `tests/parity_core.cyr` and `tests/ulp.cyr`. The constants rows go through the generated
+  `tests/constants_rows.cyr`.
+  - **First run:** 0 failing; 5,149 ok, 0 failed, 18,493 measured (class C, ≤ 2 ulp, bounds at step 8), and
+    9,632 pending (the M1 helpers). It is warning-free, and the same under `--bounds`.
+  - **Finding:** ganita's cbrt equals the oracle's on all 1,025 rows, so cbrt needs no stand-in.
+  - **Mutation-checked:** a flipped golden bit, a 1-ulp constant, and a mis-wired dispatcher each fail their row.
 
 ## [1.3.0] - 2026-11-09
 

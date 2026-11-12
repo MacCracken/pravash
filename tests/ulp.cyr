@@ -1,0 +1,147 @@
+# ulp.cyr — float comparison for the parity harness and the reference-value tests.
+#
+# The rules are scripts/oracle/README.md, Format 1 (port plan §5). Copied unchanged from impetus's
+# tests/ulp.cyr, itself tanmatra's (same format, same rules); keep them in step.
+# - Bits: identical, and any NaN matches any NaN.
+# - ulp distance: on the ordered-integer line, where +0 and -0 are the same point.
+#   NaN is only within reach of NaN, and an infinity only of itself.
+# - Relative: |got - want| <= tol * |want|. A zero `want` needs a zero `got`, of either
+#   sign. NaN and the infinities follow the ulp rule.
+#
+# Values are passed as untyped 64-bit words (the f64 bit patterns), so a caller can hand
+# over golden bits and computed f64s alike. Inside, `var x: f64 = word;` is the boxed-float
+# idiom the guide sanctions.
+
+# 1 if the word is a NaN bit pattern.
+#must_use
+fn ulp_is_nan(bits): i64 {
+    if ((bits & 0x7FF0000000000000) != 0x7FF0000000000000) { return 0; }
+    if ((bits & 0x000FFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+# 1 if the word is +inf or -inf.
+#must_use
+fn ulp_is_inf(bits): i64 {
+    if ((bits & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { return 1; }
+    return 0;
+}
+
+# 1 if the bits are identical, or both are NaN. This is class A.
+#must_use
+fn ulp_bits_match(got, want): i64 {
+    if (got == want) { return 1; }
+    if (ulp_is_nan(got) == 1 && ulp_is_nan(want) == 1) { return 1; }
+    return 0;
+}
+
+# The sign-magnitude bits mapped onto a two's-complement line. Ordering is preserved, and
+# +0 and -0 both map to 0.
+#must_use
+fn ulp_ordered(bits): i64 {
+    if (bits < 0) { return 0 - (bits & 0x7FFFFFFFFFFFFFFF); }
+    return bits;
+}
+
+# The ulp distance between two finite or infinite words, saturating at the i64 maximum.
+# Both NaN gives 0; one NaN gives the maximum; an infinity is apart from everything but
+# itself.
+#must_use
+fn ulp_distance(got, want): i64 {
+    var big = 0x7FFFFFFFFFFFFFFF;
+    var gn = ulp_is_nan(got);
+    var wn = ulp_is_nan(want);
+    if (gn == 1 && wn == 1) { return 0; }
+    if (gn == 1 || wn == 1) { return big; }
+    if (ulp_is_inf(got) == 1 || ulp_is_inf(want) == 1) {
+        if (got == want) { return 0; }
+        return big;
+    }
+    var d = ulp_ordered(got) -| ulp_ordered(want);
+    if (d < 0) { d = 0 -| d; }
+    return d;
+}
+
+# 1 if |got - want| <= tol * |want| under the rules above. `tol` is an f64 word.
+#must_use
+fn ulp_rel_match(got, want, tol): i64 {
+    var gn = ulp_is_nan(got);
+    var wn = ulp_is_nan(want);
+    if (gn == 1 || wn == 1) { return gn & wn; }
+    if (ulp_is_inf(got) == 1 || ulp_is_inf(want) == 1) {
+        if (got == want) { return 1; }
+        return 0;
+    }
+    var g: f64 = got;
+    var w: f64 = want;
+    var t: f64 = tol;
+    var aw: f64 = f64_abs(w);
+    if (aw == 0.0) {
+        if (f64_abs(g) == 0.0) { return 1; }
+        return 0;
+    }
+    var diff: f64 = f64_abs(g - w);
+    if (diff <= t * aw) { return 1; }
+    return 0;
+}
+
+# |got - want| / |want|: 0 when both are zero, and +inf when `want` is zero but `got`
+# isn't. For reporting measured errors.
+#must_use
+fn ulp_rel_err(got, want): f64 {
+    var g: f64 = got;
+    var w: f64 = want;
+    var aw: f64 = f64_abs(w);
+    var diff: f64 = f64_abs(g - w);
+    if (aw == 0.0) {
+        if (diff == 0.0) { return 0.0; }
+        return 1.0 / 0.0;
+    }
+    var r: f64 = diff / aw;
+    return r;
+}
+
+# Prints "  got <hex> want <hex>" for a failing float, to stderr.
+fn ulp_print_pair(got, want) {
+    eprint("    got  ", 9);
+    _ulp_eprint_hex(got);
+    eprint("  want ", 7);
+    _ulp_eprint_hex(want);
+    eprint("\n", 1);
+}
+
+# Writes the 16-digit lowercase hex of a word to stderr.
+fn _ulp_eprint_hex(bits) {
+    var buf[16];
+    var digits = "0123456789abcdef";
+    var k = 0;
+    while (k < 16) {
+        var shift = (15 - k) * 4;
+        var nib = (bits >> shift) & 15;
+        store8(&buf + k, load8(digits + nib));
+        k = k + 1;
+    }
+    eprint(&buf, 16);
+}
+
+# assert(...) with the class-A rule; prints both bit patterns on failure.
+fn assert_bits_eq(got, want, name) {
+    var ok = ulp_bits_match(got, want);
+    if (ok != 1) { ulp_print_pair(got, want); }
+    assert(ok, name);
+}
+
+# assert(...) that the ulp distance is at most `max_ulp`.
+fn assert_ulp(got, want, max_ulp, name) {
+    var ok = 0;
+    if (ulp_distance(got, want) <= max_ulp) { ok = 1; }
+    if (ok != 1) { ulp_print_pair(got, want); }
+    assert(ok, name);
+}
+
+# assert(...) that the relative error is at most `tol` (an f64 word).
+fn assert_rel(got, want, tol, name) {
+    var ok = ulp_rel_match(got, want, tol);
+    if (ok != 1) { ulp_print_pair(got, want); }
+    assert(ok, name);
+}

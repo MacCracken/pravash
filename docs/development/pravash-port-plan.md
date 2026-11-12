@@ -12,16 +12,17 @@
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
 > ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–6 are done:
+> published to crates.io. M0 steps 0–7 are done:
 > - the frozen oracle;
 > - the scaffold and its repairs;
 > - ADRs 0001–0003;
 > - `cyrius.cyml`;
 > - the semantics probe;
 > - the golden-value generator;
-> - `src/constants.cyr`.
+> - `src/constants.cyr`;
+> - the parity harness.
 >
-> Next is step 7, the parity harness.
+> Next is step 8, the cross-target baselines.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -448,7 +449,18 @@ function, so nothing leaves parity entirely.
 
    The generator proves the list is every `const` in `rust-old/src`. Write decimal literals out positionally (the
    lexer has no exponent notation), and never put a hex pattern in a `const`.
-7. **Parity harness**, from impetus: `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, plus:
+7. ✅ **Parity harness. Done 2026-11-11** ([`port-parity.md`](port-parity.md) §2.1).
+   - **Files:** `tests/parity.tcyr` (pravash's hooks and dispatchers), with `tests/parity_core.cyr` and
+     `tests/ulp.cyr` copied unchanged from impetus. The constants rows go through `tests/constants_rows.cyr`, a
+     lookup the generator writes from the same list as `src/constants.cyr`.
+   - **First run:** 2 modules, 0 failing; 5,149 ok, 0 failed, 18,493 measured, 9,632 pending. It is warning-free,
+     and the same under `--bounds`.
+   - **cbrt:** ganita's cbrt equals the oracle's on every row, so it needs no stand-in.
+   - **Mutation check:** a golden bit, a 1-ulp constant, and a mis-wired dispatcher each fail their row.
+   - **Not yet:** the state loaders, the step comparator and the JSON comparator arrive with the first solver and
+     the first derived types (M2, M1). The divergence table fills as ADR 0002's rows land.
+
+   As planned, from impetus: `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, plus:
    - a state loader and a step comparator per solver, with per-field classes;
    - a JSON comparator (decode the oracle's document, compare bits, re-encode, decode again);
    - the divergence table, which names each ADR 0002 row and reports it by name.
@@ -696,7 +708,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 
 | # | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
 |---|---|---|---|---|---|
-| L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2) | ganita has no correctly rounded tier | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln, log10 and cbrt to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
+| L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2); **not cbrt**, whose ganita version equals the oracle's on every row (port-parity §2.1) | ganita has no correctly rounded tier (except cbrt) | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln and log10 to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
 | L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`; the typed std float constants are generated into `src/constants.cyr` (`PV_F64_MAX`, …, `PV_F32_EPSILON`) | the stdlib's `f64_min` / `f64_max` NaN rules, missing names, and no saturating float→int convert (port-parity §1) | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
 | L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
 | L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
@@ -730,7 +742,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | constants 35 + math 33,239 (validated, deterministic, parallel-checked); `src/constants.cyr` 35 values compiled and compared | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`). Step 4 done (semantics probe). Step 5 done (`scripts/oracle/`; the oracle's cbrt is compiler_builtins'). Step 6 done (`src/constants.cyr`, `probe_tables.py`). Next: step 7, the parity harness |
+| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. First replay: 5,149 ok, 0 failed, 18,493 measured, 9,632 pending (M1 helpers) | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published. Steps 1–3 done (scaffold, repairs, ADRs, `cyrius.cyml`). Step 4 done (semantics probe). Step 5 done (`scripts/oracle/`). Step 6 done (`src/constants.cyr`). Step 7 done (`tests/parity.tcyr`; ganita's cbrt is exact). Next: step 8, the cross-target baselines |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

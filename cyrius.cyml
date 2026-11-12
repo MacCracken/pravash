@@ -39,8 +39,8 @@ tag = "3.4.1"
 modules = ["dist/hisab.cyr"]
 scope = "test"
 
-# Test / bench / fuzz compiles only.
+# Test / bench / fuzz compiles only. overflow: tests/ulp.cyr's saturating `-|` (the ulp distance).
 [test]
-stdlib = ["assert", "bench"]
+stdlib = ["assert", "bench", "overflow"]
 
 # No [lib] until M1: `modules = []` is invalid. The list will be the concatenation order (port plan §4 step 3).

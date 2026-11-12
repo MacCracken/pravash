@@ -1,0 +1,666 @@
+# parity_core.cyr — the golden-corpus replay machinery.
+#
+# Copied unchanged from impetus's tests/parity_core.cyr (its M0 version), itself kimiya's and
+# tanmatra's (same format, same outcomes). An error code is named through the harness's
+# `_par_error_name` hook, so the harness needs no src/error.cyr before M1. tests/parity.tcyr
+# includes the src modules it needs, then this file, and defines:
+# - `_par_error_name(code)`: the Rust variant name of a `PV_ERR_*` code, as a C string;
+# - `_par_dispatch(mp, ml, fp, fl)`: fill the got list for one row (1 handled, 0 pending, -1 unusable);
+# - `_par_c_bound(fp, fl)`: a class-C function's ulp bound, or -1;
+# - `_par_accepted(fp, fl, ip, il)`: the ADR accepting a divergent row, or 0;
+# - `_par_accepted_quiet(adr)`: 1 when that ADR's accepted rows are counted (on their function's
+#   line, as "accepted") but not printed one by one — a mapped divergence with many rows;
+# - `_par_module_done(mp, ml)`: called after a module's report, for module-specific summary lines;
+# - `_par_skip(mp, ml)`: 1 for a module another harness replays;
+# - `_par_shadows(mp, ml, fp, fl, cls)`: optional extra, ungated comparisons of the same row
+#   against another Cyrius candidate, each recorded with `_par_shadow_record`.
+# It runs `_par_main()`, whose result is the exit code. Format and comparison rules:
+# scripts/oracle/README.md.
+
+# ── tokens ──────────────────────────────────────────────────────────────────────────
+# Three token lists of up to _PAR_MAX tokens: the row's inputs, its wanted outputs, and what the port returned.
+# Each slot is a kind byte ('f' 'i' 'e' 's' 'n' 'E' 'v'), a value word (f64 bits, an
+# integer, or a pointer to text) and a text length.
+var _PAR_MAX = 1024;
+var _par_in_k = 0;
+var _par_in_v = 0;
+var _par_in_l = 0;
+var _par_in_n = 0;
+var _par_want_k = 0;
+var _par_want_v = 0;
+var _par_want_l = 0;
+var _par_want_n = 0;
+var _par_got_k = 0;
+var _par_got_v = 0;
+var _par_got_l = 0;
+var _par_got_n = 0;
+
+# 1 if text [p, p + len) equals the C string `s`.
+#must_use
+fn _par_eq(p, len, s): i64 {
+    if (len != strlen(s)) { return 0; }
+    return memeq(p, s, len);
+}
+
+# The value of hex digit byte `c`, or -1. Lowercase only: the format writes f64 bits in
+# lowercase, so an uppercase digit is a malformed token.
+#must_use
+fn _par_hex_digit(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0 - 1;
+}
+
+# Parses [p, p + len) as unsigned hex. Returns the word; sets *ok to 0 on a bad digit.
+fn _par_parse_hex(p, len, ok) {
+    var v = 0;
+    var k = 0;
+    while (k < len) {
+        var d = _par_hex_digit(load8(p + k));
+        if (d < 0) { store64(ok, 0); return 0; }
+        v = (v << 4) | d;
+        k = k + 1;
+    }
+    return v;
+}
+
+# Parses [p, p + len) as a signed decimal. Sets *ok to 0 on a bad digit.
+fn _par_parse_int(p, len, ok) {
+    var k = 0;
+    var neg = 0;
+    if (len > 0 && load8(p) == 45) { neg = 1; k = 1; }
+    if (k >= len) { store64(ok, 0); return 0; }
+    var v = 0;
+    while (k < len) {
+        var c = load8(p + k);
+        if (c < 48 || c > 57) { store64(ok, 0); return 0; }
+        v = v * 10 + (c - 48);
+        k = k + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+# Parses the space-separated tokens of [p, p + len) into a token list. Returns the count,
+# or -1 on a malformed token. `-` is the empty list.
+fn _par_tokens(p, len, kinds, vals, lens): i64 {
+    if (len == 1 && load8(p) == 45) { return 0; }
+    var n = 0;
+    var at = 0;
+    while (at < len) {
+        var end = at;
+        while (end < len && load8(p + end) != 32) { end = end + 1; }
+        var tp = p + at;
+        var tl = end - at;
+        if (tl < 2 || load8(tp + 1) != 58 || n >= _PAR_MAX) { return 0 - 1; }
+        var kind = load8(tp);
+        var body = tp + 2;
+        var blen = tl - 2;
+        var okw[8];
+        store64(&okw, 1);
+        var v = 0;
+        if (kind == 102) {
+            if (blen != 16) { return 0 - 1; }
+            v = _par_parse_hex(body, blen, &okw);
+        } elif (kind == 105 || kind == 118) {
+            v = _par_parse_int(body, blen, &okw);
+        } elif (kind == 101 || kind == 115 || kind == 110 || kind == 69) {
+            v = body;
+        } else {
+            return 0 - 1;
+        }
+        if (load64(&okw) != 1) { return 0 - 1; }
+        store64(kinds + n * 8, kind);
+        store64(vals + n * 8, v);
+        store64(lens + n * 8, blen);
+        n = n + 1;
+        at = end + 1;
+    }
+    return n;
+}
+
+# Input token k as a word (f64 bits or integer).
+#must_use
+fn _par_in(k): i64 { return load64(_par_in_v + k * 8); }
+
+# The value of an uppercase hex digit byte `c` (the `%XX` escapes of `s:` tokens), or -1.
+#must_use
+fn _par_hex_upper(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+# Input token k, an `s:` token, as a fresh NUL-terminated C string with its `%XX` escapes
+# decoded. 0 if the token is no `s:` token, an escape is malformed, or the text holds a NUL
+# byte (which a C string can't).
+fn _par_in_cstr(k): i64 {
+    var at = k * 8;
+    if (k >= _par_in_n || load64(_par_in_k + at) != 115) { return 0; }
+    var p = load64(_par_in_v + at);
+    var len = load64(_par_in_l + at);
+    var out = alloc(len + 1);
+    if (out == 0) { return 0; }
+    var n = 0;
+    var j = 0;
+    while (j < len) {
+        var c = load8(p + j);
+        if (c == 37) {
+            if (j + 2 >= len) { return 0; }
+            var hi = _par_hex_upper(load8(p + j + 1));
+            var lo = _par_hex_upper(load8(p + j + 2));
+            if (hi < 0 || lo < 0) { return 0; }
+            c = hi * 16 + lo;
+            j = j + 3;
+        } else {
+            j = j + 1;
+        }
+        if (c == 0) { return 0; }
+        store8(out + n, c);
+        n = n + 1;
+    }
+    store8(out + n, 0);
+    return out;
+}
+
+# Appends an f64 result word to the got list.
+fn _par_got_f(bits) {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 102);
+    store64(_par_got_v + at, bits);
+    store64(_par_got_l + at, 16);
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends an integer result to the got list.
+fn _par_got_i(v) {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 105);
+    store64(_par_got_v + at, v);
+    store64(_par_got_l + at, 0);
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends a sequence length (`v:`) to the got list.
+fn _par_got_seq(n) {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 118);
+    store64(_par_got_v + at, n);
+    store64(_par_got_l + at, 0);
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends an enum result to the got list, as its golden text ("ElementCategory.Halogen").
+fn _par_got_e(name) {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 101);
+    store64(_par_got_v + at, name);
+    store64(_par_got_l + at, strlen(name));
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends an error (`E:Variant`) to the got list, by its Rust variant name.
+fn _par_got_err(code) {
+    var name = _par_error_name(code);
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 69);
+    store64(_par_got_v + at, name);
+    store64(_par_got_l + at, strlen(name));
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends Option::None (`n:`) to the got list.
+fn _par_got_none() {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 110);
+    store64(_par_got_v + at, 0);
+    store64(_par_got_l + at, 0);
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends a text result (`s:`) to the got list.
+fn _par_got_s(p, len) {
+    var at = _par_got_n * 8;
+    store64(_par_got_k + at, 115);
+    store64(_par_got_v + at, p);
+    store64(_par_got_l + at, len);
+    _par_got_n = _par_got_n + 1;
+}
+
+# Appends text as a golden `s:` token: percent-encoded as scripts/oracle/src/tsv.rs does
+# (every byte outside 0x21..0x7e, and `%`, as %XX), since the harness compares the raw body.
+fn _par_got_text(p, len) {
+    var out = alloc(len * 3 + 8);
+    var n = 0;
+    var k = 0;
+    while (k < len) {
+        var c = load8(p + k);
+        if (c >= 33 && c <= 126 && c != 37) {
+            store8(out + n, c);
+            n = n + 1;
+        } else {
+            var hi = (c >> 4) & 15;
+            var lo = c & 15;
+            store8(out + n, 37);
+            if (hi < 10) { store8(out + n + 1, 48 + hi); } else { store8(out + n + 1, 55 + hi); }
+            if (lo < 10) { store8(out + n + 2, 48 + lo); } else { store8(out + n + 2, 55 + lo); }
+            n = n + 3;
+        }
+        k = k + 1;
+    }
+    _par_got_s(out, n);
+}
+
+# Reads `v:n` then n f64 tokens at token k into buf; returns n.
+fn _par_in_f64s(k, buf): i64 {
+    var n = _par_in(k);
+    var j = 0;
+    while (j < n) {
+        store64(buf + j * 8, _par_in(k + 1 + j));
+        j = j + 1;
+    }
+    return n;
+}
+
+# ── per-function statistics ─────────────────────────────────────────────────────────
+# One slot per distinct fn name in the current module: name, class, row counts and an ulp
+# histogram over the float outputs (0, 1, 2, 3–16, >16, NaN/inf mismatch). A shadow
+# comparison (`_par_shadow_record`) gets a slot of its own, named after the candidate.
+var _PAR_FN_MAX = 192;
+var _par_fn_p = 0;
+var _par_fn_l = 0;
+var _par_fn_cls = 0;
+var _par_fn_rows = 0;
+var _par_fn_ok = 0;
+var _par_fn_fail = 0;
+var _par_fn_meas = 0;
+var _par_fn_pend = 0;
+var _par_fn_acc = 0;
+var _par_fn_diff = 0;  # shadow slots only: rows where the candidate differs
+var _par_fn_h = 0;     # 6 buckets per fn
+var _par_fn_max = 0;
+var _par_fn_n = 0;
+
+# The stats slot for fn [fp, fp + fl), created on first sight; -1 when the table is full.
+fn _par_fn_slot(fp, fl, cls): i64 {
+    var k = 0;
+    while (k < _par_fn_n) {
+        var at = k * 8;
+        if (load64(_par_fn_l + at) == fl && memeq(load64(_par_fn_p + at), fp, fl) == 1) { return k; }
+        k = k + 1;
+    }
+    if (_par_fn_n >= _PAR_FN_MAX) { return 0 - 1; }
+    var at = _par_fn_n * 8;
+    store64(_par_fn_p + at, fp);
+    store64(_par_fn_l + at, fl);
+    store64(_par_fn_cls + at, cls);
+    store64(_par_fn_rows + at, 0);
+    store64(_par_fn_ok + at, 0);
+    store64(_par_fn_fail + at, 0);
+    store64(_par_fn_meas + at, 0);
+    store64(_par_fn_pend + at, 0);
+    store64(_par_fn_acc + at, 0);
+    store64(_par_fn_diff + at, 0);
+    store64(_par_fn_max + at, 0);
+    var b = 0;
+    while (b < 6) { store64(_par_fn_h + (_par_fn_n * 6 + b) * 8, 0); b = b + 1; }
+    _par_fn_n = _par_fn_n + 1;
+    return _par_fn_n - 1;
+}
+
+# Adds 1 to the i64 counter at `base + slot * 8`.
+fn _par_bump(base, slot) {
+    store64(base + slot * 8, load64(base + slot * 8) + 1);
+}
+
+# Records one float comparison's ulp distance in the slot's histogram and maximum.
+fn _par_hist(slot, d) {
+    var b = 5;
+    if (d == 0) { b = 0; }
+    elif (d == 1) { b = 1; }
+    elif (d == 2) { b = 2; }
+    elif (d <= 16) { b = 3; }
+    elif (d < 0x7FFFFFFFFFFFFFFF) { b = 4; }
+    _par_bump(_par_fn_h, slot * 6 + b);
+    if (d > load64(_par_fn_max + slot * 8)) { store64(_par_fn_max + slot * 8, d); }
+}
+
+# ── row comparison ──────────────────────────────────────────────────────────────────
+# Compares the got list with the wanted outputs under class `cls` ('A' 'B' 'C' 'D').
+# Returns 1 ok, 0 failed, 2 measured (class C with no bound yet). Sets _par_outlier when a
+# float is more than 16 ulp off, or a NaN / infinity disagrees.
+var _par_outlier = 0;
+fn _par_compare(slot, cls, fp, fl): i64 {
+    _par_outlier = 0;
+    if (_par_got_n != _par_want_n) { return 0; }
+    var result = 1;
+    var k = 0;
+    while (k < _par_want_n) {
+        var at = k * 8;
+        var wk = load64(_par_want_k + at);
+        var wv = load64(_par_want_v + at);
+        var wl = load64(_par_want_l + at);
+        var gk = load64(_par_got_k + at);
+        var gv = load64(_par_got_v + at);
+        var gl = load64(_par_got_l + at);
+        if (wk != gk) { return 0; }
+        if (wk == 102) {
+            var d = ulp_distance(gv, wv);
+            _par_hist(slot, d);
+            if (d > 16) { _par_outlier = 1; }
+            if (cls == 65) {
+                if (ulp_bits_match(gv, wv) != 1) { result = 0; }
+            } elif (cls == 66) {
+                if (d > 2) { result = 0; }
+            } elif (cls == 67) {
+                var bound = _par_c_bound(fp, fl);
+                if (bound < 0) {
+                    if (result == 1) { result = 2; }
+                } elif (d > bound) {
+                    result = 0;
+                }
+            } else {
+                if (ulp_rel_match(gv, wv, 0.000000000001) != 1) { result = 0; }
+            }
+        } elif (wk == 105 || wk == 118) {
+            if (gv != wv) { result = 0; }
+        } elif (wk != 110) {
+            if (gl != wl || memeq(gv, wv, wl) != 1) { result = 0; }
+        }
+        k = k + 1;
+    }
+    return result;
+}
+
+# Records a shadow comparison: the got list (filled by the caller from another Cyrius
+# candidate for the same row) against the row's wanted outputs, under the row's class, in the
+# slot named `name`. Never gated: it reports how far the candidate is from the oracle
+# (bit-identical, differs, or measured for class C), e.g. a polyfill beside the builtin.
+fn _par_shadow_record(name, cls) {
+    var slot = _par_fn_slot(name, strlen(name), cls);
+    if (slot < 0) { return 0; }
+    _par_bump(_par_fn_rows, slot);
+    var r = _par_compare(slot, cls, name, strlen(name));
+    if (r == 1) { _par_bump(_par_fn_ok, slot); }
+    elif (r == 2) { _par_bump(_par_fn_meas, slot); }
+    else { _par_bump(_par_fn_diff, slot); }
+    return 0;
+}
+
+# ── report ──────────────────────────────────────────────────────────────────────────
+
+# Prints `n` right-aligned in a field of `width`.
+fn _par_print_num(n, width) {
+    var digits = 1;
+    var t = n;
+    while (t >= 10) { t = t / 10; digits = digits + 1; }
+    while (digits < width) { print(" ", 1); digits = digits + 1; }
+    fmt_int(n);
+}
+
+# Prints the text [p, p + len) padded to `width`.
+fn _par_print_pad(p, len, width) {
+    print(p, len);
+    var k = len;
+    while (k < width) { print(" ", 1); k = k + 1; }
+}
+
+# One line per function of the current module.
+fn _par_report_fns() {
+    var k = 0;
+    while (k < _par_fn_n) {
+        var at = k * 8;
+        print("  ", 2);
+        _par_print_pad(load64(_par_fn_p + at), load64(_par_fn_l + at), 40);
+        var cls = load64(_par_fn_cls + at);
+        var cb[8];
+        store8(&cb, cls);
+        print(&cb, 1);
+        _par_print_num(load64(_par_fn_rows + at), 7);
+        print(" rows: ", 7);
+        fmt_int(load64(_par_fn_ok + at));
+        print(" ok", 3);
+        var f = load64(_par_fn_fail + at);
+        if (f > 0) { print(", ", 2); fmt_int(f); print(" FAILED", 7); }
+        var m = load64(_par_fn_meas + at);
+        if (m > 0) { print(", ", 2); fmt_int(m); print(" measured", 9); }
+        var p = load64(_par_fn_pend + at);
+        if (p > 0) { print(", ", 2); fmt_int(p); print(" pending", 8); }
+        var acc = load64(_par_fn_acc + at);
+        if (acc > 0) { print(", ", 2); fmt_int(acc); print(" accepted", 9); }
+        var dif = load64(_par_fn_diff + at);
+        if (dif > 0) { print(", ", 2); fmt_int(dif); print(" differ (shadow)", 16); }
+        var hb = k * 6;
+        var floats = 0;
+        var b = 0;
+        while (b < 6) { floats = floats + load64(_par_fn_h + (hb + b) * 8); b = b + 1; }
+        if (floats > 0) {
+            print("  | ulp 0:", 10);
+            fmt_int(load64(_par_fn_h + hb * 8));
+            print(" 1:", 3);
+            fmt_int(load64(_par_fn_h + (hb + 1) * 8));
+            print(" 2:", 3);
+            fmt_int(load64(_par_fn_h + (hb + 2) * 8));
+            print(" 3-16:", 6);
+            fmt_int(load64(_par_fn_h + (hb + 3) * 8));
+            print(" >16:", 5);
+            fmt_int(load64(_par_fn_h + (hb + 4) * 8));
+            print(" nan/inf:", 9);
+            fmt_int(load64(_par_fn_h + (hb + 5) * 8));
+            var mx = load64(_par_fn_max + at);
+            if (mx < 0x7FFFFFFFFFFFFFFF) { print(" max:", 5); fmt_int(mx); }
+        }
+        println("");
+        k = k + 1;
+    }
+}
+
+# ── driver ──────────────────────────────────────────────────────────────────────────
+var _par_rows_ok = 0;
+var _par_rows_fail = 0;
+var _par_rows_meas = 0;
+var _par_rows_pend = 0;
+var _par_rows_acc = 0;
+
+# The index of the next byte `c` in [p + at, p + end), or `end`.
+#must_use
+fn _par_find(p, at, end, c): i64 {
+    var k = at;
+    while (k < end && load8(p + k) != c) { k = k + 1; }
+    return k;
+}
+
+# Replays one module. Returns 1 if it has a failure (or can't be read), else 0.
+fn _par_module(mp, ml): i64 {
+    var path[128];
+    var pre = "tests/golden/";
+    var pl = strlen(pre);
+    if (pl + ml + 5 > 127) { return 1; }
+    memcpy(&path, pre, pl);
+    memcpy(&path + pl, mp, ml);
+    memcpy(&path + pl + ml, ".tsv", 4);
+    store8(&path + pl + ml + 4, 0);
+
+    var lenw[8];
+    var buf = file_read_whole(&path, &lenw);
+    var len = load64(&lenw);
+    print("=== parity: ", 12);
+    print(mp, ml);
+    if (buf == 0) { println(" — cannot read the golden file"); return 1; }
+    println(" ===");
+
+    _par_fn_n = 0;
+    var fails_shown = 0;
+    var outliers_shown = 0;
+    var mod_fail = 0;
+    var line = 0;
+    while (line < len) {
+        var eol = _par_find(buf, line, len, 10);
+        if (eol > line && load8(buf + line) != 35) {
+            # fn <TAB> class <TAB> inputs <TAB> outputs <TAB> note
+            var t1 = _par_find(buf, line, eol, 9);
+            var t2 = _par_find(buf, t1 + 1, eol, 9);
+            var t3 = _par_find(buf, t2 + 1, eol, 9);
+            var t4 = _par_find(buf, t3 + 1, eol, 9);
+            var fp = buf + line;
+            var fl = t1 - line;
+            var cls = load8(buf + t1 + 1);
+            var bad = 0;
+            if (t4 >= eol || t2 != t1 + 2) { bad = 1; }
+            if (cls < 65 || cls > 68) { bad = 1; }
+            if (bad == 0) {
+                _par_in_n = _par_tokens(buf + t2 + 1, t3 - t2 - 1, _par_in_k, _par_in_v, _par_in_l);
+                _par_want_n = _par_tokens(buf + t3 + 1, t4 - t3 - 1, _par_want_k, _par_want_v, _par_want_l);
+                if (_par_in_n < 0 || _par_want_n < 0) { bad = 1; }
+            }
+            var slot = _par_fn_slot(fp, fl, cls);
+            if (slot < 0) { println("  too many functions in one module"); return 1; }
+            _par_bump(_par_fn_rows, slot);
+            var outcome = 0;
+            if (bad == 0) {
+                var h = _par_dispatch(mp, ml, fp, fl);
+                if (h == 0) { outcome = 3; }
+                elif (h == 1) { outcome = _par_compare(slot, cls, fp, fl); }
+            }
+            # The ADR accepting this row, asked only of a row that failed its comparison.
+            var adr = 0;
+            if (bad == 0 && outcome == 0) { adr = _par_accepted(fp, fl, buf + t2 + 1, t3 - t2 - 1); }
+            if (outcome == 1) { _par_bump(_par_fn_ok, slot); _par_rows_ok = _par_rows_ok + 1; }
+            elif (outcome == 2) {
+                _par_bump(_par_fn_meas, slot);
+                _par_rows_meas = _par_rows_meas + 1;
+                if (_par_outlier == 1 && outliers_shown < 10) {
+                    print("  OUTLIER (measured, not gated): ", 33);
+                    print(buf + t4 + 1, eol - t4 - 1);
+                    println("");
+                    ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
+                    outliers_shown = outliers_shown + 1;
+                }
+            }
+            elif (outcome == 3) { _par_bump(_par_fn_pend, slot); _par_rows_pend = _par_rows_pend + 1; }
+            elif (adr > 0 && _par_accepted_quiet(adr) == 1) {
+                _par_bump(_par_fn_acc, slot);
+                _par_rows_acc = _par_rows_acc + 1;
+            }
+            elif (adr > 0) {
+                _par_bump(_par_fn_acc, slot);
+                _par_rows_acc = _par_rows_acc + 1;
+                print("  accepted (ADR ", 16);
+                fmt_int(adr);
+                print("): ", 3);
+                print(buf + t4 + 1, eol - t4 - 1);
+                println("");
+                ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
+            }
+            else {
+                _par_bump(_par_fn_fail, slot);
+                _par_rows_fail = _par_rows_fail + 1;
+                mod_fail = 1;
+                if (fails_shown < 10) {
+                    eprint("  FAIL: ", 8);
+                    if (bad == 1) {
+                        eprint("malformed row: ", 15);
+                        eprint(buf + line, eol - line);
+                    } else {
+                        eprint(buf + t4 + 1, eol - t4 - 1);
+                    }
+                    eprint("\n", 1);
+                    if (bad == 0 && _par_got_n > 0) {
+                        ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
+                    }
+                    fails_shown = fails_shown + 1;
+                }
+            }
+            if (bad == 0) { _par_shadows(mp, ml, fp, fl, cls); }
+        }
+        line = eol + 1;
+    }
+    _par_report_fns();
+    _par_module_done(mp, ml);
+    return mod_fail;
+}
+
+# One heap buffer of `n` words, or 0 (reported) when memory is exhausted.
+fn _par_words(n): i64 {
+    var p = alloc(n * 8);
+    if (p == 0) { println("parity: out of memory"); }
+    return p;
+}
+
+# The token and statistics buffers live on the heap: as statics they would push the test
+# past the compiler's 128 KiB static-data advisory, and a warning fails the gate. Every
+# per-function table is sized from _PAR_FN_MAX (tanmatra's fixed 768-byte tables held only
+# 96 of its 192 slots).
+fn _par_alloc(): i64 {
+    _par_in_k = _par_words(_PAR_MAX);
+    _par_in_v = _par_words(_PAR_MAX);
+    _par_in_l = _par_words(_PAR_MAX);
+    _par_want_k = _par_words(_PAR_MAX);
+    _par_want_v = _par_words(_PAR_MAX);
+    _par_want_l = _par_words(_PAR_MAX);
+    _par_got_k = _par_words(_PAR_MAX);
+    _par_got_v = _par_words(_PAR_MAX);
+    _par_got_l = _par_words(_PAR_MAX);
+    _par_fn_p = _par_words(_PAR_FN_MAX);
+    _par_fn_l = _par_words(_PAR_FN_MAX);
+    _par_fn_cls = _par_words(_PAR_FN_MAX);
+    _par_fn_rows = _par_words(_PAR_FN_MAX);
+    _par_fn_ok = _par_words(_PAR_FN_MAX);
+    _par_fn_fail = _par_words(_PAR_FN_MAX);
+    _par_fn_meas = _par_words(_PAR_FN_MAX);
+    _par_fn_pend = _par_words(_PAR_FN_MAX);
+    _par_fn_acc = _par_words(_PAR_FN_MAX);
+    _par_fn_diff = _par_words(_PAR_FN_MAX);
+    _par_fn_h = _par_words(_PAR_FN_MAX * 6);
+    _par_fn_max = _par_words(_PAR_FN_MAX);
+    if (_par_in_k == 0 || _par_in_v == 0 || _par_in_l == 0) { return 1; }
+    if (_par_want_k == 0 || _par_want_v == 0 || _par_want_l == 0) { return 1; }
+    if (_par_got_k == 0 || _par_got_v == 0 || _par_got_l == 0) { return 1; }
+    if (_par_fn_p == 0 || _par_fn_l == 0 || _par_fn_cls == 0 || _par_fn_rows == 0) { return 1; }
+    if (_par_fn_ok == 0 || _par_fn_fail == 0 || _par_fn_meas == 0 || _par_fn_pend == 0) { return 1; }
+    if (_par_fn_acc == 0 || _par_fn_diff == 0 || _par_fn_h == 0 || _par_fn_max == 0) { return 1; }
+    return 0;
+}
+
+# Replays every module in tests/golden/modules.txt that this harness doesn't skip, and prints the
+# summary. Returns the number of modules with a failure.
+fn _par_main(): i64 {
+    if (_par_alloc() != 0) { return 1; }
+    var lenw[8];
+    var idx = file_read_whole("tests/golden/modules.txt", &lenw);
+    if (idx == 0) { println("parity: cannot read tests/golden/modules.txt"); return 1; }
+    var len = load64(&lenw);
+    var failing = 0;
+    var modules = 0;
+    var line = 0;
+    while (line < len) {
+        var eol = _par_find(idx, line, len, 10);
+        if (eol > line && load8(idx + line) != 35) {
+            if (_par_skip(idx + line, eol - line) == 1) {
+                print("=== parity: ", 12);
+                print(idx + line, eol - line);
+                println(" — replayed by another harness ===");
+            } else {
+                failing = failing + _par_module(idx + line, eol - line);
+                modules = modules + 1;
+            }
+        }
+        line = eol + 1;
+    }
+    print("=== parity summary: ", 20);
+    fmt_int(modules);
+    print(" modules, ", 10);
+    fmt_int(failing);
+    print(" failing | rows: ", 17);
+    fmt_int(_par_rows_ok);
+    print(" ok, ", 5);
+    fmt_int(_par_rows_fail);
+    print(" failed, ", 9);
+    fmt_int(_par_rows_meas);
+    print(" measured, ", 11);
+    fmt_int(_par_rows_pend);
+    print(" pending, ", 10);
+    fmt_int(_par_rows_acc);
+    println(" accepted ===");
+    return failing;
+}

@@ -45,7 +45,7 @@ same files. This README records what is specific to pravash.
 
 | Module | Milestone | Golden rows | Golden emitter | Generated Cyrius |
 |---|---|---|---|---|
-| `constants` | M0 | 35 | `src/m_constants.rs` (the lists and their completeness proofs: `src/t_constants.rs`) | `src/constants.cyr`: 14 public constants and the 6 std float constants pravash uses |
+| `constants` | M0 | 35 | `src/m_constants.rs` (the lists and their completeness proofs: `src/t_constants.rs`) | `src/constants.cyr`: 14 public constants and the 6 std float constants pravash uses; `tests/constants_rows.cyr`: the harness's lookup from each golden path to its value |
 | `math` | M0 | 33,239 | `src/m_math.rs` | — |
 
 ## Format 1

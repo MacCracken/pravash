@@ -45,7 +45,10 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
 
 /// Every generated Cyrius source, in file-name order.
 fn cyrius_outputs(root: &Path, prov: &str) -> Result<Vec<Output>, String> {
-    let files = vec![("src/constants.cyr", t_constants::emit(root, prov)?)];
+    let files = vec![
+        ("src/constants.cyr", t_constants::emit(root, prov)?),
+        ("tests/constants_rows.cyr", t_constants::emit_rows(prov)),
+    ];
     Ok(files
         .into_iter()
         .map(|(rel, text)| {

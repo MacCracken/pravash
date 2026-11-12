@@ -58,9 +58,39 @@ These are the language as documented, met for the first time here; none is a def
 - An `f32` value goes through `f32_from` / `f32_to`, and f32 arithmetic needs both operands `f32` (§1.1's key
   probe).
 
-## 2. Corpus baselines (M0 step 8)
+## 2. Corpus baselines (M0 steps 7–8)
 
-Pending: the math sweep through every Cyrius counterpart, on x86_64 ELF, x86_64 PE and aarch64.
+### 2.1 First replay (M0 step 7, 2026-11-11, x86_64 Linux ELF)
+
+`tests/parity.tcyr`, adapted from impetus's harness, replays the corpus through the Cyrius counterparts available
+before M1. It runs warning-free, with the same result in bounds-checked mode:
+**2 modules, 0 failing | rows: 5,149 ok, 0 failed, 18,493 measured, 9,632 pending, 0 accepted.**
+
+| Function | Cyrius | Rows | Result |
+|---|---|---|---|
+| `const` | `src/constants.cyr` through `tests/constants_rows.cyr` | 35 | all bit-exact |
+| sqrt, abs, floor, ceil | builtins | 3,634 | all bit-exact (class A) |
+| `as f32` | `f32_from` then `f32_to` | 1,480 | all bit-exact (class A) |
+| cbrt | `ganita_f64_cbrt` | 1,025 | **all 0 ulp**: ganita's cbrt is the oracle's (correctly rounded), so cbrt needs no stand-in |
+| sin, cos, sin_cos | `f64_sin` / `f64_cos` (the polyfills) | 8,628 | ≤ 1 ulp (sin 66, cos 71 rows at 1) |
+| exp | `_f64_exp_polyfill` (shadow: native `f64_exp`, x87) | 2,125 | ≤ 1 ulp (163 rows at 1; native 42) |
+| ln | `_f64_ln_polyfill` (shadow: native `f64_ln`) | 1,610 | ≤ 1 ulp (52 rows; native 1) |
+| atan2 | ganita's atan2 on `_f64_atan_polyfill` (shadow: ganita's own, on native `f64_atan`) | 1,600 | ≤ 1 ulp (343 rows; ganita's own 328) |
+| hypot | `ganita_f64_hypot` | 1,715 | ≤ 2 ulp (400 at 1, 2 at 2) |
+| powf | `ganita_f64_pow` | 1,790 | ≤ 1 ulp (125 at 1); one outlier, ganita's known `pow(-1, DBL_MAX)` = +∞ against Rust's 1 (tanmatra ADR 0007, kimiya ADR 0004). The correctly rounded pow (L1) replaces it, so no ADR is needed |
+| min, max | pending (M1 `_pv_min` / `_pv_max`); shadow: `f64_min` / `f64_max` | 760 each | the shadows differ on exactly 69 rows each, all NaN-second-operand cases (§1) |
+| clamp, is_nan, is_finite, `as usize`, `as u32`, the SPH cell key, to_radians, powi2, powi8 | pending (M1 helpers, L2) | 7,311 | — |
+| log10 | pending (the correctly rounded log10, L1) | 801 | — |
+
+The class-C rows are *measured*: no bound is set until step 8, which repeats this on x86_64 PE and aarch64 with
+per-function digests. All the counterparts above except cbrt are 1–2 ulp from glibc, which is what the correctly
+rounded stand-ins (L1) are for. The harness was mutation-checked three ways, and each change fails its row with the
+row's note: one bit of a golden sqrt row, a 1-ulp change to one generated constant, and floor dispatched as ceil
+(813 rows fail).
+
+### 2.2 Cross-target baselines (M0 step 8)
+
+Pending: the same replay on x86_64 PE (wine) and aarch64 (qemu), per-function digests, and the class-C bounds.
 
 ## 3. Oracle provenance findings (M0 step 5, 2026-11-11)
 
