@@ -8,9 +8,16 @@
   [pravash-port-plan.md](pravash-port-plan.md). It follows tanmatra, kimiya and impetus.
 - [ ] 2.0 carries every module and feature: bridge, ai, logging, `parallel` (on `thread.cyr`) and serde (on
   `#derive`). The plan's §1.1 language review of Cyrius 6.7.18 found no language reason to defer any of them
-- [ ] Before M0: the maintainer decides D1–D6 (plan §0.2): tag/publish 1.3.0, the source of the correctly rounded
-  math, when the f32 hash is fixed, how strict JSON compatibility is, the deferred audit physics, and the shape of
-  `parallel`
+- [ ] Upstream requests (hisab, ganita, the stdlib) are filed at M0 and as found, but never block the port.
+  pravash ships local stand-ins marked `UPSTREAM(Ln)` and converts them when the library lands (plan §8, the
+  conversion ledger)
+- [x] Decisions D1–D6 (plan §0.2), made 2026-11-11:
+  - **D1:** tag and publish 1.3.0 after the oracle hooks land.
+  - **D2:** a local `crmath`, plus the ganita request.
+  - **D3:** f32 hash keys ported faithfully, then switched to f64 before 2.0.
+  - **D4:** JSON that decodes compatibly, with no text identity required.
+  - **D5:** no deferred audit physics in 2.0.
+  - **D6:** `parallel` as a runtime thread count.
 - [ ] M0 step 0 (Rust, before the freeze): the hidden `oracle` feature with state dumps for every solver, the
   tracked lockfile, glibc recorded, the 1.3.0 tag
 

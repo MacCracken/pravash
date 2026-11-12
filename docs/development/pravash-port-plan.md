@@ -11,8 +11,8 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: planning** (2026-11-11). Nothing has moved yet. §0.2 lists the decisions the maintainer
-> makes before M0 starts.
+> ⏳ **Status: planned, decisions made** (2026-11-11). Nothing has moved yet. §0.2 records the maintainer's
+> decisions. Next is M0 step 0: the Rust oracle hooks, before anything moves to `rust-old/`.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -43,12 +43,17 @@
   corpus is regenerated (as tanmatra).
 - **No Rust 2.0** (as kimiya and impetus). API shape changes land in the Cyrius API only, accepted by
   ADR 0002 (§3.3).
+- **Upstream requests never block the port** (the maintainer, 2026-11-11). Every gap found in hisab, ganita or
+  the Cyrius stdlib is filed as a request in that project, with pravash's numbers. Meanwhile pravash ships a
+  local stand-in. Each stand-in carries an `UPSTREAM(Ln)` note naming its request and the library call that
+  will replace it, and has a row in the conversion ledger (§8). When the library ships, pravash converts the
+  stand-in, whether before or after 2.0, and re-runs its parity rows. No milestone waits on an upstream release.
 - **hisab-first, but off the step path until an allocator lands.** cyrius S1 (a scoped allocator) and hisab
   H9 (allocator-scoped calls) are both still **open** (checked 2026-11-11). Until one of them lands, every hisab
   call that returns a value leaks from the global bump heap. So per-step code is pravash-owned: the neighbour
   search, the pressure solves and the vector math in loops (as impetus [ADR 0012](../../../impetus/docs/adr/0012-impetus-owned-3d-math-stopgap.md)).
-  hisab and ganita serve the calls that are not per-step. Where neither has a routine the oracle used, the port
-  transcribes Rust hisab 1.4.0's routine and files the gap
+  These are stand-ins under the rule above. hisab and ganita serve the calls that are not per-step. Where neither
+  has a routine the oracle used, the port transcribes Rust hisab 1.4.0's routine as a stand-in
   (kimiya [ADR 0003](../../../kimiya/docs/adr/0003-transcribe-missing-hisab-routines.md)).
 - **Performance is measured, not gated** (as impetus). Every Rust benchmark gets a Cyrius twin, and both
   columns are recorded per milestone in `docs/benchmarks-rust-v-cyrius.md`. A slow row is a finding to
@@ -59,16 +64,16 @@
   misrounds, the golden expectation is the oracle's formula evaluated on the correctly rounded primitive
   (`*.cr.tsv`), reported as accepted. §5 sets pravash's scope for this.
 
-### 0.2 Open: the maintainer decides before M0 (recommendation first)
+### 0.2 Decided 2026-11-11 (the maintainer took every recommendation)
 
-| # | Question | Recommended | Alternative |
+| # | Question | Decision | Not chosen |
 |---|---|---|---|
-| D1 | **Tag and publish 1.3.0.** `release.yml` runs `cargo publish` on any version tag. Tagging therefore publishes 1.3.0 to crates.io, and its five Rust dependents on `^1` get the audit's behaviour changes | Land the `oracle` hooks (M0 step 0b) first. Then tag 1.3.0 on that commit and let it publish. That gives one frozen point, and Rust users get the audited physics | Tag without publishing. Or tag the current commit and add the hooks afterwards as unreleased tooling, as impetus did |
-| D2 | **Where the correctly rounded math comes from.** pravash needs exp, ln, log10, pow, sin, cos, sin_cos, hypot and atan2. impetus has its own copies (`src/crmath.cyr`, ADR 0011), and so does kimiya (ln, log10, pow, exp, sin, cos, acos, atan2). The ganita issue asking for a correctly rounded tier is open. pravash would be the **third** crate to need these, which is CLAUDE.md's cue to extract an abstraction | Extract them into ganita as a separate task, seeded from impetus's crmath and kimiya's ln/log10. Vendor a stopgap copy into `src/crmath.cyr` (ADR 0004) only if ganita hasn't landed when M1 needs them | Vendor a third copy now and extract later |
-| D3 | **When to fix the f32 neighbour hash.** The oracle hashes f32 positions (hisab 1.4.0 `SpatialHash`), and the roadmap lists the resulting precision loss at large coordinates as a defect. Cyrius has a native `f32` type (§1.1), so a bit-faithful port costs nothing extra. The question is only when the defect gets fixed | Port the f32 keys bit-faithfully, so neighbour lists are class A and SPH steps class B/C through M5. Then switch to f64 cell keys before 2.0 as an ADR 0002 divergence, with the f32 rows remapped by name (kimiya's "noted rows mapped") | Port f32 keys and fix after 2.0; or use f64 keys from the start, which makes every SPH step row class D, because the summation order changes |
-| D4 | **How strict JSON compatibility is.** The port carries serde on all 22 types through `#derive(Serialize)` / `#derive(Deserialize)` (§1.1). bayan prints f64 with Grisu2, which round-trips exactly but doesn't always give the same digits as serde_json's shortest form | Require decode compatibility: every document serde_json writes from the oracle decodes to the same bits, and every Cyrius document round-trips. Text identity is not required | Byte-identical text, by reusing impetus's shortest-digit printer (`fmtf.cyr`, ADR 0010) as the second instance |
-| D5 | **The items the 1.3.0 audit deferred.** The roadmap lists Neumann and periodic pressure, SPH 2D kernel normalisation, an external-force input to `step()`, neighbour filtering by h, quadratic B-spline MPM and others. The language can express all of them; what they lack is an oracle | None of them in 2.0: they are new physics, checked by reference tests only, so they come after parity (as impetus). The f32 hash fix (D3) is the one exception | Pull the API-shape items (the external-force input, a dimension on the SPH config) into ADR 0002 |
-| D6 | **The shape of `parallel`.** Rust selects rayon with a compile-time feature. Cyrius `[features]` only switch optional dependencies, and `#define` holds 16 names including the target's (§1.1) | Make it a runtime thread count on each solver: 1 (the default) is serial, and any count gives the same bits. `THREADS_CONCURRENT == 0` targets (agnos, cx) run the work inline | A `[lib.parallel]` profile that `#define`s a name, giving two bundles |
+| D1 | ✅ **Tag and publish 1.3.0.** `release.yml` runs `cargo publish` on any version tag. Tagging therefore publishes 1.3.0 to crates.io, and its five Rust dependents on `^1` get the audit's behaviour changes | Land the `oracle` hooks (M0 step 0b) first. Then tag 1.3.0 on that commit and let it publish. That gives one frozen point, and Rust users get the audited physics | Tag without publishing. Or tag the current commit and add the hooks afterwards as unreleased tooling, as impetus did |
+| D2 | ✅ **Where the correctly rounded math comes from.** pravash needs exp, ln, log10, pow, sin, cos, sin_cos, hypot and atan2. impetus has its own copies (`src/crmath.cyr`, ADR 0011), and so does kimiya (ln, log10, pow, exp, sin, cos, acos, atan2). The ganita issue asking for a correctly rounded tier is open, and pravash is the **third** crate to need these | pravash vendors them into `src/crmath.cyr` now, from impetus's crmath and kimiya's ln and log10 (ledger L1). It joins the open ganita request as the third consumer, which is the extraction cue in CLAUDE.md. The port converts to ganita's functions when they ship | — |
+| D3 | ✅ **When to fix the f32 neighbour hash.** The oracle hashes f32 positions (hisab 1.4.0 `SpatialHash`), and the roadmap lists the resulting precision loss at large coordinates as a defect. Cyrius has a native `f32` type (§1.1), so a bit-faithful port costs nothing extra. The question is only when the defect gets fixed | Port the f32 keys bit-faithfully, so neighbour lists are class A and SPH steps class B/C through M5. Then switch to f64 cell keys before 2.0 as an ADR 0002 divergence, with the f32 rows remapped by name (kimiya's "noted rows mapped") | Port f32 keys and fix after 2.0; or use f64 keys from the start, which makes every SPH step row class D, because the summation order changes |
+| D4 | ✅ **How strict JSON compatibility is.** The port carries serde on all 22 types through `#derive(Serialize)` / `#derive(Deserialize)` (§1.1). bayan prints f64 with Grisu2, which round-trips exactly but doesn't always give the same digits as serde_json's shortest form | Require decode compatibility: every document serde_json writes from the oracle decodes to the same bits, and every Cyrius document round-trips. Text identity is not required | Byte-identical text, by reusing impetus's shortest-digit printer (`fmtf.cyr`, ADR 0010) as the second instance |
+| D5 | ✅ **The items the 1.3.0 audit deferred.** The roadmap lists Neumann and periodic pressure, SPH 2D kernel normalisation, an external-force input to `step()`, neighbour filtering by h, quadratic B-spline MPM and others. The language can express all of them; what they lack is an oracle | None of them in 2.0: they are new physics, checked by reference tests only, so they come after parity (as impetus). The f32 hash fix (D3) is the one exception | Pull the API-shape items (the external-force input, a dimension on the SPH config) into ADR 0002 |
+| D6 | ✅ **The shape of `parallel`.** Rust selects rayon with a compile-time feature. Cyrius `[features]` only switch optional dependencies, and `#define` holds 16 names including the target's (§1.1) | Make it a runtime thread count on each solver: 1 (the default) is serial, and any count gives the same bits. `THREADS_CONCURRENT == 0` targets (agnos, cx) run the work inline | A `[lib.parallel]` profile that `#define`s a name, giving two bundles |
 
 ---
 
@@ -125,7 +130,7 @@ is a Rust construct pravash uses, what Cyrius provides for it, and the verdict. 
 | `Vec<T>` growth, per-step `Vec` allocation | `vec` (8-byte words, never frees); `freelist` (individual free); arenas with reset and a growth policy; the allocator vtable (`alloc_via`) | guide *Allocators & Arenas*; stdlib *freelist* | solver-owned storage plus a step arena (§7.5) |
 | Cargo features (`sph`, `grid`, `shallow`, …) | `[features]` switches optional dependencies only; `#ifdef` with at most 16 `#define` names, the target's included; `[lib.X]` bundle profiles; `[build] dce = true` dead-code elimination | guide *Manifest keys*, *Preprocessor* | one bundle, with dead-code elimination removing what a consumer doesn't call (probe 7 measures it) |
 | `hisab::num::matrix_inverse` (n×n; hisab 1.4.0 does it as LU with partial pivoting plus a per-column `lu_solve`) | ganita `mat_inv` (LU with partial pivoting), `mat_lu` and `mat_lu_solve` | stdlib *linalg.cyr* (in ganita) | use ganita if probe 8 shows the same bits on the MLS moment matrices; otherwise transcribe |
-| `hisab::num::conjugate_gradient` (matrix-free linear CG) | nothing in ganita or hisab 3.4.1: `opt_conjugate_gradient` is the nonlinear optimiser, and BiCGSTAB, GMRES and PGS take CSR matrices | hisab `dist/hisab.cyr` | transcribe (ADR 0003); file P1 |
+| `hisab::num::conjugate_gradient` (matrix-free linear CG) | nothing in ganita or hisab 3.4.1: `opt_conjugate_gradient` is the nonlinear optimiser, and BiCGSTAB, GMRES and PGS take CSR matrices | hisab `dist/hisab.cyr` | a transcribed stand-in (ADR 0003, ledger L5), with hisab request P1 |
 | `#[inline]`, `#[must_use]`, `#[non_exhaustive]` | `#inline` (never applied to a fn with defaults or a `defer`), `#must_use`, `#pure` / `#io` / `#alloc`; enums are append-only by convention | guide *Attributes* | translate |
 | `Cow<'static, str>` error detail, `String` config fields | `Str`, `cstring` | guide *Strings* | errors carry codes only; config strings are `Str` |
 | `Send + Sync` bounds | — | — | Rust-only mechanics, nothing to port |
@@ -173,7 +178,7 @@ functions, so six things change.
 |---|---|---|---|---|---|---|
 | M1 | `error.rs` | 26 | — | 6 | `src/error.cyr` | — |
 | M1 | *(public and private constants, presets)* | — | — | — | `src/constants.cyr` (generated) | — |
-| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr`; `src/crmath.cyr` or ganita (D2) | ganita |
+| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr` (L2), `src/crmath.cyr` (D2, L1) | ganita where it is already exact; stand-ins otherwise |
 | M1 | `common.rs` | 611 | 35 | 49 | `src/vec3.cyr` (the `DVec3` operations pravash uses), `src/common.cyr`, codecs in `src/json.cyr` | none on the step path: a pravash-owned glam transcription, as impetus's `math3.cyr` |
 | M1 | `buoyancy.rs` | 105 | 5 | 16 | `src/buoyancy.cyr` | — |
 | M1 | `vortex.rs` | 47 | 5 | 12 | `src/vortex.cyr` | — |
@@ -282,8 +287,8 @@ function, so nothing leaves parity entirely.
    - **ADRs** (pravash has none yet):
      - 0001, the port with a Rust oracle, including the lockfile exception and the §0.1 deferral rule;
      - 0002, the §3.3 API divergences;
-     - 0003, transcribing missing hisab routines, plus the ganita substitutes (§7.2);
-     - 0004, the correctly rounded primitives (per D2).
+     - 0003, local stand-ins for library gaps and how they are converted (§8). It covers the hisab 1.4.0
+       transcriptions, the ganita substitutes and `crmath` (D2).
    - **Checks**: `cyrius.cyml` reads `version = "${file:VERSION}"`, and `bench` is in `[test] stdlib`. Document the
      scaffold's stub functions so `cyrius audit` passes. Rewrite CONTRIBUTING, SECURITY and the README for Cyrius.
 3. **`cyrius.cyml`.** There is no `[lib]` until M1, because `modules = []` is invalid. Confirm the keys with `cyrius help manifest`.
@@ -390,13 +395,20 @@ function, so nothing leaves parity entirely.
    9. **JSON.** `#derive(Serialize)` on each derived type's Cyrius struct, fed the oracle's serde_json documents:
       decoded bits, round trips, and how often bayan's Grisu2 digits differ from serde_json's. Write hand codecs
       for `DVec3` fields (serde writes `[x, y, z]`) and for the data-carrying enums.
+10. **File the upstream requests** (§8), with the probes' numbers:
+    - new requests where none is open;
+    - pravash's numbers added to the open ones.
+
+    Then write `scripts/upstream_ledger.py` and seed the ledger: one row per stand-in, the conditional rows
+    settled by probes 5 and 8. No later step waits on any request.
 
 **Gate:**
 - `cyrius build` and `cyrius bench` pass;
 - `cyrius test` runs the harness (0 modules) with no warnings;
 - `cyrius lint` and `fmt --check` are clean;
-- committed: the oracle hooks (now in `rust-old/`), the generator, `validate.py`, `tests/ulp.cyr`, ADRs 0001–0004,
-  the probe results and the upstream issues (§8).
+- `scripts/upstream_ledger.py --check` passes;
+- committed: the oracle hooks (now in `rust-old/`), the generator, `validate.py`, `tests/ulp.cyr`, ADRs 0001–0003,
+  the probe results, the ledger, and links to the upstream requests.
 
 ---
 
@@ -451,6 +463,8 @@ Every milestone ends with impetus's gates:
 - surface parity;
 - the soak test (probe 1) once a solver steps;
 - the JSON rows of the milestone's types;
+- `scripts/upstream_ledger.py --check`. Requests for the gaps the milestone found are filed, and any stand-in whose
+  library has shipped since the last milestone is converted (§8);
 - the CHANGELOG and `state.md`.
 
 Large milestones go in parts, each part gated (CLAUDE.md's task sizing).
@@ -488,7 +502,7 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 | `sqrt` (46), `abs` (34), `floor` (21), `ceil` (3) | builtins | exact on every target |
 | `max` (128), `min` (37), `clamp` (22) | `_pv_max`, `_pv_min` and `_pv_clamp` with Rust's NaN-ignoring semantics (as impetus's `mathx.cyr`) | exact |
 | `is_finite` (101), `is_nan` (3) | `x - x == 0`; `x != x` | exact |
-| `exp` (5), `ln` (8), `log10` (1), `powf` (6), `sin` (2), `cos` (4), `sin_cos` (2), `atan2` (2), `hypot` (3) | correctly rounded (D2) | class C, exact against the corrected oracle |
+| `exp` (5), `ln` (8), `log10` (1), `powf` (6), `sin` (2), `cos` (4), `sin_cos` (2), `atan2` (2), `hypot` (3) | correctly rounded: `src/crmath.cyr` (D2, ledger L1) until ganita ships its tier | class C, exact against the corrected oracle |
 | `cbrt` (2, Manning friction) | `ganita_f64_cbrt`; its comments describe an exact rounding decision, which step 8 measures | class C |
 | `powi` (6) | explicit products in LLVM's square-and-multiply order (as tanmatra) | class B |
 | `to_radians` (1) | `x * (PI / 180.0)` in Rust's order | class B |
@@ -506,11 +520,11 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 
 | Rust (hisab 1.4.0) | Cyrius 6.7.18 / hisab 3.4.1 | Plan |
 |---|---|---|
-| glam `DVec3` arithmetic | `hvec3_*`, which allocate on every operation | pravash-owned `src/vec3.cyr` on f64 locals (probe 2) until H1/H9 |
-| glam `Vec3` (f32) and `SpatialHash` (f32 cells, a `HashMap` of cells) | `spatial_hash_*` (f64 cells; allocates on insert and query) | a pravash-owned neighbour grid on native `f32` keys (D3), sorted arrays, no per-step allocation |
-| `num::dst`, `num::idst` | `num_dst`, `num_idst` | use them if probe 8 shows the same bits and no per-step leak; otherwise transcribe |
-| `num::conjugate_gradient` (matrix-free linear CG, operator as a closure) | **none** in hisab or ganita | transcribe 1.4.0's (ADR 0003), with the operator as a Cyrius closure; file P1 |
-| `num::matrix_inverse` (n×n by LU with partial pivoting, called on a 3×3) | ganita `mat_inv` (LU with partial pivoting); hisab `m3_inverse_checked`, which decides singularity exactly (class D in impetus) | ganita `mat_inv` if probe 8 shows the same bits and the per-call allocation stays off the step path; otherwise transcribe 1.4.0's (ADR 0003) |
+| glam `DVec3` arithmetic | `hvec3_*`, which allocate on every operation | stand-in `src/vec3.cyr` on f64 locals (probe 2), ledger L3 |
+| glam `Vec3` (f32) and `SpatialHash` (f32 cells, a `HashMap` of cells) | `spatial_hash_*` (f64 cells; allocates on insert and query) | stand-in neighbour grid on native `f32` keys (D3): sorted arrays, no per-step allocation, ledger L4 |
+| `num::dst`, `num::idst` | `num_dst`, `num_idst` | use them if probe 8 shows the same bits and no per-step leak; otherwise a transcribed stand-in, ledger L6 |
+| `num::conjugate_gradient` (matrix-free linear CG, operator as a closure) | **none** in hisab or ganita | stand-in transcribed from 1.4.0 (ADR 0003), with the operator as a Cyrius closure, ledger L5 |
+| `num::matrix_inverse` (n×n by LU with partial pivoting, called on a 3×3) | ganita `mat_inv` (LU with partial pivoting); hisab `m3_inverse_checked`, which decides singularity exactly (class D in impetus) | ganita `mat_inv` if probe 8 shows the same bits and the per-call allocation stays off the step path; otherwise a transcribed stand-in, ledger L7 |
 | `autodiff::{Tape, Var, reverse_gradient}` | `ad_tape_*` | use it (not per-step), with the user's function as a closure; probe 8 checks the bits |
 
 ### 7.3 Types and idioms
@@ -551,33 +565,54 @@ Probe 1 settles this:
 
 ---
 
-## 8. Gaps to file upstream (at M0, then as found)
+## 8. Upstream requests and the conversion ledger
 
-Each gap gets an issue in the owning repo, with the probe or benchmark that shows it.
+**The rule** (§0.1): a gap in hisab, ganita or the stdlib becomes a request in that project, and pravash ships
+a local stand-in. Nothing waits on the request.
 
-**hisab**
-- **P1. A matrix-free linear CG**: an operator as a closure, a relative tolerance, the iteration count
-  returned. 1.4.0's `num::conjugate_gradient` has no 3.x counterpart, and neither does ganita.
-- **P2. A spatial-hash rebuild without per-insert allocation, and a neighbour query into a caller's buffer**:
-  the per-step SPH pattern. It joins impetus's H7 and H9.
-- **A fast DST**, if probe 8 shows `num_dst` is the direct O(N²) form. The roadmap already flags the Rust
-  pressure solve's cost.
+**Filing.** Requests go in the owning repo's `docs/development/issues/`, as the siblings file them: a
+self-proving repro where one is possible, and the probe or benchmark numbers that show the gap. Where a request
+is already open (impetus or kimiya filed it), pravash adds itself as a consumer with its own numbers instead of
+filing a second one. The first batch goes in at M0 step 10, once the probes have produced numbers. Later gaps
+are filed in the milestone that finds them.
 
-**Cyrius stdlib**
-- **A stable sort** (`sort_by_zorder`), if probe 5 needs one; impetus asked for it too.
-- **`#derive` support for serde's other shapes**: a vector struct written as an array, and externally tagged
-  data-carrying variants. impetus listed these as not filed; pravash files them with its types as the cases.
-- **A sakshi Chrome-trace exporter**, if M7 finds none.
+**Marking.** Every stand-in function, or the head of every stand-in file, carries a note of this form:
 
-**Add pravash as a consumer, with its own numbers**, on:
-- cyrius S1 (the scoped allocator);
-- hisab H9 (allocator-scoped calls) and H1 (allocation-free vector math);
-- the ganita correctly rounded tier (D2);
-- impetus's S5 (`memcpy` byte loops: every particle-record copy).
+```cyrius
+# UPSTREAM(L5): hisab/docs/development/issues/<date>-linear-conjugate-gradient.md
+#   replace with hisab's linear CG once it ships; parity: CG rows (iterations A, solution B)
+```
 
-**cyrius**
-- Add pravash's case to the `cyrius port` clobber issue: a project whose `.gitignore` ignores `Cargo.lock`
-  ends up with a frozen oracle that has no lockfile.
+`scripts/upstream_ledger.py --check`, which is written at M0, checks two things: that every `UPSTREAM(Ln)` note
+in `src/` has a row below, and that every open row has at least one note. It runs in every milestone's gate.
+
+**Converting.** When a library ships the replacement, before or after 2.0:
+1. bump the dependency pin (hisab's tag, or the Cyrius pin for ganita and the stdlib);
+2. swap the call and delete the stand-in;
+3. re-run the parity rows the ledger names. They must keep their class. If the bits change, the cause is one of
+   two things. Either the library is more accurate, in which case it is accepted under the accuracy policy against
+   the corrected oracle. Or it is a defect, which is filed upstream, and the stand-in stays;
+4. close the row here, remove the notes, and add a CHANGELOG entry.
+
+**The ledger.** Rows marked *conditional* exist only if their probe says so.
+
+| # | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
+|---|---|---|---|---|---|
+| L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2) | ganita has no correctly rounded tier | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln, log10 and cbrt to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
+| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `copysign`, `sin_cos`, typed `EPSILON` / `INFINITY` / `NAN` | the stdlib's `f64_min` / `f64_max` NaN rules and missing names | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
+| L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
+| L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
+| L5 | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | **hisab P1 (new)**: an operator as a closure, a relative tolerance, the iteration count returned | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
+| L6 | *conditional (probe 8)*: `src/grid_solve.cyr` DST and IDST | `num_dst` / `num_idst` differ from 1.4.0's bits, leak per step, or are the direct O(N²) form | **hisab**: bit parity with 1.4.0, no per-call allocation, a fast DST (the roadmap flags the cost) | `num_dst`, `num_idst` | the DST pressure rows |
+| L7 | *conditional (probe 8)*: the MLS 3×3 inverse in `src/sph_fns.cyr` | ganita `mat_inv` differs from 1.4.0's bits, or allocates per call | **ganita**: an allocation-free `mat_inv_into` (caller output) with hisab 1.4.0's pivoting | ganita `mat_inv` | the MLS gradient-correction rows |
+| L8 | the step-path rule itself: solver-owned storage and a step arena, hisab kept off the step | cyrius S1, hisab H9 | as L3 | hisab back on the step path: L3, L4 and L6 convert together | every step row, plus the soak test |
+| L9 | *conditional (probe 5)*: a stable merge sort in `src/sph_fns.cyr` | `vec_sort_by` is introsort (unstable) | **stdlib**: a stable sort (impetus asked for one too) | the stdlib's stable sort | the z-order rows (class A) |
+| L10 | `src/json.cyr`: hand codecs for `DVec3` fields (`[x, y, z]`) and the data-carrying enums | `#derive` has no array form for a vector struct and no externally tagged data variants | **cyrius stdlib**: `#derive` support for those shapes (impetus listed them, unfiled), with pravash's types as the cases | `#derive(Serialize)` / `#derive(Deserialize)` | the JSON table (class A) |
+| L11 | *conditional (M7)*: a Chrome-trace writer in `src/logging.cyr` | sakshi may have no Chrome-trace exporter | **sakshi** (stdlib): an exporter | sakshi | the logging test |
+| L12 | *conditional (M1 benchmarks)*: an 8-byte-chunk record copy for particles | `memcpy` copies a byte at a time | **cyrius**: the open S5 / `2026-11-02` memcpy issue; pravash adds its particle-record numbers | stdlib `memcpy` | none (it moves bytes); the benchmark rows |
+
+**Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
+`.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
 
 ---
 
@@ -585,8 +620,11 @@ Each gap gets an issue in the owning repo, with the probe or benchmark that show
 
 The roadmap plans the work that follows 2.0.0:
 - the 1.3.0 audit's deferred physics (D5), each with reference tests;
-- the switch to hisab on the step path once S1 or H9 lands;
+- converting whatever ledger rows (§8) are still open at 2.0 as their libraries ship. L8, which puts hisab back
+  on the step path, is the largest of these;
 - retiring `rust-old/`.
+
+A stand-in is never a reason to hold the 2.0 release, and an upstream release is never a reason to hold a milestone.
 
 ---
 
@@ -594,7 +632,7 @@ The roadmap plans the work that follows 2.0.0:
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ planned | — | — | — | waits on D1–D6, then step 0 (Rust oracle hooks, lockfile, tag 1.3.0) |
+| M0 Initialize | ⏳ planned | — | — | — | D1–D6 decided 2026-11-11; next: step 0 (Rust oracle hooks, lockfile, tag 1.3.0); step 10 files the upstream requests and seeds the ledger |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |
