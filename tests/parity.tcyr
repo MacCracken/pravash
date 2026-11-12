@@ -1199,13 +1199,26 @@ fn _par_sph_listed(fp, fl): i64 {
 }
 
 # The solver rows (M5): 1 handled, 0 another function.
-fn _par_sph_solver(fp, fl): i64 {
-    if (_par_eq(fp, fl, "SphSolver::step") == 1) {
+# The solver step row kind: 0 `step`, 1 `step_pcisph`, 2 `step_dfsph`, 3 `step_multiphase`, or -1 another function.
+#must_use
+fn _par_sph_kind(fp, fl): i64 {
+    if (_par_eq(fp, fl, "SphSolver::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) { return 1; }
+    if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) { return 2; }
+    if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) { return 3; }
+    return 0 - 1;
+}
+
+# The current solver step row of `kind` (`_par_sph_kind`) on one fresh solver at `threads` threads: its particles, or
+# the first error, appended to the got list. 1, or -1 when its inputs can't be loaded.
+fn _par_sph_run(kind, threads): i64 {
+    if (kind == 0) {
         # `steps` steps of one fresh solver, stopping at the first error.
         var sc: PvFluidConfig;
         _par_config_in(0, &sc);
         var mu: f64 = _par_in(14);
         var sv: PvSphSolver = PvSphSolver_with_surface_tension(_par_in(15));
+        var sv_t = sv.set_threads(threads);
         sv.use_verlet = _par_in(16);
         var steps = _par_in(17);
         var buf, n, k = _par_particles_in(18);
@@ -1227,12 +1240,13 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(buf);
         return 1;
     }
-    if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) {
+    if (kind == 1) {
         # `steps` PCISPH steps of one fresh solver, stopping at the first error (M5 part b).
         var pc: PvFluidConfig;
         _par_config_in(0, &pc);
         var pmu: f64 = _par_in(14);
         var psv: PvSphSolver = PvSphSolver_with_surface_tension(_par_in(15));
+        var psv_t = psv.set_threads(threads);
         var iters = _par_in(16);
         var max_err: f64 = _par_in(17);
         var psteps = _par_in(18);
@@ -1255,12 +1269,13 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(pb);
         return 1;
     }
-    if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) {
+    if (kind == 2) {
         # `steps` DFSPH steps of one fresh solver, stopping at the first error (M5 part c).
         var dc: PvFluidConfig;
         _par_config_in(0, &dc);
         var dmu: f64 = _par_in(14);
         var dsv: PvSphSolver = PvSphSolver_new();
+        var dsv_t = dsv.set_threads(threads);
         var diters = _par_in(15);
         var derr: f64 = _par_in(16);
         var dsteps = _par_in(17);
@@ -1283,11 +1298,12 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(db);
         return 1;
     }
-    if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) {
+    if (kind == 3) {
         # `steps` multiphase steps of one fresh solver, stopping at the first error (M5 part d).
         var mc: PvFluidConfig;
         _par_config_in(0, &mc);
         var msv: PvSphSolver = PvSphSolver_with_surface_tension(_par_in(14));
+        var msv_t = msv.set_threads(threads);
         var mp: PvMultiPhaseConfig = _pv_mp_empty(_par_in(15));
         var np = _par_in(16);
         for (var a = 0; a < np; a = a + 1) {
@@ -1295,7 +1311,11 @@ fn _par_sph_solver(fp, fl): i64 {
             pp.rest_density = _par_in(17 + a * 3);
             pp.gas_constant = _par_in(18 + a * 3);
             pp.viscosity = _par_in(19 + a * 3);
-            if (mp.push_phase(pp) == 0) { return 0 - 1; }
+            if (mp.push_phase(pp) == 0) {
+                PvMultiPhaseConfig_drop(&mp);
+                PvSphSolver_drop(&msv);
+                return 0 - 1;
+            }
         }
         var msteps = _par_in(17 + np * 3);
         var mb, mn, mk = _par_particles_in(18 + np * 3);
@@ -1318,6 +1338,18 @@ fn _par_sph_solver(fp, fl): i64 {
         fl_free(mb);
         return 1;
     }
+    return 0 - 1;
+}
+
+fn _par_sph_solver(fp, fl): i64 {
+    var kind = _par_sph_kind(fp, fl);
+    if (kind >= 0) {
+        # At one thread (the gated outputs), then at every count in _PAR_THREADS, each of which must give the same
+        # words (port plan D6: any thread count gives the serial bits).
+        if (_par_sph_run(kind, 1) < 0) { return 0 - 1; }
+        if (_par_threads_agree("SphSolver steps", 15, &_par_sph_run, kind) == 0) { return 0 - 1; }
+        return 1;
+    }
     if (_par_eq(fp, fl, "SphSolver::adaptive_dt") == 1) {
         var ab, an, ak = _par_particles_in(5);
         var aps: *PvFluidParticle = _pv_as_particles(ab);
@@ -1332,7 +1364,8 @@ fn _par_sph_solver(fp, fl): i64 {
 # The other part d rows (M4 part d): 1 handled, 0 another function.
 fn _par_sph_d(fp, fl): i64 {
     if (_par_sph_listed(fp, fl) == 1) { return 1; }
-    if (_par_sph_solver(fp, fl) == 1) { return 1; }
+    var sr = _par_sph_solver(fp, fl);
+    if (sr != 0) { return sr; }
     if (_par_eq(fp, fl, "oracle::invert_3x3") == 1) {
         var m[72];
         var out[72];
@@ -1504,16 +1537,18 @@ fn _par_sph(fp, fl): i64 {
         var g: PvNeighborGrid;
         PvNeighborGrid_init(&g);
         if (_pv_nb_build(&g, ps, n, h) == 0) { return 0 - 1; }
+        # The f64 grid's dump (ADR 0002 #2): its cell size, point and cell counts, each point's key, the lists. The
+        # oracle's rows (an f32 grid, with its f32 positions) are all mapped by name in sph.d3.tsv.
         _par_got_f(_pv_bits(g.cell_size));
         _par_got_i(g.len);
         _par_got_i(g.cells);
-        _par_col_out(_pv_nb_col(&g, 0));
-        _par_got_seq(3 * n);
-        for (var k = 0; k < 3 * n; k = k + 1) { _par_got_i(_pv_sph_cell_key(load64(g.pos32.data + k * 8), h)); }
-        var off: *PvColumn = _pv_nb_col(&g, 5);
+        var keys: *PvColumn = _pv_nb_col(&g, 0);
+        _par_got_seq(keys.len);
+        for (var k = 0; k < keys.len; k = k + 1) { _par_got_i(load64(keys.data + k * 8)); }
+        var off: *PvColumn = _pv_nb_col(&g, 4);
         _par_got_seq(off.len);
         for (var o = 0; o < off.len; o = o + 1) { _par_got_i(load64(off.data + o * 8)); }
-        var idx: *PvColumn = _pv_nb_col(&g, 6);
+        var idx: *PvColumn = _pv_nb_col(&g, 5);
         _par_got_seq(idx.len);
         for (var x = 0; x < idx.len; x = x + 1) { _par_got_i(load64(idx.data + x * 8)); }
         PvNeighborGrid_drop(&g);
@@ -2220,9 +2255,11 @@ fn _par_got_same(j, sk, sv, sl): i64 {
     return 1;
 }
 
-# Re-runs the current step row at each thread count and compares every output word with the one-thread run: 1 when
-# all agree. The got list is left as the one-thread run made it.
-fn _par_fg_threads_agree(ks): i64 {
+# Re-runs the current row at each thread count in _PAR_THREADS by fncall2(run, arg, threads), which appends the row's
+# outputs to the got list (1, or -1 when its inputs can't be loaded), and compares every output word with the
+# one-thread run: 1 when all agree. The got list is left as the one-thread run made it. A difference is printed under
+# the name (nl bytes) and counted in the module's thread-count line.
+fn _par_threads_agree(name, nl, run, arg): i64 {
     if (load64(&_par_threads) == 0) {
         store64(&_par_threads, 2);
         store64(&_par_threads + 8, 3);
@@ -2241,11 +2278,7 @@ fn _par_fg_threads_agree(ks): i64 {
     for (var t = 0; t < _PAR_THREADS; t = t + 1) {
         var threads = load64(&_par_threads + t * 8);
         _par_got_n = 0;
-        var g: PvFluidGrid;
-        if (_par_fg_in(0, &g) < 0) { ok = 0; break; }
-        var set = g.set_threads(threads);
-        _par_fg_steps(&g, ks);
-        PvFluidGrid_drop(&g);
+        if (fncall2(run, arg, threads) < 0) { ok = 0; break; }
         var same = 1;
         if (_par_got_n != n0) { same = 0; }
         for (var j = 0; same == 1 && j < n0; j = j + 1) {
@@ -2253,7 +2286,9 @@ fn _par_fg_threads_agree(ks): i64 {
         }
         if (same == 0) {
             ok = 0;
-            print("  FluidGrid::step: ", 18);
+            print("  ", 2);
+            print(name, nl);
+            print(": ", 2);
             fmt_int(threads);
             println(" threads differ from one");
         }
@@ -2268,6 +2303,17 @@ fn _par_fg_threads_agree(ks): i64 {
     _par_mt_rows = _par_mt_rows + 1;
     if (ok == 0) { _par_mt_bad = _par_mt_bad + 1; }
     return ok;
+}
+
+# The current `FluidGrid::step` row (its steps from input ks) on a freshly loaded grid at `threads` threads: 1, or -1
+# when the grid can't be loaded.
+fn _par_fg_mt_run(ks, threads): i64 {
+    var g: PvFluidGrid;
+    if (_par_fg_in(0, &g) < 0) { return 0 - 1; }
+    var set = g.set_threads(threads);
+    _par_fg_steps(&g, ks);
+    PvFluidGrid_drop(&g);
+    return 1;
 }
 
 fn _par_grid(fp, fl): i64 {
@@ -2407,7 +2453,7 @@ fn _par_grid(fp, fl): i64 {
         # At one thread (the gated outputs), then at every count in _PAR_THREADS, each of which must give the same
         # words (port plan D6: any thread count gives the serial bits).
         _par_fg_steps(&g, ks);
-        if (_par_fg_threads_agree(ks) == 0) { handled = 0 - 1; }
+        if (_par_threads_agree("FluidGrid::step", 15, &_par_fg_mt_run, ks) == 0) { handled = 0 - 1; }
     } else {
         handled = 0;
     }
@@ -2618,6 +2664,18 @@ fn _par_module_done(mp, ml) {
         print(" rows, ", 7);
         fmt_int(_par_mt_bad);
         println(" differing from one thread");
+        _par_mt_rows = 0;
+        _par_mt_bad = 0;
+        return 0;
+    }
+    if (_par_eq(mp, ml, "sph") == 1) {
+        print("  thread counts: the SphSolver steps at 2, 3, 4 and 8 threads: ", 63);
+        fmt_int(_par_mt_rows);
+        print(" rows, ", 7);
+        fmt_int(_par_mt_bad);
+        println(" differing from one thread");
+        _par_mt_rows = 0;
+        _par_mt_bad = 0;
         return 0;
     }
     if (_par_eq(mp, ml, "math") != 1) { return 0; }

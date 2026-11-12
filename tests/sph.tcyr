@@ -768,7 +768,7 @@ fn same_particles(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
 # Cyrius-only: the solver's layout, and `reset_integrator` (a reset solver's next Verlet step is a fresh solver's).
 fn test_solver_layout() {
     test_group("solver_layout_matches_column_offsets");
-    assert_eq(sizeof(PvSphSolver), 480, "480 bytes");
+    assert_eq(sizeof(PvSphSolver), 472, "472 bytes");
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
     var bp, bn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
     var ps: *PvFluidParticle = _pv_as_particles(bp);
@@ -1319,9 +1319,100 @@ fn test_lists() {
     var before = g.indices.len;
     assert_eq(_pv_nb_build(&g, ps, n, 0.1), 1, "rebuilt");
     assert_eq(g.indices.len, before, "the same lists");
+
+    test_group("nb_f64_keys_at_large_coordinates");
+    # The same lattice moved to x = 10⁶ and 10¹², where the f32 keys put probes in other cells and listed cells
+    # twice (D3): the f64 lists still hold every particle within h, each once.
+    var offs[16];
+    store64(&offs, _pv_bits(1000000.0));
+    store64(&offs + 8, _pv_bits(1000000000000.0));
+    var cover = 0;
+    for (var t = 0; t < 2; t = t + 1) {
+        var o: f64 = load64(&offs + t * 8);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var q2: *PvFluidParticle = ps + i2;
+            q2.position.x = q2.position.x + o;
+        }
+        assert_eq(_pv_nb_build(&g, ps, n, 0.1), 1, "built");
+        if (lists_cover(&g, ps, n, 0.1) == 1) { cover = cover + 1; }
+        for (var i3 = 0; i3 < n; i3 = i3 + 1) {
+            var q3: *PvFluidParticle = ps + i3;
+            q3.position.x = q3.position.x - o;
+        }
+    }
+    assert_eq(cover, 2, "every particle within h listed once, at 10⁶ and 10¹²");
+
+    test_group("nb_f64_keys_saturate_without_wrapping");
+    # Keys saturate at i64::MAX (+∞) and i64::MIN (−∞): neither cell has a neighbour past the range on any axis, so
+    # the two never list each other (a wrapped c ± 1 would). A NaN coordinate is key 0, as hisab's.
+    var sp = fl_alloc(9 * sizeof(PvFluidParticle));
+    var sat: *PvFluidParticle = _pv_as_particles(sp);
+    var inf: f64 = PV_F64_INFINITY;
+    var ninf: f64 = -PV_F64_INFINITY;
+    var nan: f64 = PV_F64_NAN;
+    var xs[216];   # 9 points × (x, y, z)
+    for (var w = 0; w < 27; w = w + 1) { store64(&xs + w * 8, _pv_bits(0.0)); }
+    store64(&xs, _pv_bits(inf));
+    store64(&xs + 24, _pv_bits(inf));
+    store64(&xs + 48, _pv_bits(ninf));
+    store64(&xs + 72, _pv_bits(nan));
+    for (var w2 = 4; w2 < 9; w2 = w2 + 1) { store64(&xs + w2 * 24, _pv_bits(0.05)); }
+    store64(&xs + 5 * 24 + 8, _pv_bits(inf));
+    store64(&xs + 6 * 24 + 8, _pv_bits(ninf));
+    store64(&xs + 7 * 24 + 16, _pv_bits(inf));
+    store64(&xs + 8 * 24 + 16, _pv_bits(ninf));
+    for (var i4 = 0; i4 < 9; i4 = i4 + 1) {
+        var q4: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 0.001);
+        q4.position = PvVec3_new(load64(&xs + i4 * 24), load64(&xs + i4 * 24 + 8), load64(&xs + i4 * 24 + 16));
+        var d4: *PvFluidParticle = sat + i4;
+        *d4 = q4;
+    }
+    assert_eq(_pv_nb_build(&g, sat, 9, 0.1), 1, "built");
+    assert(load64(g.keys.data) == 9223372036854775807 && load64(g.keys.data + 48) == 0 - 9223372036854775807 - 1,
+      "+∞ is i64::MAX, −∞ i64::MIN");
+    assert(load64(g.keys.data + 72) == 0 && load64(g.keys.data + 96) == 0, "NaN is cell 0, as 0.05 at h 0.1");
+    var o0 = load64(g.offsets.data);
+    var o1 = load64(g.offsets.data + 8);
+    var o2 = load64(g.offsets.data + 16);
+    var o3 = load64(g.offsets.data + 24);
+    var o4 = load64(g.offsets.data + 32);
+    assert(o1 - o0 == 2 && listed(&g, o0, o1, 0) == 1 && listed(&g, o0, o1, 1) == 1, "x = +∞ lists the two at +∞");
+    assert(o3 - o2 == 1 && listed(&g, o2, o3, 2) == 1, "x = −∞ lists itself alone");
+    assert(o4 - o3 == 2 && listed(&g, o3, o4, 3) == 1 && listed(&g, o3, o4, 4) == 1, "NaN lists cell 0's two");
+    var alone = 0;
+    for (var a5 = 5; a5 < 9; a5 = a5 + 1) {
+        var s5 = load64(g.offsets.data + a5 * 8);
+        var e5 = load64(g.offsets.data + (a5 + 1) * 8);
+        if (e5 - s5 == 1 && listed(&g, s5, e5, a5) == 1) { alone = alone + 1; }
+    }
+    assert_eq(alone, 4, "y = ±∞ and z = ±∞ each list themselves alone");
+    fl_free(sp);
     PvNeighborGrid_drop(&g);
     fl_free(ps);
     return 0;
+}
+
+# 1 when every particle's list in g holds each particle within h of it (itself included) exactly once, and nothing
+# farther than its 27 cells.
+fn lists_cover(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
+    var h2: f64 = h * h;
+    var off = g.offsets.data;
+    for (var a = 0; a < n; a = a + 1) {
+        var s = load64(off + a * 8);
+        var e = load64(off + (a + 1) * 8);
+        var pa: *PvFluidParticle = ps + a;
+        for (var b = 0; b < n; b = b + 1) {
+            var pb: *PvFluidParticle = ps + b;
+            var dx: f64 = pa.position.x - pb.position.x;
+            var dy: f64 = pa.position.y - pb.position.y;
+            var r2: f64 = dx * dx + dy * dy;
+            if (r2 < h2 && listed(g, s, e, b) == 0) { return 0; }
+        }
+        for (var r = s + 1; r < e; r = r + 1) {
+            if (listed(g, s, r, load64(g.indices.data + r * 8)) == 1) { return 0; }
+        }
+    }
+    return 1;
 }
 
 # 1 when every component of v is NaN.
@@ -1382,7 +1473,7 @@ fn nb_col_data(g: *PvNeighborGrid, k): i64 {
 # Cyrius-only: the record layout the column offsets assume.
 fn test_layout() {
     test_group("nb_layout_matches_column_offsets");
-    assert_eq(sizeof(PvNeighborGrid), 224, "224 bytes");
+    assert_eq(sizeof(PvNeighborGrid), 200, "200 bytes");
     var buf[288];
     var ps: *PvFluidParticle = _pv_as_particles(&buf);
     var q0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
@@ -1392,14 +1483,13 @@ fn test_layout() {
     var g: PvNeighborGrid;
     PvNeighborGrid_init(&g);
     assert_eq(_pv_nb_build(&g, ps, 2, 0.1), 1, "a build sizes every column");
-    assert_eq(nb_col_data(&g, 0), g.pos32.data, "0: pos32");
-    assert_eq(nb_col_data(&g, 1), g.keys.data, "1: keys");
-    assert_eq(nb_col_data(&g, 2), g.order.data, "2: order");
-    assert_eq(nb_col_data(&g, 3), g.tmp.data, "3: tmp");
-    assert_eq(nb_col_data(&g, 4), g.cstart.data, "4: cstart");
-    assert_eq(nb_col_data(&g, 5), g.offsets.data, "5: offsets");
-    assert_eq(nb_col_data(&g, 6), g.indices.data, "6: indices");
-    assert_eq(nb_col_data(&g, 7), g.ckeys.data, "7: ckeys");
+    assert_eq(nb_col_data(&g, 0), g.keys.data, "0: keys");
+    assert_eq(nb_col_data(&g, 1), g.order.data, "1: order");
+    assert_eq(nb_col_data(&g, 2), g.tmp.data, "2: tmp");
+    assert_eq(nb_col_data(&g, 3), g.cstart.data, "3: cstart");
+    assert_eq(nb_col_data(&g, 4), g.offsets.data, "4: offsets");
+    assert_eq(nb_col_data(&g, 5), g.indices.data, "5: indices");
+    assert_eq(nb_col_data(&g, 6), g.ckeys.data, "6: ckeys");
     PvNeighborGrid_drop(&g);
     return 0;
 }

@@ -14,7 +14,7 @@ cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml          
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check             # verify; exit 1 on any difference
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # rayon on: must match
 python3 -I -B scripts/oracle/validate.py .                                                    # independent re-check
-python3 -I -B scripts/oracle/validate.py . --write                                            # regenerate the corrected oracle and the cr tables
+python3 -I -B scripts/oracle/validate.py . --write                                            # regenerate the corrected oracle, the f64-key oracle and the cr tables
 python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
 ```
 
@@ -97,6 +97,22 @@ fn <TAB> inputs <TAB> corrected outputs <TAB> note
   `<fn>(<args>) glibc f:… correctly rounded f:…`.
 - **A module with no such row** has no `.cr.tsv`, and `modules.txt` never lists one.
 
+## The f64-key oracle (ADR 0002 #2)
+
+`tests/golden/<module>.d3.tsv` holds the rows whose outputs change on f64 neighbour keys, the D3 switch of M5 part e:
+every `oracle::sph_cell_key` row of `math`, and the `SphSolver::neighbor_lists` and solver step rows of `sph` whose
+lists change. The oracle hashes f32 positions (hisab 1.4.0); the port keys f64 positions by floor(x · fl(1/h)) as i64,
+hisab 3.4.1's cell, and lists the cells at a particle's key ± 1 per axis. `validate.py --write` writes the file from
+its own transcription of that grid (`nb_build64`: a dict of cells and integer offsets, where the port sorts runs and
+searches them), with the oracle's operations otherwise unchanged. The format is the `.cr.tsv` one:
+
+- **The key:** fn and inputs are the golden row's fields, byte for byte. The harness compares that row against these
+  outputs, and a pass is *accepted (ADR 2)*.
+- **The outputs** of a `neighbor_lists` row are the f64 grid's dump: its cell size (h), the point and cell counts,
+  each point's key and the lists. The oracle's dump also held the f32 positions, so every such row is here.
+- **The note:** `oracle (f32 keys)` and the start of the oracle's own outputs.
+- **A module the switch doesn't change** has no `.d3.tsv`.
+
 The same `--write` writes the tables of the correctly rounded primitives:
 - `src/crmath_data.cyr`, by `crtables.py`, a copy of impetus's: π and ln 2 come from exact integer series, and are
   checked against MPFR to 2,048 bits;
@@ -131,10 +147,12 @@ oracle:
   (the Morton codes, stable on input index); and part c's brute-force sums, free step, block, split (glibc's sin and
   cos for the record, MPFR's for `sph.cr.tsv`) and merge; and part d's physics extensions, the 3×3 inverse
   (hisab 1.4.0's LU) and the contact angle (its cosine from glibc and MPFR); and M5's solver step, on the grid
-  transcription, each scene's trajectory cached across its frames, and its PCISPH, DFSPH and multiphase steps;
+  transcription, each scene's trajectory cached across its frames, and its PCISPH, DFSPH and multiphase steps; and,
+  for the f64-key oracle, every list-dependent row again on `nb_build64` (M5 part e);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
-- it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;
+- it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what
+  is committed;
 - it checks crmath's π and ln 2 against MPFR, every table's head against MPFR's correctly rounded value, and the ln
   tables' ln 2 and 1/ln 10 against integer series MPFR doesn't share.
 

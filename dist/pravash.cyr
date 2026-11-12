@@ -4026,6 +4026,16 @@ fn _pv_as_i32(x: f64): i64 {
     return f64_to(x);
 }
 
+# `x as i64`: toward zero, saturating at i64::MIN / i64::MAX, NaN → 0 (hisab 3.4.1's `_sh_cell_coord` cast).
+#must_use
+fn _pv_as_i64(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x >= 9223372036854775808.0) { return 9223372036854775807; }
+    var lo: f64 = -9223372036854775808.0;
+    if (x <= lo) { return 0 - 9223372036854775807 - 1; }
+    return f64_to(x);
+}
+
 # `x as u32`: toward zero, saturating at 0 and u32::MAX, NaN → 0.
 #must_use
 fn _pv_as_u32(x: f64): i64 {
@@ -9424,6 +9434,12 @@ struct PvKernelCoeffs {
     poly6_lap: f64;
 }
 
+# A typed view of a word (the solver's pool kernels read their coefficients through one).
+#must_use
+fn _pv_as_kc(p): *PvKernelCoeffs {
+    return p;
+}
+
 # The coefficients for smoothing radius h into *kc (Rust only debug-asserts h > 0; another h gives what its
 # arithmetic gives): h², 315/((64π)·h⁹), −45/(π·h⁶), 45/(π·h⁶) and −945/((32π)·h⁹) twice, with h⁶ = h³·h³ and
 # h⁹ = h⁶·h³. Mirrors `KernelCoeffs::new`.
@@ -9828,24 +9844,26 @@ fn max_speed(ps: *PvFluidParticle, n): f64 {
 
 # --- neighbor.cyr ---
 
-# neighbor.cyr — the SPH neighbour grid (M4 part b): hisab 1.4.0's `SpatialHash` as `SphSolver` uses it, on sorted
-# arrays, with its f32 cell keys reproduced bit for bit (port plan D3), and the solver's neighbour lists exactly as
-# its private `build_neighbors` makes them. Also the stable merge sort the grid and `sort_by_zorder` share.
+# neighbor.cyr — the SPH neighbour grid (M4 part b, switched to f64 keys in M5 part e): the cells of hisab's
+# `SpatialHash` as `SphSolver` uses it, on sorted arrays, and the solver's neighbour lists in `build_neighbors`' order.
+# Also the stable merge sort the grid and `sort_by_zorder` share.
 #
-# hisab keeps a `HashMap<(i32, i32, i32), Vec<usize>>`: each cell's indices in insertion order, which is index
-# order, since the solver inserts particle i at step i. Sorting the points on (cell key, index) gives every cell as
-# one run in that same order, and a cell lookup is a search over the runs: the same lists, with no map to iterate
-# (CLAUDE.md: never iterate a hashmap) and nothing allocated once the grid has grown. The cells are ordered z, then
-# y, then x, so a probe row's three cells (one z and y, three x) sit together: one binary search finds the first, and
-# a short scan the others. The order of the cells never shows in the lists, which follow the probes.
+# hisab keeps a `HashMap` of cells: each cell's indices in insertion order, which is index order, since the solver
+# inserts particle i at step i. Sorting the points on (cell key, index) gives every cell as one run in that same
+# order, and a cell lookup is a search over the runs: the same lists, with no map to iterate (CLAUDE.md: never
+# iterate a hashmap) and nothing allocated once the grid has grown. The cells are ordered z, then y, then x, so a
+# list row's three cells (one z and y, three consecutive x) sit together: one binary search finds the first, and a
+# short scan the others. The order of the cells never shows in the lists, which follow (dz, dy, dx).
 #
-# The keys are f32, as hisab's are: floor(x · (1/cell)) as i32 per axis on the f32 position, saturating. At large
-# coordinates the f32 rounding moves the solver's probe points into other cells (the defect D3 later fixes with f64
-# keys): the port reproduces that too.
+# The keys are f64 (port plan D3, ADR 0002 #2): floor(x · fl(1/h)) as a saturating i64 per axis, hisab 3.4.1's
+# `_sh_cell_coord`, and a particle's lists are the 27 cells at its own key ± 1 on each axis, in integers. Rust 1.3.0
+# keys f32 positions (hisab 1.4.0) and finds each neighbour cell by re-keying an f32 probe point at its centre, which
+# at |x| ≈ 10⁶ lands in another cell for 89% of the points (port-parity §4.4) and can list a cell twice. The rows the
+# switch changes are checked against tests/golden/<module>.d3.tsv, the f64 lists of scripts/oracle/validate.py.
 #
 # UPSTREAM(L4): hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md
-#   replace `PvNeighborGrid` with hisab's `spatial_hash_*` once its query writes into caller storage (and keeps the
-#   f32 keys until the D3 switch); parity: the `SphSolver::neighbor_lists` rows of tests/golden/sph.tsv (class A).
+#   replace `PvNeighborGrid` with hisab's `spatial_hash_*` once its query writes into caller storage (its f64 cells
+#   are these keys); parity: the `SphSolver::neighbor_lists` rows of tests/golden/sph.tsv and sph.d3.tsv (class A).
 # UPSTREAM(L9): cyrius:docs/development/issues/2026-11-11-no-stable-sort.md
 #   replace `_pv_msort` with the stdlib's stable sort once it ships; parity: the neighbour lists and the
 #   `sort_by_zorder` rows (class A).
@@ -9902,45 +9920,36 @@ fn _pv_msort(idx, n, tmp, cmp, ctx) {
     return 0;
 }
 
-# ── the f32 cell key ────────────────────────────────────────────────────────────────
+# ── the f64 cell key ────────────────────────────────────────────────────────────────
 
-# floor(x · inv) as i32, in f32 (x and inv are f32 values, passed widened): the product rounded to f32, floored
-# exactly, and cast saturating (NaN 0). Mirrors hisab 1.4.0 `SpatialHash::cell_key` on one axis, and the solver's
-# own `(pos.x * inv_cs).floor() as i32`.
+# floor(x · inv) as a saturating i64 (NaN 0): one axis of a cell key, inv the grid's fl(1/cell). Mirrors hisab 3.4.1
+# `_sh_cell_coord` (ADR 0002 #2).
 #must_use
 fn _pv_nb_key(x: f64, inv: f64): i64 {
-    var a: f32 = f32_from(x);
-    var b: f32 = f32_from(inv);
-    var p: f32 = a * b;
-    var w: f64 = f32_to(p);
-    var fl: f64 = f64_floor(w);
-    return _pv_as_i32(fl);
+    var prod: f64 = x * inv;
+    var fl: f64 = f64_floor(prod);
+    return _pv_as_i64(fl);
 }
 
-# The cell key of position p (f64) at smoothing radius h: (p as f32 · (1 / h as f32)).floor() as i32. Mirrors the
-# oracle hook `sph_cell_key` on one axis.
+# The cell key of position p (one axis) at smoothing radius h: floor(p · fl(1/h)) as i64. The f64 form of the oracle
+# hook `sph_cell_key`, whose f32 rows are mapped by name (ADR 0002 #2).
 #must_use
 fn _pv_sph_cell_key(p: f64, h: f64): i64 {
-    var h32: f32 = f32_from(h);
-    var one: f32 = f32_from(1.0);
-    var inv: f32 = one / h32;
-    var p32: f32 = f32_from(p);
-    var pw: f64 = f32_to(p32);
-    var iw: f64 = f32_to(inv);
-    return _pv_nb_key(pw, iw);
+    var one: f64 = 1.0;
+    var inv: f64 = one / h;
+    return _pv_nb_key(p, inv);
 }
 
 # ── the grid ────────────────────────────────────────────────────────────────────────
 
-# The neighbour grid of one solver: hisab's `SpatialHash` state (its f32 cell size and 1/cell, both widened to
-# f64, exactly), the points of the last build sorted into cells, and the neighbour lists in CSR form. Every column is
-# reused across builds. Starts as `SphSolver::new`'s grid: cell size 1, empty.
+# The neighbour grid of one solver: the cell size of the last build (its h) and fl(1/h), the points of that build
+# sorted into cells (their keys, 3 words a point), and the neighbour lists in CSR form. Every column is reused across
+# builds. Starts as `SphSolver::new`'s grid: cell size 1, empty.
 struct PvNeighborGrid {
     cell_size: f64;
     inv_cell: f64;
     len;
     cells;
-    pos32: PvColumn;
     keys: PvColumn;
     order: PvColumn;
     tmp: PvColumn;
@@ -9950,12 +9959,15 @@ struct PvNeighborGrid {
     ckeys: PvColumn;
 }
 
-# Column k of a grid (0 pos32, 1 keys, 2 order, 3 tmp, 4 cstart, 5 offsets, 6 indices, 7 ckeys), by its byte offset
-# (tests/sph.tcyr pins the layout, 224 bytes).
+# Column k of a grid (0 keys, 1 order, 2 tmp, 3 cstart, 4 offsets, 5 indices, 6 ckeys), by its byte offset
+# (tests/sph.tcyr pins the layout, 200 bytes).
 #must_use
 fn _pv_nb_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 32 + k * 24);
 }
+
+# The grid's column count.
+const _PV_NB_COLUMNS = 7;
 
 # An empty grid of cell size 1 into *g (nothing allocated yet). Mirrors `SpatialHash::new(1.0)` in `SphSolver::new`.
 fn PvNeighborGrid_init(g: *PvNeighborGrid) {
@@ -9963,7 +9975,7 @@ fn PvNeighborGrid_init(g: *PvNeighborGrid) {
     g.inv_cell = 1.0;
     g.len = 0;
     g.cells = 0;
-    for (var k = 0; k < 8; k = k + 1) {
+    for (var k = 0; k < _PV_NB_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_nb_col(g, k);
         c.data = 0;
         c.len = 0;
@@ -9974,7 +9986,7 @@ fn PvNeighborGrid_init(g: *PvNeighborGrid) {
 
 # Releases the grid's columns; it is empty and usable again (cell size kept).
 fn PvNeighborGrid_drop(g: *PvNeighborGrid) {
-    for (var k = 0; k < 8; k = k + 1) {
+    for (var k = 0; k < _PV_NB_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_nb_col(g, k);
         c.drop();
     }
@@ -10021,25 +10033,6 @@ fn _pv_nb_lower(ck, lo, hi, kx, ky, kz): i64 {
     return lo;
 }
 
-# s as an i32 (two's-complement wrap): `cx + dx` in the solver, which Rust's release builds wrap (an overflow-checked
-# build panics instead, and the oracle's rows never reach it).
-#must_use
-fn _pv_wrap_i32(s): i64 {
-    var w = s & 0xFFFFFFFF;
-    if (w >= 2147483648) { w = w - 4294967296; }
-    return w;
-}
-
-# The grid's key of the probe for cell c on one axis: (c as i32) as f32 · h + h/2 in f32 (h and h/2 f32 values,
-# passed widened), keyed by the grid's 1/cell. Mirrors one axis of `build_neighbors`' probe and `query_cell`.
-#must_use
-fn _pv_nb_probe(c, h: f64, half: f64, inv_cell: f64): i64 {
-    var b: f32 = f32_from(f64_from(_pv_wrap_i32(c)));
-    var p: f32 = (b * f32_from(h)) + f32_from(half);
-    var w: f64 = f32_to(p);
-    return _pv_nb_key(w, inv_cell);
-}
-
 # Appends order[a..b) to the list column: 1, or 0 when it can't grow (unchanged). The capacity at least doubles, as
 # `extend_from_slice`'s does.
 #must_use
@@ -10060,61 +10053,37 @@ fn _pv_nb_append(c: *PvColumn, order, a, b): i64 {
     return 1;
 }
 
-# Rebuilds the grid from the n particles at ps and makes their neighbour lists at smoothing radius h (the caller has
-# checked h as f32 is finite and > 0), as `SphSolver::build_neighbors` does:
-# - the grid is renewed with cell size h as f32 when it differs from the current one by more than f32::EPSILON;
-#   otherwise only emptied, and it keeps its old 1/cell (the probes below still use 1/h as f32);
-# - each position as f32 is inserted under the grid's key;
-# - each particle's lists are the 27 cells around its own key (by 1/h as f32), probed at (c + d)·h + h/2 in f32 for
-#   d = −1 … 1, z outermost, then y, then x, each probe's cell looked up by the grid's key: a cell probed twice (at
-#   large coordinates) is listed twice, as in Rust.
+# Rebuilds the grid from the n particles at ps and makes their neighbour lists at smoothing radius h (finite and > 0,
+# with 1/h finite: the steps check h as f32), as `SphSolver::build_neighbors` does with f64 keys (ADR 0002 #2):
+# - the cell size is h and every point is keyed by fl(1/h), each build (Rust keeps its old f32 grid when h as f32 is
+#   within f32::EPSILON of it, while keying the probes by the new h: the two sizes no longer differ);
+# - each particle's list is the 27 cells around its own key (c − 1, c, c + 1 per axis, z outermost, then y, then x),
+#   each cell's points in index order; an offset past i64's range (a saturated key) has no cell.
 # 1, or 0 when a column can't grow (the lists are then unusable; Rust aborts). Mirrors `build_neighbors`.
 #must_use
 fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
-    var h32: f32 = f32_from(h);
-    var one: f32 = f32_from(1.0);
-    var inv_cs: f32 = one / h32;
-    var half: f32 = h32 * f32_from(0.5);
-    var cs: f32 = f32_from(g.cell_size);
-    var d32: f32 = cs - h32;
-    var dw: f64 = f32_to(d32);
-    var ad: f64 = f64_abs(dw);
-    var eps: f64 = f32_to(PV_F32_EPSILON);
-    if (ad > eps) {
-        var inv_new: f32 = one / h32;
-        g.cell_size = f32_to(h32);
-        g.inv_cell = f32_to(inv_new);
-    }
-    var cpos: *PvColumn = _pv_nb_col(g, 0);
-    var ckey: *PvColumn = _pv_nb_col(g, 1);
-    var cord: *PvColumn = _pv_nb_col(g, 2);
-    var ctmp: *PvColumn = _pv_nb_col(g, 3);
-    var ccs: *PvColumn = _pv_nb_col(g, 4);
-    var coff: *PvColumn = _pv_nb_col(g, 5);
-    var cidx: *PvColumn = _pv_nb_col(g, 6);
-    var cck: *PvColumn = _pv_nb_col(g, 7);
-    var ok = cpos.resize(3 * n, 0) & ckey.resize(3 * n, 0) & cord.resize(n, 0) & ctmp.resize(n, 0);
-    ok = ok & ccs.resize(n + 1, 0) & coff.resize(n + 1, 0) & cck.resize(3 * n, 0);
+    var one: f64 = 1.0;
+    var inv: f64 = one / h;
+    g.cell_size = h;
+    g.inv_cell = inv;
+    var ckey: *PvColumn = _pv_nb_col(g, 0);
+    var cord: *PvColumn = _pv_nb_col(g, 1);
+    var ctmp: *PvColumn = _pv_nb_col(g, 2);
+    var ccs: *PvColumn = _pv_nb_col(g, 3);
+    var coff: *PvColumn = _pv_nb_col(g, 4);
+    var cidx: *PvColumn = _pv_nb_col(g, 5);
+    var cck: *PvColumn = _pv_nb_col(g, 6);
+    var ok = ckey.resize(3 * n, 0) & cord.resize(n, 0) & ctmp.resize(n, 0) & ccs.resize(n + 1, 0);
+    ok = ok & coff.resize(n + 1, 0) & cck.resize(3 * n, 0);
     if (ok == 0) { return 0; }
-    var pos = cpos.data;
     var keys = ckey.data;
     var order = cord.data;
-    var inv_cell: f64 = g.inv_cell;
-    # The f32 positions, inserted under the grid's key.
+    # Each point's key.
     for (var i = 0; i < n; i = i + 1) {
         var p: *PvFluidParticle = ps + i;
-        var x32: f32 = f32_from(p.position.x);
-        var y32: f32 = f32_from(p.position.y);
-        var z32: f32 = f32_from(p.position.z);
-        var xw: f64 = f32_to(x32);
-        var yw: f64 = f32_to(y32);
-        var zw: f64 = f32_to(z32);
-        store64(pos + i * 24, _pv_bits(xw));
-        store64(pos + i * 24 + 8, _pv_bits(yw));
-        store64(pos + i * 24 + 16, _pv_bits(zw));
-        store64(keys + i * 24, _pv_nb_key(xw, inv_cell));
-        store64(keys + i * 24 + 8, _pv_nb_key(yw, inv_cell));
-        store64(keys + i * 24 + 16, _pv_nb_key(zw, inv_cell));
+        store64(keys + i * 24, _pv_nb_key(p.position.x, inv));
+        store64(keys + i * 24 + 8, _pv_nb_key(p.position.y, inv));
+        store64(keys + i * 24 + 16, _pv_nb_key(p.position.z, inv));
         store64(order + i * 8, i);
     }
     _pv_msort(order, n, ctmp.data, &_pv_nb_cmp, keys);
@@ -10139,55 +10108,41 @@ fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
     store64(cst + cells * 8, n);
     g.cells = cells;
     g.len = n;
-    # The lists. Each axis's three probe keys depend on that axis alone, so they're made once a particle.
+    # The lists: for each (dz, dy) row, the first cell at or after x key c − 1 by a binary search, then the row's
+    # cells up to c + 1 in x order, which is dx's.
     cidx.truncate(0);
     var off = coff.data;
     store64(off, 0);
-    var invw: f64 = f32_to(inv_cs);
-    var hw: f64 = f32_to(h32);
-    var halfw: f64 = f32_to(half);
-    var pk[72];   # the probe keys: axis a (x, y, z), offset d (−1, 0, 1) at word 3·a + d + 1
+    var kmax = 9223372036854775807;
+    var kmin = 0 - 9223372036854775807 - 1;
     for (var q = 0; q < n; q = q + 1) {
-        for (var ax = 0; ax < 3; ax = ax + 1) {
-            var c = _pv_nb_key(load64(pos + q * 24 + ax * 8), invw);
-            for (var d = 0; d < 3; d = d + 1) {
-                store64(&pk + (3 * ax + d) * 8, _pv_nb_probe(c + d - 1, hw, halfw, inv_cell));
-            }
-        }
-        # The row's first cell by a binary search from the least of its x keys, each probe's cell by a scan from
-        # there over the row's cells at x keys below the probe's: two at most, a few where the probes drift (D3),
-        # more only where the keys wrap.
-        var kx0 = load64(&pk);
-        var kx1 = load64(&pk + 8);
-        var kx2 = load64(&pk + 16);
-        var kmin = kx0;
-        if (kx1 < kmin) { kmin = kx1; }
-        if (kx2 < kmin) { kmin = kx2; }
-        for (var dz = 0; dz < 3; dz = dz + 1) {
-            var kz = load64(&pk + (6 + dz) * 8);
-            for (var dy = 0; dy < 3; dy = dy + 1) {
-                var ky = load64(&pk + (3 + dy) * 8);
-                var lb = _pv_nb_lower(ck, 0, cells, kmin, ky, kz);
-                for (var dx = 0; dx < 3; dx = dx + 1) {
-                    var kx = load64(&pk + dx * 8);
-                    var j = lb;
-                    var scan = 1;
-                    while (scan == 1) {
-                        scan = 0;
-                        if (j < cells) {
-                            var at = ck + j * 24;
-                            if (load64(at + 16) == kz && load64(at + 8) == ky && load64(at) < kx) {
-                                j = j + 1;
-                                scan = 1;
-                            }
-                        }
-                    }
-                    if (j < cells) {
-                        var e = ck + j * 24;
-                        if (load64(e + 16) == kz && load64(e + 8) == ky && load64(e) == kx) {
-                            if (_pv_nb_append(cidx, order, load64(cst + j * 8), load64(cst + (j + 1) * 8)) == 0) {
+        var cx = load64(keys + q * 24);
+        var cy = load64(keys + q * 24 + 8);
+        var cz = load64(keys + q * 24 + 16);
+        var xlo = cx - 1;
+        if (cx == kmin) { xlo = cx; }
+        var xhi = cx + 1;
+        if (cx == kmax) { xhi = cx; }
+        for (var dz = 0 - 1; dz <= 1; dz = dz + 1) {
+            var zin = 1;
+            if ((dz == 1 && cz == kmax) || (dz == 0 - 1 && cz == kmin)) { zin = 0; }
+            for (var dy = 0 - 1; zin == 1 && dy <= 1; dy = dy + 1) {
+                var yin = 1;
+                if ((dy == 1 && cy == kmax) || (dy == 0 - 1 && cy == kmin)) { yin = 0; }
+                if (yin == 1) {
+                    var kz = cz + dz;
+                    var ky = cy + dy;
+                    var c = _pv_nb_lower(ck, 0, cells, xlo, ky, kz);
+                    var more = 1;
+                    while (more == 1 && c < cells) {
+                        var at = ck + c * 24;
+                        if (load64(at + 16) == kz && load64(at + 8) == ky && load64(at) <= xhi) {
+                            if (_pv_nb_append(cidx, order, load64(cst + c * 8), load64(cst + (c + 1) * 8)) == 0) {
                                 return 0;
                             }
+                            c = c + 1;
+                        } else {
+                            more = 0;
                         }
                     }
                 }
@@ -11659,9 +11614,10 @@ fn update_secondary_particles(ss: *PvSecondaryParticle, n, gravity: PvVec3, dt: 
 #
 # M5 part a: the solver's state and constructors, its WCSPH `step` (symplectic Euler or velocity Verlet, with the CSF
 # surface tension), the neighbour lists it leaves for M4 part d's functions, and `adaptive_dt`. PCISPH (part b) is in
-# src/sph_pcisph.cyr and DFSPH (part c) in src/sph_dfsph.cyr; the multiphase step is part d; part e runs the three
-# parallel loops on the worker pool and switches the neighbour keys to f64 (D3). Until then the keys are hisab 1.4.0's
-# f32 ones, bit for bit (`src/neighbor.cyr`).
+# src/sph_pcisph.cyr, DFSPH (part c) in src/sph_dfsph.cyr and the multiphase step (part d) in src/sph_multiphase.cyr.
+# Part e runs Rust's three `parallel` loops (this step's densities and forces, the multiphase step's forces) on the
+# solver's worker pool (src/par.cyr; ADR 0002 #4): every particle is written by one thread, so any thread count gives
+# the serial bits.
 #
 # Every buffer is the solver's and reused across steps: the grid's columns, the densities, the snapshot the forces
 # read, the accelerations (a per-step `Vec` in Rust, port plan §7.5), and Verlet's previous accelerations. A step
@@ -11671,8 +11627,9 @@ fn update_secondary_particles(ss: *PvSecondaryParticle, n, gravity: PvVec3, dt: 
 # The SPH solver: the neighbour grid (first, so its address is the solver's), the densities (one word a particle), the
 # snapshot (18 words a particle), the accelerations and Verlet's previous ones (3 words a particle), PCISPH's
 # non-pressure accelerations, pressures, predicted positions and velocities (M5 part b), DFSPH's α and κ factors (part
-# c), the surface tension coefficient (0 disables it) and whether to integrate by velocity Verlet. Mirrors `SphSolver`;
-# its `surface_tension` and `use_verlet` are public, as Rust's.
+# c), the surface tension coefficient (0 disables it), whether to integrate by velocity Verlet, and (Cyrius-only, part
+# e) the thread count and its pool (`set_threads`). Mirrors `SphSolver`; its `surface_tension` and `use_verlet` are
+# public, as Rust's.
 struct PvSphSolver {
     grid: PvNeighborGrid;
     densities: PvColumn;
@@ -11687,6 +11644,8 @@ struct PvSphSolver {
     dfsph_kappa: PvColumn;
     surface_tension: f64;
     use_verlet;
+    threads;
+    pool;
 }
 
 # The solver's column count after its grid.
@@ -11699,15 +11658,15 @@ fn _pv_sph_grid(s): *PvNeighborGrid {
 }
 
 # Column k of a solver (0 densities, 1 snapshot, 2 accels, 3 prev_accel, 4 pcisph_accel, 5 pcisph_pressures,
-# 6 pcisph_pred_pos, 7 pcisph_pred_vel, 8 dfsph_alpha, 9 dfsph_kappa), by its byte offset after the 224-byte grid
-# (tests/sph.tcyr pins the layout, 480 bytes).
+# 6 pcisph_pred_pos, 7 pcisph_pred_vel, 8 dfsph_alpha, 9 dfsph_kappa), by its byte offset after the 200-byte grid
+# (tests/sph.tcyr pins the layout, 472 bytes).
 #must_use
 fn _pv_sph_col(s, k): *PvColumn {
-    return _pv_as_columns(_pv_addr(s) + 224 + k * 24);
+    return _pv_as_columns(_pv_addr(s) + 200 + k * 24);
 }
 
-# A fresh solver into *s: an empty grid of cell size 1, no buffers, no surface tension, symplectic Euler. Nothing is
-# allocated.
+# A fresh solver into *s: an empty grid of cell size 1, no buffers, no surface tension, symplectic Euler, one thread.
+# Nothing is allocated.
 fn PvSphSolver_init(s: *PvSphSolver) {
     PvNeighborGrid_init(_pv_sph_grid(s));
     for (var k = 0; k < _PV_SOLVER_COLUMNS; k = k + 1) {
@@ -11718,6 +11677,8 @@ fn PvSphSolver_init(s: *PvSphSolver) {
     }
     s.surface_tension = 0.0;
     s.use_verlet = 0;
+    s.threads = 1;
+    s.pool = 0;
     return 0;
 }
 
@@ -11746,12 +11707,160 @@ fn PvSphSolver_default(): PvSphSolver {
     return s;
 }
 
-# Releases the solver's buffers; it is a fresh solver again, keeping its settings (and its grid's cell size).
+# Releases the solver's buffers and stops its pool; it is a fresh solver again, keeping its settings (its thread count
+# among them: the next step starts a new pool) and its grid's cell size.
 fn PvSphSolver_drop(s: *PvSphSolver) {
+    PvPool_drop(s.pool);
+    s.pool = 0;
     PvNeighborGrid_drop(_pv_sph_grid(s));
     for (var k = 0; k < _PV_SOLVER_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_sph_col(s, k);
         c.drop();
+    }
+    return 0;
+}
+
+# The solver's pool for its thread count, started by the first step after `set_threads` (one that can't be started
+# leaves the solver serial, which gives the same bits): its pointer, or 0 to run serially.
+fn _pv_sph_pool(s: *PvSphSolver): i64 {
+    if (s.threads > 1 && s.pool == 0) {
+        s.pool = PvPool_new(s.threads);
+        if (s.pool == 0) { s.threads = 1; }
+    }
+    return s.pool;
+}
+
+# Packs a density kernel's context (the particles, offsets, indices, densities, coefficients) into the 5 words at ctx.
+fn _pv_sph_density_ctx(ctx, ps: *PvFluidParticle, off, idx, dens, kc: *PvKernelCoeffs) {
+    store64(ctx, _pv_addr(ps));
+    store64(ctx + 8, off);
+    store64(ctx + 16, idx);
+    store64(ctx + 24, dens);
+    store64(ctx + 32, _pv_addr(kc));
+    return 0;
+}
+
+# The densities of particles [a, b) (a `_pv_par_for` kernel, the first of Rust's three `parallel` loops): ctx holds the
+# particles, the lists' offsets and indices, the densities column and the kernel coefficients. Each index writes only
+# its own density, Σ over its list (itself included) of mⱼ·poly6(r²) for r² ≤ h². The multiphase step runs it serially,
+# as Rust does.
+fn _pv_sph_density_k(ctx, a, b) {
+    var ps: *PvFluidParticle = _pv_as_particles(load64(ctx));
+    var off = load64(ctx + 8);
+    var idx = load64(ctx + 16);
+    var dens = load64(ctx + 24);
+    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var h2: f64 = kc.h2;
+    for (var i = a; i < b; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        var px: f64 = pi.position.x;
+        var py: f64 = pi.position.y;
+        var pz: f64 = pi.position.z;
+        var d: f64 = 0.0;
+        var ka = load64(off + i * 8);
+        var kb = load64(off + (i + 1) * 8);
+        for (var k = ka; k < kb; k = k + 1) {
+            var pj: *PvFluidParticle = ps + load64(idx + k * 8);
+            var dx: f64 = px - pj.position.x;
+            var dy: f64 = py - pj.position.y;
+            var dz: f64 = pz - pj.position.z;
+            var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+            if (r2 <= h2) {
+                var w: f64 = _pv_kc_poly6(kc, r2);
+                var mw: f64 = pj.mass * w;
+                d = d + mw;
+            }
+        }
+        store64(dens + i * 8, _pv_bits(d));
+    }
+    return 0;
+}
+
+# The accelerations of particles [a, b) from the snapshot (a `_pv_par_for` kernel, the second of Rust's three
+# `parallel` loops): ctx holds the snapshot, the lists' offsets and indices, the accelerations column, the kernel
+# coefficients, the config, the viscosity, σ, the CSF flag and ∇²W(0). Each index writes only its own three words.
+fn _pv_sph_accel_k(ctx, a, b) {
+    var snap: *PvFluidParticle = _pv_as_particles(load64(ctx));
+    var off = load64(ctx + 8);
+    var idx = load64(ctx + 16);
+    var acc = load64(ctx + 24);
+    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
+    var viscosity: f64 = load64(ctx + 48);
+    var st: f64 = load64(ctx + 56);
+    var csf = load64(ctx + 64);
+    var lap0: f64 = load64(ctx + 72);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var q = a; q < b; q = q + 1) {
+        var si: *PvFluidParticle = snap + q;
+        var ax: f64 = config.gravity.x;
+        var ay: f64 = config.gravity.y;
+        var az: f64 = config.gravity.z;
+        var rho: f64 = _pv_max(si.density, lo);
+        var api: f64 = si.pressure / (rho * rho);
+        var sx: f64 = si.position.x;
+        var sy: f64 = si.position.y;
+        var sz: f64 = si.position.z;
+        var vx: f64 = si.velocity.x;
+        var vy: f64 = si.velocity.y;
+        var vz: f64 = si.velocity.z;
+        var cnx: f64 = 0.0;
+        var cny: f64 = 0.0;
+        var cnz: f64 = 0.0;
+        var lapc: f64 = 0.0;
+        if (csf == 1) { lapc = (si.mass / rho) * lap0; }
+        var a2 = load64(off + q * 8);
+        var b2 = load64(off + (q + 1) * 8);
+        for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
+            var j = load64(idx + k2 * 8);
+            if (j != q) {
+                var sj: *PvFluidParticle = snap + j;
+                var ex: f64 = sx - sj.position.x;
+                var ey: f64 = sy - sj.position.y;
+                var ez: f64 = sz - sj.position.z;
+                var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                if ((s2 > h2 || s2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(s2);
+                    var rho_j: f64 = _pv_max(sj.density, lo);
+                    var bj: f64 = sj.pressure / (rho_j * rho_j);
+                    var sym: f64 = api + bj;
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var mj: f64 = sj.mass;
+                    var nmj: f64 = -mj;
+                    var p_scale: f64 = ((nmj * sym) * grad) / r;
+                    ax = ax + (p_scale * ex);
+                    ay = ay + (p_scale * ey);
+                    az = az + (p_scale * ez);
+                    var lap: f64 = _pv_kc_visc_lap(kc, r);
+                    var v_scale: f64 = (((viscosity * mj) * lap) / rho_j) / rho;
+                    var ux: f64 = sj.velocity.x - vx;
+                    var uy: f64 = sj.velocity.y - vy;
+                    var uz: f64 = sj.velocity.z - vz;
+                    ax = ax + (v_scale * ux);
+                    ay = ay + (v_scale * uy);
+                    az = az + (v_scale * uz);
+                    if (csf == 1) {
+                        var mor: f64 = mj / rho_j;
+                        var pg: f64 = _pv_kc_poly6_grad(kc, s2);
+                        var mpg: f64 = mor * pg;
+                        cnx = cnx + (mpg * ex);
+                        cny = cny + (mpg * ey);
+                        cnz = cnz + (mpg * ez);
+                        var pl: f64 = _pv_kc_poly6_lap(kc, s2);
+                        lapc = lapc + (mor * pl);
+                    }
+                }
+            }
+        }
+        var ast: PvVec3 = _pv_csf_acceleration(cnx, cny, cnz, lapc, st, rho, kc.h);
+        var fx: f64 = ax + ast.x;
+        var fy: f64 = ay + ast.y;
+        var fz: f64 = az + ast.z;
+        store64(acc + q * 24, _pv_bits(fx));
+        store64(acc + q * 24 + 8, _pv_bits(fy));
+        store64(acc + q * 24 + 16, _pv_bits(fz));
     }
     return 0;
 }
@@ -11766,6 +11875,19 @@ struct PvNeighborLists {
 }
 
 impl PvSphSolver {
+    # Sets the thread count the steps use: n ≥ 1 (a count below 1 is 1, serial). Any count gives the serial bits. The
+    # solver's pool stops now, and the next step starts one of the new size (or runs serially where threads can't
+    # start: src/par.cyr). Returns the count. Cyrius-only: Rust's `parallel` feature is compile-time (port plan D6,
+    # ADR 0002 #4).
+    fn set_threads(self, n): i64 {
+        var t = n;
+        if (t < 1) { t = 1; }
+        PvPool_drop(self.pool);
+        self.pool = 0;
+        self.threads = t;
+        return t;
+    }
+
     # Forgets Verlet's previous accelerations, so a step after the particles were reordered, split or merged starts
     # the integrator afresh. Mirrors `reset_integrator`.
     fn reset_integrator(self) {
@@ -11789,7 +11911,7 @@ impl PvSphSolver {
     # One WCSPH step of the n particles at ps, in Rust's order:
     # - the config is validated (its error returned, nothing changed); n = 0 is Ok; h as f32 must be finite and > 0
     #   (PV_ERR_INVALID_SMOOTHING_RADIUS, for h beyond f32's range either side);
-    # - the neighbour lists (`_pv_nb_build`: hisab's f32 grid, D3);
+    # - the neighbour lists (`_pv_nb_build`: f64 keys, ADR 0002 #2);
     # - each density, Σ over its list (itself included) of mⱼ·poly6(r²) for r² ≤ h², then each pressure by the linear
     #   equation of state;
     # - from a snapshot, each acceleration: gravity, the symmetric pressure and viscosity terms of the free step over
@@ -11820,34 +11942,15 @@ impl PvSphSolver {
         if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
-        var h2: f64 = kc.h2;
         var off = g.offsets.data;
         var idx = g.indices.data;
         var dens = self.densities.data;
 
-        # The densities, then the pressures.
-        for (var i = 0; i < n; i = i + 1) {
-            var pi: *PvFluidParticle = ps + i;
-            var px: f64 = pi.position.x;
-            var py: f64 = pi.position.y;
-            var pz: f64 = pi.position.z;
-            var d: f64 = 0.0;
-            var a = load64(off + i * 8);
-            var b = load64(off + (i + 1) * 8);
-            for (var k = a; k < b; k = k + 1) {
-                var pj: *PvFluidParticle = ps + load64(idx + k * 8);
-                var dx: f64 = px - pj.position.x;
-                var dy: f64 = py - pj.position.y;
-                var dz: f64 = pz - pj.position.z;
-                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
-                if (r2 <= h2) {
-                    var w: f64 = _pv_kc_poly6(&kc, r2);
-                    var mw: f64 = pj.mass * w;
-                    d = d + mw;
-                }
-            }
-            store64(dens + i * 8, _pv_bits(d));
-        }
+        # The densities (on the pool), then the pressures.
+        var pool = _pv_sph_pool(self);
+        var dctx[40];
+        _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
+        _pv_par_for(pool, 0, n, &_pv_sph_density_k, &dctx);
         var rest: f64 = config.rest_density;
         var gas: f64 = config.gas_constant;
         var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
@@ -11860,83 +11963,24 @@ impl PvSphSolver {
             *sq = *p;
         }
 
-        # The accelerations, from the snapshot, into the solver's buffer.
+        # The accelerations, from the snapshot, into the solver's buffer (on the pool).
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var csf = 0;
         if (st > 0.0) { csf = 1; }
-        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
-        var lo: f64 = _PV_SPH_MIN_DENSITY;
         var lap0: f64 = _pv_kc_poly6_lap(&kc, 0.0);
-        for (var q = 0; q < n; q = q + 1) {
-            var si: *PvFluidParticle = snap + q;
-            var ax: f64 = config.gravity.x;
-            var ay: f64 = config.gravity.y;
-            var az: f64 = config.gravity.z;
-            var rho: f64 = _pv_max(si.density, lo);
-            var api: f64 = si.pressure / (rho * rho);
-            var sx: f64 = si.position.x;
-            var sy: f64 = si.position.y;
-            var sz: f64 = si.position.z;
-            var vx: f64 = si.velocity.x;
-            var vy: f64 = si.velocity.y;
-            var vz: f64 = si.velocity.z;
-            var cnx: f64 = 0.0;
-            var cny: f64 = 0.0;
-            var cnz: f64 = 0.0;
-            var lapc: f64 = 0.0;
-            if (csf == 1) { lapc = (si.mass / rho) * lap0; }
-            var a2 = load64(off + q * 8);
-            var b2 = load64(off + (q + 1) * 8);
-            for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
-                var j = load64(idx + k2 * 8);
-                if (j != q) {
-                    var sj: *PvFluidParticle = snap + j;
-                    var ex: f64 = sx - sj.position.x;
-                    var ey: f64 = sy - sj.position.y;
-                    var ez: f64 = sz - sj.position.z;
-                    var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
-                    if ((s2 > h2 || s2 < tiny) == 0) {
-                        var r: f64 = f64_sqrt(s2);
-                        var rho_j: f64 = _pv_max(sj.density, lo);
-                        var bj: f64 = sj.pressure / (rho_j * rho_j);
-                        var sym: f64 = api + bj;
-                        var grad: f64 = _pv_kc_spiky_grad(&kc, r);
-                        var mj: f64 = sj.mass;
-                        var nmj: f64 = -mj;
-                        var p_scale: f64 = ((nmj * sym) * grad) / r;
-                        ax = ax + (p_scale * ex);
-                        ay = ay + (p_scale * ey);
-                        az = az + (p_scale * ez);
-                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
-                        var v_scale: f64 = (((viscosity * mj) * lap) / rho_j) / rho;
-                        var ux: f64 = sj.velocity.x - vx;
-                        var uy: f64 = sj.velocity.y - vy;
-                        var uz: f64 = sj.velocity.z - vz;
-                        ax = ax + (v_scale * ux);
-                        ay = ay + (v_scale * uy);
-                        az = az + (v_scale * uz);
-                        if (csf == 1) {
-                            var mor: f64 = mj / rho_j;
-                            var pg: f64 = _pv_kc_poly6_grad(&kc, s2);
-                            var mpg: f64 = mor * pg;
-                            cnx = cnx + (mpg * ex);
-                            cny = cny + (mpg * ey);
-                            cnz = cnz + (mpg * ez);
-                            var pl: f64 = _pv_kc_poly6_lap(&kc, s2);
-                            lapc = lapc + (mor * pl);
-                        }
-                    }
-                }
-            }
-            var ast: PvVec3 = _pv_csf_acceleration(cnx, cny, cnz, lapc, st, rho, kc.h);
-            var fx: f64 = ax + ast.x;
-            var fy: f64 = ay + ast.y;
-            var fz: f64 = az + ast.z;
-            store64(acc + q * 24, _pv_bits(fx));
-            store64(acc + q * 24 + 8, _pv_bits(fy));
-            store64(acc + q * 24 + 16, _pv_bits(fz));
-        }
+        var actx[80];
+        store64(&actx, _pv_addr(snap));
+        store64(&actx + 8, off);
+        store64(&actx + 16, idx);
+        store64(&actx + 24, acc);
+        store64(&actx + 32, _pv_addr(&kc));
+        store64(&actx + 40, _pv_addr(config));
+        store64(&actx + 48, _pv_bits(viscosity));
+        store64(&actx + 56, _pv_bits(st));
+        store64(&actx + 64, csf);
+        store64(&actx + 72, _pv_bits(lap0));
+        _pv_par_for(pool, 0, n, &_pv_sph_accel_k, &actx);
         for (var c = 0; c < n; c = c + 1) {
             var gx: f64 = load64(acc + c * 24);
             var gy: f64 = load64(acc + c * 24 + 8);
@@ -12890,6 +12934,12 @@ PvMultiPhaseConfig {
     return c;
 }
 
+# A typed view of a word (the multiphase pool kernel reads its configuration through one).
+#must_use
+fn _pv_as_mp(p): *PvMultiPhaseConfig {
+    return p;
+}
+
 # Releases the configuration's phases (it then has none).
 fn PvMultiPhaseConfig_drop(c: *PvMultiPhaseConfig) {
     c.phases.drop();
@@ -12913,15 +12963,126 @@ fn _pv_mp_get(c: *PvMultiPhaseConfig, phase) {
     return (load64(w), load64(w + 8), load64(w + 16));
 }
 
+# The accelerations of particles [a, b) from the snapshot (a `_pv_par_for` kernel, the third of Rust's three `parallel`
+# loops): ctx holds the snapshot, the lists' offsets and indices, the accelerations column, the kernel coefficients, the
+# config, the phase config, σ, the interface tension, the two CSF flags and ∇²W(0). Each index writes only its own three
+# words.
+fn _pv_mp_accel_k(ctx, a, b) {
+    var snap: *PvFluidParticle = _pv_as_particles(load64(ctx));
+    var off = load64(ctx + 8);
+    var idx = load64(ctx + 16);
+    var acc = load64(ctx + 24);
+    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
+    var phase_config: *PvMultiPhaseConfig = _pv_as_mp(load64(ctx + 48));
+    var st: f64 = load64(ctx + 56);
+    var it: f64 = load64(ctx + 64);
+    var free = load64(ctx + 72);
+    var inter = load64(ctx + 80);
+    var lap0: f64 = load64(ctx + 88);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var q = a; q < b; q = q + 1) {
+        var si: *PvFluidParticle = snap + q;
+        var ax: f64 = config.gravity.x;
+        var ay: f64 = config.gravity.y;
+        var az: f64 = config.gravity.z;
+        var rho: f64 = _pv_max(si.density, lo);
+        var api: f64 = si.pressure / (rho * rho);
+        var ri, gi, vi_w = _pv_mp_get(phase_config, si.phase);
+        var visc_i: f64 = vi_w;
+        var csx: f64 = 0.0;
+        var csy: f64 = 0.0;
+        var csz: f64 = 0.0;
+        var lap_s: f64 = 0.0;
+        if (free == 1) { lap_s = (si.mass / rho) * lap0; }
+        var cix: f64 = 0.0;
+        var ciy: f64 = 0.0;
+        var ciz: f64 = 0.0;
+        var lap_i: f64 = 0.0;
+        var a2 = load64(off + q * 8);
+        var b2 = load64(off + (q + 1) * 8);
+        for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
+            var j = load64(idx + k2 * 8);
+            if (j != q) {
+                var sj: *PvFluidParticle = snap + j;
+                var ex: f64 = si.position.x - sj.position.x;
+                var ey: f64 = si.position.y - sj.position.y;
+                var ez: f64 = si.position.z - sj.position.z;
+                var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                if ((s2 > h2 || s2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(s2);
+                    var rho_j: f64 = _pv_max(sj.density, lo);
+                    var bj: f64 = sj.pressure / (rho_j * rho_j);
+                    var sym: f64 = api + bj;
+                    var grad: f64 = _pv_kc_spiky_grad(kc, r);
+                    var mj: f64 = sj.mass;
+                    var nmj: f64 = -mj;
+                    var p_scale: f64 = ((nmj * sym) * grad) / r;
+                    ax = ax + (p_scale * ex);
+                    ay = ay + (p_scale * ey);
+                    az = az + (p_scale * ez);
+                    var rj, gj, vj_w = _pv_mp_get(phase_config, sj.phase);
+                    var visc_j: f64 = vj_w;
+                    var visc: f64 = 0.5 * (visc_i + visc_j);
+                    var lap: f64 = _pv_kc_visc_lap(kc, r);
+                    var v_scale: f64 = (((visc * mj) * lap) / rho_j) / rho;
+                    var ux: f64 = sj.velocity.x - si.velocity.x;
+                    var uy: f64 = sj.velocity.y - si.velocity.y;
+                    var uz: f64 = sj.velocity.z - si.velocity.z;
+                    ax = ax + (v_scale * ux);
+                    ay = ay + (v_scale * uy);
+                    az = az + (v_scale * uz);
+                    var unlike = 0;
+                    if (inter == 1 && si.phase != sj.phase) { unlike = 1; }
+                    if (free == 1 || unlike == 1) {
+                        var mor: f64 = mj / rho_j;
+                        var pg: f64 = _pv_kc_poly6_grad(kc, s2);
+                        var mpg: f64 = mor * pg;
+                        var gx: f64 = ex * mpg;
+                        var gy: f64 = ey * mpg;
+                        var gz: f64 = ez * mpg;
+                        var pl: f64 = _pv_kc_poly6_lap(kc, s2);
+                        var lap_c: f64 = mor * pl;
+                        if (free == 1) {
+                            csx = csx + gx;
+                            csy = csy + gy;
+                            csz = csz + gz;
+                            lap_s = lap_s + lap_c;
+                        }
+                        if (unlike == 1) {
+                            cix = cix + gx;
+                            ciy = ciy + gy;
+                            ciz = ciz + gz;
+                            lap_i = lap_i + lap_c;
+                        }
+                    }
+                }
+            }
+        }
+        var a_s: PvVec3 = _pv_csf_acceleration(csx, csy, csz, lap_s, st, rho, kc.h);
+        var a_i: PvVec3 = _pv_csf_acceleration(cix, ciy, ciz, lap_i, it, rho, kc.h);
+        var fx: f64 = (ax + a_s.x) + a_i.x;
+        var fy: f64 = (ay + a_s.y) + a_i.y;
+        var fz: f64 = (az + a_s.z) + a_i.z;
+        store64(acc + q * 24, _pv_bits(fx));
+        store64(acc + q * 24 + 8, _pv_bits(fy));
+        store64(acc + q * 24 + 16, _pv_bits(fz));
+    }
+    return 0;
+}
+
 impl PvSphSolver {
     # One multiphase step of the n particles at ps, in Rust's order:
     # - the config is validated (its error returned); n = 0 is Ok; no phase is PV_ERR_INVALID_PARAMETER; h as f32 must
     #   be finite and > 0 (PV_ERR_INVALID_SMOOTHING_RADIUS). Nothing changes on any of these. An out-of-range phase
     #   falls back to phase 0 (Rust also warns, once a step; logging arrives with M7);
     # - the neighbour lists, the densities, each pressure by its phase's equation of state;
-    # - from a snapshot, each acceleration: gravity, the symmetric pressure term, the viscosity at the mean of the two
-    #   phases' ((μᵢ + μⱼ)·½), the free-surface colour field for σ > 0 (its Laplacian from the self term) and the
-    #   interface colour field over unlike neighbours for an interface tension > 0 (two CSF terms), in that order;
+    # - from a snapshot, on the solver's pool, each acceleration: gravity, the symmetric pressure term, the viscosity at
+    #   the mean of the two phases' ((μᵢ + μⱼ)·½), the free-surface colour field for σ > 0 (its Laplacian from the self
+    #   term) and the interface colour field over unlike neighbours for an interface tension > 0 (two CSF terms), in
+    #   that order;
     # - PV_ERR_DIVERGED at the first non-finite acceleration (those before it written);
     # - symplectic Euler, then the walls.
     # PV_ERR_OUT_OF_MEMORY when a buffer can't grow, before any particle changes (Rust aborts). Mirrors
@@ -12946,31 +13107,14 @@ impl PvSphSolver {
         if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
-        var h2: f64 = kc.h2;
         var off = g.offsets.data;
         var idx = g.indices.data;
         var dens = self.densities.data;
 
-        # The densities, then each pressure by its phase's equation of state.
-        for (var i = 0; i < n; i = i + 1) {
-            var pi: *PvFluidParticle = ps + i;
-            var d: f64 = 0.0;
-            var a = load64(off + i * 8);
-            var b = load64(off + (i + 1) * 8);
-            for (var k = a; k < b; k = k + 1) {
-                var pj: *PvFluidParticle = ps + load64(idx + k * 8);
-                var dx: f64 = pi.position.x - pj.position.x;
-                var dy: f64 = pi.position.y - pj.position.y;
-                var dz: f64 = pi.position.z - pj.position.z;
-                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
-                if (r2 <= h2) {
-                    var w: f64 = _pv_kc_poly6(&kc, r2);
-                    var mw: f64 = pj.mass * w;
-                    d = d + mw;
-                }
-            }
-            store64(dens + i * 8, _pv_bits(d));
-        }
+        # The densities (serially, as Rust's), then each pressure by its phase's equation of state.
+        var dctx[40];
+        _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
+        _pv_sph_density_k(&dctx, 0, n);
         var snap: *PvFluidParticle = _pv_as_particles(self.snapshot.data);
         for (var i2 = 0; i2 < n; i2 = i2 + 1) {
             var p: *PvFluidParticle = ps + i2;
@@ -12984,7 +13128,7 @@ impl PvSphSolver {
             *sq = *p;
         }
 
-        # The accelerations, from the snapshot.
+        # The accelerations, from the snapshot (on the pool).
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var it: f64 = phase_config.interface_tension;
@@ -12992,96 +13136,21 @@ impl PvSphSolver {
         if (st > 0.0) { free = 1; }
         var inter = 0;
         if (it > 0.0) { inter = 1; }
-        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
-        var lo: f64 = _PV_SPH_MIN_DENSITY;
         var lap0: f64 = _pv_kc_poly6_lap(&kc, 0.0);
-        for (var q = 0; q < n; q = q + 1) {
-            var si: *PvFluidParticle = snap + q;
-            var ax: f64 = config.gravity.x;
-            var ay: f64 = config.gravity.y;
-            var az: f64 = config.gravity.z;
-            var rho: f64 = _pv_max(si.density, lo);
-            var api: f64 = si.pressure / (rho * rho);
-            var ri, gi, vi_w = _pv_mp_get(phase_config, si.phase);
-            var visc_i: f64 = vi_w;
-            var csx: f64 = 0.0;
-            var csy: f64 = 0.0;
-            var csz: f64 = 0.0;
-            var lap_s: f64 = 0.0;
-            if (free == 1) { lap_s = (si.mass / rho) * lap0; }
-            var cix: f64 = 0.0;
-            var ciy: f64 = 0.0;
-            var ciz: f64 = 0.0;
-            var lap_i: f64 = 0.0;
-            var a2 = load64(off + q * 8);
-            var b2 = load64(off + (q + 1) * 8);
-            for (var k2 = a2; k2 < b2; k2 = k2 + 1) {
-                var j = load64(idx + k2 * 8);
-                if (j != q) {
-                    var sj: *PvFluidParticle = snap + j;
-                    var ex: f64 = si.position.x - sj.position.x;
-                    var ey: f64 = si.position.y - sj.position.y;
-                    var ez: f64 = si.position.z - sj.position.z;
-                    var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
-                    if ((s2 > h2 || s2 < tiny) == 0) {
-                        var r: f64 = f64_sqrt(s2);
-                        var rho_j: f64 = _pv_max(sj.density, lo);
-                        var bj: f64 = sj.pressure / (rho_j * rho_j);
-                        var sym: f64 = api + bj;
-                        var grad: f64 = _pv_kc_spiky_grad(&kc, r);
-                        var mj: f64 = sj.mass;
-                        var nmj: f64 = -mj;
-                        var p_scale: f64 = ((nmj * sym) * grad) / r;
-                        ax = ax + (p_scale * ex);
-                        ay = ay + (p_scale * ey);
-                        az = az + (p_scale * ez);
-                        var rj, gj, vj_w = _pv_mp_get(phase_config, sj.phase);
-                        var visc_j: f64 = vj_w;
-                        var visc: f64 = 0.5 * (visc_i + visc_j);
-                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
-                        var v_scale: f64 = (((visc * mj) * lap) / rho_j) / rho;
-                        var ux: f64 = sj.velocity.x - si.velocity.x;
-                        var uy: f64 = sj.velocity.y - si.velocity.y;
-                        var uz: f64 = sj.velocity.z - si.velocity.z;
-                        ax = ax + (v_scale * ux);
-                        ay = ay + (v_scale * uy);
-                        az = az + (v_scale * uz);
-                        var unlike = 0;
-                        if (inter == 1 && si.phase != sj.phase) { unlike = 1; }
-                        if (free == 1 || unlike == 1) {
-                            var mor: f64 = mj / rho_j;
-                            var pg: f64 = _pv_kc_poly6_grad(&kc, s2);
-                            var mpg: f64 = mor * pg;
-                            var gx: f64 = ex * mpg;
-                            var gy: f64 = ey * mpg;
-                            var gz: f64 = ez * mpg;
-                            var pl: f64 = _pv_kc_poly6_lap(&kc, s2);
-                            var lap_c: f64 = mor * pl;
-                            if (free == 1) {
-                                csx = csx + gx;
-                                csy = csy + gy;
-                                csz = csz + gz;
-                                lap_s = lap_s + lap_c;
-                            }
-                            if (unlike == 1) {
-                                cix = cix + gx;
-                                ciy = ciy + gy;
-                                ciz = ciz + gz;
-                                lap_i = lap_i + lap_c;
-                            }
-                        }
-                    }
-                }
-            }
-            var a_s: PvVec3 = _pv_csf_acceleration(csx, csy, csz, lap_s, st, rho, kc.h);
-            var a_i: PvVec3 = _pv_csf_acceleration(cix, ciy, ciz, lap_i, it, rho, kc.h);
-            var fx: f64 = (ax + a_s.x) + a_i.x;
-            var fy: f64 = (ay + a_s.y) + a_i.y;
-            var fz: f64 = (az + a_s.z) + a_i.z;
-            store64(acc + q * 24, _pv_bits(fx));
-            store64(acc + q * 24 + 8, _pv_bits(fy));
-            store64(acc + q * 24 + 16, _pv_bits(fz));
-        }
+        var actx[96];
+        store64(&actx, _pv_addr(snap));
+        store64(&actx + 8, off);
+        store64(&actx + 16, idx);
+        store64(&actx + 24, acc);
+        store64(&actx + 32, _pv_addr(&kc));
+        store64(&actx + 40, _pv_addr(config));
+        store64(&actx + 48, _pv_addr(phase_config));
+        store64(&actx + 56, _pv_bits(st));
+        store64(&actx + 64, _pv_bits(it));
+        store64(&actx + 72, free);
+        store64(&actx + 80, inter);
+        store64(&actx + 88, _pv_bits(lap0));
+        _pv_par_for(_pv_sph_pool(self), 0, n, &_pv_mp_accel_k, &actx);
         for (var c = 0; c < n; c = c + 1) {
             var gx2: f64 = load64(acc + c * 24);
             var gy2: f64 = load64(acc + c * 24 + 8);

@@ -104,6 +104,16 @@ fn _pv_as_i32(x: f64): i64 {
     return f64_to(x);
 }
 
+# `x as i64`: toward zero, saturating at i64::MIN / i64::MAX, NaN → 0 (hisab 3.4.1's `_sh_cell_coord` cast).
+#must_use
+fn _pv_as_i64(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x >= 9223372036854775808.0) { return 9223372036854775807; }
+    var lo: f64 = -9223372036854775808.0;
+    if (x <= lo) { return 0 - 9223372036854775807 - 1; }
+    return f64_to(x);
+}
+
 # `x as u32`: toward zero, saturating at 0 and u32::MAX, NaN → 0.
 #must_use
 fn _pv_as_u32(x: f64): i64 {

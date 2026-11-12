@@ -1,4 +1,5 @@
-# par.tcyr — the worker pool (src/par.cyr) and the grid's thread count (M3 part e). Cyrius-only: Rust's
+# par.tcyr — the worker pool (src/par.cyr), the grid's thread count (M3 part e) and the SPH solver's (M5 part e).
+# Cyrius-only: Rust's
 # `parallel` feature is compile-time rayon, with no tests of its own (port plan D6, ADR 0002 #4).
 #
 # The pool's contract: `_pv_par_for` runs fp(ctx, a, b) over slices that cover [lo, hi) exactly once, on T distinct
@@ -44,6 +45,42 @@ fn step_err(g: *PvFluidGrid, c: *PvGridConfig): i64 {
     var t, e = g.step(c);
     if (is_err_result(t) == 1) { return e; }
     return PV_ERR_NONE;
+}
+
+# `steps` steps of a copy of the n particles at src by a fresh solver (σ 0.072) at `threads` threads, into dst:
+# `step` (Verlet when verlet is 1), or `step_multiphase` by mp when mp isn't 0. The number that failed.
+fn solver_steps(dst: *PvFluidParticle, src: *PvFluidParticle, n, threads, steps, verlet, mp): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var d: *PvFluidParticle = dst + i;
+        var e: *PvFluidParticle = src + i;
+        *d = *e;
+    }
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var s: PvSphSolver = PvSphSolver_with_surface_tension(0.072);
+    s.use_verlet = verlet;
+    var set = s.set_threads(threads);
+    var errs = 0;
+    for (var k = 0; k < steps; k = k + 1) {
+        if (mp == 0) {
+            var t, v = s.step(dst, n, &cfg, 0.001);
+            if (is_err_result(t) == 1) { errs = errs + 1; }
+        } else {
+            var t2, v2 = s.step_multiphase(dst, n, &cfg, _pv_as_mp(mp));
+            if (is_err_result(t2) == 1) { errs = errs + 1; }
+        }
+    }
+    PvSphSolver_drop(&s);
+    return errs;
+}
+
+# 1 when the n particles at a and b are the same words.
+fn same_words(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
+    var wa = _pv_addr(a);
+    var wb = _pv_addr(b);
+    for (var i = 0; i < n * 18; i = i + 1) {
+        if (load64(wa + i * 8) != load64(wb + i * 8)) { return 0; }
+    }
+    return 1;
 }
 
 # Runs the pool and thread-count tests.
@@ -132,6 +169,76 @@ fn main() {
     PvFluidGrid_drop(&g);
     PvFluidGrid_drop(&h);
     assert_eq(h.pool, 0, "drop stops the pool");
+
+    test_group("solver_thread_count_lifecycle");
+    var bp, bn = create_particle_block(0.1, 0.1, 0.5, 0.5, 0.02, 0.001);
+    var block: *PvFluidParticle = _pv_as_particles(bp);
+    var wp = fl_alloc(bn * sizeof(PvFluidParticle));
+    var work: *PvFluidParticle = _pv_as_particles(wp);
+    for (var i6 = 0; i6 < bn; i6 = i6 + 1) {
+        var d: *PvFluidParticle = work + i6;
+        var e: *PvFluidParticle = block + i6;
+        *d = *e;
+    }
+    var scfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var s: PvSphSolver = PvSphSolver_new();
+    assert(s.threads == 1 && s.pool == 0, "new: one thread, no pool");
+    assert_eq(s.set_threads(4), 4, "set_threads(4)");
+    assert_eq(s.pool, 0, "the pool starts with the next step");
+    var t1, v1 = s.step(work, bn, &scfg, 0.001);
+    assert(is_ok(t1) == 1 && s.pool != 0 && s.threads == 4, "a step at 4 threads started a pool of 4");
+    var used = alloc_used();
+    for (var r2 = 0; r2 < 20; r2 = r2 + 1) { var t2, v2 = s.step(work, bn, &scfg, 0.001); }
+    assert_eq(alloc_used() - used, 0, "20 more steps at 4 threads take no heap");
+    assert_eq(s.set_threads(0), 1, "a count below 1 is 1");
+    assert(s.pool == 0 && s.threads == 1, "and stops the pool");
+    var t3 = s.set_threads(3);
+    var t4, v4 = s.step(work, bn, &scfg, 0.001);
+    PvSphSolver_drop(&s);
+    assert(s.pool == 0 && s.threads == 3, "drop stops the pool and keeps the count");
+
+    test_group("solver_threads_give_serial_bits");
+    var ap = fl_alloc(bn * sizeof(PvFluidParticle));
+    var a: *PvFluidParticle = _pv_as_particles(ap);
+    var two: PvMultiPhaseConfig = _pv_mp_empty(0.05);
+    var water: PvPhaseProperties;
+    water.rest_density = 1000.0;
+    water.gas_constant = 2000.0;
+    water.viscosity = 0.001;
+    var light: PvPhaseProperties;
+    light.rest_density = 800.0;
+    light.gas_constant = 2000.0;
+    light.viscosity = 0.002;
+    assert(two.push_phase(water) == 1 && two.push_phase(light) == 1, "two phases");
+    for (var i7 = 0; i7 < bn; i7 = i7 + 1) {
+        var q: *PvFluidParticle = block + i7;
+        if (q.position.y > 0.35) { q.phase = 1; }
+    }
+    var tcounts[40];
+    store64(&tcounts, 2);
+    store64(&tcounts + 8, 3);
+    store64(&tcounts + 16, 4);
+    store64(&tcounts + 24, 8);
+    store64(&tcounts + 32, 16);
+    var kinds = 0;
+    for (var kind = 0; kind < 3; kind = kind + 1) {
+        var verlet = 0;
+        var mp = 0;
+        if (kind == 1) { verlet = 1; }
+        if (kind == 2) { mp = &two; }
+        var e0 = solver_steps(work, block, bn, 1, 10, verlet, mp);
+        var agree = 1;
+        for (var ci = 0; ci < 5; ci = ci + 1) {
+            var e1 = solver_steps(a, block, bn, load64(&tcounts + ci * 8), 10, verlet, mp);
+            if (e0 != 0 || e1 != 0 || same_words(work, a, bn) == 0) { agree = 0; }
+        }
+        kinds = kinds + agree;
+    }
+    assert_eq(kinds, 3, "Euler, Verlet and multiphase: 2, 3, 4, 8 and 16 threads give one thread's bits");
+    PvMultiPhaseConfig_drop(&two);
+    fl_free(ap);
+    fl_free(wp);
+    fl_free(bp);
     return assert_summary();
 }
 

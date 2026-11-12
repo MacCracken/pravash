@@ -3,6 +3,47 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M5 part e): the solver's thread count, and the D3 switch to f64 neighbour keys. M5 is complete.
+  - **`s.set_threads(n)`** (ADR 0002 #4, amended): the solver's pool runs Rust's three `parallel` loops, `step`'s
+    densities and accelerations and `step_multiphase`'s accelerations, as `_pv_par_for` kernels. Each particle is
+    written by one thread, so every count gives the serial bits. Drop stops the pool and keeps the count. PCISPH and
+    DFSPH have no `parallel` loops in Rust and stay serial.
+    - **Parity:** every solver step row (147) replays at 2, 3, 4 and 8 threads: 0 differ from one thread.
+    - **Tests:** `tests/par.tcyr` adds the solver's thread-count lifecycle (the pool starts on the first step, 20 more
+      steps at 4 threads take no heap) and Euler, Verlet and multiphase at 2–16 threads against one: 50 checks.
+      Mutants that route a sum through a shared global are caught by both the replay and the test.
+  - **f64 neighbour keys** (port plan D3, ADR 0002 #2, amended):
+    - each point's cell is floor(x · fl(1/h)) as a saturating i64, hisab 3.4.1's `_sh_cell_coord`;
+    - a particle's list is the 27 cells at its own key ± 1 per axis, in integers.
+
+    The switch drops the f32 probe points, which at large coordinates land in other cells and list a cell twice, and
+    the f32 grid's cell-size reuse band. The grid loses its f32 position column (200 bytes; the solver 472).
+    - **Parity:** the rows the switch changes are mapped by name to two new tables, which validate.py writes from its
+      own transcription of the f64 grid: `tests/golden/math.d3.tsv` (558 of the 2,460 cell-key rows) and
+      `sph.d3.tsv` (all 30 list rows, 6 `step`, 1 `step_dfsph`, 1 `step_multiphase`). All 596 pass, *accepted
+      (ADR 2)*; the other rows keep the oracle's outputs.
+    - **Tests:** lattices at x = 10⁶ and 10¹², where the f32 lists drifted, still list every particle within h once.
+      Keys saturated at ±∞ on each axis never list each other, and a NaN coordinate is cell 0 (no row can hold a ±∞
+      position: the oracle panics on `cx + 1`). 190 checks.
+- **The parity harness**: `tests/golden/<module>.d3.tsv` loads into the corrected-oracle table, each row tagged with its
+  ADR, and reports *accepted (ADR 2)* apart from ADR 4. Thread-count replays share one helper, `_par_threads_agree`.
+  validate.py writes and checks the `.d3.tsv` files (`--write`, as the `.cr.tsv` ones), and the generator's `--check`
+  counts each as its module's.
+
+### Fixed
+- **The parity harness**: an unusable solver row (-1, a phase column that can't grow) fell through `_par_sph_d` and
+  was read as pending. It is now reported as unusable, which fails the module.
+
+### Performance
+- **f64 keys** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M5 part e; A/B against the f32
+  grid): the 1,000-particle neighbour build 1.5–1.6× faster in 2D (now 0.93× Rust's) and 1.4–1.6× in 3D (1.25–1.34×
+  Rust's, from 1.9×); the dense 625-particle step 12–14% faster.
+- **Thread counts** (pinned to cores 8–15, on the f64 keys): at 8 threads the dense 625-particle step runs 2.1–2.3×
+  faster than at one, the 2,500-particle one 3.1–3.2×, and the multiphase step 1.8× (its density loop is serial, as
+  Rust's). Rust's rayon build gains at most 1.1×, 1.7× and 1.2× on the same rows, so at 8 threads the port is 1.2–1.45×,
+  2.7–2.9× and 1.8–1.9× Rust's time (2.8–3.0×, 5.2× and 2.8–3.0× at one).
+
+### Added (Cyrius)
 - **sph** (M5 part d): `src/sph_multiphase.cyr`, the solver's multiphase step.
   - **`PvPhaseProperties`** (rest density, gas constant, viscosity) and **`PvMultiPhaseConfig`**. Its phases are a
     column of three words a phase, with `phase_count()`, `push_phase(p)` and `PvMultiPhaseConfig_drop`. The

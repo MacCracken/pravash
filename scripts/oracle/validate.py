@@ -289,6 +289,23 @@ def r_cell_key(p, h):
     return r_as_i32(_libm.floor(prod))
 
 
+def r_as_i64(x):
+    """`x as i64`: toward zero, saturating, NaN → 0."""
+    if x != x:
+        return 0
+    if x >= 2.0 ** 63:
+        return 2 ** 63 - 1
+    if x <= -(2.0 ** 63):
+        return -(2 ** 63)
+    return int(x)
+
+
+def r_cell_key64(p, h):
+    """floor(p · fl(1/h)) as i64 (saturating, NaN 0): hisab 3.4.1's `_sh_cell_coord`, the port's f64 key since the D3
+    switch (ADR 0002 #2)."""
+    return r_as_i64(_libm.floor(p * (1.0 / h)))
+
+
 def cbrt_correctly_rounded(x, y):
     """Whether y is cbrt(x) correctly rounded to nearest (ties to even), decided exactly.
 
@@ -2996,6 +3013,41 @@ def nb_build(pos, h):
     return cell, len(pos), len(cells), p32, own, offsets, indices
 
 
+def nb_build64(pos, h):
+    """The port's neighbour grid since the D3 switch (ADR 0002 #2), from its definition rather than its code: every
+    point keyed by fl(1/h) as i64, each particle's list the cells at its own key ± 1 per axis in integers (z, then y,
+    then x; an offset past i64's range has no cell), each cell's points in index order. A dict of cells, as
+    `nb_build`'s. Returns the cell size (h), the point and cell counts, the keys and the CSR lists."""
+    inv = 1.0 / h
+    keys = [tuple(r_as_i64(_libm.floor(c * inv)) for c in q) for q in pos]
+    cells = {}
+    for i, k in enumerate(keys):
+        cells.setdefault(k, []).append(i)
+    lo, hi = -(2 ** 63), 2 ** 63 - 1
+    offsets, indices = [0], []
+    for cx, cy, cz in keys:
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    k = (cx + dx, cy + dy, cz + dz)
+                    if all(lo <= c <= hi for c in k):
+                        indices += cells.get(k, [])
+        offsets.append(len(indices))
+    return h, len(pos), len(cells), keys, offsets, indices
+
+
+# The D3 switch (ADR 0002 #2): False recomputes the corpus as the oracle made it (f32 keys); `d3_rows` sets it to
+# recompute the rows the f64 keys change.
+NB64 = False
+
+
+def nb_lists(pos, h):
+    """A fresh solver's CSR neighbour lists: the oracle's f32 grid, or the port's f64 one under NB64."""
+    if NB64:
+        return nb_build64(pos, h)[4:]
+    return nb_build(pos, h)[5:]
+
+
 def spread_bits(v):
     v &= 0xFFFFFFFF
     for sh, mask in ((16, 0x0000FFFF0000FFFF), (8, 0x00FF00FF00FF00FF), (4, 0x0F0F0F0F0F0F0F0F),
@@ -3039,6 +3091,11 @@ def sph_want(func, x, P):
     if func == "SphSolver::neighbor_lists":
         h, n = x[0], x[1]
         pos = [tuple(x[2 + 3 * j:5 + 3 * j]) for j in range(n)]
+        if NB64:
+            # The f64 grid's dump: no f32 positions, each point's key by fl(1/h).
+            cell, ln, nc, keys, offsets, indices = nb_build64(pos, h)
+            return ([cell, ln, nc, ("v", 3 * n)] + [c for q in keys for c in q] + [("v", len(offsets))] + offsets
+                    + [("v", len(indices))] + indices)
         cell, ln, nc, p32, own, offsets, indices = nb_build(pos, h)
         return ([cell, ln, nc, ("v", 3 * n)] + [c for q in p32 for c in q] + [("v", 3 * n)]
                 + [r_cell_key(c, h) for q in p32 for c in q] + [("v", len(offsets))] + offsets
@@ -3695,7 +3752,7 @@ def r_solver_step(ps, c, mu, sigma, verlet, prev):
     hw = f32(h)
     if not (fin(hw) and hw > 0.0):
         return "E:InvalidSmoothingRadius", prev
-    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    offsets, indices = nb_lists([tuple(p[0:3]) for p in ps], h)
     kc = kc_new(h)
     dens = []
     for i in range(n):
@@ -3863,7 +3920,7 @@ def r_pcisph_step(ps, c, mu, sigma, iters, max_err):
     h = c[4]
     if not (fin(f32(h)) and f32(h) > 0.0):
         return "E:InvalidSmoothingRadius"
-    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    offsets, indices = nb_lists([tuple(p[0:3]) for p in ps], h)
     kc = kc_new(h)
     dt, rest = c[0], c[6]
     dens = []
@@ -4082,7 +4139,7 @@ def r_dfsph_step(ps, c, mu, iters, max_err):
         return "E:InvalidSmoothingRadius"
     kc = kc_new(h)
     dt, rest = c[0], c[6]
-    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    offsets, indices = nb_lists([tuple(p[0:3]) for p in ps], h)
     alphas = r_dfsph_alpha(ps, offsets, indices, kc)
     snap = [list(p) for p in ps]
     for i, pi in enumerate(snap):
@@ -4116,7 +4173,7 @@ def r_dfsph_step(ps, c, mu, iters, max_err):
     for p in ps:
         for a in range(3):
             p[a] = p[a] + p[3 + a] * dt
-    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    offsets, indices = nb_lists([tuple(p[0:3]) for p in ps], h)
     alphas = r_dfsph_alpha(ps, offsets, indices, kc)
     for _ in range(iters):
         err_sum = 0.0
@@ -4186,7 +4243,7 @@ def r_multiphase_step(ps, c, sigma, it, phases):
     h = c[4]
     if not (fin(f32(h)) and f32(h) > 0.0):
         return "E:InvalidSmoothingRadius"
-    _, _, _, _, _, offsets, indices = nb_build([tuple(p[0:3]) for p in ps], h)
+    offsets, indices = nb_lists([tuple(p[0:3]) for p in ps], h)
     kc = kc_new(h)
     dens = []
     for i in range(n):
@@ -4490,6 +4547,92 @@ def check_corrections(root, module, path_tsv, rows):
     print(f"{module}.cr.tsv: current, {text.count(chr(10)) - 5} corrected rows")
 
 
+# The rows the D3 switch can change (ADR 0002 #2): the cell key, the lists, and every solver step.
+D3_FNS = {
+    "math": ("oracle::sph_cell_key",),
+    "sph": ("SphSolver::neighbor_lists", "SphSolver::step", "SphSolver::step_pcisph", "SphSolver::step_dfsph",
+            "SphSolver::step_multiphase"),
+}
+
+
+def _clear_solver_caches():
+    for c in (SOLVER_CACHE, PCISPH_CACHE, DFSPH_CACHE, MULTI_CACHE):
+        c.clear()
+
+
+def d3_rows(module, rows):
+    """(fn, inputs text, f64-key outputs text, note) for every row of `module` whose outputs change on the f64 keys."""
+    global NB64
+    fns = D3_FNS.get(module, ())
+    out = []
+    if not fns:
+        return out
+    NB64 = True
+    _clear_solver_caches()
+    try:
+        for fn, cls, ins, outs, where in rows:
+            if fn not in fns:
+                continue
+            if fn == "oracle::sph_cell_key":
+                want = [r_cell_key64(tok_f(ins[0]), tok_f(ins[1]))]
+                got = [tok_i(outs[0])]
+            else:
+                want = sph_want(fn, [tok_val(t) for t in ins], GLIBC)
+                got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle (f32 keys) " + " ".join(outs)[:200]))
+    finally:
+        NB64 = False
+        _clear_solver_caches()
+    return out
+
+
+def d3_text(module, golden_header, rows):
+    """The text of tests/golden/<module>.d3.tsv, or None when the f64 keys change no row."""
+    rows3 = d3_rows(module, rows)
+    if not rows3:
+        return None
+    oracle = next(l for l in golden_header if l.startswith("# oracle:"))
+    oracle = oracle.replace(" Generated by scripts/oracle; do not edit.", "")
+    head = [
+        f"# pravash f64-key oracle (ADR 0002 #2), format 1: {module}",
+        f"{oracle} f64 keys: the port's grid since M5 part e, by validate.py's transcription. Generated by "
+        "scripts/oracle/validate.py; do not edit.",
+        "# regenerate: python3 -I scripts/oracle/validate.py . --write",
+        "# columns: fn<TAB>inputs<TAB>outputs<TAB>note (fn, inputs: the golden row's, byte for byte; outputs: the "
+        "oracle's operations on f64 cell keys, each list the cells at a particle's key ± 1; note: the oracle's own "
+        "outputs, on its f32 keys)",
+        f"# rows: {len(rows3)}",
+    ]
+    return "\n".join(head + ["\t".join(f) for f in rows3]) + "\n"
+
+
+def check_d3(root, module, path_tsv, rows):
+    """tests/golden/<module>.d3.tsv is current (written with --write)."""
+    header = path_tsv.read_text().splitlines()[:5]
+    text = d3_text(module, header, rows)
+    path = path_tsv.with_name(f"{module}.d3.tsv")
+    rel = f"tests/golden/{module}.d3.tsv"
+    if WRITE:
+        if text is None:
+            if path.exists():
+                path.unlink()
+                print(f"removed {rel}")
+        else:
+            path.write_text(text)
+            print(f"wrote {rel} ({text.count(chr(10)) - 5} rows)")
+        return
+    if text is None:
+        if path.exists():
+            fail(f"{rel}: the f64 keys change no row, but the file exists (regenerate with --write)")
+        return
+    if not path.exists() or path.read_text() != text:
+        fail(f"{rel}: differs from the f64-key oracle (regenerate with --write)")
+        return
+    print(f"{module}.d3.tsv: current, {text.count(chr(10)) - 5} remapped rows")
+
+
 def _write_or_check(root, rel, text):
     path = root / rel
     if WRITE:
@@ -4558,7 +4701,7 @@ def check_tables(root):
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests" / "golden"
-    files = sorted(p for p in golden.glob("*.tsv") if not p.name.endswith(".cr.tsv"))
+    files = sorted(p for p in golden.glob("*.tsv") if not p.name.endswith((".cr.tsv", ".d3.tsv")))
     listed = [l for l in (golden / "modules.txt").read_text().split("\n") if l and not l.startswith("#")]
     if sorted(listed) != sorted(p.stem for p in files):
         fail(f"modules.txt lists {listed}, the files are {[p.stem for p in files]}")
@@ -4598,6 +4741,7 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"sph: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "sph", path, rows)
+            check_d3(root, "sph", path, rows)
         elif path.stem in ("vof", "phase_field"):
             counts = check_vof(rows) if path.stem == "vof" else check_phase_field(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
@@ -4607,10 +4751,11 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"math: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "math", path, rows)
+            check_d3(root, "math", path, rows)
         else:
             print(f"{path.stem}: {len(rows)} rows parsed (no recomputation yet)")
-    for path in sorted(golden.glob("*.cr.tsv")):
-        if not (golden / path.name.replace(".cr.tsv", ".tsv")).exists():
+    for path in sorted(golden.glob("*.cr.tsv")) + sorted(golden.glob("*.d3.tsv")):
+        if not (golden / (path.name.split(".")[0] + ".tsv")).exists():
             fail(f"{path.name}: no golden module of that name")
     check_tables(root)
     for msg in FAILS[:40]:

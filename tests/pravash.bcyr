@@ -1627,6 +1627,73 @@ fn bench_sph_m5d() {
     return 0;
 }
 
+# sph_m5e/*: against scripts/probes/rust/src/bin/bench_sph_m5e.rs (bodies in its header), built with `parallel`: the
+# solver's three `parallel` loops at T threads. One solver (σ 0.072) at T, after a first step that starts its pool;
+# the block copied in before each step. kind 0 `step`, 1 `step_multiphase` on the two-phase layer of `bench_sph_m5d`.
+fn _bench_sph_threads(name, sp: f64, kind, threads, iters, mp: *PvMultiPhaseConfig) {
+    var bp, bn = create_particle_block(0.1, 0.1, 0.5, 0.5, sp, 0.001);
+    var src: *PvFluidParticle = _pv_as_particles(bp);
+    if (kind == 1) {
+        for (var i = 0; i < bn; i = i + 1) {
+            var q: *PvFluidParticle = src + i;
+            if (q.position.y > 0.35) { q.phase = 1; }
+        }
+    }
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(bn * sizeof(PvFluidParticle)));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var s: PvSphSolver = PvSphSolver_with_surface_tension(0.072);
+    var set = s.set_threads(threads);
+    var label = _bench_name_n(name, threads, "");
+    var b = bench_new(label);
+    for (var k = 0; k <= iters; k = k + 1) {
+        if (k == 1) { bench_batch_start(b); }
+        for (var c = 0; c < bn; c = c + 1) {
+            var d: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *d = *e;
+        }
+        if (kind == 0) {
+            var t, v = s.step(work, bn, &cfg, mu);
+            g_sink = g_sink ^ t;
+        } else {
+            var t2, v2 = s.step_multiphase(work, bn, &cfg, mp);
+            g_sink = g_sink ^ t2;
+        }
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvSphSolver_drop(&s);
+    fl_free(work);
+    fl_free(bp);
+    return 0;
+}
+
+# The M5 part e benches: the bench_sph_m5e.rs twins at T = 1, 2, 4 and 8.
+fn bench_sph_m5e() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var water: PvPhaseProperties;
+    water.rest_density = cfg.rest_density;
+    water.gas_constant = cfg.gas_constant;
+    water.viscosity = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var light: PvPhaseProperties;
+    light.rest_density = 800.0;
+    light.gas_constant = 2000.0;
+    light.viscosity = 0.002;
+    var two: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(water, light, 0.05);
+    for (var k = 0; k < 4; k = k + 1) {
+        var t = 1;
+        if (k == 1) { t = 2; }
+        if (k == 2) { t = 4; }
+        if (k == 3) { t = 8; }
+        _bench_sph_threads("sph_m5e/step_625_t", 0.02, 0, t, 100, &two);
+        _bench_sph_threads("sph_m5e/multiphase_625_t", 0.02, 1, t, 100, &two);
+        _bench_sph_threads("sph_m5e/step_2500_t", 0.01, 0, t, 20, &two);
+    }
+    PvMultiPhaseConfig_drop(&two);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1660,6 +1727,7 @@ fn main(): i64 {
     bench_sph_m5b();
     bench_sph_m5c();
     bench_sph_m5d();
+    bench_sph_m5e();
     return 0;
 }
 

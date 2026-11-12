@@ -695,3 +695,40 @@ Pinned to core 15. Rust's criterion suite has no multiphase group.
 - **The interface term costs little on both sides** (about 1% in Rust, at most 3% in Cyrius), since only the pairs
   across the interface add to it. The free-surface term costs 11% in Cyrius and under 3% in Rust, as in part a's
   `dense_625_st` row (3.6× against 3.2×).
+
+## M5 part e: the solver's thread count and the f64 keys (2026-11-12)
+
+**The f64 keys** (A/B, pinned to core 15, three interleaved runs; A is this tree with M5 part d's f32 grid, B the f64
+one; Rust is the `bench_sph_b` twin, two runs interleaved with B):
+
+| Bench | Rust 1.3.0 | f32 keys (A) | f64 keys (B) | B / Rust |
+|---|---|---|---|---|
+| `sph_b/neighbor_build_2d_1000` | 887–891 µs | 1.29–1.34 ms | 0.82–0.87 ms | 0.93× |
+| `sph_b/neighbor_build_3d_1000` | 895–910 µs | 1.72–1.77 ms | 1.11–1.24 ms | 1.25–1.34× |
+| `sph_m5a/dense_625` | (part a: 798–817 µs) | 2.48–2.57 ms | 2.18–2.27 ms | |
+| `sph_m5e/step_2500_t1` (σ 0.072) | | 34.8–35.2 ms | 33.3–34.0 ms | |
+
+**Thread counts** (pinned to cores 8–15, two runs, on the f64 keys). The Cyrius rows are `tests/pravash.bcyr`'s
+`bench_sph_m5e`: one solver at T threads with σ 0.072, timed after a first step that starts its pool. Rust is the twin
+`scripts/probes/rust/src/bin/bench_sph_m5e.rs` built with `parallel`, at `RAYON_NUM_THREADS=T`.
+
+| Bench | | T = 1 | T = 2 | T = 4 | T = 8 |
+|---|---|---|---|---|---|
+| `sph_m5e/step_625` (as `dense_625_st`) | Rust | 0.83–0.89 ms | 0.76–0.90 ms | 0.77–0.82 ms | 0.80–0.93 ms |
+| | Cyrius | 2.45–2.54 ms | 1.59–1.62 ms | 1.20–1.22 ms | 1.10–1.16 ms |
+| `sph_m5e/multiphase_625` (two phases, both tensions) | Rust | 0.89–0.97 ms | 0.76–0.83 ms | 0.76–0.79 ms | 0.79–0.83 ms |
+| | Cyrius | 2.66–2.69 ms | 1.98 ms | 1.69–1.71 ms | 1.46–1.47 ms |
+| `sph_m5e/step_2500` (spacing 0.01, about 78 neighbours) | Rust | 6.17–6.22 ms | 4.80–5.23 ms | 3.77–3.98 ms | 3.65–3.73 ms |
+| | Cyrius | 32.2–32.4 ms | 18.2–18.3 ms | 12.2–13.5 ms | 10.0–10.5 ms |
+
+**Reading it.**
+- **The f64 build is faster than the f32 one.** It keys each point once and walks integer cells. The f32 grid made
+  nine probe keys a particle, each an f32 product, and scanned for drifting probes. The 2D build now takes less time
+  than Rust's `HashMap` build of the f32 cells.
+- **The port scales where Rust's rayon build barely does.** At 8 threads the 625-particle step is 2.1–2.3× faster than
+  at one, and the 2,500-particle step 3.1–3.2×. Rust's gains are at most 1.1× and 1.7×. The serial parts, the build
+  and the pressures and integration, are the same in both.
+- **The multiphase step gains less** (1.8×): its density loop is serial, as Rust's.
+- **The 2,500-particle block is 5.2× Rust's time at one thread,** against 2.8–3.0× on the 625 block. The build is
+  3.65 ms of the 33 ms (timed apart, on the f32 grid). The rest is the two sums over 490,000 list entries, about 61 ns
+  an entry, as on the 625 block (67 ns over 29,929). So the gap is part a's per-pair cost, over 16× more entries.

@@ -14,7 +14,7 @@
 - [x] Decisions D1–D6 (plan §0.2), made 2026-11-11:
   - **D1:** tag and publish 1.3.0 after the oracle hooks land.
   - **D2:** a local `crmath`, plus the ganita request.
-  - **D3:** f32 hash keys ported faithfully, then switched to f64 before 2.0.
+  - **D3:** f32 hash keys ported faithfully, then switched to f64 before 2.0 (switched in M5 part e).
   - **D4:** JSON that decodes compatibly, with no text identity required.
   - **D5:** no deferred audit physics in 2.0.
   - **D6:** `parallel` as a runtime thread count.
@@ -72,7 +72,10 @@
 - [x] M5 part c: DFSPH (35 rows, bit-exact on the first replay; 4 Rust tests, and the 2 CFL tests of `sph.rs`)
 - [x] M5 part d: the multiphase step (`PhaseProperties`, `MultiPhaseConfig`; 26 rows, the first 25 bit-exact on the
   first replay; the last 5 Rust tests of `sph.rs`)
-- [ ] M5 part e: the three parallel SPH loops on the worker pool, then the D3 switch to f64 keys (the rows remapped)
+- [x] M5 part e: the three parallel SPH loops on the worker pool (every step row at 2–8 threads gives the serial
+  bits), then the D3 switch to f64 keys (596 rows mapped by name to the `.d3.tsv` tables, all passing)
+- [x] **M5 done 2026-11-12.**
+- [ ] M6: coupling (FLIP/APIC, rigid bodies) and MPM
 
 ### 1.3.0
 

@@ -1634,3 +1634,80 @@ Surface parity: 349 items ok, 0 pending, 0 missing.
 | the dense 625-particle block, one phase | 3.4–3.5× |
 | two phases, interface tension 0.05 | 3.5× |
 | two phases, and free-surface tension 0.072 | 3.8–3.9× |
+
+## 23. M5 part e: the solver's thread count and the f64 keys (2026-11-12); M5 complete
+
+**The thread count** (ADR 0002 #4, amended). `PvSphSolver` gains `threads` and `pool` after its columns, and
+`s.set_threads(n)`, as `PvFluidGrid` has. The first step after it starts a `src/par.cyr` pool. Rust's three `parallel`
+loops are `_pv_par_for` kernels, each particle written by one thread:
+- `_pv_sph_density_k`: `step`'s densities. The multiphase step runs the same kernel serially, as Rust runs its own;
+- `_pv_sph_accel_k`: `step`'s accelerations;
+- `_pv_mp_accel_k`: `step_multiphase`'s accelerations.
+
+Struct results return through caller frame storage (the Cyrius guide, "Returning a struct by value"), so the kernels'
+`PvVec3` helpers need no locking. A kernel reads only the snapshot, the lists and its context, and writes only its own
+words. PCISPH and DFSPH have no `parallel` loops in Rust and run serially at any count.
+
+- **Parity:** every solver step row of all four steps (147) replays at 2, 3, 4 and 8 threads: **0 differ** from one
+  thread. The replay shares `_par_threads_agree` with the grid's. The fix that came with it: an unusable solver row
+  (-1) fell through `_par_sph_d` and was read as pending.
+- **Tests** (`tests/par.tcyr`, 50 checks): the lifecycle (the pool starts on the first step; 20 more steps at 4 threads
+  take no heap; `set_threads(0)` is 1 and stops it; drop stops it and keeps the count), and Euler, Verlet and
+  multiphase at 2, 3, 4, 8 and 16 threads against one thread's bits.
+- **Mutations:** routing the density, a WCSPH acceleration or a multiphase acceleration through a shared global (a
+  race at T > 1) is caught by both the replay (18–39 of 147 rows differ) and the test. A pool that never starts is
+  caught by the lifecycle test; the replay can't see it.
+
+**The f64 keys** (port plan D3, ADR 0002 #2, amended). `src/neighbor.cyr`:
+- each point's cell is floor(x · fl(1/h)) as a saturating i64 (NaN 0), hisab 3.4.1's `_sh_cell_coord`, with
+  `_pv_as_i64` (`src/mathx.cyr`);
+- a particle's list is the 27 cells at its own key ± 1 per axis in integers, (dz, dy, dx) order, each cell's points in
+  index order: per (dz, dy) row, one binary search to x key c − 1 and a scan to c + 1. An offset past i64's range has
+  no cell;
+- the cell size is h at every build. The f32 grid kept its old size within f32::EPSILON of h while keying its probes
+  by the new h (§5's branch point), and that band is gone with the probes;
+- the f32 position column is gone: the grid is 200 bytes, the solver 472. The steps keep Rust's `h as f32` check.
+
+**The rows mapped by name.** `validate.py` transcribes the f64 grid from its definition (`nb_build64`: a dict of cells
+and integer offsets) and recomputes every list-dependent row on it. Each row whose outputs change goes to
+`tests/golden/<module>.d3.tsv` with the f64 outputs; the harness loads it with the `.cr.tsv` rows, tagged ADR 2:
+
+| Function | Rows | Changed (`.d3.tsv`) | Why |
+|---|---|---|---|
+| `oracle::sph_cell_key` (math) | 2,460 | 558 | the f32 product rounds across a cell boundary, or the key passes i32's range |
+| `SphSolver::neighbor_lists` | 30 | 30 | the dump has no f32 positions; and the lists of the clouds at offsets up to 3e6 |
+| `SphSolver::step` | 49 | 6 | the block at x ≈ 10⁶ (frames 1 and 10), and the two droplets at frames 10 and 60 |
+| `SphSolver::step_pcisph` | 37 | 0 | |
+| `SphSolver::step_dfsph` | 35 | 1 | a 70-particle scene at frame 2 |
+| `SphSolver::step_multiphase` | 26 | 1 | water under air (Rust's test shape), 10 steps |
+
+Where a particle sits within an f32 rounding of a cell boundary (the oracle rounds the position to f32 and then the
+product x · 20 to f32; at h 0.05, 1/h as f32 is exactly 20), the two grids put it in different cells. Its list then
+holds another set of candidates or another order, so the sums change bits. Both grids list every particle within h.
+
+**Result:**
+- validate.py's transcription changed exactly the rows the port failed on (558 and 38). On replay **all 596 pass
+  against it bit for bit: 12 modules, 0 failing | rows: 49,255 ok, 0 failed, 0 measured, 3 pending, 710 accepted
+  (ADR 4: 114, ADR 2: 596)**. The other rows keep the oracle's outputs, class A or S as before. The switch reordered
+  no sum, so no row needed class D (§5).
+- **Mutations of the grid:** 11 of 11 caught. Seven fail rows (floor → ceil, an i32 key, the x run one short at either
+  end, a 1/h in f32, y outermost, a cell size other than h). The four overflow guards (x at i64::MAX, x at i64::MIN,
+  y, z) fail only `tests/sph.tcyr`: no row can hold a ±∞ position, because the oracle's overflow-checked build panics
+  on `cx + 1`.
+- **Mutations of the transcription:** 5 of 5 caught, each by a `.d3.tsv` that no longer matches (an f32 1/h in the
+  key, x / h in the grid, x outermost, the multiphase rows not recomputed, the dump's keys zeroed).
+
+**Tests** (`tests/sph.tcyr`, 190 checks): two Cyrius-only groups. A jittered lattice at x = 10⁶ and 10¹², where the
+f32 probes drifted, lists every particle within h exactly once. Keys saturated at ±∞ on each axis never list each
+other, and a NaN coordinate is cell 0. The Rust tests pass unchanged; `test_solver_grid_clear_reuse`'s bound (the cell
+size within f32::EPSILON of h as f32) holds for a cell size of h.
+
+**Speed** (benchmarks-rust-v-cyrius, M5 part e):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the 1,000-particle neighbour build, 2D (f64 keys; f32: 1.5×) | 0.93× |
+| the 1,000-particle neighbour build, 3D (f32: 1.9×) | 1.25–1.34× |
+| the dense 625-particle step, σ 0.072, 1 / 8 threads | 2.8–3.0× / 1.2–1.45× |
+| the 2,500-particle step, 1 / 8 threads | 5.2× / 2.7–2.9× |
+| the two-phase step, 1 / 8 threads | 2.8–3.0× / 1.8–1.9× |
