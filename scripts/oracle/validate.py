@@ -198,7 +198,7 @@ def check_constants(root, rows):
 _libm = ctypes.CDLL(ctypes.util.find_library("m"))
 for _name, _arity in [("sin", 1), ("cos", 1), ("exp", 1), ("log", 1), ("log10", 1),
                       ("floor", 1), ("ceil", 1), ("atan2", 2), ("hypot", 2),
-                      ("pow", 2)]:
+                      ("pow", 2), ("fmod", 2)]:
     _fn = getattr(_libm, _name)
     _fn.restype = ctypes.c_double
     _fn.argtypes = [ctypes.c_double] * _arity
@@ -340,6 +340,7 @@ BINARY_F = {
     "f64::atan2": _libm.atan2,
     "f64::hypot": _libm.hypot,
     "f64::powf": _libm.pow,
+    "f64::rem": _libm.fmod,
 }
 UNARY_I = {
     "f64::is_finite": lambda x: int(math.isfinite(x)),
@@ -350,7 +351,7 @@ UNARY_I = {
 CLASS = {
     **dict.fromkeys(["f64::sqrt", "f64::abs", "f64::floor", "f64::ceil", "f64::as_f32",
                      "f64::max", "f64::min", "f64::clamp", "f64::is_finite", "f64::is_nan",
-                     "f64::as_usize", "f64::as_u32", "oracle::sph_cell_key"], "A"),
+                     "f64::as_usize", "f64::as_u32", "f64::rem", "oracle::sph_cell_key"], "A"),
     **dict.fromkeys(["f64::to_radians", "f64::powi2", "f64::powi8"], "B"),
     **dict.fromkeys(["f64::sin", "f64::cos", "f64::sin_cos", "f64::exp", "f64::ln",
                      "f64::log10", "f64::cbrt", "f64::atan2", "f64::hypot", "f64::powf"], "C"),
@@ -1464,6 +1465,615 @@ def check_shallow(rows):
     return counts
 
 
+# ── grid (M3 part a) ───────────────────────────────────────────────────────────────────────
+# rust-old/src/grid.rs's FluidGrid transcribed, in Rust's order, on a state dict (scripts/oracle/src/m_grid.rs's
+# token layout). Python's + − × ÷, math.sqrt, math.floor and math.fmod are IEEE's (fmod is exact), and Python's
+# operator precedence and left associativity are Rust's, so each formula is written as Rust writes it. Part a's
+# rows use the periodic Gauss–Seidel and multigrid projections; the DST and CG paths arrive with part b.
+
+FG_FIELDS = ["vx", "vy", "pressure", "density"]
+BCS = ["NoSlip", "FreeSlip", "Periodic"]
+GC_FIELDS = ["dt", "viscosity", "diffusion_iterations", "pressure_iterations", "boundary",
+             "vorticity_confinement", "buoyancy_alpha", "ambient_density", "use_maccormack", "use_bfecc",
+             "smagorinsky_cs", "use_multigrid", "use_cg"]
+GC_SMOKE = {"dt": 0.1, "viscosity": 0.0001, "diffusion_iterations": 20, "pressure_iterations": 40,
+            "boundary": "NoSlip", "vorticity_confinement": 0.5, "buoyancy_alpha": 0.1, "ambient_density": 0.0,
+            "use_maccormack": 0, "use_bfecc": 0, "smagorinsky_cs": 0.0, "use_multigrid": 0, "use_cg": 0}
+NAN = float("nan")
+USIZE = 1 << 64
+
+
+def fg_read(x, k=0):
+    """(state dict, the index after it) from the token values at k; nx and ny as usizes."""
+    g = {"nx": x[k] % USIZE, "ny": x[k + 1] % USIZE, "dx": x[k + 2]}
+    at = k + 3
+    for name in FG_FIELDS:
+        n = x[at][1]
+        g[name] = list(x[at + 1:at + 1 + n])
+        at += 1 + n
+    return g, at
+
+
+def word(n):
+    """A usize as the signed word its token holds."""
+    return n - USIZE if n >= 1 << 63 else n
+
+
+def fg_tokens(g):
+    out = [word(g["nx"]), word(g["ny"]), g["dx"]]
+    for name in FG_FIELDS:
+        out += [("v", len(g[name]))] + list(g[name])
+    return out
+
+
+def gc_read(x, k):
+    c = dict(zip(GC_FIELDS, x[k:k + 13]))
+    c["boundary"] = c["boundary"].split(".")[-1]
+    return c
+
+
+def gc_tokens(c):
+    return [c[f] if f != "boundary" else f"e:BoundaryCondition.{c[f]}" for f in GC_FIELDS]
+
+
+def fg_new(nx, ny, dx):
+    if nx < 4 or ny < 4:
+        return ["E:InvalidGridResolution"]
+    if dx <= 0.0 or not fin(dx):
+        return ["E:InvalidParameter"]
+    size = nx * ny
+    if size >= USIZE:
+        return ["E:InvalidParameter"]
+    return [word(nx), word(ny), dx] + [size, 0.0] * 4 + [size] * 4 + [0]
+
+
+def fg_sample(f, nx, ny, fx, fy):
+    if not fin(fx) or not fin(fy):
+        return NAN
+    x0 = int(r_minf(r_max(float(math.floor(fx)), 0.0), float(nx - 2)))
+    y0 = int(r_minf(r_max(float(math.floor(fy)), 0.0), float(ny - 2)))
+    x1 = x0 + 1
+    y1 = y0 + 1
+    sx = r_clamp(fx - float(x0), 0.0, 1.0)
+    sy = r_clamp(fy - float(y0), 0.0, 1.0)
+    v00 = f[y0 * nx + x0]
+    v10 = f[y0 * nx + x1]
+    v01 = f[y1 * nx + x0]
+    v11 = f[y1 * nx + x1]
+    return v00 * (1.0 - sx) * (1.0 - sy) + v10 * sx * (1.0 - sy) + v01 * (1.0 - sx) * sy + v11 * sx * sy
+
+
+def fg_bounds(f, nx, ny, fx, fy):
+    if not fin(fx) or not fin(fy):
+        return (-math.inf, math.inf)
+    x0 = int(r_minf(r_max(float(math.floor(fx)), 0.0), float(nx - 2)))
+    y0 = int(r_minf(r_max(float(math.floor(fy)), 0.0), float(ny - 2)))
+    v00 = f[y0 * nx + x0]
+    v10 = f[y0 * nx + x0 + 1]
+    v01 = f[(y0 + 1) * nx + x0]
+    v11 = f[(y0 + 1) * nx + x0 + 1]
+    return (r_minf(r_minf(r_minf(v00, v10), v01), v11), r_max(r_max(r_max(v00, v10), v01), v11))
+
+
+def fg_clamp_safe(v, lo, hi):
+    return r_clamp(v, lo, hi) if lo <= hi else v
+
+
+def fg_copy_ring(dst, src, nx, ny):
+    dst[:nx] = src[:nx]
+    top = (ny - 1) * nx
+    dst[top:top + nx] = src[top:top + nx]
+    for y in range(1, ny - 1):
+        dst[y * nx] = src[y * nx]
+        dst[y * nx + nx - 1] = src[y * nx + nx - 1]
+
+
+def fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx):
+    k = dt * inv_dx
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            dst[i] = fg_sample(src, nx, ny, float(x) - k * vx[i], float(y) - k * vy[i])
+
+
+def fg_sample_periodic(f, nx, ny, fx, fy):
+    if not fin(fx) or not fin(fy):
+        return NAN
+    nxf = float(nx)
+    nyf = float(ny)
+    fx = math.fmod(math.fmod(fx, nxf) + nxf, nxf)
+    fy = math.fmod(math.fmod(fy, nyf) + nyf, nyf)
+    x0 = int(math.floor(fx)) % nx
+    y0 = int(math.floor(fy)) % ny
+    x1 = (x0 + 1) % nx
+    y1 = (y0 + 1) % ny
+    sx = fx - float(math.floor(fx))
+    sy = fy - float(math.floor(fy))
+    v00 = f[y0 * nx + x0]
+    v10 = f[y0 * nx + x1]
+    v01 = f[y1 * nx + x0]
+    v11 = f[y1 * nx + x1]
+    return v00 * (1.0 - sx) * (1.0 - sy) + v10 * sx * (1.0 - sy) + v01 * (1.0 - sx) * sy + v11 * sx * sy
+
+
+def fg_advect_periodic(dst, src, vx, vy, nx, ny, dt, inv_dx):
+    k = dt * inv_dx
+    for y in range(ny):
+        for x in range(nx):
+            i = y * nx + x
+            dst[i] = fg_sample_periodic(src, nx, ny, float(x) - k * vx[i], float(y) - k * vy[i])
+
+
+def fg_maccormack(dst, src, vx, vy, nx, ny, dt, inv_dx, temp):
+    k = dt * inv_dx
+    fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx)
+    fg_copy_ring(dst, src, nx, ny)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            temp[i] = fg_sample(dst, nx, ny, float(x) + k * vx[i], float(y) + k * vy[i])
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            corrected = dst[i] + 0.5 * (src[i] - temp[i])
+            fx = float(x) - k * vx[i]
+            fy = float(y) - k * vy[i]
+            lo, hi = fg_bounds(src, nx, ny, fx, fy)
+            dst[i] = fg_clamp_safe(corrected, lo, hi)
+
+
+def fg_bfecc(dst, src, vx, vy, nx, ny, dt, inv_dx, t1, t2):
+    k = dt * inv_dx
+    fg_advect(t1, src, vx, vy, nx, ny, dt, inv_dx)
+    fg_copy_ring(t1, src, nx, ny)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            t2[i] = fg_sample(t1, nx, ny, float(x) + k * vx[i], float(y) + k * vy[i])
+    fg_copy_ring(t2, src, nx, ny)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            t2[i] = src[i] + 0.5 * (src[i] - t2[i])
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            fx = float(x) - k * vx[i]
+            fy = float(y) - k * vy[i]
+            v = fg_sample(t2, nx, ny, fx, fy)
+            lo, hi = fg_bounds(src, nx, ny, fx, fy)
+            dst[i] = fg_clamp_safe(v, lo, hi)
+
+
+def fg_diffuse_buf(field, nx, ny, rate, dt, dx, iters):
+    a = dt * rate / (dx * dx)
+    inv_denom = 1.0 / (1.0 + 4.0 * a)
+    rhs = list(field)
+    for _ in range(iters):
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                nb = field[i - 1] + field[i + 1] + field[i - nx] + field[i + nx]
+                field[i] = (rhs[i] + a * nb) * inv_denom
+
+
+def fg_diffuse(field, nx, ny, rate, dt, dx, iters):
+    if nx < 3 or ny < 3 or nx * ny >= USIZE or nx * ny != len(field):
+        return field
+    fg_diffuse_buf(field, nx, ny, rate, dt, dx, iters)
+    return field
+
+
+def fg_divergence(div, vx, vy, nx, ny, scale):
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            div[i] = -((vx[i + 1] - vx[i - 1]) + (vy[i + nx] - vy[i - nx])) * scale
+
+
+def fg_gs(p, div, nx, ny, iters):
+    for _ in range(iters):
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                p[i] = (div[i] + (p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx])) * 0.25
+
+
+def fg_vcycle(p, rhs, nx, ny, nu, levels, depth):
+    if nx <= 6 or ny <= 6 or depth >= 10:
+        fg_gs(p, rhs, nx, ny, 50)
+        return
+    fg_gs(p, rhs, nx, ny, nu)
+    n = nx * ny
+    cnx = -(-nx // 2)
+    cny = -(-ny // 2)
+    if cnx < 4 or cny < 4:
+        fg_gs(p, rhs, nx, ny, nu * 4)
+        return
+    cn = cnx * cny
+    while len(levels) <= depth:
+        levels.append([[], [], []])
+    lv = levels[depth]
+    residual = lv[0] = [0.0] * n
+    c_rhs = lv[1] = [0.0] * cn
+    c_p = lv[2] = [0.0] * cn
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            a_p = 4.0 * p[i] - (p[i - 1] + p[i + 1] + p[i - nx] + p[i + nx])
+            residual[i] = rhs[i] - a_p
+    for cy in range(1, cny - 1):
+        for cx in range(1, cnx - 1):
+            fi = cy * 2 * nx + cx * 2
+            r = residual
+            c_rhs[cy * cnx + cx] = (4.0 * r[fi] + 2.0 * (r[fi - 1] + r[fi + 1] + r[fi - nx] + r[fi + nx])
+                                    + r[fi - nx - 1] + r[fi - nx + 1] + r[fi + nx - 1] + r[fi + nx + 1]) * 0.25
+    fg_vcycle(c_p, c_rhs, cnx, cny, nu, levels, depth + 1)
+
+    def c_at(cx, cy):
+        return c_p[cy * cnx + cx] if cx < cnx and cy < cny else 0.0
+
+    for y in range(1, ny - 1):
+        cy = y // 2
+        odd_y = y % 2 == 1
+        for x in range(1, nx - 1):
+            cx = x // 2
+            odd_x = x % 2 == 1
+            if not odd_x and not odd_y:
+                corr = c_at(cx, cy)
+            elif odd_x and not odd_y:
+                corr = 0.5 * (c_at(cx, cy) + c_at(cx + 1, cy))
+            elif not odd_x and odd_y:
+                corr = 0.5 * (c_at(cx, cy) + c_at(cx, cy + 1))
+            else:
+                corr = 0.25 * (c_at(cx, cy) + c_at(cx + 1, cy) + c_at(cx, cy + 1) + c_at(cx + 1, cy + 1))
+            p[y * nx + x] += corr
+    fg_gs(p, rhs, nx, ny, nu)
+
+
+def fg_multigrid(p, div, nx, ny, nu, cycles, levels):
+    for _ in range(max(cycles, 1)):
+        fg_vcycle(p, div, nx, ny, nu, levels, 0)
+
+
+def fg_project(vx, vy, p, nx, ny, inv_2dx):
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            vx[i] -= (p[i + 1] - p[i - 1]) * inv_2dx
+            vy[i] -= (p[i + nx] - p[i - nx]) * inv_2dx
+
+
+def fg_vorticity(vx, vy, nx, ny, dx, dt, eps, w):
+    inv_2dx = 0.5 / dx
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            w[i] = (vy[i + 1] - vy[i - 1]) * inv_2dx - (vx[i + nx] - vx[i - nx]) * inv_2dx
+    for y in range(2, max(ny - 2, 0)):
+        for x in range(2, max(nx - 2, 0)):
+            i = y * nx + x
+            if abs(w[i]) < 1e-10:
+                continue
+            eta_x = (abs(w[i + 1]) - abs(w[i - 1])) * inv_2dx
+            eta_y = (abs(w[i + nx]) - abs(w[i - nx])) * inv_2dx
+            eta_mag = math.sqrt(eta_x * eta_x + eta_y * eta_y)
+            if eta_mag < 1e-10:
+                continue
+            nx_v = eta_x / eta_mag
+            ny_v = eta_y / eta_mag
+            vx[i] += eps * dx * dt * ny_v * w[i]
+            vy[i] -= eps * dx * dt * nx_v * w[i]
+
+
+def fg_enforce(vx, vy, nx, ny, bc):
+    if bc == "NoSlip":
+        for x in range(nx):
+            vx[x] = -vx[nx + x]
+            vy[x] = -vy[nx + x]
+            top = (ny - 1) * nx + x
+            below = (ny - 2) * nx + x
+            vx[top] = -vx[below]
+            vy[top] = -vy[below]
+        for y in range(ny):
+            l = y * nx
+            vx[l] = -vx[l + 1]
+            vy[l] = -vy[l + 1]
+            r = y * nx + nx - 1
+            vx[r] = -vx[r - 1]
+            vy[r] = -vy[r - 1]
+    elif bc == "FreeSlip":
+        for x in range(nx):
+            vx[x] = vx[nx + x]
+            vy[x] = -vy[nx + x]
+            top = (ny - 1) * nx + x
+            below = (ny - 2) * nx + x
+            vx[top] = vx[below]
+            vy[top] = -vy[below]
+        for y in range(ny):
+            l = y * nx
+            vx[l] = -vx[l + 1]
+            vy[l] = vy[l + 1]
+            r = y * nx + nx - 1
+            vx[r] = -vx[r - 1]
+            vy[r] = vy[r - 1]
+    else:
+        for x in range(nx):
+            vx[x] = vx[(ny - 2) * nx + x]
+            vy[x] = vy[(ny - 2) * nx + x]
+            vx[(ny - 1) * nx + x] = vx[nx + x]
+            vy[(ny - 1) * nx + x] = vy[nx + x]
+        for y in range(ny):
+            vx[y * nx] = vx[y * nx + nx - 2]
+            vy[y * nx] = vy[y * nx + nx - 2]
+            vx[y * nx + nx - 1] = vx[y * nx + 1]
+            vy[y * nx + nx - 1] = vy[y * nx + 1]
+        c = (ny - 2) * nx + nx - 2
+        vx[0] = vx[c]
+        vy[0] = vy[c]
+        vx[nx - 1] = vx[(ny - 2) * nx + 1]
+        vy[nx - 1] = vy[(ny - 2) * nx + 1]
+        vx[(ny - 1) * nx] = vx[nx + nx - 2]
+        vy[(ny - 1) * nx] = vy[nx + nx - 2]
+        vx[(ny - 1) * nx + nx - 1] = vx[nx + 1]
+        vy[(ny - 1) * nx + nx - 1] = vy[nx + 1]
+
+
+def fg_enforce_scalar(f, nx, ny):
+    for x in range(nx):
+        f[x] = f[nx + x]
+        f[(ny - 1) * nx + x] = f[(ny - 2) * nx + x]
+    for y in range(ny):
+        f[y * nx] = f[y * nx + 1]
+        f[y * nx + nx - 1] = f[y * nx + nx - 2]
+
+
+def fg_advect_by(dst, src, g, c, sc, drhs):
+    nx, ny = g["nx"], g["ny"]
+    inv_dx = 1.0 / g["dx"]
+    periodic = c["boundary"] == "Periodic"
+    if c["use_bfecc"] and not periodic:
+        fg_bfecc(dst, src, g["vx"], g["vy"], nx, ny, c["dt"], inv_dx, sc, drhs)
+    elif c["use_maccormack"] and not periodic:
+        fg_maccormack(dst, src, g["vx"], g["vy"], nx, ny, c["dt"], inv_dx, sc)
+    elif periodic:
+        fg_advect_periodic(dst, src, g["vx"], g["vy"], nx, ny, c["dt"], inv_dx)
+    else:
+        fg_advect(dst, src, g["vx"], g["vy"], nx, ny, c["dt"], inv_dx)
+
+
+def fg_step(g, c):
+    """One FluidGrid::step: None, or the failure's token. The multigrid levels persist in g["mg"]."""
+    dt = c["dt"]
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    if c["viscosity"] < 0.0 or not fin(c["viscosity"]):
+        return "E:InvalidViscosity"
+    for key in ("smagorinsky_cs", "vorticity_confinement"):
+        if not fin(c[key]) or c[key] < 0.0:
+            return "E:InvalidParameter"
+    if not fin(c["buoyancy_alpha"]) or not fin(c["ambient_density"]):
+        return "E:InvalidParameter"
+    if c["pressure_iterations"] == 0 or c["diffusion_iterations"] == 0:
+        return "E:InvalidParameter"
+    nx, ny, dx = g["nx"], g["ny"], g["dx"]
+    n = nx * ny
+    if nx < 4 or ny < 4 or n >= USIZE or any(len(g[f]) != n for f in FG_FIELDS):
+        return "E:InvalidGridResolution"
+    if not fin(dx) or dx <= 0.0:
+        return "E:InvalidParameter"
+    inv_dx = 1.0 / dx
+    inv_2dx = 0.5 * inv_dx
+    bc = c["boundary"]
+    if bc not in BCS or c["use_cg"] or (not c["use_multigrid"] and bc != "Periodic"):
+        raise ValueError("a part b path (DST or CG)")
+    sa, sb, sc, drhs = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
+    vx, vy, rho = g["vx"], g["vy"], g["density"]
+    fg_advect_by(sa, vx, g, c, sc, drhs)
+    fg_advect_by(sb, vy, g, c, sc, drhs)
+    vx[:] = sa
+    vy[:] = sb
+    fg_enforce(vx, vy, nx, ny, bc)
+    if any(v != v for v in vx) or any(v != v for v in vy):
+        return "E:Diverged"
+    eff = c["viscosity"]
+    if c["smagorinsky_cs"] > 0.0:
+        cs_dx = c["smagorinsky_cs"] * dx
+        cs_dx2 = cs_dx * cs_dx
+        sum_nu_t = 0.0
+        count = 0.0
+        for y in range(1, ny - 1):
+            for x in range(1, nx - 1):
+                i = y * nx + x
+                dudx = (vx[i + 1] - vx[i - 1]) * inv_2dx
+                dudy = (vx[i + nx] - vx[i - nx]) * inv_2dx
+                dvdx = (vy[i + 1] - vy[i - 1]) * inv_2dx
+                dvdy = (vy[i + nx] - vy[i - nx]) * inv_2dx
+                s11, s22, s12 = dudx, dvdy, 0.5 * (dudy + dvdx)
+                s_mag = math.sqrt(2.0 * (s11 * s11 + s22 * s22 + 2.0 * s12 * s12))
+                sum_nu_t += cs_dx2 * s_mag
+                count += 1.0
+        eff = c["viscosity"] + (sum_nu_t / count if count > 0.0 else 0.0)
+    if eff > 0.0:
+        fg_diffuse_buf(vx, nx, ny, eff, dt, dx, c["diffusion_iterations"])
+        fg_diffuse_buf(vy, nx, ny, eff, dt, dx, c["diffusion_iterations"])
+        fg_enforce(vx, vy, nx, ny, bc)
+    if c["buoyancy_alpha"] != 0.0:
+        for i in range(n):
+            vy[i] += c["buoyancy_alpha"] * (rho[i] - c["ambient_density"]) * dt
+    if c["vorticity_confinement"] > 0.0:
+        sa = [0.0] * n
+        fg_vorticity(vx, vy, nx, ny, dx, dt, c["vorticity_confinement"], sa)
+    fg_enforce(vx, vy, nx, ny, bc)
+    sa = [0.0] * n
+    fg_divergence(sa, vx, vy, nx, ny, 0.5 * dx)
+    if c["use_multigrid"]:
+        fg_multigrid(g["pressure"], sa, nx, ny, 4, -(-c["pressure_iterations"] // 10), g["mg"])
+    else:
+        fg_gs(g["pressure"], sa, nx, ny, c["pressure_iterations"])
+    fg_project(vx, vy, g["pressure"], nx, ny, inv_2dx)
+    fg_enforce(vx, vy, nx, ny, bc)
+    if not all(fin(v) for v in vx + vy):
+        return "E:Diverged"
+    sa = [0.0] * n
+    fg_advect_by(sa, rho, g, c, sc, drhs)
+    rho[:] = sa
+    if bc != "Periodic":
+        fg_enforce_scalar(rho, nx, ny)
+    return None
+
+
+def fg_run(x):
+    """A step row's outputs: the state and the scratch dump after its nsteps steps, or the first failure."""
+    g, k = fg_read(x)
+    c = gc_read(x, k)
+    steps = x[k + 13]
+    g["mg"] = []
+    for _ in range(steps):
+        bad = fg_step(g, c)
+        if bad:
+            return [bad]
+    n = g["nx"] * g["ny"]
+    out = fg_tokens(g) + [n] * 4 + [len(g["mg"])]
+    for lv in g["mg"]:
+        out += [len(lv[0]), len(lv[1]), len(lv[2])]
+    return out
+
+
+def fg_json(func, doc):
+    """serde_json's reading of a FluidGrid, GridConfig or BoundaryCondition document."""
+    def us(v):
+        if not (isinstance(v, tuple) and v[0] == "int") or int(v[1]) < 0:
+            raise JsonRefused("not a usize")
+        return int(v[1])
+
+    def bl(v):
+        if not isinstance(v, bool):
+            raise JsonRefused("not a bool")
+        return int(v)
+
+    def bc(v):
+        if isinstance(v, str) and v in BCS:
+            return v
+        if isinstance(v, tuple) and v[0] == "obj" and len(v[1]) == 1:
+            key, val = v[1][0]
+            if key in BCS and val is None:
+                return key
+        raise JsonRefused("no variant")
+
+    try:
+        v = j_load(doc)
+        if func == "BoundaryCondition::from_json":
+            return [f"e:BoundaryCondition.{bc(v)}"]
+        if func == "GridConfig::from_json":
+            f = j_struct(v, GC_FIELDS)
+            c = {"dt": j_f64(f[0]), "viscosity": j_f64(f[1]), "diffusion_iterations": us(f[2]),
+                 "pressure_iterations": us(f[3]), "boundary": bc(f[4]), "vorticity_confinement": j_f64(f[5]),
+                 "buoyancy_alpha": j_f64(f[6]), "ambient_density": j_f64(f[7]), "use_maccormack": bl(f[8]),
+                 "use_bfecc": bl(f[9]), "smagorinsky_cs": j_f64(f[10]), "use_multigrid": bl(f[11]),
+                 "use_cg": bl(f[12])}
+            return gc_tokens(c)
+        f = j_struct(v, ["nx", "ny", "dx"] + FG_FIELDS)
+        g = {"nx": us(f[0]), "ny": us(f[1]), "dx": j_f64(f[2])}
+        for name, val in zip(FG_FIELDS, f[3:]):
+            g[name] = [j_f64(e) for e in j_arr(val)]
+        return fg_tokens(g)
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def r_cfl_dt(g, visc, cfl):
+    big = sys.float_info.max
+    dt = big
+    max_v = fg_max_speed(g)
+    if max_v > 1e-20:
+        dt = r_minf(dt, g["dx"] / max_v)
+    if visc > 1e-20:
+        dt = r_minf(dt, g["dx"] * g["dx"] / (4.0 * visc))
+    return r_minf(cfl * dt, big)
+
+
+def fg_max_speed(g):
+    m = 0.0
+    for u, v in zip(g["vx"], g["vy"]):
+        m = r_max(m, u * u + v * v)
+    return math.sqrt(m)
+
+
+def check_grid(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        short = func.split("::")[-1]
+        if func == "FluidGrid::new":
+            want = fg_new(x[0] % USIZE, x[1] % USIZE, x[2])
+        elif func in ("GridConfig::smoke", "GridConfig::default"):
+            want = gc_tokens(GC_SMOKE)
+        elif short == "from_json":
+            want = fg_json(func, unpct(ins[0][2:]))
+        elif func == "FluidGrid::diffuse":
+            n = x[0][1]
+            field = list(x[1:1 + n])
+            nx, ny, rate, dt, dx, iters = x[1 + n:7 + n]
+            out = fg_diffuse(field, nx % USIZE, ny % USIZE, rate, dt, dx, iters)
+            want = [("v", len(out))] + out
+        elif func.startswith("oracle::pressure_solve_"):
+            n = x[0][1]
+            p = list(x[1:1 + n])
+            m = x[1 + n][1]
+            div = list(x[2 + n:2 + n + m])
+            k = 2 + n + m
+            nx, ny = x[k], x[k + 1]
+            if short == "pressure_solve_gauss_seidel":
+                fg_gs(p, div, nx, ny, x[k + 2])
+                want = [("v", n)] + p
+            else:
+                levels = []
+                fg_multigrid(p, div, nx, ny, x[k + 2], x[k + 3], levels)
+                want = [("v", n)] + p + [len(levels)]
+                for lv in levels:
+                    for col in lv:
+                        want += [("v", len(col))] + col
+        else:
+            g, k = fg_read(x)
+            nx, ny = g["nx"], g["ny"]
+            n = nx * ny
+            if short == "cell_count":
+                want = [word(n % USIZE)]
+            elif short == "idx":
+                want = [("v", n)] + [(i // nx) * nx + i % nx for i in range(n)]
+            elif short == "velocity_at":
+                want = [("v", 2 * n)]
+                for i in range(n):
+                    want += [g["vx"][i], g["vy"][i]]
+            elif short == "speed_at":
+                want = [("v", n)] + [math.sqrt(g["vx"][i] * g["vx"][i] + g["vy"][i] * g["vy"][i])
+                                     for i in range(n)]
+            elif short == "max_speed":
+                want = [fg_max_speed(g)]
+            elif short == "total_kinetic_energy":
+                dx2 = g["dx"] * g["dx"]
+                e = -0.0
+                for u, v, rho in zip(g["vx"], g["vy"], g["density"]):
+                    e += 0.5 * rho * (u * u + v * v) * dx2
+                want = [e]
+            elif short == "cfl_dt":
+                m = x[k][1]
+                visc = x[k + 1:k + 1 + m]
+                cfl = x[k + 2 + m:k + 2 + 2 * m]
+                want = [("v", m)] + [r_cfl_dt(g, a, b) for a, b in zip(visc, cfl)]
+            elif short == "step":
+                want = fg_run(x)
+            else:
+                fail(f"{where}: no check for {func}")
+                continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 # ── the correctly rounded math (ADR 0004) ─────────────────────────────────────────────────────
 # The corrected oracle: the oracle's own operations with every exp, ln, log10, sin, cos, hypot, pow and
 # atan2 result correctly rounded (MPFR). Where glibc rounded every call correctly the row is unchanged
@@ -1695,6 +2305,10 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"shallow: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "shallow", path, rows)
+        elif path.stem == "grid":
+            counts = check_grid(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"grid: {len(rows)} rows recomputed ({summary})")
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

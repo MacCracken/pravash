@@ -1,9 +1,10 @@
 # integration.tcyr — the ported tests of rust-old/tests/integration.rs, as their modules land.
 #
 # M1 (part 4): the eleven that use only M1 modules. M2: the three shallow water tests (`.unwrap()` on `new` and
-# `step` is an assertion that every call was Ok). The rest arrive with their milestones:
-# - serde_roundtrip_all_types (it also needs FluidGrid): M3;
-# - the grid tests: M3;
+# `step` is an assertion that every call was Ok). M3 (parts a–b): the five grid tests, in `test_grid` (Rust's two
+# grid sections, then grid_invalid_dx_rejected from its edge cases; `is_err()` is the `PV_ERR_*` code Rust's path
+# returns), and serde_roundtrip_all_types, whose four types all read and write JSON now (serde_json is `to_json` /
+# `Pv*_from_json`). The rest arrive with their milestones:
 # - the SPH and solver tests: M4–M5;
 # - the coupling and FLIP tests: M6.
 
@@ -13,6 +14,160 @@ fn near(a: f64, b: f64, tol: f64): i64 {
     var d: f64 = a - b;
     var ad: f64 = f64_abs(d);
     if (ad < tol) { return 1; }
+    return 0;
+}
+
+var F64_EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
+
+# The error code of `PvFluidGrid_new` (PV_ERR_NONE when it built: *g then holds storage to drop).
+fn grid_new_err(g: *PvFluidGrid, nx, ny, dx: f64): i64 {
+    var t, e = PvFluidGrid_new(nx, ny, dx, g);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
+}
+
+# n steps by config c: the number that returned Err (each is Rust's `step(&config).unwrap()`).
+fn grid_steps(g: *PvFluidGrid, c: *PvGridConfig, n): i64 {
+    var bad = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var t, e = g.step(c);
+        if (is_err_result(t) == 1) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# 1 when each of the n f64 words at p is finite (Rust's `for v in &g.vx { assert!(v.is_finite()) }`).
+fn all_finite(p, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        if (_pv_is_finite(x) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Σ of the n f64 words at p in index order, folded from −0 as Rust's `f64::sum` is.
+fn fsum(p, n): f64 {
+    var s: f64 = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        s = s + x;
+    }
+    return s;
+}
+
+# The grid tests (M3 parts a–b), in Rust's order; grid_invalid_dx_rejected, from the edge-case section, closes them.
+fn test_grid() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+
+    test_group("grid_diffusion_conserves_total");
+    var nx = 20;
+    var ny = 20;
+    var n = nx * ny;
+    var field = alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) { store64(field + i * 8, 0); }
+    var peak: f64 = 100.0;
+    store64(field + (nx * 10 + 10) * 8, _pv_bits(peak));
+    var total_before: f64 = fsum(field, n);
+    assert_eq(PvFluidGrid_diffuse(field, n, nx, ny, 0.1, 0.01, 0.1, 50), 1, "diffused");
+    var total_after: f64 = fsum(field, n);
+    var dt: f64 = total_after - total_before;
+    var adt: f64 = f64_abs(dt);
+    var ab: f64 = f64_abs(total_before);
+    var rel: f64 = adt / ab;
+    assert(rel < 0.5, "diffusion keeps the total within the same order of magnitude");
+
+    test_group("grid_large_grid_creation");
+    assert_eq(grid_new_err(&g, 256, 256, 0.01), PV_ERR_NONE, "new");
+    assert_eq(g.cell_count(), 256 * 256, "256 × 256 cells");
+    var ms0: f64 = g.max_speed();
+    var ams0: f64 = f64_abs(ms0);
+    assert(ams0 < F64_EPS, "a new grid is still");
+    PvFluidGrid_drop(&g);
+
+    test_group("grid_navier_stokes_smoke_rises");
+    assert_eq(grid_new_err(&g, 30, 30, 0.1), PV_ERR_NONE, "new");
+    for (var x = 12; x < 18; x = x + 1) {
+        var j = 2 * 30 + x;
+        g.density.set_f(j, 1.0);
+        g.vy.set_f(j, 2.0);
+    }
+    var bad = 0;
+    for (var k = 0; k < 50; k = k + 1) {
+        for (var x2 = 12; x2 < 18; x2 = x2 + 1) { g.density.set_f(2 * 30 + x2, 1.0); }
+        bad = bad + grid_steps(&g, &c, 1);
+    }
+    assert_eq(bad, 0, "50 steps");
+    var ms1: f64 = g.max_speed();
+    assert(ms1 > 0.01, "the plume moves");
+    assert_eq(_pv_is_finite(ms1), 1, "the speed is finite");
+    assert_eq(all_finite(g.vx.data, g.vx.len), 1, "every vx is finite");
+    assert_eq(all_finite(g.vy.data, g.vy.len), 1, "every vy is finite");
+    PvFluidGrid_drop(&g);
+
+    test_group("grid_navier_stokes_stable_empty");
+    assert_eq(grid_new_err(&g, 20, 20, 0.1), PV_ERR_NONE, "new");
+    assert_eq(grid_steps(&g, &c, 100), 0, "100 steps");
+    var ms2: f64 = g.max_speed();
+    assert(ms2 < F64_EPS, "an empty grid stays at zero");
+    PvFluidGrid_drop(&g);
+
+    test_group("grid_invalid_dx_rejected");
+    assert_eq(grid_new_err(&g, 10, 10, 0.0), PV_ERR_INVALID_PARAMETER, "dx = 0: InvalidParameter");
+    assert_eq(grid_new_err(&g, 10, 10, -1.0), PV_ERR_INVALID_PARAMETER, "dx < 0: InvalidParameter");
+    return 0;
+}
+
+# serde_roundtrip_all_types (Rust's cross-module section, after materials_have_consistent_physics): each type through
+# its JSON and back.
+fn test_serde_all_types() {
+    test_group("serde_roundtrip_all_types");
+    var config: PvFluidConfig = PvFluidConfig_water_2d();
+    var sb1 = str_builder_new();
+    assert_eq(config.to_json(sb1), 0, "FluidConfig written");
+    var s1 = str_builder_build(sb1);
+    var config2: PvFluidConfig;
+    var t1, e1 = PvFluidConfig_from_json(str_data(s1), str_len(s1), &config2);
+    assert_eq(is_err_result(t1), 0, "FluidConfig read back");
+    assert(near(config2.dt, config.dt, F64_EPS) == 1, "FluidConfig: dt round-trips");
+
+    var mat: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+    var sb2 = str_builder_new();
+    assert_eq(mat.to_json(sb2), 0, "FluidMaterial written");
+    var s2 = str_builder_build(sb2);
+    var mat2: PvFluidMaterial;
+    var t2, e2 = PvFluidMaterial_from_json(str_data(s2), str_len(s2), &mat2);
+    assert_eq(is_err_result(t2), 0, "FluidMaterial read back");
+    assert(near(mat2.density, mat.density, F64_EPS) == 1, "FluidMaterial: density round-trips");
+
+    var grid: PvFluidGrid;
+    var grid2: PvFluidGrid;
+    assert_eq(grid_new_err(&grid, 5, 5, 0.1), PV_ERR_NONE, "FluidGrid new");
+    var sb3 = str_builder_new();
+    assert_eq(grid.to_json(sb3), 0, "FluidGrid written");
+    var s3 = str_builder_build(sb3);
+    var t3, e3 = PvFluidGrid_from_json(str_data(s3), str_len(s3), &grid2);
+    assert_eq(is_err_result(t3), 0, "FluidGrid read back");
+    if (is_err_result(t3) == 0) {
+        assert_eq(grid2.nx, grid.nx, "FluidGrid: nx round-trips");
+        PvFluidGrid_drop(&grid2);
+    }
+    PvFluidGrid_drop(&grid);
+
+    var sw: PvShallowWater;
+    var sw2: PvShallowWater;
+    var t4, e4 = PvShallowWater_new(5, 5, 0.1, 1.0, &sw);
+    assert_eq(is_err_result(t4), 0, "ShallowWater new");
+    var sb4 = str_builder_new();
+    assert_eq(sw.to_json(sb4), 0, "ShallowWater written");
+    var s4 = str_builder_build(sb4);
+    var t5, e5 = PvShallowWater_from_json(str_data(s4), str_len(s4), &sw2);
+    assert_eq(is_err_result(t5), 0, "ShallowWater read back");
+    if (is_err_result(t5) == 0) {
+        assert_eq(sw2.nx, sw.nx, "ShallowWater: nx round-trips");
+        PvShallowWater_drop(&sw2);
+    }
+    PvShallowWater_drop(&sw);
     return 0;
 }
 
@@ -78,6 +233,7 @@ fn test_shallow() {
 
 fn main() {
     alloc_init();
+    test_grid();
     test_shallow();
     var pi: f64 = PV_F64_PI;
     var w: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
@@ -105,6 +261,8 @@ fn main() {
     var ac: f64 = air.speed_of_sound;
     var wc: f64 = w.speed_of_sound;
     assert(ad < wd && wv < hv && ac < wc, "air lighter than water, water thinner than honey, sound slower in air");
+
+    test_serde_all_types();
 
     test_group("buoyancy_sphere_in_water");
     var r: f64 = 0.062;

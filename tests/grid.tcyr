@@ -1,0 +1,1049 @@
+# grid.tcyr — the ported Rust tests of rust-old/src/grid.rs's `FluidGrid` (M3 parts a–b).
+#
+# Every test keeps its Rust name as its group, in Rust's order: 44 of the 49 are ported (one in part), and
+# `potential_flow`, `div_norm` and the closures are helpers. Left for M3 part c, where `MacGrid`, `KEpsilon` and
+# `apply_ghost_fluid` arrive:
+# - test_kepsilon_size_mismatch_no_panic (KEpsilon);
+# - test_mac_projection_divergence_free, test_mac_buoyancy_does_not_accumulate_on_walls and test_mac_advects_density
+#   (MacGrid);
+# - test_ghost_fluid_size_mismatch_no_panic (apply_ghost_fluid);
+# - the MacGrid half of test_cfl_dt_finite_without_flow (`m.cfl_dt(0.5) > 1e300`); its FluidGrid half is here.
+# Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9, #10, #12):
+# - `is_err()` is the `PV_ERR_*` code, checked against the variant Rust's code path returns (which implies is_err);
+# - `.unwrap()` on `new`, `step` and the pressure solves is an assertion that every call was Ok;
+# - a `Vec<f64>` field is a PvColumn (`v[i]` is `get_f` / `set_f`); a local `vec![x; n]` is n f64 words, and a
+#   `&[f64]` argument their pointer; the private helpers are the `_pv_fg_*` functions;
+# - `FluidGrid::diffuse` takes (pointer, count) and returns 1 (diffused) or 0 (refused, where Rust warns and
+#   returns): the tests check that flag too;
+# - a size mismatch Rust survives without a panic is a call that returns, then Rust's assertions;
+# - a closure is a helper function; Rust's per-cell assertion loops count the failing cells into one check;
+# - `capacity()` is the column's `cap`, and its storage pointer is checked not to move either: the four scratch
+#   columns (4–7) across a later step;
+# - serde_json is `to_json` / `PvFluidGrid_from_json`.
+# One Cyrius-only group, `fg_layout_matches_column_offsets`, pins the record layouts that src/grid.cyr's `_pv_fg_col`
+# and `_pv_mg_col` offsets assume.
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+var EPS: f64 = 0.0000000001;                            # the Rust tests' 1e-10
+var F64_EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
+
+# ── helpers ─────────────────────────────────────────────────────────────────────────
+
+# A new grid into *g, as `FluidGrid::new(..).unwrap()`: 1 when it built.
+fn fresh(g: *PvFluidGrid, nx, ny, dx: f64): i64 {
+    var t, e = PvFluidGrid_new(nx, ny, dx, g);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# The error code of `PvFluidGrid_new` (PV_ERR_NONE when it built: *g then holds storage to drop).
+fn new_err(g: *PvFluidGrid, nx, ny, dx: f64): i64 {
+    var t, e = PvFluidGrid_new(nx, ny, dx, g);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
+}
+
+# The error code of one step (PV_ERR_NONE for Ok).
+fn step_err(g: *PvFluidGrid, c: *PvGridConfig): i64 {
+    var t, e = g.step(c);
+    if (is_err_result(t) == 1) { return e; }
+    return PV_ERR_NONE;
+}
+
+# n steps: the number that returned Err (each is Rust's `step(&config).unwrap()`, so the tests assert 0).
+fn steps(g: *PvFluidGrid, c: *PvGridConfig, n): i64 {
+    var bad = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var t, e = g.step(c);
+        if (is_err_result(t) == 1) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# Sets the n f64 words at p to v.
+fn fill(p, n, v: f64) {
+    for (var i = 0; i < n; i = i + 1) { store64(p + i * 8, _pv_bits(v)); }
+    return 0;
+}
+
+# n f64 words of v (Rust's `vec![v; n]`).
+fn filled(n, v: f64): i64 {
+    var p = alloc(n * 8);
+    fill(p, n, v);
+    return p;
+}
+
+# n zeros (Rust's `vec![0.0; n]`).
+fn zeros(n): i64 {
+    return filled(n, 0.0);
+}
+
+# Word i of the f64 buffer p (Rust's `v[i]`).
+fn at(p, i): f64 {
+    var x: f64 = load64(p + i * 8);
+    return x;
+}
+
+# Word i of the f64 buffer p set to v (Rust's `v[i] = x`).
+fn put(p, i, v: f64) {
+    store64(p + i * 8, _pv_bits(v));
+    return 0;
+}
+
+# 1 when each of the n f64 words at p is finite.
+fn all_finite(p, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        if (_pv_is_finite(x) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# The number of the n f64 words at p not within tol of v (Rust's `all(|&x| (x − v).abs() < tol)` fails on each).
+fn count_far(p, n, v: f64, tol: f64): i64 {
+    var bad = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        if (near(x, v, tol) == 0) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# The number of i in 0..n where |a[i] − b[i]| < tol fails.
+fn count_differ(pa, pb, n, tol: f64): i64 {
+    var bad = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var a: f64 = load64(pa + i * 8);
+        var b: f64 = load64(pb + i * 8);
+        if (near(a, b, tol) == 0) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# Σ of the n f64 words at p in index order, folded from −0 as Rust's `f64::sum` is.
+fn fsum(p, n): f64 {
+    var s: f64 = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        s = s + x;
+    }
+    return s;
+}
+
+# Σ x² of the n f64 words at p, from −0 (Rust's `iter().map(|d| d * d).sum()`).
+fn sum_sq(p, n): f64 {
+    var s: f64 = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        s = s + (x * x);
+    }
+    return s;
+}
+
+# m0 folded with the n f64 words at p by Rust's NaN-ignoring max (`fold(m0, f64::max)`).
+fn fold_max(m0: f64, p, n): f64 {
+    var m: f64 = m0;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        m = _pv_max(m, x);
+    }
+    return m;
+}
+
+# m0 folded with the |x| of the n f64 words at p (`fold(m0, |m, v| m.max(v.abs()))`).
+fn fold_max_abs(m0: f64, p, n): f64 {
+    var m: f64 = m0;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        var a: f64 = f64_abs(x);
+        m = _pv_max(m, a);
+    }
+    return m;
+}
+
+# max |a[i] − b[i]| over i in 0..n, from 0 (`zip(b).fold(0.0, |m, (a, b)| m.max((a − b).abs()))`).
+fn max_abs_diff(pa, pb, n): f64 {
+    var m: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var a: f64 = load64(pa + i * 8);
+        var b: f64 = load64(pb + i * 8);
+        var d: f64 = a - b;
+        var ad: f64 = f64_abs(d);
+        m = _pv_max(m, ad);
+    }
+    return m;
+}
+
+# The smooth potential-flow field u = ∇φ (φ a Gaussian bump), zero near the walls, over the nx·ny words at vx and vy
+# (every word written). Mirrors the Rust tests' `potential_flow`, in its operation order.
+fn potential_flow(vx, vy, nx, ny, dx: f64) {
+    var n = nx * ny;
+    fill(vx, n, 0.0);
+    fill(vy, n, 0.0);
+    var nxf: f64 = f64_from(nx);
+    var nyf: f64 = f64_from(ny);
+    var cx: f64 = nxf / 2.0;
+    var cy: f64 = nyf / 2.0;
+    var sigma: f64 = nxf / 8.0;
+    var s2: f64 = sigma * sigma;
+    var m2: f64 = -2.0;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        var ry: f64 = yf - cy;
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var xf: f64 = f64_from(x);
+            var rx: f64 = xf - cx;
+            var q: f64 = (rx * rx) + (ry * ry);
+            var nq: f64 = -q;
+            var arg: f64 = nq / s2;
+            var phi: f64 = _pv_exp(arg);
+            var ux: f64 = (((m2 * rx) / s2) * phi) / dx;
+            var uy: f64 = (((m2 * ry) / s2) * phi) / dx;
+            put(vx, y * nx + x, ux);
+            put(vy, y * nx + x, uy);
+        }
+    }
+    return 0;
+}
+
+# ‖∇·u‖₂ by the central divergence at scale 0.5/dx. Mirrors the Rust tests' `div_norm`.
+fn div_norm(vx, vy, nx, ny, dx: f64): f64 {
+    var n = nx * ny;
+    var div = zeros(n);
+    var scale: f64 = 0.5 / dx;
+    _pv_fg_divergence(div, vx, vy, nx, ny, scale);
+    var s: f64 = sum_sq(div, n);
+    var r: f64 = f64_sqrt(s);
+    return r;
+}
+
+# Solves 4p − Σp = rhs into p (nx × ny) with solver k (0 Gauss–Seidel, 1 DST, 2 multigrid with ν = 4, 3 conjugate
+# gradient), `iters` the Gauss–Seidel or CG iterations or the multigrid cycles, each with fresh scratch (Rust's
+# `Vec::new()` levels): 1 when it was Ok (Rust's `.unwrap()`).
+fn solve(k, p, rhs, nx, ny, iters): i64 {
+    if (k == 0) {
+        _pv_fg_pressure_gs(p, rhs, nx, ny, iters);
+        return 1;
+    }
+    var a: PvColumn = PvColumn_new();
+    var b: PvColumn = PvColumn_new();
+    var c: PvColumn = PvColumn_new();
+    var ok = 1;
+    if (k == 1) {
+        var t1, e1 = _pv_fg_pressure_dst(p, nx * ny, rhs, nx, ny, &a, &b, &c);
+        if (is_err_result(t1) == 1) { ok = 0; }
+    } elif (k == 2) {
+        var t2, e2 = _pv_fg_pressure_mg(p, rhs, nx, ny, 4, iters, &a);
+        if (is_err_result(t2) == 1) { ok = 0; }
+        _pv_mg_levels_drop(&a);
+    } else {
+        var t3, e3 = _pv_fg_pressure_cg(p, rhs, nx, ny, iters, &a, &b, &c);
+        if (is_err_result(t3) == 1) { ok = 0; }
+    }
+    a.drop();
+    b.drop();
+    c.drop();
+    return ok;
+}
+
+# The message of check `which` (0 the solve was Ok, 1 the divergence shrank) for solver k of `solve`.
+fn solver_msg(k, which): i64 {
+    if (which == 0) {
+        if (k == 0) { return "gs: Ok"; }
+        if (k == 1) { return "dst: Ok"; }
+        if (k == 2) { return "mg: Ok"; }
+        return "cg: Ok";
+    }
+    if (k == 0) { return "gs: the divergence at least halves"; }
+    if (k == 1) { return "dst: the divergence at least halves"; }
+    if (k == 2) { return "mg: the divergence at least halves"; }
+    return "cg: the divergence at least halves";
+}
+
+# The interior residual ‖rhs − (4p − Σp)‖₂ of the nx × ny system. The Rust test's `residual` closure.
+fn mg_residual(p, rhs, nx, ny): f64 {
+    var r: f64 = 0.0;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var pc: f64 = at(p, i);
+            var pl: f64 = at(p, i - 1);
+            var pr: f64 = at(p, i + 1);
+            var pd: f64 = at(p, i - nx);
+            var pu: f64 = at(p, i + nx);
+            var a: f64 = (4.0 * pc) - (((pl + pr) + pd) + pu);
+            var b: f64 = at(rhs, i);
+            var d: f64 = b - a;
+            var d2: f64 = _pv_powi2(d);
+            r = r + d2;
+        }
+    }
+    var s: f64 = f64_sqrt(r);
+    return s;
+}
+
+# The message of check `which` (0 mass, 1 moved, 2 bounded) for scheme w (0 MacCormack, 1 BFECC).
+fn blob_msg(w, which): i64 {
+    if (w == 0) {
+        if (which == 0) { return "maccormack: the blob's mass is kept"; }
+        if (which == 1) { return "maccormack: the blob moves by 2"; }
+        return "maccormack: every value within [-1e-12, 1 + 1e-12]";
+    }
+    if (which == 0) { return "bfecc: the blob's mass is kept"; }
+    if (which == 1) { return "bfecc: the blob moves by 2"; }
+    return "bfecc: every value within [-1e-12, 1 + 1e-12]";
+}
+
+# The message of check `which` (0 the step was Ok, 1 the divergence shrank) for the solver path k (0 DST, 1
+# multigrid, 2 CG).
+fn small_dx_msg(k, which): i64 {
+    if (which == 0) {
+        if (k == 0) { return "cg = false, mg = false: step"; }
+        if (k == 1) { return "cg = false, mg = true: step"; }
+        return "cg = true, mg = false: step";
+    }
+    if (k == 0) { return "cg = false, mg = false: the divergence at least halves"; }
+    if (k == 1) { return "cg = false, mg = true: the divergence at least halves"; }
+    return "cg = true, mg = false: the divergence at least halves";
+}
+
+# ── basics ──────────────────────────────────────────────────────────────────────────
+
+fn test_basics() {
+    var g: PvFluidGrid;
+    var g2: PvFluidGrid;
+    var nan: f64 = PV_F64_NAN;
+
+    test_group("test_grid_new");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    assert_eq(g.cell_count(), 100, "100 cells");
+    assert_eq(g.vx.len, 100, "vx has 100 values");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_grid_invalid");
+    assert_eq(new_err(&g, 0, 10, 0.1), PV_ERR_INVALID_GRID_RESOLUTION, "nx = 0: InvalidGridResolution");
+    assert_eq(new_err(&g, 10, 0, 0.1), PV_ERR_INVALID_GRID_RESOLUTION, "ny = 0: InvalidGridResolution");
+    assert_eq(new_err(&g, 3, 10, 0.1), PV_ERR_INVALID_GRID_RESOLUTION, "nx = 3, below the minimum");
+    assert_eq(new_err(&g, 10, 3, 0.1), PV_ERR_INVALID_GRID_RESOLUTION, "ny = 3, below the minimum");
+
+    test_group("test_grid_invalid_dx");
+    assert_eq(new_err(&g, 10, 10, 0.0), PV_ERR_INVALID_PARAMETER, "dx = 0: InvalidParameter");
+    assert_eq(new_err(&g, 10, 10, -1.0), PV_ERR_INVALID_PARAMETER, "dx < 0: InvalidParameter");
+    assert_eq(new_err(&g, 10, 10, nan), PV_ERR_INVALID_PARAMETER, "NaN dx: InvalidParameter");
+
+    test_group("test_grid_idx");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    assert_eq(g.idx(0, 0), 0, "(0, 0) is 0");
+    assert_eq(g.idx(5, 3), 35, "(5, 3) is 35");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_velocity_at");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    var i = g.idx(3, 4);
+    g.vx.set_f(i, 1.5);
+    g.vy.set_f(i, 2.5);
+    var u, v = g.velocity_at(3, 4);
+    var uf: f64 = u;
+    var vf: f64 = v;
+    assert(near(uf, 1.5, F64_EPS) == 1, "vx 1.5");
+    assert(near(vf, 2.5, F64_EPS) == 1, "vy 2.5");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_speed_at");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    var j = g.idx(5, 5);
+    g.vx.set_f(j, 3.0);
+    g.vy.set_f(j, 4.0);
+    var s: f64 = g.speed_at(5, 5);
+    assert(near(s, 5.0, EPS) == 1, "|(3, 4)| = 5");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_max_speed_zero");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    var m0: f64 = g.max_speed();
+    assert(near(m0, 0.0, F64_EPS) == 1, "a still grid has speed 0");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_max_speed");
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    g.vx.set_f(50, 3.0);
+    g.vy.set_f(50, 4.0);
+    var m1: f64 = g.max_speed();
+    assert(near(m1, 5.0, EPS) == 1, "the fastest cell's speed");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_diffuse_preserves_zeros");
+    var f0 = zeros(100);
+    assert_eq(PvFluidGrid_diffuse(f0, 100, 10, 10, 0.01, 0.001, 0.1, 10), 1, "diffused");
+    assert_eq(count_far(f0, 100, 0.0, F64_EPS), 0, "zeros stay zeros");
+
+    test_group("test_diffuse_spreads");
+    var f1 = zeros(100);
+    put(f1, 55, 100.0);
+    assert_eq(PvFluidGrid_diffuse(f1, 100, 10, 10, 0.1, 0.01, 0.1, 20), 1, "diffused");
+    var left: f64 = at(f1, 54);
+    var right: f64 = at(f1, 56);
+    assert(left > 0.0 || right > 0.0, "the peak spreads to a neighbour");
+
+    test_group("test_grid_serde");
+    assert_eq(fresh(&g, 5, 5, 0.2), 1, "new");
+    var sb = str_builder_new();
+    assert_eq(g.to_json(sb), 0, "written");
+    var js = str_builder_build(sb);
+    var t, e = PvFluidGrid_from_json(str_data(js), str_len(js), &g2);
+    assert_eq(is_err_result(t), 0, "read back");
+    if (is_err_result(t) == 0) {
+        assert_eq(g2.nx, 5, "nx 5");
+        assert_eq(g2.ny, 5, "ny 5");
+        PvFluidGrid_drop(&g2);
+    }
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# ── advection ───────────────────────────────────────────────────────────────────────
+
+fn test_advection() {
+    test_group("test_sample_center");
+    var fc = zeros(4 * 4);
+    put(fc, 4 + 1, 1.0);
+    var val: f64 = _pv_fg_sample(fc, 4, 4, 1.0, 1.0);
+    assert(near(val, 1.0, EPS) == 1, "a cell centre samples its own value");
+
+    test_group("test_sample_interpolation");
+    var fi = zeros(4 * 4);
+    put(fi, 4 + 1, 1.0);
+    put(fi, 4 + 2, 3.0);
+    var vi: f64 = _pv_fg_sample(fi, 4, 4, 1.5, 1.0);
+    assert(near(vi, 2.0, EPS) == 1, "halfway between 1 and 3");
+
+    test_group("test_advect_zero_velocity");
+    var nx = 8;
+    var ny = 8;
+    var n = nx * ny;
+    var vx = zeros(n);
+    var vy = zeros(n);
+    var src = zeros(n);
+    put(src, 4 * nx + 4, 1.0);
+    var dst = zeros(n);
+    _pv_fg_advect(dst, src, vx, vy, nx, ny, 0.1, 1.0);
+    var d0: f64 = at(dst, 4 * nx + 4);
+    assert(near(d0, 1.0, EPS) == 1, "no velocity, no motion");
+
+    test_group("test_advect_uniform_velocity");
+    var mx = 16;
+    var my = 16;
+    var m = mx * my;
+    var ux = filled(m, 1.0);
+    var uy = zeros(m);
+    var usrc = zeros(m);
+    put(usrc, 8 * mx + 8, 1.0);
+    var udst = zeros(m);
+    _pv_fg_advect(udst, usrc, ux, uy, mx, my, 1.0, 1.0);
+    var d1: f64 = at(udst, 8 * mx + 9);
+    assert(d1 > 0.5, "the advected value appears at (9, 8)");
+    return 0;
+}
+
+# ── pressure projection ─────────────────────────────────────────────────────────────
+
+fn test_projection() {
+    test_group("test_divergence_zero_field");
+    var nx = 8;
+    var ny = 8;
+    var n = nx * ny;
+    var vx = zeros(n);
+    var vy = zeros(n);
+    var div = zeros(n);
+    _pv_fg_divergence(div, vx, vy, nx, ny, 0.5);
+    assert_eq(count_far(div, n, 0.0, F64_EPS), 0, "a still field has no divergence");
+
+    test_group("test_pressure_solve_zero_rhs");
+    var div0 = zeros(n);
+    var pressure = zeros(n);
+    _pv_fg_pressure_gs(pressure, div0, nx, ny, 50);
+    var bad = 0;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var pv: f64 = at(pressure, y * nx + x);
+            if (near(pv, 0.0, 0.000001) == 0) { bad = bad + 1; }
+        }
+    }
+    assert_eq(bad, 0, "zero right-hand side and guess: the interior stays 0");
+
+    test_group("test_projection_reduces_divergence");
+    var mx = 15;
+    var my = 15;
+    var m = mx * my;
+    var ux = zeros(m);
+    var uy = zeros(m);
+    var cx = mx / 2;
+    var cy = my / 2;
+    var cxf: f64 = f64_from(cx);
+    var cyf: f64 = f64_from(cy);
+    for (var y2 = 1; y2 < my - 1; y2 = y2 + 1) {
+        var yf: f64 = f64_from(y2);
+        for (var x2 = 1; x2 < mx - 1; x2 = x2 + 1) {
+            var xf: f64 = f64_from(x2);
+            var i = y2 * mx + x2;
+            put(ux, i, (xf - cxf) * 0.1);
+            put(uy, i, (yf - cyf) * 0.1);
+        }
+    }
+    var inv_2dx: f64 = 0.5;
+    var div_before = zeros(m);
+    _pv_fg_divergence(div_before, ux, uy, mx, my, inv_2dx);
+    var mag_before: f64 = sum_sq(div_before, m);
+    var p = zeros(m);
+    _pv_fg_pressure_gs(p, div_before, mx, my, 100);
+    _pv_fg_project(ux, uy, p, mx, my, inv_2dx);
+    var div_after = zeros(m);
+    _pv_fg_divergence(div_after, ux, uy, mx, my, inv_2dx);
+    var mag_after: f64 = sum_sq(div_after, m);
+    assert(mag_after < mag_before, "projection reduces the divergence");
+    return 0;
+}
+
+# ── boundary conditions ─────────────────────────────────────────────────────────────
+
+fn test_boundary() {
+    test_group("test_no_slip_boundary");
+    var nx = 8;
+    var ny = 8;
+    var n = nx * ny;
+    var vx = filled(n, 1.0);
+    var vy = filled(n, 1.0);
+    _pv_fg_enforce(vx, vy, nx, ny, PV_BOUNDARY_CONDITION_NO_SLIP);
+    var a: f64 = at(vx, nx);
+    var b: f64 = at(vx, nx + 1);
+    assert(near(a + b, 0.0, EPS) == 1, "left wall, row 1: vx mirrors its neighbour");
+    var c: f64 = at(vy, 1);
+    var d: f64 = at(vy, nx + 1);
+    assert(near(c + d, 0.0, EPS) == 1, "bottom wall, column 1: vy mirrors its neighbour");
+
+    test_group("test_free_slip_boundary");
+    var fx = filled(n, 1.0);
+    var fy = filled(n, 2.0);
+    _pv_fg_enforce(fx, fy, nx, ny, PV_BOUNDARY_CONDITION_FREE_SLIP);
+    var l = 3 * nx;
+    var xl: f64 = at(fx, l);
+    var xl1: f64 = at(fx, l + 1);
+    assert(near(xl + xl1, 0.0, F64_EPS) == 1, "left wall: the normal vx averages to 0 on the face");
+    var yb: f64 = at(fy, 1);
+    var yb1: f64 = at(fy, nx + 1);
+    assert(near(yb + yb1, 0.0, F64_EPS) == 1, "bottom wall: the normal vy averages to 0 on the face");
+    var yl: f64 = at(fy, l);
+    var yl1: f64 = at(fy, l + 1);
+    assert(near(yl, yl1, F64_EPS) == 1, "left wall: the tangential vy is copied");
+    var xb: f64 = at(fx, 1);
+    var xb1: f64 = at(fx, nx + 1);
+    assert(near(xb, xb1, F64_EPS) == 1, "bottom wall: the tangential vx is copied");
+    return 0;
+}
+
+# ── full steps ──────────────────────────────────────────────────────────────────────
+
+fn test_step() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+    var nan: f64 = PV_F64_NAN;
+
+    test_group("test_step_empty_grid_stable");
+    assert_eq(fresh(&g, 16, 16, 0.1), 1, "new");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "step");
+    var m: f64 = g.max_speed();
+    assert(m < F64_EPS, "an empty grid stays still");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_smoke_plume");
+    var nx = 30;
+    var nxf: f64 = f64_from(nx);
+    var dx: f64 = 1.0 / nxf;
+    assert_eq(fresh(&g, nx, nx, dx), 1, "new");
+    c.dt = 0.01;
+    for (var x = 13; x < 17; x = x + 1) {
+        var i = 2 * nx + x;
+        g.density.set_f(i, 1.0);
+        g.vy.set_f(i, 0.5);
+    }
+    var bad = 0;
+    for (var k = 0; k < 50; k = k + 1) {
+        for (var x2 = 13; x2 < 17; x2 = x2 + 1) { g.density.set_f(2 * nx + x2, 1.0); }
+        bad = bad + steps(&g, &c, 1);
+    }
+    assert_eq(bad, 0, "50 steps");
+    var ms: f64 = g.max_speed();
+    assert_eq(_pv_is_finite(ms), 1, "the velocity stays finite");
+    assert_eq(all_finite(g.density.data, g.density.len), 1, "every density is finite");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_invalid_dt");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    c = PvGridConfig_smoke();
+    c.dt = -1.0;
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_TIMESTEP, "dt < 0: InvalidTimestep");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_nan_dt");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    c = PvGridConfig_smoke();
+    c.dt = nan;
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_TIMESTEP, "NaN dt: InvalidTimestep");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_no_divergence_after_projection");
+    assert_eq(fresh(&g, 15, 15, 0.1), 1, "new");
+    c = PvGridConfig_smoke();
+    var center = 7 * 15 + 7;
+    g.vx.set_f(center, 5.0);
+    g.vy.set_f(center, 3.0);
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "step");
+    var div = zeros(15 * 15);
+    var gdx: f64 = g.dx;
+    var scale: f64 = 0.5 / gdx;
+    _pv_fg_divergence(div, g.vx.data, g.vy.data, 15, 15, scale);
+    var max_div: f64 = fold_max_abs(0.0, div, 15 * 15);
+    assert(max_div < 5.0, "the divergence is bounded after projection");
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# ── MacCormack ──────────────────────────────────────────────────────────────────────
+
+fn test_maccormack() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+
+    test_group("test_maccormack_zero_velocity");
+    var nx = 8;
+    var ny = 8;
+    var n = nx * ny;
+    var vx = zeros(n);
+    var vy = zeros(n);
+    var src = zeros(n);
+    put(src, 4 * nx + 4, 1.0);
+    var dst = zeros(n);
+    var temp = zeros(n);
+    _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, 0.1, 1.0, temp);
+    var d: f64 = at(dst, 4 * nx + 4);
+    assert(near(d, 1.0, EPS) == 1, "no velocity, no motion");
+
+    test_group("test_maccormack_less_diffusive");
+    var mx = 32;
+    var my = 32;
+    var m = mx * my;
+    var ux = filled(m, 1.0);
+    var uy = zeros(m);
+    var peak = zeros(m);
+    put(peak, 16 * mx + 16, 1.0);
+    var dst_sl = zeros(m);
+    _pv_fg_advect(dst_sl, peak, ux, uy, mx, my, 1.0, 1.0);
+    var dst_mc = zeros(m);
+    var tmc = zeros(m);
+    _pv_fg_advect_maccormack(dst_mc, peak, ux, uy, mx, my, 1.0, 1.0, tmc);
+    var max_sl: f64 = fold_max(0.0, dst_sl, m);
+    var max_mc: f64 = fold_max(0.0, dst_mc, m);
+    assert(max_mc >= max_sl, "MacCormack is at least as sharp as semi-Lagrangian");
+
+    test_group("test_step_maccormack_stable");
+    assert_eq(fresh(&g, 16, 16, 0.1), 1, "new");
+    c.use_maccormack = 1;
+    c.dt = 0.01;
+    var center = 8 * 16 + 8;
+    g.density.set_f(center, 1.0);
+    g.vy.set_f(center, 0.5);
+    assert_eq(steps(&g, &c, 20), 0, "20 steps");
+    var ms: f64 = g.max_speed();
+    assert_eq(_pv_is_finite(ms), 1, "the velocity stays finite");
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# ── periodic walls ──────────────────────────────────────────────────────────────────
+
+fn test_periodic() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+
+    test_group("test_periodic_boundary_enforcement");
+    var nx = 8;
+    var ny = 8;
+    var n = nx * ny;
+    var vx = zeros(n);
+    var vy = zeros(n);
+    put(vx, nx + 1, 1.0);
+    _pv_fg_enforce(vx, vy, nx, ny, PV_BOUNDARY_CONDITION_PERIODIC);
+    var r: f64 = at(vx, nx + nx - 1);
+    var l: f64 = at(vx, nx + 1);
+    assert(near(r, l, F64_EPS) == 1, "the right edge matches the left interior");
+
+    test_group("test_step_periodic_stable");
+    assert_eq(fresh(&g, 16, 16, 0.1), 1, "new");
+    c.boundary = PV_BOUNDARY_CONDITION_PERIODIC;
+    c.dt = 0.01;
+    g.vx.set_f(8 * 16 + 8, 1.0);
+    assert_eq(steps(&g, &c, 20), 0, "20 steps");
+    var ms: f64 = g.max_speed();
+    assert_eq(_pv_is_finite(ms), 1, "the velocity stays finite");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_sample_periodic_wrapping");
+    var field = zeros(4 * 4);
+    put(field, 0, 1.0);
+    var fx: f64 = -0.5;
+    var val: f64 = _pv_fg_sample_periodic(field, 4, 4, fx, 0.0);
+    assert_eq(_pv_is_finite(val), 1, "a sample left of the grid wraps to the right side");
+    return 0;
+}
+
+# ── state: scratch, serde, determinism ──────────────────────────────────────────────
+
+fn test_state() {
+    var g: PvFluidGrid;
+    var g2: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+
+    test_group("test_no_alloc_after_first_step");
+    # Rust checks scratch_a's and scratch_b's capacities across a later step. Here each of the four scratch columns
+    # (4–7: scratch_a, scratch_b, scratch_c, diffuse_rhs, read through `_pv_fg_col`) keeps its cap and its storage
+    # pointer across the second step.
+    assert_eq(fresh(&g, 10, 10, 0.1), 1, "new");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "first step");
+    var s4: *PvColumn = _pv_fg_col(&g, 4);
+    var s5: *PvColumn = _pv_fg_col(&g, 5);
+    var s6: *PvColumn = _pv_fg_col(&g, 6);
+    var s7: *PvColumn = _pv_fg_col(&g, 7);
+    var cap4 = s4.cap;
+    var cap5 = s5.cap;
+    var cap6 = s6.cap;
+    var cap7 = s7.cap;
+    var buf4 = s4.data;
+    var buf5 = s5.data;
+    var buf6 = s6.data;
+    var buf7 = s7.data;
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "second step");
+    assert_eq(s4.cap, cap4, "scratch_a capacity unchanged");
+    assert_eq(s5.cap, cap5, "scratch_b capacity unchanged");
+    assert_eq(s6.cap, cap6, "scratch_c capacity unchanged");
+    assert_eq(s7.cap, cap7, "diffuse_rhs capacity unchanged");
+    assert_eq(s4.data, buf4, "scratch_a not reallocated");
+    assert_eq(s5.data, buf5, "scratch_b not reallocated");
+    assert_eq(s6.data, buf6, "scratch_c not reallocated");
+    assert_eq(s7.data, buf7, "diffuse_rhs not reallocated");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_grid_serde_preserves_state");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    var center = g.idx(4, 4);
+    g.density.set_f(center, 1.0);
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "step");
+    var sb = str_builder_new();
+    assert_eq(g.to_json(sb), 0, "written");
+    var js = str_builder_build(sb);
+    var t, e = PvFluidGrid_from_json(str_data(js), str_len(js), &g2);
+    assert_eq(is_err_result(t), 0, "read back");
+    if (is_err_result(t) == 0) {
+        assert_eq(step_err(&g2, &c), PV_ERR_NONE, "the skipped scratch buffers are rebuilt on the next step");
+        var ms: f64 = g2.max_speed();
+        assert_eq(_pv_is_finite(ms), 1, "the velocity stays finite");
+        PvFluidGrid_drop(&g2);
+    }
+    PvFluidGrid_drop(&g);
+
+    test_group("test_grid_step_deterministic");
+    # The Rust test's `run` closure, twice: a 20 × 20 grid with a buoyant blob at (10, 10), 10 steps.
+    assert_eq(fresh(&g, 20, 20, 0.1) + fresh(&g2, 20, 20, 0.1), 2, "new, twice");
+    var c1 = g.idx(10, 10);
+    g.density.set_f(c1, 1.0);
+    g.vy.set_f(c1, 0.5);
+    var c2 = g2.idx(10, 10);
+    g2.density.set_f(c2, 1.0);
+    g2.vy.set_f(c2, 0.5);
+    assert_eq(steps(&g, &c, 10) + steps(&g2, &c, 10), 0, "10 steps each");
+    assert_eq(count_differ(g.vx.data, g2.vx.data, g.vx.len, EPS), 0, "the grid step is deterministic");
+    PvFluidGrid_drop(&g);
+    PvFluidGrid_drop(&g2);
+
+    test_group("test_free_slip_tangential_preserved");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    var i = g.idx(1, 4);
+    g.vy.set_f(i, 1.0);
+    _pv_fg_enforce(g.vx.data, g.vy.data, g.nx, g.ny, PV_BOUNDARY_CONDITION_FREE_SLIP);
+    var l = g.idx(0, 4);
+    var nl: f64 = g.vx.get_f(l);
+    var tl: f64 = g.vy.get_f(l);
+    assert(near(nl, 0.0, EPS) == 1, "free-slip: the normal vx is 0");
+    assert(near(tl, 1.0, EPS) == 1, "free-slip: the tangential vy is kept");
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# ── audit regressions (1.3.0): the solvers ──────────────────────────────────────────
+
+fn test_audit_solvers() {
+    test_group("test_projection_all_solvers_dx_scaled");
+    var nx = 33;
+    var ny = 33;
+    var dx: f64 = 0.1;
+    var n = nx * ny;
+    var vx = zeros(n);
+    var vy = zeros(n);
+    var rhs = zeros(n);
+    var p = zeros(n);
+    var half_dx: f64 = 0.5 * dx;
+    var inv_2dx: f64 = 0.5 / dx;
+    for (var k = 0; k < 4; k = k + 1) {
+        potential_flow(vx, vy, nx, ny, dx);
+        var before: f64 = div_norm(vx, vy, nx, ny, dx);
+        fill(rhs, n, 0.0);
+        _pv_fg_divergence(rhs, vx, vy, nx, ny, half_dx);
+        fill(p, n, 0.0);
+        var iters = 2000;
+        if (k == 2) { iters = 10; }
+        if (k == 3) { iters = 500; }
+        assert_eq(solve(k, p, rhs, nx, ny, iters), 1, solver_msg(k, 0));
+        _pv_fg_project(vx, vy, p, nx, ny, inv_2dx);
+        var after: f64 = div_norm(vx, vy, nx, ny, dx);
+        assert(after < 0.5 * before, solver_msg(k, 1));
+    }
+
+    test_group("test_pressure_solvers_agree");
+    var mx = 17;
+    var my = 17;
+    var mdx: f64 = 0.25;
+    var m = mx * my;
+    var ux = zeros(m);
+    var uy = zeros(m);
+    potential_flow(ux, uy, mx, my, mdx);
+    var mrhs = zeros(m);
+    var mhalf: f64 = 0.5 * mdx;
+    _pv_fg_divergence(mrhs, ux, uy, mx, my, mhalf);
+    var p_dst = zeros(m);
+    assert_eq(solve(1, p_dst, mrhs, mx, my, 0), 1, "dst: Ok");
+    var p_gs = zeros(m);
+    assert_eq(solve(0, p_gs, mrhs, mx, my, 5000), 1, "gs: Ok");
+    var p_cg = zeros(m);
+    assert_eq(solve(3, p_cg, mrhs, mx, my, 1000), 1, "cg: Ok");
+    var p_mg = zeros(m);
+    assert_eq(solve(2, p_mg, mrhs, mx, my, 30), 1, "mg: Ok");
+    var scale: f64 = fold_max_abs(0.0, p_dst, m);
+    assert(scale > 0.0, "the DST pressure is not 0");
+    var tol: f64 = 0.001 * scale;
+    var err_gs: f64 = max_abs_diff(p_gs, p_dst, m);
+    assert(err_gs < tol, "gs agrees with DST");
+    var err_cg: f64 = max_abs_diff(p_cg, p_dst, m);
+    assert(err_cg < tol, "cg agrees with DST");
+    var err_mg: f64 = max_abs_diff(p_mg, p_dst, m);
+    assert(err_mg < tol, "mg agrees with DST");
+
+    test_group("test_multigrid_converges");
+    var gx = 33;
+    var gy = 33;
+    var gn = gx * gy;
+    var grhs = zeros(gn);
+    for (var y = 1; y < gy - 1; y = y + 1) {
+        for (var x = 1; x < gx - 1; x = x + 1) {
+            var q = ((x * 7) + (y * 3)) % 5;
+            var qf: f64 = f64_from(q);
+            put(grhs, y * gx + x, qf - 2.0);
+        }
+    }
+    var gp = zeros(gn);
+    var levels: PvColumn = PvColumn_new();
+    var last: f64 = mg_residual(gp, grhs, gx, gy);
+    var bad = 0;
+    for (var it = 0; it < 6; it = it + 1) {
+        var t, e = _pv_fg_pressure_mg(gp, grhs, gx, gy, 4, 1, &levels);
+        if (is_err_result(t) == 1) { bad = bad + 1; }
+        var r: f64 = mg_residual(gp, grhs, gx, gy);
+        assert(r < 0.5 * last, "each V-cycle at least halves the residual");
+        last = r;
+    }
+    assert_eq(bad, 0, "6 V-cycles, each Ok");
+    _pv_mg_levels_drop(&levels);
+
+    test_group("test_maccormack_bfecc_preserve_moving_blob");
+    var bx = 40;
+    var by = 9;
+    var bn = bx * by;
+    var bsrc = zeros(bn);
+    for (var x2 = 8; x2 < 12; x2 = x2 + 1) { put(bsrc, 4 * bx + x2, 1.0); }
+    var bvx = filled(bn, 2.0);
+    var bvy = zeros(bn);
+    var mass0: f64 = fsum(bsrc, bn);
+    var tiny: f64 = 0.000000000001;
+    var lo: f64 = -tiny;
+    var hi: f64 = 1.0 + tiny;
+    for (var w = 0; w < 2; w = w + 1) {
+        var dst = zeros(bn);
+        var t1 = zeros(bn);
+        var t2 = zeros(bn);
+        if (w == 0) {
+            _pv_fg_advect_maccormack(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1);
+        } else {
+            _pv_fg_advect_bfecc(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1, t2);
+        }
+        var mass: f64 = fsum(dst, bn);
+        assert(near(mass, mass0, 0.000000001) == 1, blob_msg(w, 0));
+        var moved: f64 = at(dst, 4 * bx + 12);
+        assert(near(moved, 1.0, 0.000000001) == 1, blob_msg(w, 1));
+        var outside = 0;
+        for (var j = 0; j < bn; j = j + 1) {
+            var v: f64 = at(dst, j);
+            if (v >= lo && v <= hi) {} else { outside = outside + 1; }
+        }
+        assert_eq(outside, 0, blob_msg(w, 2));
+    }
+    return 0;
+}
+
+# ── audit regressions (1.3.0): the state ────────────────────────────────────────────
+
+fn test_audit_state() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+    var nan: f64 = PV_F64_NAN;
+
+    test_group("test_step_rejects_nan_config");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    c.smagorinsky_cs = nan;
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_PARAMETER, "NaN smagorinsky_cs: InvalidParameter");
+    c = PvGridConfig_smoke();
+    c.buoyancy_alpha = nan;
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_PARAMETER, "NaN buoyancy_alpha: InvalidParameter");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_rejects_inconsistent_grid");
+    c = PvGridConfig_smoke();
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    g.vx.truncate(10);
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_GRID_RESOLUTION, "a short vx: InvalidGridResolution");
+    PvFluidGrid_drop(&g);
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    g.nx = 1;
+    assert_eq(step_err(&g, &c), PV_ERR_INVALID_GRID_RESOLUTION, "nx = 1: InvalidGridResolution");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_diffuse_size_mismatch_no_panic");
+    var f = filled(10, 1.0);
+    assert_eq(PvFluidGrid_diffuse(f, 10, 8, 8, 0.1, 0.1, 0.1, 5), 0, "8 × 8 over 10 values: refused");
+    assert_eq(PvFluidGrid_diffuse(f, 10, 10, 0, 0.1, 0.1, 0.1, 5), 0, "ny = 0: refused");
+    var changed = 0;
+    for (var i = 0; i < 10; i = i + 1) {
+        var v: f64 = at(f, i);
+        if (v == 1.0) {} else { changed = changed + 1; }
+    }
+    assert_eq(changed, 0, "the field is untouched");
+
+    test_group("test_cfl_dt_finite_without_flow");
+    # The FluidGrid half; the MacGrid half (`m.cfl_dt(0.5) > 1e300`) arrives with MacGrid in M3 part c.
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    var dt: f64 = g.cfl_dt(0.0, 2.0);
+    assert_eq(_pv_is_finite(dt), 1, "finite with no flow and no viscosity");
+    PvFluidGrid_drop(&g);
+
+    test_group("test_step_reduces_divergence_small_dx");
+    var nx = 33;
+    var ny = 33;
+    var dx: f64 = 0.1;
+    for (var k = 0; k < 3; k = k + 1) {
+        assert_eq(fresh(&g, nx, ny, dx), 1, "new");
+        potential_flow(g.vx.data, g.vy.data, nx, ny, dx);
+        var before: f64 = div_norm(g.vx.data, g.vy.data, nx, ny, dx);
+        c = PvGridConfig_smoke();
+        c.dt = 0.0001;
+        c.viscosity = 0.0;
+        c.buoyancy_alpha = 0.0;
+        c.vorticity_confinement = 0.0;
+        c.pressure_iterations = 200;
+        c.use_cg = 0;
+        c.use_multigrid = 0;
+        if (k == 1) { c.use_multigrid = 1; }
+        if (k == 2) { c.use_cg = 1; }
+        assert_eq(step_err(&g, &c), PV_ERR_NONE, small_dx_msg(k, 0));
+        var after: f64 = div_norm(g.vx.data, g.vy.data, nx, ny, dx);
+        assert(after < 0.5 * before, small_dx_msg(k, 1));
+        PvFluidGrid_drop(&g);
+    }
+    return 0;
+}
+
+# ── Cyrius-only: the record layouts ─────────────────────────────────────────────────
+
+# Column k's storage pointer through `_pv_fg_col`'s byte offsets.
+fn fg_col_data(g: *PvFluidGrid, k): i64 {
+    var c: *PvColumn = _pv_fg_col(g, k);
+    return c.data;
+}
+
+# Column k's storage pointer of a multigrid level through `_pv_mg_col`'s byte offsets.
+fn mg_col_data(lv, k): i64 {
+    var c: *PvColumn = _pv_mg_col(lv, k);
+    return c.data;
+}
+
+fn test_layout() {
+    var g: PvFluidGrid;
+    var c: PvGridConfig = PvGridConfig_smoke();
+
+    test_group("fg_layout_matches_column_offsets");
+    assert_eq(sizeof(PvFluidGrid), 312, "PvFluidGrid: 312 bytes");
+    assert_eq(sizeof(PvGridConfig), 104, "PvGridConfig: 104 bytes");
+    assert_eq(sizeof(PvMgLevel), 72, "PvMgLevel: 72 bytes");
+    assert_eq(fresh(&g, 8, 8, 0.1), 1, "new");
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a DST step sizes solve_a … solve_c");
+    c.use_multigrid = 1;
+    assert_eq(step_err(&g, &c), PV_ERR_NONE, "a multigrid step pushes a level");
+    assert(g.solve_a.data != 0 && g.mg_levels.len > 0, "every column has storage");
+    assert_eq(fg_col_data(&g, 0), g.vx.data, "0: vx");
+    assert_eq(fg_col_data(&g, 1), g.vy.data, "1: vy");
+    assert_eq(fg_col_data(&g, 2), g.pressure.data, "2: pressure");
+    assert_eq(fg_col_data(&g, 3), g.density.data, "3: density");
+    assert_eq(fg_col_data(&g, 4), g.scratch_a.data, "4: scratch_a");
+    assert_eq(fg_col_data(&g, 5), g.scratch_b.data, "5: scratch_b");
+    assert_eq(fg_col_data(&g, 6), g.scratch_c.data, "6: scratch_c");
+    assert_eq(fg_col_data(&g, 7), g.diffuse_rhs.data, "7: diffuse_rhs");
+    assert_eq(fg_col_data(&g, 8), g.mg_levels.data, "8: mg_levels");
+    assert_eq(fg_col_data(&g, 9), g.solve_a.data, "9: solve_a");
+    assert_eq(fg_col_data(&g, 10), g.solve_b.data, "10: solve_b");
+    assert_eq(fg_col_data(&g, 11), g.solve_c.data, "11: solve_c");
+    var lv = load64(g.mg_levels.data);
+    var level: *PvMgLevel = _pv_as_mg_level(lv);
+    assert(level.residual.data != 0 && level.coarse_rhs.data != 0 && level.coarse_p.data != 0,
+      "the level's columns have storage");
+    assert_eq(mg_col_data(lv, 0), level.residual.data, "level column 0: residual");
+    assert_eq(mg_col_data(lv, 1), level.coarse_rhs.data, "level column 1: coarse_rhs");
+    assert_eq(mg_col_data(lv, 2), level.coarse_p.data, "level column 2: coarse_p");
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# Runs the ported FluidGrid tests.
+fn main() {
+    alloc_init();
+    test_basics();
+    test_advection();
+    test_projection();
+    test_boundary();
+    test_step();
+    test_maccormack();
+    test_periodic();
+    test_state();
+    test_audit_solvers();
+    test_audit_state();
+    test_layout();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

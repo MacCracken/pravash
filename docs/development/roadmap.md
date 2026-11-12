@@ -46,7 +46,12 @@
 - [x] **M1 done 2026-11-11.**
 - [x] M2: shallow water (888 rows, 142 class S step rows, all bit-exact; 44 + 3 Rust tests)
 - [x] **M2 done 2026-11-11.**
-- [ ] M3: grid (parts a–e)
+- [x] M3 part a: `FluidGrid` (569 rows, 188 class S step rows on the periodic and multigrid projections, all
+  bit-exact; 44 of 49 + 5 Rust tests), the DST / IDST / CG transcriptions, the exact fmod (L14)
+- [ ] M3 part b: the DST, IDST and CG rows (corrected oracle), the step on those projections, the sine table
+- [ ] M3 part c: `MacGrid` and k-ε (the last 5 Rust tests of `grid.rs`)
+- [ ] M3 part d: VOF and the phase field
+- [ ] M3 part e: `src/par.cyr` and the grid's parallel loops
 
 ### 1.3.0
 

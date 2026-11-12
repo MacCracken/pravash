@@ -11,7 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M2 complete** (2026-11-11); M3 (grid) is next. M0 is complete (§4). M2 delivered `src/shallow.cyr`, the
+> ⏳ **Status: M3 part a complete** (2026-11-11); M3 part b (the DST and CG rows) is next. M3 part a delivered
+> `src/grid.cyr` and `src/grid_solve.cyr`: 569 rows bit-exact (188 class S step rows on the periodic and multigrid
+> projections), 44 of 49 + 5 Rust tests (port-parity §10). M0 is complete (§4). M2 delivered `src/shallow.cyr`, the
 > first stateful solver: 888 rows bit-exact (142 class S step rows among them), all 44 + 3 Rust tests ported
 > (port-parity §9). M1 delivered, in four parts:
 > - `src/mathx.cyr`, the first `[lib]` and the bundle;
@@ -777,11 +779,16 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | L11 | open | `src/logging.cyr`: a chrome://tracing writer over sakshi's spans (M7) | sakshi 2.5.10 has spans and text outputs, but no Trace Event export (checked at M0 step 10) | `sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md` | sakshi's exporter | the logging test |
 | L12 | closed | (none needed) an 8-byte-chunk record copy for particles, had M1's benchmarks shown `memcpy` dominating. Closed at M1 part 3: struct assignment `*dst = *src` copies a 144-byte record word-wise in 11.7 ns, against `memcpy`'s 245 ns, and every particle move is an assignment (benchmarks-rust-v-cyrius, M1 part 3) | `memcpy` copies a byte at a time | the open `cyrius:docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` (pravash's numbers added 2026-11-11) | stdlib `memcpy`, where raw bytes are copied | none |
 | L13 | open | `src/column.cyr`: a growable column of 8-byte slots on the freelist (push doubling and freeing the outgrown buffer, `drop`, NaN / 0 on a bad index), what `ParticleSoa`'s `Vec<f64>` / `Vec<u8>` fields become | `vec_push_a` never frees the outgrown buffer, even through a freeing Allocator, there is no `vec_free`, and `vec_get` / `vec_set` abort on a bad index | `cyrius:docs/development/issues/2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md` | the stdlib `vec` with a freeing grow, `vec_free_a` and non-aborting access | the ParticleSoa rows of `tests/golden/common.tsv` (class A) |
+| L14 | open | `src/mathx.cyr`: `_pv_fmod`, the exact fmod (C's, which Rust's `%` on f64 lowers to) in integer bit operations, transcribed from hisab 3.4.1's `f64_fmod`. The periodic grid sampler needs it (M3) | ganita and the stdlib's math have no fmod; hisab's exact one is test-scope here, as a production hisab would reach every consumer's compile (the `[deps.hisab]` note in `cyrius.cyml`) | `ganita:docs/development/issues/2026-11-11-no-fmod.md` | ganita's fmod | the `f64::rem` rows of `tests/golden/math.tsv` (class A) and the periodic `FluidGrid::step` rows of `tests/golden/grid.tsv` (class S) |
 
 **Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
 
 **Also filed at M1 part 4, outside the ledger:** `bayan:docs/development/issues/2026-11-11-json-integer-negative-zero-loses-its-sign.md` (the integer `-0` reads as +0, where serde_json reads −0.0; one pending JSON row, with impetus's S3 and S4).
+
+**Also filed at M3 part a, outside the ledger:** pravash's measurements of the correctly rounded sin and cos at
+fl(k·π/2) (18.4 µs a call, against 165 ns elsewhere; the DST's arguments land there), appended to the L1 request
+`ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`.
 
 **Also filed at M2, outside the ledger:** `cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md` (`#inline` declines helpers with more than 2 parameters, a body over 32 tokens or a pointer parameter; the shallow-water step's 7.2× is that call overhead).
 
@@ -853,7 +860,15 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - surface parity 165.
 
 **Next:** M3, grid |
-| M3 Grid | — | — | — | — | |
+| M3 Grid | 🟡 **part a done 2026-11-11**; parts b–e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
+- `src/grid.cyr` (every advection, diffusion, Smagorinsky, the forces, the four projections, the wall rules) and `src/grid_solve.cyr` (L5, L6);
+- ADR 0002 #12 (the private solver buffers, the boundary refusal, `PvFluidGrid_diffuse`'s flag);
+- `_pv_fmod`, ledger L14, requested at ganita with a repro;
+- the grid transcribed in `validate.py`, mutation-checked;
+- the sin / cos slow path appended to the L1 request;
+- surface parity 227 (24 pending part c).
+
+**Next:** M3 part b: the DST, IDST and CG rows on the corrected oracle, the step on those projections, the per-length sine table |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |

@@ -1,0 +1,111 @@
+# grid_solve.cyr — the library solvers the grid's pressure projection calls: hisab 1.4.0's direct DST-I and IDST-I
+# and its matrix-free linear conjugate gradient, transcribed into caller scratch (ADR 0003).
+#
+# Each is 1.4.0's algorithm in its operation order, so the rows compare against the oracle's own calls: the sums run
+# in index order, the transforms' sines are correctly rounded (src/crmath.cyr, ledger L1, ADR 0004), and nothing
+# allocates. The caller owns every buffer, so the step path stays flat (port plan §7.5).
+#
+# UPSTREAM(L6): hisab:docs/development/issues/2026-11-11-dst-allocates-per-call.md
+#   replace `_pv_dst` / `_pv_idst` with hisab's `num_dst` / `num_idst` once they write into caller scratch, with the
+#   DST rows re-bounded for their algorithm; parity: the DST pressure rows of tests/golden/grid.tsv.
+# UPSTREAM(L5): hisab:docs/development/issues/2026-11-11-no-matrix-free-linear-cg.md
+#   replace `_pv_cg` with hisab's linear CG once it ships; parity: the CG pressure rows of tests/golden/grid.tsv
+#   (iterations class A, solution class B).
+
+# The DST-I of x[0 … n) into out[0 … n) (out must not be x): X[k] = Σ x[i]·sin(π·(i+1)·(k+1)/(n+1)), each sum from
+# +0 in i order, the argument ((π·(i+1))·(k+1))/(n+1). 1, or 0 for n ≤ 0 (hisab's InvalidInput for an empty input).
+# Mirrors hisab 1.4.0 `num::dst`.
+fn _pv_dst(x, n, out): i64 {
+    if (n <= 0) { return 0; }
+    var pi: f64 = PV_F64_PI;
+    var np1: f64 = f64_from(n + 1);
+    for (var k = 0; k < n; k = k + 1) {
+        var kf: f64 = f64_from(k + 1);
+        var sum: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var xf: f64 = f64_from(i + 1);
+            var arg: f64 = ((pi * xf) * kf) / np1;
+            var s: f64 = _pv_sin(arg);
+            var xi: f64 = load64(x + i * 8);
+            sum = sum + (xi * s);
+        }
+        store64(out + k * 8, _pv_bits(sum));
+    }
+    return 1;
+}
+
+# The IDST-I of x[0 … n) into out[0 … n): the DST-I, each value then multiplied by 2/(n+1). 1, or 0 for n ≤ 0.
+# Mirrors hisab 1.4.0 `num::idst`.
+fn _pv_idst(x, n, out): i64 {
+    if (_pv_dst(x, n, out) == 0) { return 0; }
+    var np1: f64 = f64_from(n + 1);
+    var scale: f64 = 2.0 / np1;
+    for (var k = 0; k < n; k = k + 1) {
+        var v: f64 = load64(out + k * 8);
+        var w: f64 = v * scale;
+        store64(out + k * 8, _pv_bits(w));
+    }
+    return 1;
+}
+
+# Σ v[i]·w[i] over i in 0 … n, folded from −0 in index order, as Rust's `f64::sum` does.
+#must_use
+fn _pv_cg_dot(v, w, n): f64 {
+    var s: f64 = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        var a: f64 = load64(v + i * 8);
+        var b: f64 = load64(w + i * 8);
+        s = s + (a * b);
+    }
+    return s;
+}
+
+# hisab 1.4.0's matrix-free linear conjugate gradient: solves A·x = b (n unknowns) from the guess in x, in place. A is
+# applied as `fncall3(op, ctx, v, out)` (out = A·v, n words). r, p and ap are n-word scratch. It stops when ‖r‖² <
+# tol², when |pᵀAp| < 1e-12 (hisab's EPSILON_F64), or after max_iter iterations, leaving the last iterate in x, as
+# hisab returns it. 1, or 0 for n ≤ 0 (hisab's InvalidInput; x untouched). Mirrors `num::conjugate_gradient`, with
+# x0 and the result one buffer: hisab refuses a length mismatch before it computes, and the caller copies the
+# result over x0.
+fn _pv_cg(op, ctx, b, x, n, tol: f64, max_iter, r, p, ap): i64 {
+    if (n <= 0) { return 0; }
+    fncall3(op, ctx, x, ap);
+    for (var i = 0; i < n; i = i + 1) {
+        var bi: f64 = load64(b + i * 8);
+        var ai: f64 = load64(ap + i * 8);
+        var ri: f64 = bi - ai;
+        store64(r + i * 8, _pv_bits(ri));
+        store64(p + i * 8, _pv_bits(ri));
+    }
+    var rs_old: f64 = _pv_cg_dot(r, r, n);
+    var tol_sq: f64 = tol * tol;
+    if (rs_old < tol_sq) { return 1; }
+    var eps: f64 = 0x3D719799812DEA11;   # 1e-12
+    for (var it = 0; it < max_iter; it = it + 1) {
+        fncall3(op, ctx, p, ap);
+        var pap: f64 = _pv_cg_dot(p, ap, n);
+        var apap: f64 = f64_abs(pap);
+        if (apap < eps) { break; }
+        var alpha: f64 = rs_old / pap;
+        for (var j = 0; j < n; j = j + 1) {
+            var xj: f64 = load64(x + j * 8);
+            var pj: f64 = load64(p + j * 8);
+            var rj: f64 = load64(r + j * 8);
+            var aj: f64 = load64(ap + j * 8);
+            var xn: f64 = xj + (alpha * pj);
+            var rn: f64 = rj - (alpha * aj);
+            store64(x + j * 8, _pv_bits(xn));
+            store64(r + j * 8, _pv_bits(rn));
+        }
+        var rs_new: f64 = _pv_cg_dot(r, r, n);
+        if (rs_new < tol_sq) { return 1; }
+        var beta: f64 = rs_new / rs_old;
+        for (var q = 0; q < n; q = q + 1) {
+            var rq: f64 = load64(r + q * 8);
+            var pq: f64 = load64(p + q * 8);
+            var pn: f64 = rq + (beta * pq);
+            store64(p + q * 8, _pv_bits(pn));
+        }
+        rs_old = rs_new;
+    }
+    return 1;
+}

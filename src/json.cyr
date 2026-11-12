@@ -623,3 +623,158 @@ fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
     out.use_riemann = load64(&w + 80);
     return Ok(0);
 }
+
+# ── BoundaryCondition, GridConfig, FluidGrid (M3) ───────────────────────────────────
+
+# Appends the boundary condition as serde_json writes a `BoundaryCondition` (`"NoSlip"`): 0, or -1.
+#must_use
+fn boundary_condition_to_json(k, sb): i64 {
+    var rc = _pv_jw(sb, "\"");
+    rc = rc | _pv_jw(sb, boundary_condition_name(k));
+    rc = rc | _pv_jw(sb, "\"");
+    return rc;
+}
+
+# Reads a `BoundaryCondition` document (`"NoSlip"` or `{"NoSlip":null}`) into *out: Ok(0), or
+# Err(PV_ERR_DESERIALIZE).
+#must_use
+fn boundary_condition_from_json(buf, len, out): Result {
+    var v = _pv_jr_parse(buf, len);
+    var k = 0;
+    if (_pv_jr_enum(v, &boundary_condition_name, 3, &k) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    store64(out, k);
+    return Ok(0);
+}
+
+#must_use
+fn _pv_as_grid_config(p): *PvGridConfig {
+    return p;
+}
+
+impl PvGridConfig {
+    # Appends the config as serde_json writes a `GridConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "dt", 1);
+        rc = rc | _pv_jw_f64(sb, self.dt);
+        rc = rc | _pv_jw_key(sb, "viscosity", 0);
+        rc = rc | _pv_jw_f64(sb, self.viscosity);
+        rc = rc | _pv_jw_key(sb, "diffusion_iterations", 0);
+        rc = rc | _pv_jw_int(sb, self.diffusion_iterations);
+        rc = rc | _pv_jw_key(sb, "pressure_iterations", 0);
+        rc = rc | _pv_jw_int(sb, self.pressure_iterations);
+        rc = rc | _pv_jw_key(sb, "boundary", 0);
+        rc = rc | boundary_condition_to_json(self.boundary, sb);
+        rc = rc | _pv_jw_key(sb, "vorticity_confinement", 0);
+        rc = rc | _pv_jw_f64(sb, self.vorticity_confinement);
+        rc = rc | _pv_jw_key(sb, "buoyancy_alpha", 0);
+        rc = rc | _pv_jw_f64(sb, self.buoyancy_alpha);
+        rc = rc | _pv_jw_key(sb, "ambient_density", 0);
+        rc = rc | _pv_jw_f64(sb, self.ambient_density);
+        rc = rc | _pv_jw_key(sb, "use_maccormack", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_maccormack);
+        rc = rc | _pv_jw_key(sb, "use_bfecc", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_bfecc);
+        rc = rc | _pv_jw_key(sb, "smagorinsky_cs", 0);
+        rc = rc | _pv_jw_f64(sb, self.smagorinsky_cs);
+        rc = rc | _pv_jw_key(sb, "use_multigrid", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_multigrid);
+        rc = rc | _pv_jw_key(sb, "use_cg", 0);
+        rc = rc | _pv_jw_bool(sb, self.use_cg);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `GridConfig` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched. (No validation:
+# `step` checks the config.)
+#must_use
+fn PvGridConfig_from_json(buf, len, out: *PvGridConfig): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 13);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # Read into the record's 13 words, then copy it whole.
+    var w[104];
+    var ok = _pv_jr_f64(_pv_jr_at(v, f, 0, "dt"), &w);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 1, "viscosity"), &w + 8);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 2, "diffusion_iterations"), &w + 16);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 3, "pressure_iterations"), &w + 24);
+    ok = ok & _pv_jr_enum(_pv_jr_at(v, f, 4, "boundary"), &boundary_condition_name, 3, &w + 32);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 5, "vorticity_confinement"), &w + 40);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 6, "buoyancy_alpha"), &w + 48);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 7, "ambient_density"), &w + 56);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 8, "use_maccormack"), &w + 64);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 9, "use_bfecc"), &w + 72);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 10, "smagorinsky_cs"), &w + 80);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 11, "use_multigrid"), &w + 88);
+    ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 12, "use_cg"), &w + 96);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var src: *PvGridConfig = _pv_as_grid_config(&w);
+    *out = *src;
+    return Ok(0);
+}
+
+# The serialized fields of a `FluidGrid`, in declaration order (the scratch buffers and levels are `#[serde(skip)]`).
+#must_use
+fn _pv_fg_field(k): i64 {
+    match k {
+        0 => { return "nx"; }
+        1 => { return "ny"; }
+        2 => { return "dx"; }
+        3 => { return "vx"; }
+        4 => { return "vy"; }
+        5 => { return "pressure"; }
+        _ => { return "density"; }
+    }
+    return "density";
+}
+
+impl PvFluidGrid {
+    # Appends the grid as serde_json writes a `FluidGrid` (the scratch buffers and levels skipped): 0, or -1 when the
+    # builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "nx", 1);
+        rc = rc | _pv_jw_int(sb, self.nx);
+        rc = rc | _pv_jw_key(sb, "ny", 0);
+        rc = rc | _pv_jw_int(sb, self.ny);
+        rc = rc | _pv_jw_key(sb, "dx", 0);
+        rc = rc | _pv_jw_f64(sb, self.dx);
+        for (var k = 0; k < 4; k = k + 1) {
+            rc = rc | _pv_jw_key(sb, _pv_fg_field(k + 3), 0);
+            rc = rc | _pv_jw_col(sb, _pv_fg_col(self, k), 0);
+        }
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `FluidGrid` document into *out, a fresh grid with empty scratch buffers and no multigrid levels (as serde's
+# skipped fields default), released with `PvFluidGrid_drop`: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out holding
+# no storage. The field lengths are the document's (they need not agree with nx·ny: `step` refuses an inconsistent
+# grid).
+#must_use
+fn PvFluidGrid_from_json(buf, len, out: *PvFluidGrid): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 7);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[24];
+    var ok = _pv_jr_usize(_pv_jr_at(v, f, 0, "nx"), &w);
+    ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    _pv_fg_zero(out);
+    for (var c = 0; c < 4; c = c + 1) {
+        if (_pv_jr_col(_pv_jr_at(v, f, c + 3, _pv_fg_field(c + 3)), _pv_fg_col(out, c), 0) == 0) {
+            PvFluidGrid_drop(out);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    out.nx = load64(&w);
+    out.ny = load64(&w + 8);
+    var dx: f64 = load64(&w + 16);
+    out.dx = dx;
+    return Ok(0);
+}

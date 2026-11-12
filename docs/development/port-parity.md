@@ -648,3 +648,96 @@ columns' `cap`, and the data pointers are checked too. Surface parity now covers
 **Speed** (benchmarks-rust-v-cyrius, M2): the step runs at 7.2× Rust's at every grid size, a per-cell cost of
 calls to small helpers that `#inline` declines (filed). The volume rewrite on raw loads made `total_volume` 3.1×
 faster, with its rows unchanged.
+
+## 10. M3 part a: the grid (2026-11-11)
+
+`src/grid_solve.cyr` and `src/grid.cyr` go after `src/shallow.cyr` in `[lib]`. `PvFluidGrid` mirrors `FluidGrid`:
+- **The record:** 312 bytes: nx, ny, dx and twelve columns at 24 + 24·k, pinned by a test.
+- **Public fields:** vx, vy, pressure and density are `PvColumn`s, and `step` refuses inconsistent lengths.
+- **Scratch:** the four scratch buffers persist across steps. `mg_levels` is a column of `*PvMgLevel` records,
+  each holding three columns. Three Cyrius-only buffers, `solve_a` … `solve_c`, hold what Rust's DST and CG solves
+  allocate per call (ADR 0002 #12).
+- **Config and walls:** `PvGridConfig` and `PvBoundaryCondition` (NoSlip 0, FreeSlip 1, Periodic 2) come with
+  their JSON (`src/json.cyr`).
+
+`grid.cyr` covers:
+- construction and the reads (`cell_count`, `idx`, `velocity_at`, `speed_at`, `max_speed`, `cfl_dt`,
+  `total_kinetic_energy`) and the public `PvFluidGrid_diffuse`;
+- the step's whole pipeline:
+  - semi-Lagrangian, periodic, MacCormack and BFECC advection, with the backtrace limiter;
+  - Gauss–Seidel diffusion with the Smagorinsky viscosity;
+  - buoyancy and vorticity confinement;
+  - the four projections: CG, multigrid V-cycles, Gauss–Seidel on periodic walls, DST otherwise;
+  - the ghost rules of each wall type and the density's zero-gradient ring.
+
+`grid_solve.cyr` transcribes hisab 1.4.0's direct DST-I and IDST-I (L6) and its matrix-free linear CG (L5, with the
+operator as a function pointer) into caller scratch, so nothing on the step path allocates.
+
+Rust's `%` on f64 (the periodic sampler's wrap) is C's fmod, which ganita and the stdlib don't have. It is
+`_pv_fmod` in `src/mathx.cyr`: hisab 3.4.1's exact integer-bit fmod, transcribed (ledger L14, requested at ganita).
+The math corpus gains 810 `f64::rem` rows for it (every special pair, wide gaps, subnormals, the sampler's shapes),
+all bit-exact.
+
+**The golden module** `grid.tsv` holds 569 rows (4.5 MB):
+- construction, the configs, the reads (`cfl_dt` takes eight (ν, cfl) pairs a row), `diffuse`;
+- the Gauss–Seidel and multigrid oracle hooks on 10 shared systems (the multigrid rows give every level's
+  residual, coarse right-hand side and coarse correction);
+- JSON for the three types;
+- 188 `FluidGrid::step` rows in class S:
+  - bit-level trajectories of four still tanks (no-slip, free-slip, periodic, and ambient-density fluid);
+  - single steps at frames {0, 1, 2, 10, 60, 300} of a buoyant plume under ten scheme and force variants, of a
+    16 × 16 plume (two multigrid levels), of a vortex and of an inflow jet;
+  - 24 random states on random configs;
+  - 40 refusals: each config check, the state's lengths, nx, ny, dx, and both divergence checks.
+
+Every row's input grid is fresh, built by `new` and then given the public fields, so the private buffers' contents
+never reach a row, only their lengths (the scratch dump). Part a's step rows use the periodic and multigrid
+projections. The DST and CG rows, and the step rows on those paths, come with part b and its corrected-oracle work:
+the DST's sines and cosines are where glibc may misround.
+
+`validate.py` transcribes the grid too: the samplers, all four advections, diffusion, Smagorinsky, the forces, the
+walls, Gauss–Seidel and the recursive V-cycle, the step and its refusals, and the JSON readers. It recomputes all
+569 rows. Two mutations of the transcription are caught: the restriction weight 0.25 → 0.2501 fails the multigrid
+rows, and the BFECC compensation × 1.0000001 fails the step rows.
+
+**Result:** every row passes on the first replay, bit-exact. The 188 step rows hold 60,421 field values at 0 ulp,
+the 300-step trajectories included. The replay is **9 modules, 0 failing | rows: 44,964 ok, 0 failed, 0 measured,
+2,463 pending, 72 accepted (ADR 4: 72)**. It is identical on x86_64 ELF, x86_64 PE and aarch64 and under `--bounds`,
+and the oracle's `--check` passes with rayon on, so the parallel advection and projection loops give the serial bits.
+
+**Mutation checks** (each restored and re-verified after):
+
+| Mutation | Rows failed |
+|---|---|
+| a sampler weight `sx` → `1 − sx` | 94 step rows |
+| free-slip's bottom tangential reflected instead of copied | 20 |
+| the prolongation's half weight → a quarter | 32 multigrid rows (108 in all) |
+| BFECC's compensation ½ → 0.4 | 23 |
+| vorticity confinement's force along N instead of N × ω | 101 |
+| Smagorinsky's 2·S₁₂² → S₁₂² | 23 |
+| MacCormack's ring copy dropped | 9 |
+| the multigrid coarsest size 6 → 7 | 4 multigrid rows |
+| fmod's signed zero → +0 | 5 `f64::rem` rows |
+
+One mutation changed nothing, correctly so. Dropping a periodic corner assignment is equivalent: the row copies run
+before the column copies, so each corner already holds its diagonal cell when Rust's corner block runs. That block
+is redundant in 1.3.0, not a gap in the rows.
+
+**Tests ported:**
+- 44 of the 49 Rust tests of `grid.rs`: `tests/grid.tcyr`, 164 checks. The rest wait for part c, where `MacGrid`,
+  `KEpsilon` and `apply_ghost_fluid` arrive: the three MacGrid tests, the KEpsilon size-mismatch test, the
+  ghost-fluid test, and the MacGrid half of `test_cfl_dt_finite_without_flow`. A Cyrius-only group pins the record
+  layouts.
+- The 5 grid tests of `integration.rs` and `serde_roundtrip_all_types`, whose four types now all have codecs:
+  `tests/integration.tcyr` has 59 checks.
+
+`test_pressure_solvers_agree` and `test_projection_all_solvers_dx_scaled` already show the DST and CG solves agreeing
+with Gauss–Seidel to Rust's 1e-3 on the same systems, before part b's rows. Surface parity covers 227 items with
+`grid`, the 24 part-c items listed as pending.
+
+**Speed** (benchmarks-rust-v-cyrius, M3 part a):
+- **The periodic step is 2.7–4.0× Rust** and diffuse 2.5–3.7×, the codegen's per-cell cost.
+- **max_speed is 16–17×** after writing its max out, which made it 1.44× faster with the rows unchanged.
+- **The DST steps are 15–231×,** because the correctly rounded sin takes 18.4 µs at fl(k·π/2), where the DST's
+  arguments land whenever n + 1 has small factors. Appended to the L1 request. Part b's sine table per transform
+  length keeps the bits and removes it.

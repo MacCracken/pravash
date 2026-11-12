@@ -176,6 +176,7 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = _pv_powf(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _pv_max(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _pv_min(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::rem") == 1) { var r: f64 = _pv_fmod(x, y); _par_got_f(r); return 1; }
     if (_par_in_n < 3) { return 0; }
     var z: f64 = _par_in(2);
     if (_par_eq(fp, fl, "f64::clamp") == 1) { var r: f64 = _pv_clamp(x, y, z); _par_got_f(r); return 1; }
@@ -917,6 +918,292 @@ fn _par_shallow(fp, fl): i64 {
     return handled;
 }
 
+# ── grid (M3) ───────────────────────────────────────────────────────────────────────
+# A state is nx, ny, dx and 4 `v:<n>` fields; a config is 13 tokens (scripts/oracle/src/m_grid.rs).
+
+# The state whose tokens start at input k into *g (scratch and levels empty): the index after it, or -1 for no
+# memory.
+fn _par_fg_in(k, g: *PvFluidGrid): i64 {
+    _pv_fg_zero(g);
+    g.nx = _par_in(k);
+    g.ny = _par_in(k + 1);
+    g.dx = _par_in(k + 2);
+    var at = k + 3;
+    for (var c = 0; c < 4; c = c + 1) {
+        var n = _par_in(at);
+        if (_par_col_in(at + 1, n, _pv_fg_col(g, c)) == 0) { return 0 - 1; }
+        at = at + 1 + n;
+    }
+    return at;
+}
+
+# Appends a state's 3 scalars and 4 fields.
+fn _par_fg_out(g: *PvFluidGrid) {
+    _par_got_i(g.nx);
+    _par_got_i(g.ny);
+    _par_got_f(_pv_bits(g.dx));
+    for (var c = 0; c < 4; c = c + 1) { _par_col_out(_pv_fg_col(g, c)); }
+    return 0;
+}
+
+# Appends the scratch dump: the 4 scratch lengths, the level count, each level's 3 lengths.
+fn _par_fg_dump(g: *PvFluidGrid) {
+    for (var c = 4; c < 8; c = c + 1) {
+        var s: *PvColumn = _pv_fg_col(g, c);
+        _par_got_i(s.len);
+    }
+    var lv: *PvColumn = _pv_fg_col(g, 8);
+    _par_got_i(lv.len);
+    for (var j = 0; j < lv.len; j = j + 1) {
+        var r = load64(lv.data + j * 8);
+        for (var q = 0; q < 3; q = q + 1) {
+            var col: *PvColumn = _pv_mg_col(r, q);
+            _par_got_i(col.len);
+        }
+    }
+    return 0;
+}
+
+# The boundary condition named by the `e:BoundaryCondition.<Variant>` token k, or -1.
+fn _par_bc_in(k): i64 {
+    var p = _par_in(k);
+    var n = load64(_par_in_l + k * 8);
+    if (_par_eq(p, n, "BoundaryCondition.NoSlip") == 1) { return PV_BOUNDARY_CONDITION_NO_SLIP; }
+    if (_par_eq(p, n, "BoundaryCondition.FreeSlip") == 1) { return PV_BOUNDARY_CONDITION_FREE_SLIP; }
+    if (_par_eq(p, n, "BoundaryCondition.Periodic") == 1) { return PV_BOUNDARY_CONDITION_PERIODIC; }
+    return 0 - 1;
+}
+
+# The config whose 13 tokens start at input k into *c.
+fn _par_gc_in(k, c: *PvGridConfig) {
+    c.dt = _par_in(k);
+    c.viscosity = _par_in(k + 1);
+    c.diffusion_iterations = _par_in(k + 2);
+    c.pressure_iterations = _par_in(k + 3);
+    c.boundary = _par_bc_in(k + 4);
+    c.vorticity_confinement = _par_in(k + 5);
+    c.buoyancy_alpha = _par_in(k + 6);
+    c.ambient_density = _par_in(k + 7);
+    c.use_maccormack = _par_in(k + 8);
+    c.use_bfecc = _par_in(k + 9);
+    c.smagorinsky_cs = _par_in(k + 10);
+    c.use_multigrid = _par_in(k + 11);
+    c.use_cg = _par_in(k + 12);
+    return 0;
+}
+
+# Appends a config's 13 tokens.
+fn _par_gc_out(c: *PvGridConfig) {
+    _par_got_f(_pv_bits(c.dt));
+    _par_got_f(_pv_bits(c.viscosity));
+    _par_got_i(c.diffusion_iterations);
+    _par_got_i(c.pressure_iterations);
+    _par_got_e(_par_enum_text("BoundaryCondition", boundary_condition_name(c.boundary)));
+    _par_got_f(_pv_bits(c.vorticity_confinement));
+    _par_got_f(_pv_bits(c.buoyancy_alpha));
+    _par_got_f(_pv_bits(c.ambient_density));
+    _par_got_i(c.use_maccormack);
+    _par_got_i(c.use_bfecc);
+    _par_got_f(_pv_bits(c.smagorinsky_cs));
+    _par_got_i(c.use_multigrid);
+    _par_got_i(c.use_cg);
+    return 0;
+}
+
+# The JSON rows: decode the oracle's document, then round-trip the port's encoding of the result.
+fn _par_grid_json(fp, fl): i64 {
+    var doc = _par_in_cstr(0);
+    if (doc == 0) { return 0 - 1; }
+    var dl = strlen(doc);
+    var sb = str_builder_new();
+    if (_par_eq(fp, fl, "BoundaryCondition::from_json") == 1) {
+        var k = 0;
+        var t, v = boundary_condition_from_json(doc, dl, &k);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_e(_par_enum_text("BoundaryCondition", boundary_condition_name(k)));
+        if (boundary_condition_to_json(k, sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var k2 = 0 - 1;
+        var t2, v2 = boundary_condition_from_json(d, n, &k2);
+        if (is_err_result(t2) == 1 || k2 != k) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "GridConfig::from_json") == 1) {
+        var c: PvGridConfig;
+        var tc, vc = PvGridConfig_from_json(doc, dl, &c);
+        if (is_err_result(tc) == 1) { _par_got_err(vc); return 1; }
+        _par_gc_out(&c);
+        if (c.to_json(sb) != 0) { return 0 - 1; }
+        var dc, nc = _par_sb_text(sb);
+        var c2: PvGridConfig;
+        var tc2, vc2 = PvGridConfig_from_json(dc, nc, &c2);
+        if (is_err_result(tc2) == 1 || memeq(&c, &c2, 104) != 1) { return 0 - 1; }
+        return 1;
+    }
+    var g: PvFluidGrid;
+    var tg, vg = PvFluidGrid_from_json(doc, dl, &g);
+    if (is_err_result(tg) == 1) { _par_got_err(vg); return 1; }
+    _par_fg_out(&g);
+    if (g.to_json(sb) != 0) { return 0 - 1; }
+    var dg, ng = _par_sb_text(sb);
+    var g2: PvFluidGrid;
+    var tg2, vg2 = PvFluidGrid_from_json(dg, ng, &g2);
+    if (is_err_result(tg2) == 1 || memeq(&g, &g2, 24) != 1) { return 0 - 1; }
+    for (var c3 = 0; c3 < 4; c3 = c3 + 1) {
+        var a: *PvColumn = _pv_fg_col(&g, c3);
+        var b: *PvColumn = _pv_fg_col(&g2, c3);
+        if (a.len != b.len) { return 0 - 1; }
+        if (a.len > 0 && memeq(a.data, b.data, a.len * 8) != 1) { return 0 - 1; }
+    }
+    PvFluidGrid_drop(&g);
+    PvFluidGrid_drop(&g2);
+    return 1;
+}
+
+# The f64 column whose `v:<n>` token is at input k into *c: the index after it, or -1 for no memory.
+fn _par_vcol_in(k, c: *PvColumn): i64 {
+    var n = _par_in(k);
+    if (_par_col_in(k + 1, n, c) == 0) { return 0 - 1; }
+    return k + 1 + n;
+}
+
+fn _par_grid(fp, fl): i64 {
+    if (_par_eq(fp, fl, "FluidGrid::new") == 1) {
+        var g: PvFluidGrid;
+        var t, v = PvFluidGrid_new(_par_in(0), _par_in(1), _par_in(2), &g);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_i(g.nx);
+        _par_got_i(g.ny);
+        _par_got_f(_pv_bits(g.dx));
+        for (var c = 0; c < 4; c = c + 1) {
+            var col: *PvColumn = _pv_fg_col(&g, c);
+            _par_got_i(col.len);
+            _par_got_f(load64(col.data));
+        }
+        _par_fg_dump(&g);
+        PvFluidGrid_drop(&g);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "GridConfig::smoke") == 1) {
+        var cs: PvGridConfig = PvGridConfig_smoke();
+        _par_gc_out(&cs);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "GridConfig::default") == 1) {
+        var cd: PvGridConfig = PvGridConfig_default();
+        _par_gc_out(&cd);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidGrid::from_json") == 1 || _par_eq(fp, fl, "GridConfig::from_json") == 1
+      || _par_eq(fp, fl, "BoundaryCondition::from_json") == 1) {
+        return _par_grid_json(fp, fl);
+    }
+    if (_par_eq(fp, fl, "FluidGrid::diffuse") == 1) {
+        var fd: PvColumn;
+        var k = _par_vcol_in(0, &fd);
+        if (k < 0) { return 0 - 1; }
+        PvFluidGrid_diffuse(fd.data, fd.len, _par_in(k), _par_in(k + 1), _par_in(k + 2), _par_in(k + 3),
+          _par_in(k + 4), _par_in(k + 5));
+        _par_col_out(&fd);
+        fd.drop();
+        return 1;
+    }
+    if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1
+      || _par_eq(fp, fl, "oracle::pressure_solve_multigrid") == 1) {
+        var pc: PvColumn;
+        var dc: PvColumn;
+        var k1 = _par_vcol_in(0, &pc);
+        if (k1 < 0) { return 0 - 1; }
+        var k2 = _par_vcol_in(k1, &dc);
+        if (k2 < 0) { return 0 - 1; }
+        var nx = _par_in(k2);
+        var ny = _par_in(k2 + 1);
+        if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1) {
+            _pv_fg_pressure_gs(pc.data, dc.data, nx, ny, _par_in(k2 + 2));
+            _par_col_out(&pc);
+        } else {
+            var levels: PvColumn = PvColumn_new();
+            var tm, vm = _pv_fg_pressure_mg(pc.data, dc.data, nx, ny, _par_in(k2 + 2), _par_in(k2 + 3), &levels);
+            if (is_err_result(tm) == 1) {
+                _par_got_err(vm);
+            } else {
+                _par_col_out(&pc);
+                _par_got_i(levels.len);
+                for (var j = 0; j < levels.len; j = j + 1) {
+                    var lv = load64(levels.data + j * 8);
+                    for (var q = 0; q < 3; q = q + 1) { _par_col_out(_pv_mg_col(lv, q)); }
+                }
+            }
+            _pv_mg_levels_drop(&levels);
+        }
+        pc.drop();
+        dc.drop();
+        return 1;
+    }
+    # Every other row starts with a state.
+    var g: PvFluidGrid;
+    var ks = _par_fg_in(0, &g);
+    if (ks < 0) { return 0 - 1; }
+    var n = g.nx * g.ny;
+    var handled = 1;
+    if (_par_eq(fp, fl, "FluidGrid::cell_count") == 1) {
+        _par_got_i(g.cell_count());
+    } elif (_par_eq(fp, fl, "FluidGrid::idx") == 1) {
+        _par_got_seq(n);
+        for (var i = 0; i < n; i = i + 1) { _par_got_i(g.idx(i % g.nx, i / g.nx)); }
+    } elif (_par_eq(fp, fl, "FluidGrid::velocity_at") == 1) {
+        _par_got_seq(2 * n);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var u, w = g.velocity_at(i2 % g.nx, i2 / g.nx);
+            var uf: f64 = u;
+            var wf: f64 = w;
+            _par_got_f(_pv_bits(uf));
+            _par_got_f(_pv_bits(wf));
+        }
+    } elif (_par_eq(fp, fl, "FluidGrid::speed_at") == 1) {
+        _par_got_seq(n);
+        for (var i3 = 0; i3 < n; i3 = i3 + 1) {
+            var sp: f64 = g.speed_at(i3 % g.nx, i3 / g.nx);
+            _par_got_f(_pv_bits(sp));
+        }
+    } elif (_par_eq(fp, fl, "FluidGrid::max_speed") == 1) {
+        var ms: f64 = g.max_speed();
+        _par_got_f(_pv_bits(ms));
+    } elif (_par_eq(fp, fl, "FluidGrid::total_kinetic_energy") == 1) {
+        var ke: f64 = g.total_kinetic_energy();
+        _par_got_f(_pv_bits(ke));
+    } elif (_par_eq(fp, fl, "FluidGrid::cfl_dt") == 1) {
+        var m = _par_in(ks);
+        _par_got_seq(m);
+        for (var j2 = 0; j2 < m; j2 = j2 + 1) {
+            var cf: f64 = g.cfl_dt(_par_in(ks + 1 + j2), _par_in(ks + 2 + m + j2));
+            _par_got_f(_pv_bits(cf));
+        }
+    } elif (_par_eq(fp, fl, "FluidGrid::step") == 1) {
+        # The state stepped nsteps times, then the scratch dump; the first failure's code if one fails.
+        var cfg: PvGridConfig;
+        _par_gc_in(ks, &cfg);
+        var steps = _par_in(ks + 13);
+        var failed = 0;
+        for (var s = 0; s < steps; s = s + 1) {
+            var ts, vs = g.step(&cfg);
+            if (is_err_result(ts) == 1) {
+                _par_got_err(vs);
+                failed = 1;
+                break;
+            }
+        }
+        if (failed == 0) {
+            _par_fg_out(&g);
+            _par_fg_dump(&g);
+        }
+    } else {
+        handled = 0;
+    }
+    PvFluidGrid_drop(&g);
+    return handled;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
@@ -926,6 +1213,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
     if (_par_eq(mp, ml, "shallow") == 1) { return _par_shallow(fp, fl); }
+    if (_par_eq(mp, ml, "grid") == 1) { return _par_grid(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;
 }
@@ -1049,6 +1337,9 @@ fn _par_c_bound(fp, fl): i64 {
     # The shallow-water step (class S): Rust's operations on the correctly rounded damping powf and cbrt, so every
     # field of every step row is bit for bit the oracle's (the corrected oracle's where glibc's pow misrounds).
     if (_par_eq(fp, fl, "ShallowWater::step") == 1) { return 0; }
+    # The grid step (class S), on the paths M3 part a covers (periodic Gauss–Seidel, multigrid): +, −, ×, ÷, √,
+    # floor and the exact fmod in Rust's order, so every field is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "FluidGrid::step") == 1) { return 0; }
     return 0 - 1;
 }
 

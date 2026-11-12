@@ -18,7 +18,8 @@ give (port plan §7.4):
 - `pub enum E` and each variant V          -> `enum <ENUM_NAMES[E]> {` and `<ENUM_PREFIX[E]><SNAKE(V)> =`
 - `pub struct S` and each `pub` field f    -> `struct Pv<S> {` with a field f, or FIELD_RENAMES' fields
 A function the naming rules would name otherwise is in FN_RENAMES; one whose Cyrius owner arrives with a later
-milestone is in PENDING_FNS (counted and listed); anything else needs an EXCEPTIONS entry with its reason. Every file
+milestone is in PENDING_FNS, and a type arriving with a later part of its module (its fields and methods with it) is
+in PENDING_TYPES (both counted and listed); anything else needs an EXCEPTIONS entry with its reason. Every file
 under rust-old/src must be in MODULES, PENDING_MODULES (a later milestone), DEFERRED_MODULES or
 NOT_APPLICABLE_MODULES. It also checks that tests/lib.cyr includes exactly cyrius.cyml's [lib] list, and scans for the
 cyrius 6.7.18 field-store miscompile (field_store_scan). Exits 1 on a missing item, an EXCEPTIONS entry that names no
@@ -30,9 +31,9 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
-MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow"]
+MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid"]
 PENDING_MODULES = {
-    "grid": "M3", "vof": "M3", "phase_field": "M3", "sph": "M4–M5",
+    "vof": "M3", "phase_field": "M3", "sph": "M4–M5",
     "coupling": "M6", "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
 }
 DEFERRED_MODULES = {}
@@ -52,7 +53,9 @@ FN_RENAMES = {}
 FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-PENDING_FNS = {}
+PENDING_FNS = {"apply_ghost_fluid": "M3 part c"}
+# Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
+PENDING_TYPES = {"grid::KEpsilon": "M3 part c", "grid::MacGrid": "M3 part c"}
 EXCEPTIONS = {
     "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "
                                  "(src/constants.cyr); its serde form is drag_coefficient_to_json / _from_json",
@@ -274,6 +277,12 @@ def main():
                 else:
                     missing.append(label)
                 continue
+            tkey = f"{module}::{name if kind == 'struct' else owner}"
+            if (owner or kind == "struct") and tkey in PENDING_TYPES:
+                used_pending.add(tkey)
+                pending.append(f"{label} [{PENDING_TYPES[tkey]}]")
+                ok += 1
+                continue
             ex = f"{module}::{owner + '::' if owner else ''}{name}"
             if ex in EXCEPTIONS:
                 used_exceptions.add(ex)
@@ -309,7 +318,7 @@ def main():
             if kind == "fn":
                 if f"{owner + '::' if owner else ''}{name}" in PENDING_FNS:
                     used_pending.add(f"{owner + '::' if owner else ''}{name}")
-                    pending.append(label)
+                    pending.append(f"{label} [{PENDING_FNS[f'{owner + '::' if owner else ''}{name}']}]")
                     ok += 1
                     continue
                 rename = FN_RENAMES.get(f"{owner + '::' if owner else ''}{name}")
@@ -335,6 +344,9 @@ def main():
     for pn in PENDING_FNS:
         if pn not in used_pending:
             missing.append(f"PENDING_FNS entry names no Rust function: {pn}")
+    for pt in PENDING_TYPES:
+        if pt not in used_pending:
+            missing.append(f"PENDING_TYPES entry names no Rust type: {pt}")
     missing.extend(profile_drift())
     missing.extend(field_store_scan())
     # Every rust-old/src file is accounted for.

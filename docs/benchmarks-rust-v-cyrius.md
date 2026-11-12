@@ -186,3 +186,54 @@ value for every d, NaN and ±0 included. The golden rows are unchanged.
   pointer parameter. Filed (`cyrius:docs/development/issues/2026-11-11-inline-refuses-small-numeric-helpers.md`)
   with these numbers. Hand-inlining a 300-line kernel in Rust's order is the alternative; it waits for that answer.
 - **The disturbance is 1.4–1.6×:** one sqrt per cell inside the radius and few calls.
+
+## M3 part a: the grid (2026-11-11)
+
+Rust's own criterion benches (`rust-old/benches/benchmarks.rs`: `grid_diffuse`, `grid_max_speed`, `grid_step`,
+`grid_step_maccormack`, `grid_step_periodic`), re-run pinned on core 15 for this record (criterion's median; the steps
+time a fresh clone, excluded from the measurement). The Cyrius rows are their twins in `tests/pravash.bcyr`, on the
+same inputs: diffuse's spike, max_speed's sin / cos fields, and the steps' four-cell plume, using the smoke config
+(the DST projection), MacCormack at dt 0.01, or periodic walls (Gauss–Seidel).
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `grid_diffuse/32x32` | 86.5 µs | 320 µs | 3.7× |
+| `grid_diffuse/64x64` | 456 µs | 1.29 ms | 2.8× |
+| `grid_diffuse/128x128` | 2.05 ms | 5.04 ms | 2.5× |
+| `grid_max_speed/32x32` | 360 ns | 5.89 µs | 16× |
+| `grid_max_speed/64x64` | 1.44 µs | 24.1 µs | 17× |
+| `grid_max_speed/128x128` | 5.72 µs | 96.2 µs | 17× |
+| `grid_step/15x15` | 127 µs | 29.3 ms | 231× |
+| `grid_step/30x30` | 1.07 ms | 16.3 ms | 15× |
+| `grid_step/63x63` | 10.1 ms | 736 ms | 73× |
+| `grid_step_maccormack/15x15` | 134 µs | 29.2 ms | 218× |
+| `grid_step_maccormack/30x30` | 1.11 ms | 16.6 ms | 15× |
+| `grid_step_maccormack/63x63` | 10.5 ms | 737 ms | 70× |
+| `grid_step_periodic/15x15` | 70.6 µs | 284 µs | 4.0× |
+| `grid_step_periodic/30x30` | 377 µs | 1.27 ms | 3.4× |
+| `grid_step_periodic/63x63` | 2.07 ms | 5.68 ms | 2.7× |
+| `math/fmod` (x in [−200, 200), y in [4, 64)) | 7.26 ns (glibc) | 20 ns (`_pv_fmod`, L14) | 2.8× |
+
+**The A/B behind the max_speed rows** (pinned, interleaved, two runs each, on the grid-only bench): the fold's
+NaN-ignoring max written out as `if (q >= m || m != m) m = q`, instead of a `_pv_max` call, took 8.54–8.58 µs →
+5.95 µs at 32 × 32 and 140–141 µs → 96.7–98.2 µs at 128 × 128 (1.44×). The rewrite gives the same value for every
+pair, NaN and ±0 included, and the golden rows are unchanged. Marking `_pv_bits` `#inline` (it is called on every
+f64 store) changed nothing measurable, so it was reverted.
+
+**Reading it.**
+- **The DST steps are slow because of one function, the correctly rounded `sin`.** hisab 1.4.0's direct DST
+  evaluates sin(((π·a)·b)/(n+1)) for every term. At fl(k·π/2) that sin takes **18.4 µs on average** (cos the same),
+  against 165 ns on generic arguments: the result is within about 2⁻⁵³ of 0 or ±1, and the fast path's rounding
+  test sends it to the accurate path. When n + 1 has small factors, many DST terms land there. A 15 × 15 grid has
+  n + 1 = 14 and one term in 7 lands there: sin averages 3,992 ns over the DST's arguments, so the step is 231× Rust.
+  A 30 × 30 grid has n + 1 = 29, a prime: 171 ns, and the step is 15×. A 63 × 63 grid has n + 1 = 62: 778 ns, 73×.
+  - Appended to the L1 request (`ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`)
+    with these numbers.
+  - The fix on pravash's side keeps the bits: the arguments depend only on (a, b, n), so each transform length's
+    sine table can be built once and reused for every row, column and step. That comes with the DST's parity rows
+    in M3 part b, measured by A/B.
+- **The periodic step (no DST) is 2.7–4.0×,** in line with the shallow-water step's per-cell call cost. Its sampler
+  calls the fmod stand-in four times a sample, about 1 ms of the 5.7 ms at 63 × 63.
+- **diffuse is 2.5–3.7×:** a Gauss–Seidel sweep is a chain of dependent loads and adds, which neither side
+  vectorises. The gap is the codegen's, 18 ns a cell update against 4.8 ns.
+- **max_speed is 16–17× after the A/B.** Rust vectorises the squared-speed fold; the Cyrius loop is scalar.

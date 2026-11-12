@@ -86,6 +86,7 @@ fn _bench_binary(name, id) {
         elif (id == 3) { r = ganita_f64_pow(x, y); }
         elif (id == 4) { r = _pv_atan2(x, y); }
         elif (id == 5) { r = ganita_f64_atan2(x, y); }
+        elif (id == 6) { r = _pv_fmod(x, y); }
         g_sink = g_sink ^ _pv_bits(r);
     }
     bench_batch_stop(b, NS);
@@ -143,6 +144,9 @@ fn bench_math() {
     _bench_args(-1.0, 1.0, -1.0, 1.0);
     _bench_binary("math/atan2_cr", 4);
     _bench_binary("math/atan2_ganita", 5);
+    # x % y: the periodic grid sampler's wrap, a backtraced coordinate against the grid size (M3).
+    _bench_args(-200.0, 200.0, 4.0, 64.0);
+    _bench_binary("math/fmod_stand_in", 6);
     return 0;
 }
 
@@ -522,6 +526,121 @@ fn bench_shallow() {
     return 0;
 }
 
+# ── grid (M3): Rust's criterion benches grid_diffuse, grid_max_speed, grid_step, grid_step_maccormack,
+# grid_step_periodic ──
+# rust-old/benches/benchmarks.rs. diffuse: an n × n field of zeros with 100 at n²/2, rate 0.1, dt 0.01, dx 0.1, 20
+# sweeps, on a fresh copy each time. max_speed: vx = sin(0.01·i), vy = cos(0.01·i) at dx 0.01. The steps: the smoke
+# config (the DST projection), with MacCormack at dt 0.01, or on periodic walls (Gauss–Seidel), on an n × n grid
+# (n = 15, 30, 63) at dx 0.1 with density 1 and vy 1 on four cells of row 2. Clones are made outside the timed batch,
+# as criterion's iter_batched excludes them.
+
+fn _bench_fg_diffuse(n, iters) {
+    var cells = n * n;
+    var pool = fl_alloc(iters * cells * 8);
+    for (var k = 0; k < iters; k = k + 1) {
+        var f = pool + k * cells * 8;
+        for (var i = 0; i < cells; i = i + 1) { store64(f + i * 8, 0); }
+        store64(f + (cells / 2) * 8, _pv_bits(100.0));
+    }
+    var b = bench_new(_bench_name("grid_diffuse/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ok = PvFluidGrid_diffuse(pool + k * cells * 8, cells, n, n, 0.1, 0.01, 0.1, 20);
+        g_sink = g_sink ^ ok;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(pool);
+    return 0;
+}
+
+fn _bench_fg_max_speed(n, iters) {
+    var g: PvFluidGrid;
+    var t, v = PvFluidGrid_new(n, n, 0.01, &g);
+    for (var i = 0; i < n * n; i = i + 1) {
+        var a: f64 = f64_from(i) * 0.01;
+        var sa: f64 = _pv_sin(a);
+        var ca: f64 = _pv_cos(a);
+        store64(g.vx.data + i * 8, _pv_bits(sa));
+        store64(g.vy.data + i * 8, _pv_bits(ca));
+    }
+    var b = bench_new(_bench_name("grid_max_speed/", n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ms: f64 = g.max_speed();
+        g_sink = g_sink ^ _pv_bits(ms);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
+# kind 0: grid_step (smoke), 1: grid_step_maccormack (dt 0.01), 2: grid_step_periodic.
+fn _bench_fg_step(n, iters, kind) {
+    var base: PvFluidGrid;
+    var t, v = PvFluidGrid_new(n, n, 0.1, &base);
+    var mid = n / 2;
+    for (var x = mid - 2; x < mid + 2; x = x + 1) {
+        var i = 2 * n + x;
+        store64(base.density.data + i * 8, _pv_bits(1.0));
+        store64(base.vy.data + i * 8, _pv_bits(1.0));
+    }
+    var c: PvGridConfig = PvGridConfig_smoke();
+    var name = "grid_step/";
+    if (kind == 1) {
+        c.use_maccormack = 1;
+        c.dt = 0.01;
+        name = "grid_step_maccormack/";
+    }
+    if (kind == 2) {
+        c.boundary = PV_BOUNDARY_CONDITION_PERIODIC;
+        name = "grid_step_periodic/";
+    }
+    var pool = fl_alloc(iters * sizeof(PvFluidGrid));
+    for (var k = 0; k < iters; k = k + 1) { var ok = PvFluidGrid_clone(_bench_fg(pool, k), &base); }
+    var b = bench_new(_bench_name(name, n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var s: *PvFluidGrid = _bench_fg(pool, k);
+        var ts, vs = s.step(&c);
+        g_sink = g_sink ^ ts;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    for (var k = 0; k < iters; k = k + 1) { PvFluidGrid_drop(_bench_fg(pool, k)); }
+    fl_free(pool);
+    PvFluidGrid_drop(&base);
+    return 0;
+}
+
+# Grid k of a pool of grids.
+#must_use
+fn _bench_fg(pool, k): *PvFluidGrid {
+    var p: *PvFluidGrid = _bench_as_fg(pool);
+    return p + k;
+}
+
+#must_use
+fn _bench_as_fg(p): *PvFluidGrid {
+    return p;
+}
+
+fn bench_grid() {
+    _bench_fg_diffuse(32, 200);
+    _bench_fg_diffuse(64, 50);
+    _bench_fg_diffuse(128, 20);
+    _bench_fg_max_speed(32, 100000);
+    _bench_fg_max_speed(64, 20000);
+    _bench_fg_max_speed(128, 5000);
+    for (var kind = 0; kind < 3; kind = kind + 1) {
+        _bench_fg_step(15, 100, kind);
+        _bench_fg_step(30, 20, kind);
+        _bench_fg_step(63, 5, kind);
+    }
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -542,6 +661,7 @@ fn main(): i64 {
     bench_common();
     bench_m1b();
     bench_shallow();
+    bench_grid();
     return 0;
 }
 

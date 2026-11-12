@@ -500,5 +500,32 @@ pub fn emit() -> Module {
     cb.extend(wide(0xcb02, 300));
     unary(&mut m, "f64::cbrt", Class::C, f64::cbrt, &cb);
 
+    // x % y (C's fmod, exact): the periodic grid sampler's wrap ((f % n) + n) % n (M3). Every special pair (a zero
+    // or NaN divisor, ±∞, ±0 both ways), |x| < |y|, exact multiples, wide exponent gaps and subnormals, then the
+    // sampler's own shapes: a backtraced coordinate against the grid size, and its wrapped successor.
+    let mut rem = grid(&specials());
+    rem.extend(pairs(0x7e3a, 300, -300.0, 300.0));
+    rem.extend([
+        (6.0, 3.0),
+        (-6.0, 3.0),
+        (-7.5, 3.0),
+        (1.0, 0.1),
+        (f64::MAX, f64::from_bits(1)),
+        (f64::from_bits(5), f64::from_bits(3)),
+        (f64::MIN_POSITIVE, f64::from_bits(7)),
+        (-0.0, 10.0),
+        (-1e-300, 10.0),
+        (-1e-17, 16.0),
+    ]);
+    let mut rng = Rng::new(0x7e3b);
+    for _ in 0..200 {
+        #[allow(clippy::cast_precision_loss)]
+        let n = rng.int(4, 64) as f64;
+        let x = rng.uniform(-3.0, 3.0) * n;
+        let w = black_box(x) % n + n;
+        rem.extend([(x, n), (w, n)]);
+    }
+    binary(&mut m, "f64::rem", Class::A, |x, y| x % y, &rem);
+
     m
 }

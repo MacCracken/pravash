@@ -78,4 +78,7 @@ fn main() {
     let a = args(-1.0, 1.0, -1.0, 1.0);
     // The Cyrius row is _pv_atan2(x, y) = atan2(y = x, x = y): Rust's x.atan2(y).
     time("math/atan2", &a, |x, y| x.atan2(y));
+    // x % y: the periodic grid sampler's wrap, a backtraced coordinate against the grid size (M3).
+    let a = args(-200.0, 200.0, 4.0, 64.0);
+    time("math/fmod", &a, |x, y| x % y);
 }

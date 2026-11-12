@@ -3,6 +3,55 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **grid** (M3 part a): `src/grid.cyr` and `src/grid_solve.cyr`, the port of `rust-old/src/grid.rs`'s `FluidGrid`.
+  - **`PvFluidGrid`:**
+    - `PvFluidGrid_new`, `PvFluidGrid_clone` and `PvFluidGrid_drop`;
+    - the reads `cell_count`, `idx`, `velocity_at`, `speed_at`, `max_speed`, `cfl_dt` and `total_kinetic_energy`;
+    - the public `PvFluidGrid_diffuse` (Rust's `FluidGrid::diffuse`);
+    - JSON (`to_json`, `PvFluidGrid_from_json`).
+  - **`PvGridConfig`** (`PvGridConfig_smoke`, `PvGridConfig_default`) and **`PvBoundaryCondition`** (NoSlip 0,
+    FreeSlip 1, Periodic 2), each with its JSON.
+  - **`step`:**
+    - semi-Lagrangian, periodic, MacCormack and BFECC advection, with the backtrace limiter;
+    - Gauss–Seidel diffusion and the Smagorinsky viscosity;
+    - buoyancy and vorticity confinement;
+    - the CG, multigrid, Gauss–Seidel and DST projections;
+    - the ghost rules for each wall type.
+
+    Every formula follows Rust's operation order.
+  - **`src/grid_solve.cyr`:** hisab 1.4.0's direct DST-I / IDST-I (ledger L6) and matrix-free linear CG (L5),
+    transcribed into caller scratch.
+  - **Storage:** the public fields are `PvColumn`s, the multigrid levels persist as `PvMgLevel` records, and three
+    Cyrius-only private buffers replace the DST's and CG's per-call allocations (ADR 0002 #12). A step allocates
+    nothing once sized.
+  - **`PvGridConfig.boundary` outside the enum** is refused with `PV_ERR_INVALID_PARAMETER` (ADR 0002 #12).
+  - **Parity:** `tests/golden/grid.tsv`, 569 rows, all bit-exact on the first replay on three targets, and the same
+    with rayon on.
+    - 188 of them are `FluidGrid::step` rows (class S, bound 0) on the periodic and multigrid projections: 300-step
+      trajectories of still tanks, and single steps at frames {0, 1, 2, 10, 60, 300} of plumes, a vortex and a jet
+      under every scheme and force.
+    - 70 rows run the Gauss–Seidel and multigrid oracle hooks on shared systems. The DST and CG rows come with part b.
+    - `validate.py` transcribes the grid and recomputes every row.
+  - **Tests:** 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`; the other 5 need part c's MacGrid and
+    KEpsilon), the 5 grid integration tests, and `serde_roundtrip_all_types`.
+  - **Surface parity:** 227 items, 24 pending part c.
+- **`_pv_fmod`** (`src/mathx.cyr`): the exact fmod, Rust's `%` on f64, transcribed from hisab 3.4.1. It is ledger
+  L14, a stand-in until ganita has one (requested, `ganita:docs/development/issues/2026-11-11-no-fmod.md`).
+  `tests/golden/math.tsv` gains 810 `f64::rem` rows, all bit-exact.
+
+### Performance
+- **The grid benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M3 part a),
+  against Rust's own criterion benches, re-run pinned:
+  - `grid_step_periodic` 284 µs (Rust 70.6 µs) at 15 × 15, 2.7–4.0×;
+  - `grid_diffuse` 320 µs (86.5 µs) at 32 × 32, 2.5–3.7×;
+  - `grid_max_speed` 5.89 µs (360 ns), 16–17×;
+  - `grid_step` (the DST projection) 29.3 ms (127 µs) at 15 × 15 and 736 ms (10.1 ms) at 63 × 63.
+
+  `max_speed` with its max written out went from 8.56 µs to 5.95 µs (pinned A/B), its rows unchanged. The DST steps'
+  cost is the correctly rounded sin at fl(k·π/2), 18.4 µs a call there against 165 ns elsewhere. That is appended
+  to the L1 request, and part b's per-length sine table keeps the bits and removes it.
+
+### Added (Cyrius)
 - **shallow** (M2): `src/shallow.cyr`, the port of `rust-old/src/shallow.rs` and the first stateful solver.
   - **`PvShallowWater`:**
     - `PvShallowWater_new`, `PvShallowWater_clone` and `PvShallowWater_drop`;

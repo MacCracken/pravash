@@ -64,5 +64,7 @@ modules = [
     "src/vortex.cyr",
     "src/bridge.cyr",
     "src/shallow.cyr",
+    "src/grid_solve.cyr",
+    "src/grid.cyr",
     "src/json.cyr",
 ]

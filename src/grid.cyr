@@ -1,0 +1,1358 @@
+# grid.cyr — 2D incompressible Euler / Navier–Stokes on a uniform grid (port of rust-old/src/grid.rs, `FluidGrid`).
+#
+# `PvFluidGrid` mirrors `FluidGrid`: nx × ny cells of size dx, row-major (index y·nx + x), with a ghost ring: the
+# public fields `vx`, `vy`, `pressure` and `density` are columns (src/column.cyr) a caller may resize, as Rust's
+# public Vecs. A step splits the operators in Rust's order: advect the velocity (semi-Lagrangian, MacCormack or BFECC,
+# both limited to the backtraced stencil; a wrapping sampler for periodic walls), diffuse it (Gauss–Seidel, with an
+# optional Smagorinsky viscosity), apply buoyancy and vorticity confinement, project it (the Poisson system 4p − Σp =
+# −dx²·∇·u by DST, multigrid, conjugate gradient or Gauss–Seidel), then advect the density.
+#
+# The scratch buffers are private and persist across steps, so a step allocates nothing once the sizes are set.
+# Rust's DST and CG solves allocate per call; here they use three more private buffers, `solve_a` … `solve_c`
+# (ADR 0002 #12). Create with `PvFluidGrid_new`, release with `PvFluidGrid_drop`.
+#
+# Every formula is Rust's in Rust's operation order; the DST's sines and cosines are correctly rounded (ADR 0004),
+# and the periodic sampler's `%` is the exact fmod (src/mathx.cyr, L14). An index outside a field, where Rust panics,
+# reads NaN and writes nothing (ADR 0002 #8). Rust's `trace_span!`s arrive with M7's logging, and the three parallel
+# row loops with src/par.cyr (M3 part e); a serial loop gives the same bits.
+
+# The wall rule for the velocity ghosts. Append-only values. Mirrors `BoundaryCondition`.
+enum PvBoundaryCondition {
+    PV_BOUNDARY_CONDITION_NO_SLIP = 0;
+    PV_BOUNDARY_CONDITION_FREE_SLIP = 1;
+    PV_BOUNDARY_CONDITION_PERIODIC = 2;
+}
+
+# The Rust variant name of a boundary condition (`"NoSlip"`), or "Unknown".
+#must_use
+fn boundary_condition_name(k): i64 {
+    match k {
+        PV_BOUNDARY_CONDITION_NO_SLIP => { return "NoSlip"; }
+        PV_BOUNDARY_CONDITION_FREE_SLIP => { return "FreeSlip"; }
+        PV_BOUNDARY_CONDITION_PERIODIC => { return "Periodic"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# The configuration of a grid step. The flags are 0 / 1; the iteration counts are usizes. Mirrors `GridConfig`.
+struct PvGridConfig {
+    dt: f64;
+    viscosity: f64;
+    diffusion_iterations;
+    pressure_iterations;
+    boundary;
+    vorticity_confinement: f64;
+    buoyancy_alpha: f64;
+    ambient_density: f64;
+    use_maccormack;
+    use_bfecc;
+    smagorinsky_cs: f64;
+    use_multigrid;
+    use_cg;
+}
+
+# The smoke defaults (y up): dt 0.1, viscosity 1e-4, 20 diffusion and 40 pressure iterations, no-slip walls,
+# vorticity confinement 0.5, buoyancy 0.1 against an ambient density 0, semi-Lagrangian advection, no Smagorinsky,
+# the DST pressure solve. Mirrors `GridConfig::smoke`.
+#must_use
+fn PvGridConfig_smoke(): PvGridConfig {
+    var c: PvGridConfig;
+    c.dt = 0.1;
+    var visc: f64 = 0x3F1A36E2EB1C432D;   # 1e-4
+    c.viscosity = visc;
+    c.diffusion_iterations = 20;
+    c.pressure_iterations = 40;
+    c.boundary = PV_BOUNDARY_CONDITION_NO_SLIP;
+    c.vorticity_confinement = 0.5;
+    c.buoyancy_alpha = 0.1;
+    c.ambient_density = 0.0;
+    c.use_maccormack = 0;
+    c.use_bfecc = 0;
+    c.smagorinsky_cs = 0.0;
+    c.use_multigrid = 0;
+    c.use_cg = 0;
+    return c;
+}
+
+# The smoke defaults. Mirrors `GridConfig::default`.
+#must_use
+fn PvGridConfig_default(): PvGridConfig {
+    return PvGridConfig_smoke();
+}
+
+# One multigrid level as the grid keeps it between steps: the residual (the level's size), the coarse right-hand
+# side and the coarse correction (the next level's size). Mirrors the `(Vec, Vec, Vec)` of `mg_levels`.
+struct PvMgLevel {
+    residual: PvColumn;
+    coarse_rhs: PvColumn;
+    coarse_p: PvColumn;
+}
+
+struct PvFluidGrid {
+    nx;
+    ny;
+    dx: f64;
+    vx: PvColumn;
+    vy: PvColumn;
+    pressure: PvColumn;
+    density: PvColumn;
+    scratch_a: PvColumn;
+    scratch_b: PvColumn;
+    scratch_c: PvColumn;
+    diffuse_rhs: PvColumn;
+    mg_levels: PvColumn;
+    solve_a: PvColumn;
+    solve_b: PvColumn;
+    solve_c: PvColumn;
+}
+
+# The number of columns in a `PvFluidGrid`: the 4 public fields, the 4 scratch buffers, `mg_levels` (column 8, whose
+# words are `*PvMgLevel`s) and the 3 solver buffers.
+const _PV_FG_COLUMNS = 12;
+
+# Column k of a grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_a, 5 scratch_b, 6 scratch_c, 7 diffuse_rhs,
+# 8 mg_levels, 9 … 11 solve_a … solve_c), by its byte offset (a field's address can't be taken; tests/grid.tcyr pins
+# the layout: nx, ny, dx, then the twelve columns, 312 bytes).
+#must_use
+fn _pv_fg_col(g, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
+}
+
+#must_use
+fn _pv_as_mg_level(p): *PvMgLevel {
+    return p;
+}
+
+# Column k (0 residual, 1 coarse_rhs, 2 coarse_p) of a multigrid level.
+#must_use
+fn _pv_mg_col(lv, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(lv) + k * 24);
+}
+
+# Releases every level and the level list; the list is empty after.
+fn _pv_mg_levels_drop(levels: *PvColumn) {
+    for (var k = 0; k < levels.len; k = k + 1) {
+        var lv = load64(levels.data + k * 8);
+        for (var c = 0; c < 3; c = c + 1) {
+            var col: *PvColumn = _pv_mg_col(lv, c);
+            col.drop();
+        }
+        fl_free(lv);
+    }
+    levels.drop();
+    return 0;
+}
+
+# Appends an empty level: 1, or 0 when the memory isn't there (the list unchanged).
+#must_use
+fn _pv_mg_levels_push(levels: *PvColumn): i64 {
+    var lv = fl_alloc(72);
+    if (lv == 0) { return 0; }
+    for (var c = 0; c < 3; c = c + 1) {
+        var col: *PvColumn = _pv_mg_col(lv, c);
+        col.data = 0;
+        col.len = 0;
+        col.cap = 0;
+    }
+    if (levels.push(lv) == 0) {
+        fl_free(lv);
+        return 0;
+    }
+    return 1;
+}
+
+# Empties every column of *g without releasing anything (for a record about to be filled).
+fn _pv_fg_zero(g: *PvFluidGrid) {
+    for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_fg_col(g, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    return 0;
+}
+
+# Releases every field's storage, the multigrid levels included; the grid holds no storage after. Mirrors dropping
+# the `FluidGrid`.
+fn PvFluidGrid_drop(g: *PvFluidGrid) {
+    _pv_mg_levels_drop(_pv_fg_col(g, 8));
+    for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_fg_col(g, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# The usize product nx·ny (each ≥ 4 or a word ≥ 2^63): 0 when it is below 2^63 (an i64 size), 1 when it is in
+# [2^63, 2^64) (a size no allocation reaches: Rust's `vec!` aborts), 2 when it overflows a usize (Rust's
+# `checked_mul` is None).
+#must_use
+fn _pv_fg_mul_class(nx, ny): i64 {
+    if (nx < 0 || ny < 0) { return 2; }
+    if (nx <= 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+    # ⌊(2^64 − 1)/ny⌋ = 2a + ⌊(2b + 1)/ny⌋ for 2^63 − 1 = a·ny + b.
+    var a = 0x7FFFFFFFFFFFFFFF / ny;
+    var b = 0x7FFFFFFFFFFFFFFF % ny;
+    var q = 2 * a + (2 * b + 1) / ny;
+    if (nx > q) { return 2; }
+    return 1;
+}
+
+# A grid of zeros into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx or ny
+# below 4, PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0 or for nx·ny overflowing;
+# PV_ERR_OUT_OF_MEMORY when the fields can't be allocated (Rust aborts). On an error *out holds no storage. The
+# four scratch buffers start at nx·ny zeros and the multigrid levels empty. Mirrors `FluidGrid::new`.
+#must_use
+fn PvFluidGrid_new(nx, ny, dx: f64, out: *PvFluidGrid): Result {
+    _pv_fg_zero(out);
+    # nx and ny are usizes: a word at or above 2^63 reads negative, and is a size Rust accepts until nx·ny.
+    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    var ov = _pv_fg_mul_class(nx, ny);
+    if (ov == 2) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (ov == 1) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var size = nx * ny;
+    var ok = 1;
+    for (var k = 0; k < 8; k = k + 1) {
+        var c: *PvColumn = _pv_fg_col(out, k);
+        ok = ok & c.resize(size, 0);
+    }
+    if (ok == 0) {
+        PvFluidGrid_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    return Ok(0);
+}
+
+# A deep copy of `src` into *out, scratch and multigrid levels included: 1, or 0 when the memory isn't there (then
+# *out holds no storage). Mirrors `FluidGrid::clone`.
+#must_use
+fn PvFluidGrid_clone(out: *PvFluidGrid, src: *PvFluidGrid): i64 {
+    out.nx = src.nx;
+    out.ny = src.ny;
+    out.dx = src.dx;
+    _pv_fg_zero(out);
+    for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
+        if (k == 8) { continue; }
+        var s: *PvColumn = _pv_fg_col(src, k);
+        var d: *PvColumn = _pv_fg_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvFluidGrid_drop(out);
+            return 0;
+        }
+        d.copy_from(s);
+    }
+    var sl: *PvColumn = _pv_fg_col(src, 8);
+    var dl: *PvColumn = _pv_fg_col(out, 8);
+    for (var j = 0; j < sl.len; j = j + 1) {
+        if (_pv_mg_levels_push(dl) == 0) {
+            PvFluidGrid_drop(out);
+            return 0;
+        }
+        var sv = load64(sl.data + j * 8);
+        var dv = load64(dl.data + j * 8);
+        for (var c = 0; c < 3; c = c + 1) {
+            var s2: *PvColumn = _pv_mg_col(sv, c);
+            var d2: *PvColumn = _pv_mg_col(dv, c);
+            if (d2.resize(s2.len, 0) == 0) {
+                PvFluidGrid_drop(out);
+                return 0;
+            }
+            d2.copy_from(s2);
+        }
+    }
+    return 1;
+}
+
+# Copies n words from src to dst.
+fn _pv_fg_copy(dst, src, n) {
+    for (var i = 0; i < n; i = i + 1) { store64(dst + i * 8, load64(src + i * 8)); }
+    return 0;
+}
+
+# Sets n words at p to w.
+fn _pv_fg_fill(p, n, w) {
+    for (var i = 0; i < n; i = i + 1) { store64(p + i * 8, w); }
+    return 0;
+}
+
+# ── sampling and advection ──────────────────────────────────────────────────────────
+
+# The bilinear interpolation of field f (nx × ny) at the continuous position (fx, fy) in cell units: the cell
+# x0 = floor(fx) clamped to [0, nx − 2] (likewise y0), the weights sx = fx − x0 clamped to [0, 1], and
+# ((v00·(1−sx))·(1−sy) + (v10·sx)·(1−sy)) + (v01·(1−sx))·sy + (v11·sx)·sy. NaN when a coordinate is not finite (the
+# backtrace's divergence signal). Mirrors the private `sample`.
+#must_use
+fn _pv_fg_sample(f, nx, ny, fx: f64, fy: f64): f64 {
+    var tx: f64 = fx - fx;
+    var ty: f64 = fy - fy;
+    if (tx != 0.0 || ty != 0.0) {
+        var nan: f64 = PV_F64_NAN;
+        return nan;
+    }
+    # floor, then max(0), then min(n − 2), then `as usize`: only the integer is used after, so the comparisons
+    # stand for Rust's max / min on these finite values.
+    var x0 = 0;
+    var flx: f64 = f64_floor(fx);
+    if (flx > 0.0) {
+        var hx: f64 = f64_from(nx - 2);
+        if (flx < hx) { x0 = f64_to(flx); } else { x0 = nx - 2; }
+    }
+    var y0 = 0;
+    var fly: f64 = f64_floor(fy);
+    if (fly > 0.0) {
+        var hy: f64 = f64_from(ny - 2);
+        if (fly < hy) { y0 = f64_to(fly); } else { y0 = ny - 2; }
+    }
+    var x0f: f64 = f64_from(x0);
+    var y0f: f64 = f64_from(y0);
+    var sx: f64 = fx - x0f;
+    if (sx < 0.0) { sx = 0.0; }
+    if (sx > 1.0) { sx = 1.0; }
+    var sy: f64 = fy - y0f;
+    if (sy < 0.0) { sy = 0.0; }
+    if (sy > 1.0) { sy = 1.0; }
+    var r0 = f + (y0 * nx + x0) * 8;
+    var r1 = r0 + nx * 8;
+    var v00: f64 = load64(r0);
+    var v10: f64 = load64(r0 + 8);
+    var v01: f64 = load64(r1);
+    var v11: f64 = load64(r1 + 8);
+    var osx: f64 = 1.0 - sx;
+    var osy: f64 = 1.0 - sy;
+    var r: f64 = ((((v00 * osx) * osy) + ((v10 * sx) * osy)) + ((v01 * osx) * sy)) + ((v11 * sx) * sy);
+    return r;
+}
+
+# (lo, hi): the min and max of the four stencil values `_pv_fg_sample` reads at (fx, fy), the MacCormack / BFECC
+# limiter bounds (Selle et al. 2008), NaN-ignoring as Rust's min / max are; (−∞, +∞) when a coordinate is not
+# finite. Read as `var lo, hi = …` and bind each to an f64 local. Mirrors the private `sample_bounds`.
+#must_use
+fn _pv_fg_bounds(f, nx, ny, fx: f64, fy: f64) {
+    var tx: f64 = fx - fx;
+    var ty: f64 = fy - fy;
+    if (tx != 0.0 || ty != 0.0) {
+        var ninf: f64 = PV_F64_NEG_INFINITY;
+        var pinf: f64 = PV_F64_INFINITY;
+        return (ninf, pinf);
+    }
+    var x0 = 0;
+    var flx: f64 = f64_floor(fx);
+    if (flx > 0.0) {
+        var hx: f64 = f64_from(nx - 2);
+        if (flx < hx) { x0 = f64_to(flx); } else { x0 = nx - 2; }
+    }
+    var y0 = 0;
+    var fly: f64 = f64_floor(fy);
+    if (fly > 0.0) {
+        var hy: f64 = f64_from(ny - 2);
+        if (fly < hy) { y0 = f64_to(fly); } else { y0 = ny - 2; }
+    }
+    var r0 = f + (y0 * nx + x0) * 8;
+    var r1 = r0 + nx * 8;
+    var v00: f64 = load64(r0);
+    var v10: f64 = load64(r0 + 8);
+    var v01: f64 = load64(r1);
+    var v11: f64 = load64(r1 + 8);
+    var a: f64 = _pv_min(v00, v10);
+    var b: f64 = _pv_min(a, v01);
+    var lo: f64 = _pv_min(b, v11);
+    var c: f64 = _pv_max(v00, v10);
+    var d: f64 = _pv_max(c, v01);
+    var hi: f64 = _pv_max(d, v11);
+    return (lo, hi);
+}
+
+# v clamped to [lo, hi] when lo ≤ hi, else v unchanged (a NaN or inverted bound never panics). Mirrors the private
+# `clamp_safe`.
+#must_use
+fn _pv_fg_clamp_safe(v: f64, lo: f64, hi: f64): f64 {
+    if (lo <= hi) {
+        var r: f64 = _pv_clamp(v, lo, hi);
+        return r;
+    }
+    return v;
+}
+
+# Copies the boundary ring of src into dst. Mirrors the private `copy_ring`.
+fn _pv_fg_copy_ring(dst, src, nx, ny) {
+    _pv_fg_copy(dst, src, nx);
+    var top = (ny - 1) * nx;
+    _pv_fg_copy(dst + top * 8, src + top * 8, nx);
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var l = y * nx;
+        var r = l + nx - 1;
+        store64(dst + l * 8, load64(src + l * 8));
+        store64(dst + r * 8, load64(src + r * 8));
+    }
+    return 0;
+}
+
+# Semi-Lagrangian advection of src into dst on the interior: each cell traced back through (vx, vy) by
+# dt·inv_dx·v cells and sampled. Mirrors the private `advect`.
+fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
+    var k: f64 = dt * inv_dx;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var xf: f64 = f64_from(x);
+            var u: f64 = load64(vx + i * 8);
+            var v: f64 = load64(vy + i * 8);
+            var fx: f64 = xf - (k * u);
+            var fy: f64 = yf - (k * v);
+            var s: f64 = _pv_fg_sample(src, nx, ny, fx, fy);
+            store64(dst + i * 8, _pv_bits(s));
+        }
+    }
+    return 0;
+}
+
+# The bilinear sample at (fx, fy) with both axes wrapped: ((f % n) + n) % n, then the floor cell mod n and its
+# successor mod n, the weights f − floor(f). NaN when a coordinate is not finite. Mirrors the private
+# `sample_periodic`.
+#must_use
+fn _pv_fg_sample_periodic(f, nx, ny, fx0: f64, fy0: f64): f64 {
+    var tx: f64 = fx0 - fx0;
+    var ty: f64 = fy0 - fy0;
+    if (tx != 0.0 || ty != 0.0) {
+        var nan: f64 = PV_F64_NAN;
+        return nan;
+    }
+    var nxf: f64 = f64_from(nx);
+    var nyf: f64 = f64_from(ny);
+    var ax: f64 = _pv_fmod(fx0, nxf);
+    var bx: f64 = ax + nxf;
+    var fx: f64 = _pv_fmod(bx, nxf);
+    var ay: f64 = _pv_fmod(fy0, nyf);
+    var by: f64 = ay + nyf;
+    var fy: f64 = _pv_fmod(by, nyf);
+    var flx: f64 = f64_floor(fx);
+    var fly: f64 = f64_floor(fy);
+    var x0 = f64_to(flx) % nx;
+    var y0 = f64_to(fly) % ny;
+    var x1 = (x0 + 1) % nx;
+    var y1 = (y0 + 1) % ny;
+    var sx: f64 = fx - flx;
+    var sy: f64 = fy - fly;
+    var v00: f64 = load64(f + (y0 * nx + x0) * 8);
+    var v10: f64 = load64(f + (y0 * nx + x1) * 8);
+    var v01: f64 = load64(f + (y1 * nx + x0) * 8);
+    var v11: f64 = load64(f + (y1 * nx + x1) * 8);
+    var osx: f64 = 1.0 - sx;
+    var osy: f64 = 1.0 - sy;
+    var r: f64 = ((((v00 * osx) * osy) + ((v10 * sx) * osy)) + ((v01 * osx) * sy)) + ((v11 * sx) * sy);
+    return r;
+}
+
+# Semi-Lagrangian advection with periodic wrapping, over every cell (the ring included). Mirrors the private
+# `advect_periodic`.
+fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
+    var k: f64 = dt * inv_dx;
+    for (var y = 0; y < ny; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        for (var x = 0; x < nx; x = x + 1) {
+            var i = y * nx + x;
+            var xf: f64 = f64_from(x);
+            var u: f64 = load64(vx + i * 8);
+            var v: f64 = load64(vy + i * 8);
+            var fx: f64 = xf - (k * u);
+            var fy: f64 = yf - (k * v);
+            var s: f64 = _pv_fg_sample_periodic(src, nx, ny, fx, fy);
+            store64(dst + i * 8, _pv_bits(s));
+        }
+    }
+    return 0;
+}
+
+# MacCormack advection of src into dst: the forward semi-Lagrangian step, the source's ring copied into it, the
+# backward step from it into temp, then dst + ½(src − temp) clamped to the stencil of the backtraced point in src.
+# Mirrors the private `advect_maccormack`.
+fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp) {
+    var k: f64 = dt * inv_dx;
+    _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx);
+    _pv_fg_copy_ring(dst, src, nx, ny);
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var xf: f64 = f64_from(x);
+            var u: f64 = load64(vx + i * 8);
+            var v: f64 = load64(vy + i * 8);
+            var fx: f64 = xf + (k * u);
+            var fy: f64 = yf + (k * v);
+            var s: f64 = _pv_fg_sample(dst, nx, ny, fx, fy);
+            store64(temp + i * 8, _pv_bits(s));
+        }
+    }
+    for (var y2 = 1; y2 < ny - 1; y2 = y2 + 1) {
+        var yf2: f64 = f64_from(y2);
+        for (var x2 = 1; x2 < nx - 1; x2 = x2 + 1) {
+            var j = y2 * nx + x2;
+            var dj: f64 = load64(dst + j * 8);
+            var sj: f64 = load64(src + j * 8);
+            var tj: f64 = load64(temp + j * 8);
+            var corrected: f64 = dj + (0.5 * (sj - tj));
+            var xf2: f64 = f64_from(x2);
+            var u2: f64 = load64(vx + j * 8);
+            var v2: f64 = load64(vy + j * 8);
+            var gx: f64 = xf2 - (k * u2);
+            var gy: f64 = yf2 - (k * v2);
+            var lo, hi = _pv_fg_bounds(src, nx, ny, gx, gy);
+            var lof: f64 = lo;
+            var hif: f64 = hi;
+            var c: f64 = _pv_fg_clamp_safe(corrected, lof, hif);
+            store64(dst + j * 8, _pv_bits(c));
+        }
+    }
+    return 0;
+}
+
+# BFECC advection of src into dst: forward into temp1 (the source's ring copied in), backward into temp2, the
+# compensated source src + ½(src − temp2) in temp2 (ring from src), and its forward advection clamped to the stencil
+# of the backtraced point in src. Mirrors the private `advect_bfecc`.
+fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, temp2) {
+    var k: f64 = dt * inv_dx;
+    _pv_fg_advect(temp1, src, vx, vy, nx, ny, dt, inv_dx);
+    _pv_fg_copy_ring(temp1, src, nx, ny);
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var xf: f64 = f64_from(x);
+            var u: f64 = load64(vx + i * 8);
+            var v: f64 = load64(vy + i * 8);
+            var fx: f64 = xf + (k * u);
+            var fy: f64 = yf + (k * v);
+            var s: f64 = _pv_fg_sample(temp1, nx, ny, fx, fy);
+            store64(temp2 + i * 8, _pv_bits(s));
+        }
+    }
+    _pv_fg_copy_ring(temp2, src, nx, ny);
+    for (var y2 = 1; y2 < ny - 1; y2 = y2 + 1) {
+        for (var x2 = 1; x2 < nx - 1; x2 = x2 + 1) {
+            var j = y2 * nx + x2;
+            var sj: f64 = load64(src + j * 8);
+            var tj: f64 = load64(temp2 + j * 8);
+            var w: f64 = sj + (0.5 * (sj - tj));
+            store64(temp2 + j * 8, _pv_bits(w));
+        }
+    }
+    for (var y3 = 1; y3 < ny - 1; y3 = y3 + 1) {
+        var yf3: f64 = f64_from(y3);
+        for (var x3 = 1; x3 < nx - 1; x3 = x3 + 1) {
+            var q = y3 * nx + x3;
+            var xf3: f64 = f64_from(x3);
+            var u3: f64 = load64(vx + q * 8);
+            var v3: f64 = load64(vy + q * 8);
+            var gx: f64 = xf3 - (k * u3);
+            var gy: f64 = yf3 - (k * v3);
+            var sv: f64 = _pv_fg_sample(temp2, nx, ny, gx, gy);
+            var lo, hi = _pv_fg_bounds(src, nx, ny, gx, gy);
+            var lof: f64 = lo;
+            var hif: f64 = hi;
+            var c: f64 = _pv_fg_clamp_safe(sv, lof, hif);
+            store64(dst + q * 8, _pv_bits(c));
+        }
+    }
+    return 0;
+}
+
+# ── diffusion ───────────────────────────────────────────────────────────────────────
+
+# Gauss–Seidel diffusion of field (nx × ny) with rhs as the right-hand side buffer (resized to nx·ny and set to the
+# field): `iterations` sweeps of field = (rhs + a·Σ neighbours)/(1 + 4a), a = (dt·diff_rate)/(dx·dx). 1, or 0 when
+# rhs can't grow (field unchanged). Mirrors the private `diffuse_with_buf`.
+fn _pv_fg_diffuse_buf(field, nx, ny, diff_rate: f64, dt: f64, dx: f64, iterations, rhs: *PvColumn): i64 {
+    var a: f64 = (dt * diff_rate) / (dx * dx);
+    var inv_denom: f64 = 1.0 / (1.0 + (4.0 * a));
+    var n = nx * ny;
+    if (rhs.resize(n, 0) == 0) { return 0; }
+    var rd = rhs.data;
+    _pv_fg_copy(rd, field, n);
+    for (var it = 0; it < iterations; it = it + 1) {
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var p = field + (y * nx + x) * 8;
+                var l: f64 = load64(p - 8);
+                var r: f64 = load64(p + 8);
+                var d: f64 = load64(p - nx * 8);
+                var u: f64 = load64(p + nx * 8);
+                var nb: f64 = ((l + r) + d) + u;
+                var b: f64 = load64(rd + (y * nx + x) * 8);
+                var v: f64 = (b + (a * nb)) * inv_denom;
+                store64(p, _pv_bits(v));
+            }
+        }
+    }
+    return 1;
+}
+
+# Diffuses `field` (`len` f64s, nx × ny) in place by Gauss–Seidel: the implicit (I − a·∇²)·x_new = x_old with
+# a = (dt·diff_rate)/dx², `iterations` sweeps over the interior, the original field as the right-hand side. 1, or
+# 0 with the field unchanged when nx or ny is below 3, nx·ny overflows or isn't `len` (Rust warns and returns), or
+# the right-hand side can't be allocated (Rust aborts). Mirrors `FluidGrid::diffuse`.
+fn PvFluidGrid_diffuse(field, len, nx, ny, diff_rate: f64, dt: f64, dx: f64, iterations): i64 {
+    if (nx < 3 || ny < 3) { return 0; }
+    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+    if (nx * ny != len) { return 0; }
+    var rhs: PvColumn = PvColumn_new();
+    var ok = _pv_fg_diffuse_buf(field, nx, ny, diff_rate, dt, dx, iterations, &rhs);
+    rhs.drop();
+    return ok;
+}
+
+# ── pressure projection ─────────────────────────────────────────────────────────────
+
+# div = −((vx[i+1] − vx[i−1]) + (vy[i+nx] − vy[i−nx]))·scale on the interior. With scale dx/2 it is −dx²·∇·u, the
+# right-hand side of the unit-stencil Poisson system. Mirrors the private `divergence`.
+fn _pv_fg_divergence(div, vx, vy, nx, ny, scale: f64) {
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var xr: f64 = load64(vx + (i + 1) * 8);
+            var xl: f64 = load64(vx + (i - 1) * 8);
+            var yu: f64 = load64(vy + (i + nx) * 8);
+            var yd: f64 = load64(vy + (i - nx) * 8);
+            var s: f64 = (xr - xl) + (yu - yd);
+            var ns: f64 = -s;
+            var d: f64 = ns * scale;
+            store64(div + i * 8, _pv_bits(d));
+        }
+    }
+    return 0;
+}
+
+# `iterations` Gauss–Seidel sweeps of 4·p − Σ p = rhs on the interior, warm-started from p, the ring held. Mirrors the
+# private `pressure_solve` (always Ok).
+fn _pv_fg_pressure_gs(p, div, nx, ny, iterations) {
+    for (var it = 0; it < iterations; it = it + 1) {
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var q = p + (y * nx + x) * 8;
+                var l: f64 = load64(q - 8);
+                var r: f64 = load64(q + 8);
+                var d: f64 = load64(q - nx * 8);
+                var u: f64 = load64(q + nx * 8);
+                var nb: f64 = ((l + r) + d) + u;
+                var b: f64 = load64(div + (y * nx + x) * 8);
+                var v: f64 = (b + nb) * 0.25;
+                store64(q, _pv_bits(v));
+            }
+        }
+    }
+    return 0;
+}
+
+# The DST pressure solve of 4p − Σp = div with p = 0 on the ring: the interior divergence transformed by DST-I rows
+# then columns, divided by the eigenvalues μ = −((2cos(π(kx+1)/(inx+1)) − 2) + (2cos(π(ky+1)/(iny+1)) − 2)) where
+# |μ| > 1e-12, transformed back by IDST-I rows then columns; then all `plen` words of p zeroed and the interior
+# written. ra, rb and rc are scratch columns (inx·iny, and the longer side twice). Ok(0) (also when the interior is
+# empty), or Err(PV_ERR_OUT_OF_MEMORY) when the scratch can't grow. Mirrors the private `pressure_solve_dst`.
+#must_use
+fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn): Result {
+    var inx = nx - 2;
+    var iny = ny - 2;
+    if (inx <= 0 || iny <= 0) { return Ok(0); }
+    var longest = inx;
+    if (iny > longest) { longest = iny; }
+    if (ra.resize(inx * iny, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (rb.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (rc.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var rhs = ra.data;
+    var col = rb.data;
+    var tr = rc.data;
+    for (var iy = 0; iy < iny; iy = iy + 1) {
+        _pv_fg_copy(rhs + iy * inx * 8, div + ((iy + 1) * nx + 1) * 8, inx);
+    }
+    # The forward transform: rows, then columns.
+    for (var r = 0; r < iny; r = r + 1) {
+        var row = rhs + r * inx * 8;
+        _pv_dst(row, inx, tr);
+        _pv_fg_copy(row, tr, inx);
+    }
+    for (var cx = 0; cx < inx; cx = cx + 1) {
+        for (var cy = 0; cy < iny; cy = cy + 1) { store64(col + cy * 8, load64(rhs + (cy * inx + cx) * 8)); }
+        _pv_dst(col, iny, tr);
+        for (var cy2 = 0; cy2 < iny; cy2 = cy2 + 1) { store64(rhs + (cy2 * inx + cx) * 8, load64(tr + cy2 * 8)); }
+    }
+    # The eigenvalues of the unit-stencil operator.
+    var pi: f64 = PV_F64_PI;
+    var ix1: f64 = f64_from(inx + 1);
+    var iy1: f64 = f64_from(iny + 1);
+    var tiny: f64 = 0x3D719799812DEA11;   # 1e-12
+    for (var ky = 0; ky < iny; ky = ky + 1) {
+        var kyf: f64 = f64_from(ky + 1);
+        var ay: f64 = (pi * kyf) / iy1;
+        for (var kx = 0; kx < inx; kx = kx + 1) {
+            var kxf: f64 = f64_from(kx + 1);
+            var ax: f64 = (pi * kxf) / ix1;
+            var cxv: f64 = _pv_cos(ax);
+            var lx: f64 = (2.0 * cxv) - 2.0;
+            var cyv: f64 = _pv_cos(ay);
+            var ly: f64 = (2.0 * cyv) - 2.0;
+            var s: f64 = lx + ly;
+            var eig: f64 = -s;
+            var ae: f64 = f64_abs(eig);
+            if (ae > tiny) {
+                var at = rhs + (ky * inx + kx) * 8;
+                var v: f64 = load64(at);
+                var w: f64 = v / eig;
+                store64(at, _pv_bits(w));
+            }
+        }
+    }
+    # The inverse transform: rows, then columns.
+    for (var r2 = 0; r2 < iny; r2 = r2 + 1) {
+        var row2 = rhs + r2 * inx * 8;
+        _pv_idst(row2, inx, tr);
+        _pv_fg_copy(row2, tr, inx);
+    }
+    for (var dx2 = 0; dx2 < inx; dx2 = dx2 + 1) {
+        for (var dy = 0; dy < iny; dy = dy + 1) { store64(col + dy * 8, load64(rhs + (dy * inx + dx2) * 8)); }
+        _pv_idst(col, iny, tr);
+        for (var dy2 = 0; dy2 < iny; dy2 = dy2 + 1) { store64(rhs + (dy2 * inx + dx2) * 8, load64(tr + dy2 * 8)); }
+    }
+    _pv_fg_fill(p, plen, 0);
+    for (var oy = 0; oy < iny; oy = oy + 1) {
+        _pv_fg_copy(p + ((oy + 1) * nx + 1) * 8, rhs + oy * inx * 8, inx);
+    }
+    return Ok(0);
+}
+
+# One multigrid V-cycle on 4p − Σp = rhs (nx × ny) at `depth`: below 7 cells a side (or at depth 10) 50 Gauss–Seidel
+# sweeps; otherwise nu pre-smoothing sweeps, the residual restricted by full weighting to the vertex-centred coarse
+# grid (⌈nx/2⌉ × ⌈ny/2⌉, its right-hand side 4× the restricted residual), a V-cycle there, the correction prolonged
+# bilinearly, and nu post-smoothing sweeps. The level buffers persist in `levels` (pushed as first reached). 1, or 0
+# when a level's buffers can't be allocated. Mirrors the private `mg_vcycle`.
+fn _pv_fg_mg_vcycle(p, rhs, nx, ny, nu, levels: *PvColumn, depth): i64 {
+    if (nx <= 6 || ny <= 6 || depth >= 10) {
+        _pv_fg_pressure_gs(p, rhs, nx, ny, 50);
+        return 1;
+    }
+    _pv_fg_pressure_gs(p, rhs, nx, ny, nu);
+    var n = nx * ny;
+    var cnx = (nx + 1) / 2;
+    var cny = (ny + 1) / 2;
+    if (cnx < 4 || cny < 4) {
+        _pv_fg_pressure_gs(p, rhs, nx, ny, nu * 4);
+        return 1;
+    }
+    var cn = cnx * cny;
+    while (levels.len <= depth) {
+        if (_pv_mg_levels_push(levels) == 0) { return 0; }
+    }
+    var lv = load64(levels.data + depth * 8);
+    var res_c: *PvColumn = _pv_mg_col(lv, 0);
+    var crhs_c: *PvColumn = _pv_mg_col(lv, 1);
+    var cp_c: *PvColumn = _pv_mg_col(lv, 2);
+    if (res_c.resize(n, 0) == 0) { return 0; }
+    if (crhs_c.resize(cn, 0) == 0) { return 0; }
+    if (cp_c.resize(cn, 0) == 0) { return 0; }
+    var res = res_c.data;
+    var crhs = crhs_c.data;
+    var cp = cp_c.data;
+    _pv_fg_fill(cp, cn, 0);
+    _pv_fg_fill(res, n, 0);
+    # The residual of the smoother's system: r = rhs − (4p − Σp).
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var q = p + i * 8;
+            var pc: f64 = load64(q);
+            var l: f64 = load64(q - 8);
+            var r: f64 = load64(q + 8);
+            var d: f64 = load64(q - nx * 8);
+            var u: f64 = load64(q + nx * 8);
+            var a_p: f64 = (4.0 * pc) - (((l + r) + d) + u);
+            var b: f64 = load64(rhs + i * 8);
+            var rv: f64 = b - a_p;
+            store64(res + i * 8, _pv_bits(rv));
+        }
+    }
+    # Restriction (full weighting).
+    _pv_fg_fill(crhs, cn, 0);
+    for (var cy = 1; cy < cny - 1; cy = cy + 1) {
+        for (var cx = 1; cx < cnx - 1; cx = cx + 1) {
+            var fi = (cy * 2) * nx + cx * 2;
+            var f = res + fi * 8;
+            var c0: f64 = load64(f);
+            var w: f64 = load64(f - 8);
+            var e: f64 = load64(f + 8);
+            var s: f64 = load64(f - nx * 8);
+            var nn: f64 = load64(f + nx * 8);
+            var sw: f64 = load64(f - nx * 8 - 8);
+            var se: f64 = load64(f - nx * 8 + 8);
+            var nw: f64 = load64(f + nx * 8 - 8);
+            var ne: f64 = load64(f + nx * 8 + 8);
+            var edges: f64 = ((w + e) + s) + nn;
+            var t: f64 = ((((((4.0 * c0) + (2.0 * edges)) + sw) + se) + nw) + ne) * 0.25;
+            store64(crhs + (cy * cnx + cx) * 8, _pv_bits(t));
+        }
+    }
+    if (_pv_fg_mg_vcycle(cp, crhs, cnx, cny, nu, levels, depth + 1) == 0) { return 0; }
+    # Prolongation (bilinear): even fine points take the coarse value, odd ones average their 2 or 4 coarse parents;
+    # a parent outside the coarse grid reads 0, and the ring stays.
+    for (var py = 1; py < ny - 1; py = py + 1) {
+        var gy = py / 2;
+        var odd_y = py % 2;
+        for (var px = 1; px < nx - 1; px = px + 1) {
+            var gx = px / 2;
+            var odd_x = px % 2;
+            var c00: f64 = 0.0;
+            if (gx < cnx && gy < cny) { c00 = load64(cp + (gy * cnx + gx) * 8); }
+            var corr: f64 = c00;
+            if (odd_x == 1 && odd_y == 0) {
+                var c10: f64 = 0.0;
+                if (gx + 1 < cnx && gy < cny) { c10 = load64(cp + (gy * cnx + gx + 1) * 8); }
+                corr = 0.5 * (c00 + c10);
+            } elif (odd_x == 0 && odd_y == 1) {
+                var c01: f64 = 0.0;
+                if (gx < cnx && gy + 1 < cny) { c01 = load64(cp + ((gy + 1) * cnx + gx) * 8); }
+                corr = 0.5 * (c00 + c01);
+            } elif (odd_x == 1 && odd_y == 1) {
+                var d10: f64 = 0.0;
+                if (gx + 1 < cnx && gy < cny) { d10 = load64(cp + (gy * cnx + gx + 1) * 8); }
+                var d01: f64 = 0.0;
+                if (gx < cnx && gy + 1 < cny) { d01 = load64(cp + ((gy + 1) * cnx + gx) * 8); }
+                var d11: f64 = 0.0;
+                if (gx + 1 < cnx && gy + 1 < cny) { d11 = load64(cp + ((gy + 1) * cnx + gx + 1) * 8); }
+                corr = 0.25 * (((c00 + d10) + d01) + d11);
+            }
+            var at = p + (py * nx + px) * 8;
+            var pv: f64 = load64(at);
+            var pn: f64 = pv + corr;
+            store64(at, _pv_bits(pn));
+        }
+    }
+    _pv_fg_pressure_gs(p, rhs, nx, ny, nu);
+    return 1;
+}
+
+# `cycles` V-cycles (at least 1) with nu smoothing sweeps per level, the level buffers in `levels`. Ok(0), or
+# Err(PV_ERR_OUT_OF_MEMORY) when a level can't be allocated (Rust aborts). Mirrors the private
+# `pressure_solve_multigrid`.
+#must_use
+fn _pv_fg_pressure_mg(p, div, nx, ny, nu, cycles, levels: *PvColumn): Result {
+    var c = cycles;
+    if (c < 1) { c = 1; }
+    for (var k = 0; k < c; k = k + 1) {
+        if (_pv_fg_mg_vcycle(p, div, nx, ny, nu, levels, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    }
+    return Ok(0);
+}
+
+# The unit-stencil operator of the pressure systems, for `_pv_cg`: out = 4v − (((v[i−1] + v[i+1]) + v[i−nx]) +
+# v[i+nx]) on the interior, 0 on the ring. ctx holds the words nx, ny. Mirrors the `a_mul` closure of
+# `pressure_solve_cg`.
+fn _pv_fg_stencil(ctx, v, out) {
+    var nx = load64(ctx);
+    var ny = load64(ctx + 8);
+    _pv_fg_fill(out, nx * ny, 0);
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var q = v + i * 8;
+            var c: f64 = load64(q);
+            var l: f64 = load64(q - 8);
+            var r: f64 = load64(q + 8);
+            var d: f64 = load64(q - nx * 8);
+            var u: f64 = load64(q + nx * 8);
+            var a: f64 = (4.0 * c) - (((l + r) + d) + u);
+            store64(out + i * 8, _pv_bits(a));
+        }
+    }
+    return 0;
+}
+
+# The conjugate-gradient pressure solve of 4p − Σp = div (nx·ny unknowns, p the guess and the result): tolerance
+# max(1e-6·‖div‖, 1e-14), at most `iterations` iterations. ra, rb and rc are scratch columns (nx·ny each). Ok(0);
+# Err(PV_ERR_DIVERGED) for an empty system (hisab's InvalidInput, which Rust maps to Diverged), or
+# Err(PV_ERR_OUT_OF_MEMORY) when the scratch can't grow. Mirrors the private `pressure_solve_cg`.
+#must_use
+fn _pv_fg_pressure_cg(p, div, nx, ny, iterations, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn): Result {
+    var n = nx * ny;
+    var ss: f64 = _pv_cg_dot(div, div, n);
+    var b_norm: f64 = f64_sqrt(ss);
+    var lo: f64 = 0x3D06849B86A12B9B;   # 1e-14
+    var rel: f64 = 0x3EB0C6F7A0B5ED8D;  # 1e-6
+    var t0: f64 = rel * b_norm;
+    var tol: f64 = _pv_max(t0, lo);
+    if (n <= 0) { return Err(PV_ERR_DIVERGED); }
+    if (ra.resize(n, 0) == 0 || rb.resize(n, 0) == 0 || rc.resize(n, 0) == 0) {
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    var ctx[16];
+    store64(&ctx, nx);
+    store64(&ctx + 8, ny);
+    _pv_cg(&_pv_fg_stencil, &ctx, div, p, n, tol, iterations, ra.data, rb.data, rc.data);
+    return Ok(0);
+}
+
+# u −= ∇p by central differences (scaled by inv_2dx) on the interior. Mirrors the private `project_velocity`.
+fn _pv_fg_project(vx, vy, p, nx, ny, inv_2dx: f64) {
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var q = p + i * 8;
+            var pr: f64 = load64(q + 8);
+            var pl: f64 = load64(q - 8);
+            var pu: f64 = load64(q + nx * 8);
+            var pd: f64 = load64(q - nx * 8);
+            var u: f64 = load64(vx + i * 8);
+            var v: f64 = load64(vy + i * 8);
+            var un: f64 = u - ((pr - pl) * inv_2dx);
+            var vn: f64 = v - ((pu - pd) * inv_2dx);
+            store64(vx + i * 8, _pv_bits(un));
+            store64(vy + i * 8, _pv_bits(vn));
+        }
+    }
+    return 0;
+}
+
+# ── vorticity confinement and walls ─────────────────────────────────────────────────
+
+# Vorticity confinement: ω = ∂vy/∂x − ∂vx/∂y into vort on the interior, then, two cells in from the walls, the force
+# ε·dx·dt·(N × ω) with N = ∇|ω|/‖∇|ω|‖, skipped where |ω| or ‖∇|ω|‖ is below 1e-10. Mirrors the private
+# `apply_vorticity_confinement`.
+fn _pv_fg_vorticity(vx, vy, nx, ny, dx: f64, dt: f64, epsilon: f64, vort) {
+    var inv_2dx: f64 = 0.5 / dx;
+    for (var y = 1; y < ny - 1; y = y + 1) {
+        for (var x = 1; x < nx - 1; x = x + 1) {
+            var i = y * nx + x;
+            var vr: f64 = load64(vy + (i + 1) * 8);
+            var vl: f64 = load64(vy + (i - 1) * 8);
+            var uu: f64 = load64(vx + (i + nx) * 8);
+            var ud: f64 = load64(vx + (i - nx) * 8);
+            var dvydx: f64 = (vr - vl) * inv_2dx;
+            var dvxdy: f64 = (uu - ud) * inv_2dx;
+            var w: f64 = dvydx - dvxdy;
+            store64(vort + i * 8, _pv_bits(w));
+        }
+    }
+    var tiny: f64 = 0x3DDB7CDFD9D7BDBB;   # 1e-10
+    var scale: f64 = (epsilon * dx) * dt;
+    for (var y2 = 2; y2 < ny - 2; y2 = y2 + 1) {
+        for (var x2 = 2; x2 < nx - 2; x2 = x2 + 1) {
+            var j = y2 * nx + x2;
+            var q = vort + j * 8;
+            var wj: f64 = load64(q);
+            var abs_w: f64 = f64_abs(wj);
+            if (abs_w < tiny) { continue; }
+            var wr: f64 = load64(q + 8);
+            var wl: f64 = load64(q - 8);
+            var wu: f64 = load64(q + nx * 8);
+            var wd: f64 = load64(q - nx * 8);
+            var awr: f64 = f64_abs(wr);
+            var awl: f64 = f64_abs(wl);
+            var awu: f64 = f64_abs(wu);
+            var awd: f64 = f64_abs(wd);
+            var eta_x: f64 = (awr - awl) * inv_2dx;
+            var eta_y: f64 = (awu - awd) * inv_2dx;
+            var m2: f64 = (eta_x * eta_x) + (eta_y * eta_y);
+            var eta_mag: f64 = f64_sqrt(m2);
+            if (eta_mag < tiny) { continue; }
+            var nx_v: f64 = eta_x / eta_mag;
+            var ny_v: f64 = eta_y / eta_mag;
+            var u: f64 = load64(vx + j * 8);
+            var v: f64 = load64(vy + j * 8);
+            var un: f64 = u + ((scale * ny_v) * wj);
+            var vn: f64 = v - ((scale * nx_v) * wj);
+            store64(vx + j * 8, _pv_bits(un));
+            store64(vy + j * 8, _pv_bits(vn));
+        }
+    }
+    return 0;
+}
+
+# Stores −x at word index d.
+fn _pv_fg_neg_to(p, d, s) {
+    var x: f64 = load64(p + s * 8);
+    var nx: f64 = -x;
+    store64(p + d * 8, _pv_bits(nx));
+    return 0;
+}
+
+# Stores the word at index s to index d.
+fn _pv_fg_mov(p, d, s) {
+    store64(p + d * 8, load64(p + s * 8));
+    return 0;
+}
+
+# The velocity ghosts by wall rule: no-slip reflects both components, free-slip reflects the normal one and copies
+# the tangential one (the wall on the face between the ghost and the first interior cell), periodic copies the
+# opposite interior row and column, then the corners from the diagonal cell. An unknown rule leaves the ring. Mirrors
+# the private `enforce_boundary`.
+fn _pv_fg_enforce(vx, vy, nx, ny, bc) {
+    if (bc == PV_BOUNDARY_CONDITION_NO_SLIP) {
+        for (var x = 0; x < nx; x = x + 1) {
+            _pv_fg_neg_to(vx, x, nx + x);
+            _pv_fg_neg_to(vy, x, nx + x);
+            var top = (ny - 1) * nx + x;
+            var below = (ny - 2) * nx + x;
+            _pv_fg_neg_to(vx, top, below);
+            _pv_fg_neg_to(vy, top, below);
+        }
+        for (var y = 0; y < ny; y = y + 1) {
+            var l = y * nx;
+            _pv_fg_neg_to(vx, l, l + 1);
+            _pv_fg_neg_to(vy, l, l + 1);
+            var r = y * nx + nx - 1;
+            _pv_fg_neg_to(vx, r, r - 1);
+            _pv_fg_neg_to(vy, r, r - 1);
+        }
+        return 0;
+    }
+    if (bc == PV_BOUNDARY_CONDITION_FREE_SLIP) {
+        for (var x2 = 0; x2 < nx; x2 = x2 + 1) {
+            _pv_fg_mov(vx, x2, nx + x2);
+            _pv_fg_neg_to(vy, x2, nx + x2);
+            var top2 = (ny - 1) * nx + x2;
+            var below2 = (ny - 2) * nx + x2;
+            _pv_fg_mov(vx, top2, below2);
+            _pv_fg_neg_to(vy, top2, below2);
+        }
+        for (var y2 = 0; y2 < ny; y2 = y2 + 1) {
+            var l2 = y2 * nx;
+            _pv_fg_neg_to(vx, l2, l2 + 1);
+            _pv_fg_mov(vy, l2, l2 + 1);
+            var r2 = y2 * nx + nx - 1;
+            _pv_fg_neg_to(vx, r2, r2 - 1);
+            _pv_fg_mov(vy, r2, r2 - 1);
+        }
+        return 0;
+    }
+    if (bc == PV_BOUNDARY_CONDITION_PERIODIC) {
+        for (var x3 = 0; x3 < nx; x3 = x3 + 1) {
+            _pv_fg_mov(vx, x3, (ny - 2) * nx + x3);
+            _pv_fg_mov(vy, x3, (ny - 2) * nx + x3);
+            _pv_fg_mov(vx, (ny - 1) * nx + x3, nx + x3);
+            _pv_fg_mov(vy, (ny - 1) * nx + x3, nx + x3);
+        }
+        for (var y3 = 0; y3 < ny; y3 = y3 + 1) {
+            _pv_fg_mov(vx, y3 * nx, y3 * nx + nx - 2);
+            _pv_fg_mov(vy, y3 * nx, y3 * nx + nx - 2);
+            _pv_fg_mov(vx, y3 * nx + nx - 1, y3 * nx + 1);
+            _pv_fg_mov(vy, y3 * nx + nx - 1, y3 * nx + 1);
+        }
+        var c = (ny - 2) * nx + nx - 2;
+        _pv_fg_mov(vx, 0, c);
+        _pv_fg_mov(vy, 0, c);
+        _pv_fg_mov(vx, nx - 1, (ny - 2) * nx + 1);
+        _pv_fg_mov(vy, nx - 1, (ny - 2) * nx + 1);
+        _pv_fg_mov(vx, (ny - 1) * nx, nx + nx - 2);
+        _pv_fg_mov(vy, (ny - 1) * nx, nx + nx - 2);
+        _pv_fg_mov(vx, (ny - 1) * nx + nx - 1, nx + 1);
+        _pv_fg_mov(vy, (ny - 1) * nx + nx - 1, nx + 1);
+    }
+    return 0;
+}
+
+# The scalar ghosts: each ring cell copies its interior neighbour (zero gradient), rows first, then columns.
+# Mirrors the private `enforce_scalar_boundary`.
+fn _pv_fg_enforce_scalar(f, nx, ny) {
+    for (var x = 0; x < nx; x = x + 1) {
+        _pv_fg_mov(f, x, nx + x);
+        _pv_fg_mov(f, (ny - 1) * nx + x, (ny - 2) * nx + x);
+    }
+    for (var y = 0; y < ny; y = y + 1) {
+        _pv_fg_mov(f, y * nx, y * nx + 1);
+        _pv_fg_mov(f, y * nx + nx - 1, y * nx + nx - 2);
+    }
+    return 0;
+}
+
+# 1 when any of the n f64s at p is NaN (all = 0) or not finite (all = 1).
+#must_use
+fn _pv_fg_any_bad(p, n, all): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(p + i * 8);
+        if (all == 1) {
+            var d: f64 = x - x;
+            if (d != 0.0) { return 1; }
+        } elif (x != x) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# One advection of src into dst by the configured scheme (BFECC, then MacCormack, both only off periodic walls;
+# the wrapping sampler on periodic walls; else semi-Lagrangian), with sc and drhs as the BFECC / MacCormack scratch
+# (zeroed first, as the step does).
+fn _pv_fg_advect_by(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, config: *PvGridConfig, sc, drhs) {
+    var n = nx * ny;
+    var periodic = 0;
+    if (config.boundary == PV_BOUNDARY_CONDITION_PERIODIC) { periodic = 1; }
+    if (config.use_bfecc != 0 && periodic == 0) {
+        _pv_fg_fill(sc, n, 0);
+        _pv_fg_fill(drhs, n, 0);
+        _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt, inv_dx, sc, drhs);
+    } elif (config.use_maccormack != 0 && periodic == 0) {
+        _pv_fg_fill(sc, n, 0);
+        _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt, inv_dx, sc);
+    } elif (periodic == 1) {
+        _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt, inv_dx);
+    } else {
+        _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx);
+    }
+    return 0;
+}
+
+impl PvFluidGrid {
+    # nx·ny. Mirrors `FluidGrid::cell_count`.
+    #must_use
+    fn cell_count(self): i64 {
+        return self.nx * self.ny;
+    }
+
+    # The row-major index y·nx + x (Rust checks the range only in debug builds). Mirrors `FluidGrid::idx`.
+    #must_use
+    fn idx(self, x, y): i64 {
+        return y * self.nx + x;
+    }
+
+    # (vx, vy) at cell (x, y); NaN for an index outside a field (Rust panics). Read as `var u, v = …` and bind each
+    # to an f64 local. Mirrors `FluidGrid::velocity_at`.
+    #must_use
+    fn velocity_at(self, x, y) {
+        var i = y * self.nx + x;
+        var u: f64 = self.vx.get_f(i);
+        var v: f64 = self.vy.get_f(i);
+        return (u, v);
+    }
+
+    # √(vx² + vy²) at cell (x, y). Mirrors `FluidGrid::speed_at`.
+    #must_use
+    fn speed_at(self, x, y): f64 {
+        var i = y * self.nx + x;
+        var u: f64 = self.vx.get_f(i);
+        var v: f64 = self.vy.get_f(i);
+        var s: f64 = f64_sqrt((u * u) + (v * v));
+        return s;
+    }
+
+    # The largest speed: √ of the max of vx² + vy² over the cells both fields have, folded with Rust's NaN-ignoring
+    # max from +0. The max is written out (as a `_pv_max` call the loop took 1.44× as long, port-parity §10): q when
+    # q ≥ m (equal operands give the second, as Rust's does) or when m is NaN; a NaN q is ignored. Mirrors
+    # `FluidGrid::max_speed`.
+    #must_use
+    fn max_speed(self): f64 {
+        var n = self.vx.len;
+        if (self.vy.len < n) { n = self.vy.len; }
+        var xd = self.vx.data;
+        var yd = self.vy.data;
+        var m: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var u: f64 = load64(xd + i * 8);
+            var v: f64 = load64(yd + i * 8);
+            var q: f64 = (u * u) + (v * v);
+            if (q >= m || m != m) { m = q; }
+        }
+        var s: f64 = f64_sqrt(m);
+        return s;
+    }
+
+    # The CFL-limited time step cfl·min(dx/v_max, dx²/(4ν)), each term only when v_max or ν is above 1e-20, capped at
+    # f64::MAX (so f64::MAX·cfl, saturated, with neither). Mirrors `FluidGrid::cfl_dt`.
+    #must_use
+    fn cfl_dt(self, viscosity: f64, cfl_factor: f64): f64 {
+        var big: f64 = PV_F64_MAX;
+        var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+        var dt: f64 = big;
+        var max_v: f64 = self.max_speed();
+        if (max_v > tiny) {
+            var a: f64 = self.dx / max_v;
+            dt = _pv_min(dt, a);
+        }
+        if (viscosity > tiny) {
+            var b: f64 = (self.dx * self.dx) / (4.0 * viscosity);
+            dt = _pv_min(dt, b);
+        }
+        var c: f64 = cfl_factor * dt;
+        var r: f64 = _pv_min(c, big);
+        return r;
+    }
+
+    # Σ ((0.5·ρ)·(vx² + vy²))·dx² over the cells all three fields have, folded from −0. Mirrors
+    # `FluidGrid::total_kinetic_energy`.
+    #must_use
+    fn total_kinetic_energy(self): f64 {
+        var dx2: f64 = self.dx * self.dx;
+        var n = self.vx.len;
+        if (self.vy.len < n) { n = self.vy.len; }
+        if (self.density.len < n) { n = self.density.len; }
+        var xd = self.vx.data;
+        var yd = self.vy.data;
+        var rd = self.density.data;
+        var s: f64 = 0x8000000000000000;
+        for (var i = 0; i < n; i = i + 1) {
+            var u: f64 = load64(xd + i * 8);
+            var v: f64 = load64(yd + i * 8);
+            var rho: f64 = load64(rd + i * 8);
+            var e: f64 = ((0.5 * rho) * ((u * u) + (v * v))) * dx2;
+            s = s + e;
+        }
+        return s;
+    }
+
+    # One Navier–Stokes step by `config`: advect the velocity, diffuse it (with the Smagorinsky viscosity when
+    # smagorinsky_cs > 0), add buoyancy and vorticity confinement, project it (CG, else multigrid, else Gauss–Seidel
+    # on periodic walls, else DST), then advect the density; the ghosts after each stage. Ok(0), or the first failure
+    # in Rust's order:
+    # - PV_ERR_INVALID_TIMESTEP (dt not finite and > 0), PV_ERR_INVALID_VISCOSITY (not finite and ≥ 0),
+    #   PV_ERR_INVALID_PARAMETER (smagorinsky_cs or vorticity_confinement not finite and ≥ 0, buoyancy_alpha or
+    #   ambient_density not finite, a zero iteration count), then, Cyrius-only, PV_ERR_INVALID_PARAMETER for a
+    #   boundary value outside PvBoundaryCondition (ADR 0002 #12);
+    # - PV_ERR_INVALID_GRID_RESOLUTION when nx or ny is below 4, nx·ny overflows or a field isn't nx·ny long (the
+    #   public fields may be resized), PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0;
+    # - PV_ERR_DIVERGED for a NaN velocity after advection or a non-finite one after projection (the state then
+    #   holds that stage's values, as Rust's does);
+    # - PV_ERR_OUT_OF_MEMORY when a scratch buffer can't grow (Rust aborts).
+    # Mirrors `FluidGrid::step`.
+    #must_use
+    fn step(self, config: *PvGridConfig): Result {
+        var dt: f64 = config.dt;
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var visc: f64 = config.viscosity;
+        if (visc < 0.0 || _pv_is_finite(visc) == 0) { return Err(PV_ERR_INVALID_VISCOSITY); }
+        var cs: f64 = config.smagorinsky_cs;
+        if (_pv_is_finite(cs) == 0 || cs < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var eps: f64 = config.vorticity_confinement;
+        if (_pv_is_finite(eps) == 0 || eps < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var alpha: f64 = config.buoyancy_alpha;
+        var ambient: f64 = config.ambient_density;
+        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(ambient) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (config.pressure_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (config.diffusion_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var bc = config.boundary;
+        if (bc < 0 || bc > PV_BOUNDARY_CONDITION_PERIODIC) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var nx = self.nx;
+        var ny = self.ny;
+        if (nx < 4 || ny < 4) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var n = nx * ny;
+        if (self.vx.len != n || self.vy.len != n || self.pressure.len != n || self.density.len != n) {
+            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
+        var dx: f64 = self.dx;
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var inv_dx: f64 = 1.0 / dx;
+        var inv_2dx: f64 = 0.5 * inv_dx;
+        var ok = self.scratch_a.resize(n, 0);
+        ok = ok & self.scratch_b.resize(n, 0);
+        ok = ok & self.scratch_c.resize(n, 0);
+        ok = ok & self.diffuse_rhs.resize(n, 0);
+        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var sa = self.scratch_a.data;
+        var sb = self.scratch_b.data;
+        var sc = self.scratch_c.data;
+        var drhs = self.diffuse_rhs.data;
+        _pv_fg_fill(sa, n, 0);
+        _pv_fg_fill(sb, n, 0);
+        var vx = self.vx.data;
+        var vy = self.vy.data;
+        var rho = self.density.data;
+
+        # 1. Advect the velocity (both components from the same old field), then the ghosts.
+        _pv_fg_advect_by(sa, vx, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
+        _pv_fg_advect_by(sb, vy, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
+        _pv_fg_copy(vx, sa, n);
+        _pv_fg_copy(vy, sb, n);
+        _pv_fg_enforce(vx, vy, nx, ny, bc);
+        if (_pv_fg_any_bad(vx, n, 0) == 1 || _pv_fg_any_bad(vy, n, 0) == 1) { return Err(PV_ERR_DIVERGED); }
+
+        # 2. Diffuse the velocity, with the grid-averaged Smagorinsky viscosity ν_t = (Cs·dx)²·|S|.
+        var eff: f64 = visc;
+        if (cs > 0.0) {
+            var cs_dx: f64 = cs * dx;
+            var cs_dx2: f64 = cs_dx * cs_dx;
+            var sum_nu_t: f64 = 0.0;
+            var count: f64 = 0.0;
+            for (var y = 1; y < ny - 1; y = y + 1) {
+                for (var x = 1; x < nx - 1; x = x + 1) {
+                    var i = y * nx + x;
+                    var ur: f64 = load64(vx + (i + 1) * 8);
+                    var ul: f64 = load64(vx + (i - 1) * 8);
+                    var uu: f64 = load64(vx + (i + nx) * 8);
+                    var ud: f64 = load64(vx + (i - nx) * 8);
+                    var vr: f64 = load64(vy + (i + 1) * 8);
+                    var vl: f64 = load64(vy + (i - 1) * 8);
+                    var vu: f64 = load64(vy + (i + nx) * 8);
+                    var vd: f64 = load64(vy + (i - nx) * 8);
+                    var dudx: f64 = (ur - ul) * inv_2dx;
+                    var dudy: f64 = (uu - ud) * inv_2dx;
+                    var dvdx: f64 = (vr - vl) * inv_2dx;
+                    var dvdy: f64 = (vu - vd) * inv_2dx;
+                    var s12: f64 = 0.5 * (dudy + dvdx);
+                    var inner: f64 = ((dudx * dudx) + (dvdy * dvdy)) + ((2.0 * s12) * s12);
+                    var s_mag: f64 = f64_sqrt(2.0 * inner);
+                    sum_nu_t = sum_nu_t + (cs_dx2 * s_mag);
+                    count = count + 1.0;
+                }
+            }
+            var mean: f64 = 0.0;
+            if (count > 0.0) { mean = sum_nu_t / count; }
+            eff = visc + mean;
+        }
+        if (eff > 0.0) {
+            var dr: *PvColumn = _pv_fg_col(self, 7);
+            if (_pv_fg_diffuse_buf(vx, nx, ny, eff, dt, dx, config.diffusion_iterations, dr) == 0) {
+                return Err(PV_ERR_OUT_OF_MEMORY);
+            }
+            if (_pv_fg_diffuse_buf(vy, nx, ny, eff, dt, dx, config.diffusion_iterations, dr) == 0) {
+                return Err(PV_ERR_OUT_OF_MEMORY);
+            }
+            _pv_fg_enforce(vx, vy, nx, ny, bc);
+        }
+
+        # 3. Forces: buoyancy on every cell, then vorticity confinement.
+        if (alpha != 0.0) {
+            for (var b = 0; b < n; b = b + 1) {
+                var r: f64 = load64(rho + b * 8);
+                var v: f64 = load64(vy + b * 8);
+                var vn: f64 = v + ((alpha * (r - ambient)) * dt);
+                store64(vy + b * 8, _pv_bits(vn));
+            }
+        }
+        if (eps > 0.0) {
+            _pv_fg_fill(sa, n, 0);
+            _pv_fg_vorticity(vx, vy, nx, ny, dx, dt, eps, sa);
+        }
+        _pv_fg_enforce(vx, vy, nx, ny, bc);
+
+        # 4. Pressure projection: the right-hand side −dx²·∇·u, a solve, u −= ∇p.
+        _pv_fg_fill(sa, n, 0);
+        var half_dx: f64 = 0.5 * dx;
+        _pv_fg_divergence(sa, vx, vy, nx, ny, half_dx);
+        var pd = self.pressure.data;
+        if (config.use_cg != 0) {
+            var tc, vc = _pv_fg_pressure_cg(pd, sa, nx, ny, config.pressure_iterations, _pv_fg_col(self, 9),
+              _pv_fg_col(self, 10), _pv_fg_col(self, 11));
+            if (is_err_result(tc) == 1) { return Err(vc); }
+        } elif (config.use_multigrid != 0) {
+            var cycles = (config.pressure_iterations + 9) / 10;
+            var tm, vm = _pv_fg_pressure_mg(pd, sa, nx, ny, 4, cycles, _pv_fg_col(self, 8));
+            if (is_err_result(tm) == 1) { return Err(vm); }
+        } elif (bc == PV_BOUNDARY_CONDITION_PERIODIC) {
+            _pv_fg_pressure_gs(pd, sa, nx, ny, config.pressure_iterations);
+        } else {
+            var td, vd2 = _pv_fg_pressure_dst(pd, n, sa, nx, ny, _pv_fg_col(self, 9), _pv_fg_col(self, 10),
+              _pv_fg_col(self, 11));
+            if (is_err_result(td) == 1) { return Err(vd2); }
+        }
+        _pv_fg_project(vx, vy, pd, nx, ny, inv_2dx);
+        _pv_fg_enforce(vx, vy, nx, ny, bc);
+        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
+
+        # 5. Advect the density, then its zero-gradient ghosts (except on periodic walls).
+        _pv_fg_advect_by(sa, rho, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
+        _pv_fg_copy(rho, sa, n);
+        if (bc != PV_BOUNDARY_CONDITION_PERIODIC) { _pv_fg_enforce_scalar(rho, nx, ny); }
+        return Ok(0);
+    }
+}

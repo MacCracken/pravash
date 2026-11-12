@@ -31,6 +31,7 @@ mod m_bridge;
 mod m_buoyancy;
 mod m_common;
 mod m_constants;
+mod m_grid;
 mod m_json;
 mod m_math;
 mod m_shallow;
@@ -53,6 +54,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_buoyancy::emit(),
         m_common::emit(),
         m_constants::emit(root)?,
+        m_grid::emit(),
         m_json::emit(),
         m_math::emit(),
         m_shallow::emit(),
