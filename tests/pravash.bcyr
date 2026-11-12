@@ -624,6 +624,54 @@ fn _bench_fg_step(n, iters, kind) {
     return 0;
 }
 
+# `prefix` followed by `t`, "/" and `n`x`n`, as a fresh C string (a thread-count bench's label).
+fn _bench_name_t(prefix, t, n): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, t);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, "x");
+    str_builder_add_int(sb, n);
+    var s = str_builder_build(sb);
+    var out = alloc(str_len(s) + 1);
+    memcpy(out, str_data(s), str_len(s));
+    store8(out + str_len(s), 0);
+    return out;
+}
+
+# The grid step at a thread count (M3 part e; Cyrius-only): kind 0 the smoke step (the DST projection), 2 the
+# periodic one, on the bench's plume, `iters` steps of one grid after a first that starts its pool (a clone per step
+# would time a pool start each time). The bits are the one-thread ones at every count.
+fn _bench_fg_threads(n, iters, kind, threads) {
+    var g: PvFluidGrid;
+    var t, v = PvFluidGrid_new(n, n, 0.1, &g);
+    var mid = n / 2;
+    for (var x = mid - 2; x < mid + 2; x = x + 1) {
+        var i = 2 * n + x;
+        store64(g.density.data + i * 8, _pv_bits(1.0));
+        store64(g.vy.data + i * 8, _pv_bits(1.0));
+    }
+    var c: PvGridConfig = PvGridConfig_smoke();
+    var name = "grid_step_t";
+    if (kind == 2) {
+        c.boundary = PV_BOUNDARY_CONDITION_PERIODIC;
+        name = "grid_step_periodic_t";
+    }
+    var set = g.set_threads(threads);
+    var t0, v0 = g.step(&c);
+    var b = bench_new(_bench_name_t(name, threads, n));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var ts, vs = g.step(&c);
+        g_sink = g_sink ^ ts;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvFluidGrid_drop(&g);
+    return 0;
+}
+
 # Grid k of a pool of grids.
 #must_use
 fn _bench_fg(pool, k): *PvFluidGrid {
@@ -731,6 +779,20 @@ fn _bench_ghost(n, iters) {
     bench_report(b);
     fl_free(ls);
     fl_free(p);
+    return 0;
+}
+
+# The grid step at 1, 2, 4 and 8 threads (M3 part e), on Rust's 63 × 63 bench grid and a 255 × 255 one.
+fn bench_threads() {
+    for (var k = 0; k < 4; k = k + 1) {
+        var t = 1;
+        if (k == 1) { t = 2; }
+        if (k == 2) { t = 4; }
+        if (k == 3) { t = 8; }
+        _bench_fg_threads(63, 50, 2, t);
+        _bench_fg_threads(255, 10, 2, t);
+        _bench_fg_threads(63, 50, 0, t);
+    }
     return 0;
 }
 
@@ -851,6 +913,7 @@ fn main(): i64 {
     bench_grid();
     bench_grid_c();
     bench_m3d();
+    bench_threads();
     return 0;
 }
 

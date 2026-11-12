@@ -451,7 +451,7 @@ fn test_advection() {
     var src = zeros(n);
     put(src, 4 * nx + 4, 1.0);
     var dst = zeros(n);
-    _pv_fg_advect(dst, src, vx, vy, nx, ny, 0.1, 1.0);
+    _pv_fg_advect(dst, src, vx, vy, nx, ny, 0.1, 1.0, 0);
     var d0: f64 = at(dst, 4 * nx + 4);
     assert(near(d0, 1.0, EPS) == 1, "no velocity, no motion");
 
@@ -464,7 +464,7 @@ fn test_advection() {
     var usrc = zeros(m);
     put(usrc, 8 * mx + 8, 1.0);
     var udst = zeros(m);
-    _pv_fg_advect(udst, usrc, ux, uy, mx, my, 1.0, 1.0);
+    _pv_fg_advect(udst, usrc, ux, uy, mx, my, 1.0, 1.0, 0);
     var d1: f64 = at(udst, 8 * mx + 9);
     assert(d1 > 0.5, "the advected value appears at (9, 8)");
     return 0;
@@ -522,7 +522,7 @@ fn test_projection() {
     var mag_before: f64 = sum_sq(div_before, m);
     var p = zeros(m);
     _pv_fg_pressure_gs(p, div_before, mx, my, 100);
-    _pv_fg_project(ux, uy, p, mx, my, inv_2dx);
+    _pv_fg_project(ux, uy, p, mx, my, inv_2dx, 0);
     var div_after = zeros(m);
     _pv_fg_divergence(div_after, ux, uy, mx, my, inv_2dx);
     var mag_after: f64 = sum_sq(div_after, m);
@@ -653,7 +653,7 @@ fn test_maccormack() {
     put(src, 4 * nx + 4, 1.0);
     var dst = zeros(n);
     var temp = zeros(n);
-    _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, 0.1, 1.0, temp);
+    _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, 0.1, 1.0, temp, 0);
     var d: f64 = at(dst, 4 * nx + 4);
     assert(near(d, 1.0, EPS) == 1, "no velocity, no motion");
 
@@ -666,10 +666,10 @@ fn test_maccormack() {
     var peak = zeros(m);
     put(peak, 16 * mx + 16, 1.0);
     var dst_sl = zeros(m);
-    _pv_fg_advect(dst_sl, peak, ux, uy, mx, my, 1.0, 1.0);
+    _pv_fg_advect(dst_sl, peak, ux, uy, mx, my, 1.0, 1.0, 0);
     var dst_mc = zeros(m);
     var tmc = zeros(m);
-    _pv_fg_advect_maccormack(dst_mc, peak, ux, uy, mx, my, 1.0, 1.0, tmc);
+    _pv_fg_advect_maccormack(dst_mc, peak, ux, uy, mx, my, 1.0, 1.0, tmc, 0);
     var max_sl: f64 = fold_max(0.0, dst_sl, m);
     var max_mc: f64 = fold_max(0.0, dst_mc, m);
     assert(max_mc >= max_sl, "MacCormack is at least as sharp as semi-Lagrangian");
@@ -834,7 +834,7 @@ fn test_audit_solvers() {
         if (k == 2) { iters = 10; }
         if (k == 3) { iters = 500; }
         assert_eq(solve(k, p, rhs, nx, ny, iters), 1, solver_msg(k, 0));
-        _pv_fg_project(vx, vy, p, nx, ny, inv_2dx);
+        _pv_fg_project(vx, vy, p, nx, ny, inv_2dx, 0);
         var after: f64 = div_norm(vx, vy, nx, ny, dx);
         assert(after < 0.5 * before, solver_msg(k, 1));
     }
@@ -911,9 +911,9 @@ fn test_audit_solvers() {
         var t1 = zeros(bn);
         var t2 = zeros(bn);
         if (w == 0) {
-            _pv_fg_advect_maccormack(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1);
+            _pv_fg_advect_maccormack(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1, 0);
         } else {
-            _pv_fg_advect_bfecc(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1, t2);
+            _pv_fg_advect_bfecc(dst, bsrc, bvx, bvy, bx, by, 1.0, 1.0, t1, t2, 0);
         }
         var mass: f64 = fsum(dst, bn);
         assert(near(mass, mass0, 0.000000001) == 1, blob_msg(w, 0));
@@ -1104,7 +1104,7 @@ fn test_layout() {
     var c: PvGridConfig = PvGridConfig_smoke();
 
     test_group("fg_layout_matches_column_offsets");
-    assert_eq(sizeof(PvFluidGrid), 360, "PvFluidGrid: 360 bytes");
+    assert_eq(sizeof(PvFluidGrid), 376, "PvFluidGrid: 376 bytes");
     assert_eq(sizeof(PvGridConfig), 104, "PvGridConfig: 104 bytes");
     assert_eq(sizeof(PvMgLevel), 72, "PvMgLevel: 72 bytes");
     assert_eq(sizeof(PvMacGrid), 168, "PvMacGrid: 168 bytes");

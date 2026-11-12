@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **The worker pool and the grid's thread count** (M3 part e, which completes M3; port plan D6).
+  - **`src/par.cyr`:** `PvPool_new`, `PvPool_drop` and `_pv_par_for`.
+    - The caller plus T − 1 persistent workers on `thread_create` and `chan_*`, each running one contiguous slice of
+      an index range.
+    - Serial where threads can't run (agnos, cx) or can't be started.
+    - The pool loads crmath's tables before starting workers.
+  - **`PvFluidGrid.set_threads(n)`** (ADR 0002 #4, amended). The count is 1 by default, and the first step after a
+    change starts the pool. A clone keeps the count, and drop stops the pool. `PvFluidGrid` is now 376 bytes.
+  - **The three loops Rust runs on rayon** go through the pool: the advection, the periodic advection and the
+    projection, each row written by one thread.
+  - **Parity:** `tests/parity.tcyr` replays every `FluidGrid::step` row at 2, 3, 4 and 8 threads and fails one whose
+    words differ from its one-thread run. Result: 376 rows, 0 differing, on x86_64 ELF, PE and aarch64 and under
+    `--bounds`.
+  - **Tests:** `tests/par.tcyr`, 40 checks: exact coverage on T distinct threads, short and empty ranges, no heap
+    per call, the grid's thread-count lifecycle.
+
+### Performance
+- **Thread counts** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M3 part e; cores 8–15).
+  - The pooled periodic advection runs 2.0× faster at 2 threads, 3.2–3.6× at 4 and 4.1× at 8 (255 × 255).
+  - A whole step gains 1.07× (63 × 63) to 1.15× (255 × 255) at 8 threads: its serial Gauss–Seidel solves dominate,
+    in Rust too.
+  - Rust's own rayon build is no faster than its serial one at 63 × 63 (`grid_step_periodic` 2.07 ms either way)
+    and slower on small grids (124 µs against 70.6 µs at 15 × 15).
+
+### Added (Cyrius)
 - **vof** and **phase_field** (M3 part d): `src/vof.cyr` and `src/phase_field.cyr`, the ports of `rust-old/src/vof.rs`
   and `phase_field.rs`.
   - **`PvVofField`:**

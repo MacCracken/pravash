@@ -1592,6 +1592,100 @@ fn _par_grid_c(fp, fl): i64 {
     return 1;
 }
 
+# ── the thread counts (M3 part e) ───────────────────────────────────────────────────
+# Every `FluidGrid::step` row runs at one thread, which the golden outputs gate, and again at each count below on a
+# freshly loaded grid. Each must give the one-thread words exactly: Rust's three `parallel` loops run on src/par.cyr's
+# pool, and every row is written by one thread. 3 splits the rows unevenly; 8 leaves workers without rows on the
+# small grids.
+var _PAR_THREADS = 4;
+var _par_threads[32];
+var _par_mt_rows = 0;
+var _par_mt_bad = 0;
+
+# The row's state stepped nsteps times by its config (input ks on), then the state and the scratch dump, or the
+# first failure's code.
+fn _par_fg_steps(g: *PvFluidGrid, ks) {
+    var cfg: PvGridConfig;
+    _par_gc_in(ks, &cfg);
+    var steps = _par_in(ks + 13);
+    for (var s = 0; s < steps; s = s + 1) {
+        var ts, vs = g.step(&cfg);
+        if (is_err_result(ts) == 1) {
+            _par_got_err(vs);
+            return 0;
+        }
+    }
+    _par_fg_out(g);
+    _par_fg_dump(g);
+    return 0;
+}
+
+# 1 when got word j equals the snapshot's (kind, value, length; a text by its bytes).
+#must_use
+fn _par_got_same(j, sk, sv, sl): i64 {
+    var at = j * 8;
+    var k = load64(_par_got_k + at);
+    var v = load64(_par_got_v + at);
+    var l = load64(_par_got_l + at);
+    if (k != load64(sk + at) || l != load64(sl + at)) { return 0; }
+    if (k == 102 || k == 105 || k == 118) {
+        if (v != load64(sv + at)) { return 0; }
+        return 1;
+    }
+    if (l > 0 && memeq(v, load64(sv + at), l) != 1) { return 0; }
+    return 1;
+}
+
+# Re-runs the current step row at each thread count and compares every output word with the one-thread run: 1 when
+# all agree. The got list is left as the one-thread run made it.
+fn _par_fg_threads_agree(ks): i64 {
+    if (load64(&_par_threads) == 0) {
+        store64(&_par_threads, 2);
+        store64(&_par_threads + 8, 3);
+        store64(&_par_threads + 16, 4);
+        store64(&_par_threads + 24, 8);
+    }
+    var n0 = _par_got_n;
+    var sk = fl_alloc(n0 * 8 + 8);
+    var sv = fl_alloc(n0 * 8 + 8);
+    var sl = fl_alloc(n0 * 8 + 8);
+    if (sk == 0 || sv == 0 || sl == 0) { return 0; }
+    memcpy(sk, _par_got_k, n0 * 8);
+    memcpy(sv, _par_got_v, n0 * 8);
+    memcpy(sl, _par_got_l, n0 * 8);
+    var ok = 1;
+    for (var t = 0; t < _PAR_THREADS; t = t + 1) {
+        var threads = load64(&_par_threads + t * 8);
+        _par_got_n = 0;
+        var g: PvFluidGrid;
+        if (_par_fg_in(0, &g) < 0) { ok = 0; break; }
+        var set = g.set_threads(threads);
+        _par_fg_steps(&g, ks);
+        PvFluidGrid_drop(&g);
+        var same = 1;
+        if (_par_got_n != n0) { same = 0; }
+        for (var j = 0; same == 1 && j < n0; j = j + 1) {
+            if (_par_got_same(j, sk, sv, sl) == 0) { same = 0; }
+        }
+        if (same == 0) {
+            ok = 0;
+            print("  FluidGrid::step: ", 18);
+            fmt_int(threads);
+            println(" threads differ from one");
+        }
+    }
+    memcpy(_par_got_k, sk, n0 * 8);
+    memcpy(_par_got_v, sv, n0 * 8);
+    memcpy(_par_got_l, sl, n0 * 8);
+    _par_got_n = n0;
+    fl_free(sk);
+    fl_free(sv);
+    fl_free(sl);
+    _par_mt_rows = _par_mt_rows + 1;
+    if (ok == 0) { _par_mt_bad = _par_mt_bad + 1; }
+    return ok;
+}
+
 fn _par_grid(fp, fl): i64 {
     if (_par_eq(fp, fl, "FluidGrid::new") == 1) {
         var g: PvFluidGrid;
@@ -1726,23 +1820,10 @@ fn _par_grid(fp, fl): i64 {
             _par_got_f(_pv_bits(cf));
         }
     } elif (_par_eq(fp, fl, "FluidGrid::step") == 1) {
-        # The state stepped nsteps times, then the scratch dump; the first failure's code if one fails.
-        var cfg: PvGridConfig;
-        _par_gc_in(ks, &cfg);
-        var steps = _par_in(ks + 13);
-        var failed = 0;
-        for (var s = 0; s < steps; s = s + 1) {
-            var ts, vs = g.step(&cfg);
-            if (is_err_result(ts) == 1) {
-                _par_got_err(vs);
-                failed = 1;
-                break;
-            }
-        }
-        if (failed == 0) {
-            _par_fg_out(&g);
-            _par_fg_dump(&g);
-        }
+        # At one thread (the gated outputs), then at every count in _PAR_THREADS, each of which must give the same
+        # words (port plan D6: any thread count gives the serial bits).
+        _par_fg_steps(&g, ks);
+        if (_par_fg_threads_agree(ks) == 0) { handled = 0 - 1; }
     } else {
         handled = 0;
     }
@@ -1924,6 +2005,14 @@ fn _par_accepted_quiet(adr): i64 {
 # After each module: its cross-target digests.
 fn _par_module_done(mp, ml) {
     if (_par_eq(mp, ml, "constants") == 1) { _par_dg_print(11, "const"); return 0; }
+    if (_par_eq(mp, ml, "grid") == 1) {
+        print("  thread counts: FluidGrid::step at 2, 3, 4 and 8 threads: ", 59);
+        fmt_int(_par_mt_rows);
+        print(" rows, ", 7);
+        fmt_int(_par_mt_bad);
+        println(" differing from one thread");
+        return 0;
+    }
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
     _par_dg_print(0, "f64::sin_cos");
     _par_dg_print(1, "f64::sin");

@@ -344,3 +344,37 @@ The bodies:
 **Reading it.** Both loops update independent cells from a copy of the old field, which Rust vectorises and the
 Cyrius codegen runs scalar. That puts them at about 9×, between the MAC step (a dependent Gauss–Seidel chain, 2.2–2.9×)
 and the k-ε step (13–14×).
+
+## M3 part e: thread counts (2026-11-12)
+
+Pinned to cores 8–15. Each Cyrius row times `iters` steps of one grid, after a first step that starts its pool
+(`tests/pravash.bcyr`'s `bench_threads`; a clone per step would time a pool start each time). The bits are the
+one-thread ones at every count. Rust is its criterion bench built with `parallel`, rayon at
+`RAYON_NUM_THREADS=8`. Three Cyrius runs; the medians are given.
+
+| Bench | Rust serial (part a) | Rust rayon, 8 threads | Cyrius T = 1 | T = 2 | T = 4 | T = 8 |
+|---|---|---|---|---|---|---|
+| `grid_step/63x63` (DST) | 10.1 ms | 10.7 ms | 5.99 ms | 6.00 ms | 5.74 ms | 5.81 ms |
+| `grid_step_periodic/63x63` | 2.07 ms | 2.07 ms | 5.88 ms | 5.78 ms | 5.42 ms | 5.49 ms |
+| `grid_step_periodic/255x255` (Cyrius only) | — | — | 95.8 ms | 86.9 ms | 86.3 ms | 83.1 ms |
+| `grid_step/15x15` | 127 µs | 198 µs | | | | |
+| `grid_step_periodic/15x15` | 70.6 µs | 124 µs | | | | |
+| `grid_step_periodic/30x30` | 377 µs | 512 µs | | | | |
+
+**The pooled loop alone** (the periodic advection, 40 or 400 calls on one pool):
+
+| Grid | T = 1 | T = 2 | T = 4 | T = 8 |
+|---|---|---|---|---|
+| 255 × 255 | 5.65 ms | 2.85 ms | 1.55–1.79 ms | 1.37 ms |
+| 63 × 63 | 344 µs | 186–190 µs | 104–105 µs | 101 µs |
+
+**Reading it.**
+- **The pool scales.** The loop runs 2.0× faster at T = 2, 3.2–3.6× at T = 4 and 4.1× at T = 8 on 255 × 255. That is
+  probe 6's curve: memory-bound past four threads.
+- **The step doesn't, and neither does Rust's.** Rust parallelises the same three loops: the two advections and the
+  projection. On a periodic step they are about a fifth of the time; the serial Gauss–Seidel diffusion and pressure
+  solves are the rest. So eight threads save about 0.4 ms of 5.9 at 63 × 63, and 13 ms of 96 at 255 × 255, which
+  is what three advections at 4× predict. Rust's rayon build is no faster than its serial one at 63 × 63, and slower
+  on the small grids, where rayon's per-call cost exceeds the work.
+- Parallelising the solves would change their order of operations (Gauss–Seidel is a sequential sweep), so no
+  thread count could keep the bits. The port stays with Rust's three loops.

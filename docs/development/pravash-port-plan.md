@@ -11,8 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M3 part d complete** (2026-11-12); M3 part e (`src/par.cyr` and the grid's parallel loops) is next.
-> Part d ported `VofField` and `PhaseField` (`src/vof.cyr`, `src/phase_field.cyr`): 384 rows in two new golden
+> ⏳ **Status: M3 complete** (2026-11-12); M4 (SPH foundations) is next. Part e added `src/par.cyr`, the worker
+> pool behind each solver's runtime thread count (D6), on the grid's three `parallel` loops: every `FluidGrid::step`
+> row gives its one-thread words at 2, 3, 4 and 8 threads (port-parity §14). Part d ported `VofField` and `PhaseField` (`src/vof.cyr`, `src/phase_field.cyr`): 384 rows in two new golden
 > modules, bit-exact on the first replay, all 8 + 11 Rust tests (port-parity §13). Part c ported
 > `KEpsilon`, `apply_ghost_fluid` and `MacGrid` (`src/k_epsilon.cyr`, `src/mac_grid.cyr`): 293 rows bit-exact on the
 > first replay, all 49 Rust tests of `grid.rs` (port-parity §12). Part b put
@@ -870,7 +871,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - surface parity 165.
 
 **Next:** M3, grid |
-| M3 Grid | 🟡 **parts a–d done 2026-11-11 / 12**; part e next | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
+| M3 Grid | ✅ **done 2026-11-12** (parts a–e) | grid 569: construction, configs, reads, diffuse, JSON, 70 Gauss–Seidel / multigrid hook rows (with every level's buffers), 188 class S step rows on the periodic and multigrid projections (still-tank trajectories; single steps of plumes under every scheme and force, a vortex, a jet; random states; 40 refusals); all bit-exact, the step rows 60,421 values at 0 ulp, on x86_64 ELF, x86_64 PE and aarch64 and with rayon on. math gains 810 `f64::rem` rows (L14) | 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`, 164 checks; the 5 MacGrid / KEpsilon ones wait for part c), the 5 grid integration tests and `serde_roundtrip_all_types` | `grid_diffuse` 2.5–3.7×, `grid_max_speed` 16–17× (after a 1.44× A/B), `grid_step_periodic` 2.7–4.0×, `grid_step` and `_maccormack` (DST) 15–231×: the correctly rounded sin at fl(k·π/2), 18.4 µs a call | port-parity §10:
 - `src/grid.cyr` (every advection, diffusion, Smagorinsky, the forces, the four projections, the wall rules) and `src/grid_solve.cyr` (L5, L6);
 - ADR 0002 #12 (the private solver buffers, the boundary refusal, `PvFluidGrid_diffuse`'s flag);
 - `_pv_fmod`, ledger L14, requested at ganita with a repro;
@@ -910,7 +911,16 @@ Part d (2026-11-12, port-parity §13):
 - Rust twins (`bench_vof_pf.rs`): VOF advect 8.1–8.7×, phase-field step 8.7–8.9× (each 1.17–1.19× faster after
   writing its calls out).
 
-**Next:** M3 part e: `src/par.cyr` and the grid's parallel loops (every grid row at several thread counts) |
+Part e (2026-11-12, port-parity §14):
+- `src/par.cyr`: a persistent pool (the caller and T − 1 workers on `thread_create` / `chan_*`), serial where threads
+  can't run or start; it loads crmath's tables before starting workers;
+- `PvFluidGrid.set_threads(n)` on Rust's three `parallel` loops (ADR 0002 #4, amended);
+- every `FluidGrid::step` row replayed at 2, 3, 4 and 8 threads: 376 rows, 0 differing from one thread, on three
+  targets; `tests/par.tcyr` 40 checks; both pool mutations caught;
+- the pooled advection 4.1× at 8 threads (255 × 255); the step 1.07–1.15×, its serial Gauss–Seidel solves
+  dominating, as Rust's rayon build gains nothing.
+
+**Next:** M4, SPH foundations |
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |

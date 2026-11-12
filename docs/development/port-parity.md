@@ -1005,3 +1005,67 @@ two changes that keep the bits:
 - The phase-field step's clamp is written out.
 
 Each made its step 1.17–1.19× faster in a pinned A/B. The rest is a loop of independent cells that Rust vectorises.
+
+## 14. M3 part e: the worker pool and the grid's parallel loops (2026-11-12)
+
+**`src/par.cyr`** is the pool probe 6 chose (§4.6, D6). A `PvPool` of T threads is the caller plus T − 1 persistent
+workers, each parked on its own job channel. `_pv_par_for(pool, lo, hi, fp, ctx)` works like this:
+- it splits [lo, hi) into T contiguous slices, [lo + (n·w)/T, lo + (n·(w+1))/T);
+- it posts a job token to every worker, runs slice 0 itself, and waits for T − 1 answers;
+- every index is written by exactly one thread, so the split changes no bit;
+- a pool of 0 runs the range on the caller.
+
+`PvPool_new(T)` gives no pool, and the caller then runs serially, in these cases:
+- a count of 1 or less;
+- a target where `THREADS_CONCURRENT` or `CHAN_BLOCKING` is 0 (agnos, cx);
+- a failure to make a channel or a thread (the workers already started are stopped).
+
+It loads crmath's tables first, because they fill lazily behind a plain flag. A pool's channels are not returned
+when it stops, since the stdlib has no `chan_free`, but a pool starts once per thread-count change, not per step.
+
+**The grid** takes Rust's three `parallel` loops onto it: `advect` and `advect_periodic` (each row its own slice of
+dst) and `project_velocity` (each row its own slice of vx and vy). Each becomes a row kernel. MacCormack's and BFECC's
+forward steps go through `advect`, as Rust's do, and their other loops stay serial, as Rust's are. `PvFluidGrid` gains
+`threads` (1 by default) and `pool` after its columns, so it is now 376 bytes:
+- `set_threads(n)` stops any pool and records the count;
+- the first step after it starts the pool, or leaves the grid serial when it can't;
+- a clone keeps the count and starts its own pool;
+- drop stops it;
+- ADR 0002 #4 is amended.
+
+**Parity at every thread count.** `tests/parity.tcyr` runs each of the 376 `FluidGrid::step` rows at one thread,
+which is what the golden outputs gate. It then reloads the row and runs it again at 2, 3, 4 and 8 threads, and
+fails the row if any output word differs from the one-thread run.
+- 3 splits the rows unevenly, and 8 leaves workers without rows on the 4-row grids.
+- Result: **376 rows, 0 differing from one thread**, on x86_64 ELF, PE (wine) and aarch64 (qemu) and under `--bounds`.
+- The replay is unchanged: 11 modules, 0 failing, 45,879 ok, 92 accepted.
+
+**Tests:** `tests/par.tcyr`, 40 checks.
+- No pool below 2 threads, and a pool of 0 runs the whole range on the caller.
+- At 2, 3, 4, 8 and 16 threads, the range is covered exactly once on exactly T distinct thread ids (`gettid`).
+- Ranges shorter than T, and empty ones, run correctly.
+- 500 calls on one pool take no heap.
+- The grid's count works through its lifecycle: `set_threads`, the lazy start, the clone, a count below 1, drop.
+  One thread and four give the same bits.
+
+**Mutation checks:**
+
+| Mutation | Caught by |
+|---|---|
+| each slice skipping its first index | 342 step rows at T > 1, 12 pool checks |
+| the caller skipping slice 0 | 339 step rows at T > 1, 7 pool checks |
+
+Keeping the projection serial changes nothing, correctly: serial is always a valid schedule. What the pool buys is
+speed, which is measured, not gated.
+
+**Speed** (benchmarks-rust-v-cyrius, M3 part e; cores 8–15). The periodic advection alone, on one pool:
+
+| Grid | T = 2 | T = 4 | T = 8 |
+|---|---|---|---|
+| 255 × 255 | 2.0× | 3.2–3.6× | 4.1× |
+| 63 × 63 | 1.85× | 3.3× | 3.4× |
+
+A whole step gains less: 1.07× at 8 threads on 63 × 63, 1.15× on 255 × 255. The two serial Gauss–Seidel solves
+(diffusion, then pressure) dominate it, and the three pooled loops are about a fifth of a periodic step. Rust's own
+`parallel` build gains nothing at its bench sizes either: grid_step_periodic 2.07 ms at 63 × 63, as serial, and
+124 µs against 70.6 µs at 15 × 15.

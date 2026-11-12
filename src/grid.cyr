@@ -107,6 +107,8 @@ struct PvFluidGrid {
     solve_c: PvColumn;
     dst_x: PvColumn;
     dst_y: PvColumn;
+    threads;
+    pool;
 }
 
 # The number of columns in a `PvFluidGrid`: the 4 public fields, the 4 scratch buffers, `mg_levels` (column 8, whose
@@ -115,7 +117,8 @@ const _PV_FG_COLUMNS = 14;
 
 # Column k of a grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_a, 5 scratch_b, 6 scratch_c, 7 diffuse_rhs,
 # 8 mg_levels, 9 … 11 solve_a … solve_c, 12 dst_x, 13 dst_y), by its byte offset (a field's address can't be taken;
-# tests/grid.tcyr pins the layout: nx, ny, dx, then the fourteen columns, 360 bytes).
+# tests/grid.tcyr pins the layout: nx, ny, dx, the fourteen columns, then the thread count and the pool (a
+# `PvPool` pointer, 0 for none: src/par.cyr), 376 bytes).
 #must_use
 fn _pv_fg_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
@@ -164,7 +167,8 @@ fn _pv_mg_levels_push(levels: *PvColumn): i64 {
     return 1;
 }
 
-# Empties every column of *g without releasing anything (for a record about to be filled).
+# Empties every column of *g without releasing anything, and sets the serial default (one thread, no pool), for a
+# record about to be filled.
 fn _pv_fg_zero(g: *PvFluidGrid) {
     for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
         var z: *PvColumn = _pv_fg_col(g, k);
@@ -172,12 +176,16 @@ fn _pv_fg_zero(g: *PvFluidGrid) {
         z.len = 0;
         z.cap = 0;
     }
+    g.threads = 1;
+    g.pool = 0;
     return 0;
 }
 
 # Releases every field's storage, the multigrid levels included; the grid holds no storage after. Mirrors dropping
 # the `FluidGrid`.
 fn PvFluidGrid_drop(g: *PvFluidGrid) {
+    PvPool_drop(g.pool);
+    g.pool = 0;
     _pv_mg_levels_drop(_pv_fg_col(g, 8));
     for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_fg_col(g, k);
@@ -238,6 +246,7 @@ fn PvFluidGrid_clone(out: *PvFluidGrid, src: *PvFluidGrid): i64 {
     out.ny = src.ny;
     out.dx = src.dx;
     _pv_fg_zero(out);
+    out.threads = src.threads;
     for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
         if (k == 8) { continue; }
         var s: *PvColumn = _pv_fg_col(src, k);
@@ -394,11 +403,17 @@ fn _pv_fg_copy_ring(dst, src, nx, ny) {
     return 0;
 }
 
-# Semi-Lagrangian advection of src into dst on the interior: each cell traced back through (vx, vy) by
-# dt·inv_dx·v cells and sampled. Mirrors the private `advect`.
-fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
-    var k: f64 = dt * inv_dx;
-    for (var y = 1; y < ny - 1; y = y + 1) {
+# The rows [y0, y1) of a semi-Lagrangian advection (a `_pv_par_for` kernel): ctx holds dst, src, vx, vy, nx, ny and
+# the f64 dt·inv_dx, as `_pv_fg_advect` lays them out. Each row writes only its own interior cells of dst.
+fn _pv_fg_advect_k(ctx, y0, y1) {
+    var dst = load64(ctx);
+    var src = load64(ctx + 8);
+    var vx = load64(ctx + 16);
+    var vy = load64(ctx + 24);
+    var nx = load64(ctx + 32);
+    var ny = load64(ctx + 40);
+    var k: f64 = load64(ctx + 48);
+    for (var y = y0; y < y1; y = y + 1) {
         var yf: f64 = f64_from(y);
         for (var x = 1; x < nx - 1; x = x + 1) {
             var i = y * nx + x;
@@ -411,6 +426,29 @@ fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
             store64(dst + i * 8, _pv_bits(s));
         }
     }
+    return 0;
+}
+
+# Packs the advection kernels' context (dst, src, vx, vy, nx, ny, k) into the 7 words at ctx.
+fn _pv_fg_advect_ctx(ctx, dst, src, vx, vy, nx, ny, k: f64) {
+    store64(ctx, dst);
+    store64(ctx + 8, src);
+    store64(ctx + 16, vx);
+    store64(ctx + 24, vy);
+    store64(ctx + 32, nx);
+    store64(ctx + 40, ny);
+    store64(ctx + 48, _pv_bits(k));
+    return 0;
+}
+
+# Semi-Lagrangian advection of src into dst on the interior: each cell traced back through (vx, vy) by
+# dt·inv_dx·v cells and sampled, the rows split across `pool` (0 runs them serially; src/par.cyr). Mirrors the
+# private `advect`, one of Rust's three `parallel` loops.
+fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
+    var k: f64 = dt * inv_dx;
+    var ctx[56];
+    _pv_fg_advect_ctx(&ctx, dst, src, vx, vy, nx, ny, k);
+    _pv_par_for(pool, 1, ny - 1, &_pv_fg_advect_k, &ctx);
     return 0;
 }
 
@@ -451,11 +489,17 @@ fn _pv_fg_sample_periodic(f, nx, ny, fx0: f64, fy0: f64): f64 {
     return r;
 }
 
-# Semi-Lagrangian advection with periodic wrapping, over every cell (the ring included). Mirrors the private
-# `advect_periodic`.
-fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
-    var k: f64 = dt * inv_dx;
-    for (var y = 0; y < ny; y = y + 1) {
+# The rows [y0, y1) of a periodic advection (a `_pv_par_for` kernel; ctx as `_pv_fg_advect_k`'s): every cell of
+# each row, the ring included.
+fn _pv_fg_advect_periodic_k(ctx, y0, y1) {
+    var dst = load64(ctx);
+    var src = load64(ctx + 8);
+    var vx = load64(ctx + 16);
+    var vy = load64(ctx + 24);
+    var nx = load64(ctx + 32);
+    var ny = load64(ctx + 40);
+    var k: f64 = load64(ctx + 48);
+    for (var y = y0; y < y1; y = y + 1) {
         var yf: f64 = f64_from(y);
         for (var x = 0; x < nx; x = x + 1) {
             var i = y * nx + x;
@@ -471,12 +515,23 @@ fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64) {
     return 0;
 }
 
+# Semi-Lagrangian advection with periodic wrapping, over every cell (the ring included), the rows split across
+# `pool`. Mirrors the private `advect_periodic`, one of Rust's three `parallel` loops.
+fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
+    var k: f64 = dt * inv_dx;
+    var ctx[56];
+    _pv_fg_advect_ctx(&ctx, dst, src, vx, vy, nx, ny, k);
+    _pv_par_for(pool, 0, ny, &_pv_fg_advect_periodic_k, &ctx);
+    return 0;
+}
+
 # MacCormack advection of src into dst: the forward semi-Lagrangian step, the source's ring copied into it, the
 # backward step from it into temp, then dst + ½(src − temp) clamped to the stencil of the backtraced point in src.
-# Mirrors the private `advect_maccormack`.
-fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp) {
+# The forward step's rows split across `pool`, as Rust's `advect` call is; the rest is serial, as Rust's is. Mirrors
+# the private `advect_maccormack`.
+fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp, pool) {
     var k: f64 = dt * inv_dx;
-    _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx);
+    _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
     _pv_fg_copy_ring(dst, src, nx, ny);
     for (var y = 1; y < ny - 1; y = y + 1) {
         var yf: f64 = f64_from(y);
@@ -516,10 +571,11 @@ fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp
 
 # BFECC advection of src into dst: forward into temp1 (the source's ring copied in), backward into temp2, the
 # compensated source src + ½(src − temp2) in temp2 (ring from src), and its forward advection clamped to the stencil
-# of the backtraced point in src. Mirrors the private `advect_bfecc`.
-fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, temp2) {
+# of the backtraced point in src. The first forward step's rows split across `pool`, as Rust's `advect` call is;
+# the rest is serial, as Rust's is. Mirrors the private `advect_bfecc`.
+fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, temp2, pool) {
     var k: f64 = dt * inv_dx;
-    _pv_fg_advect(temp1, src, vx, vy, nx, ny, dt, inv_dx);
+    _pv_fg_advect(temp1, src, vx, vy, nx, ny, dt, inv_dx, pool);
     _pv_fg_copy_ring(temp1, src, nx, ny);
     for (var y = 1; y < ny - 1; y = y + 1) {
         var yf: f64 = f64_from(y);
@@ -921,9 +977,29 @@ fn _pv_fg_pressure_cg(p, div, nx, ny, iterations, ra: *PvColumn, rb: *PvColumn, 
     return Ok(0);
 }
 
-# u −= ∇p by central differences (scaled by inv_2dx) on the interior. Mirrors the private `project_velocity`.
-fn _pv_fg_project(vx, vy, p, nx, ny, inv_2dx: f64) {
-    for (var y = 1; y < ny - 1; y = y + 1) {
+# u −= ∇p by central differences (scaled by inv_2dx) on the interior, the rows split across `pool`. Mirrors the
+# private `project_velocity`, one of Rust's three `parallel` loops.
+fn _pv_fg_project(vx, vy, p, nx, ny, inv_2dx: f64, pool) {
+    var ctx[48];
+    store64(&ctx, vx);
+    store64(&ctx + 8, vy);
+    store64(&ctx + 16, p);
+    store64(&ctx + 24, nx);
+    store64(&ctx + 32, ny);
+    store64(&ctx + 40, _pv_bits(inv_2dx));
+    _pv_par_for(pool, 1, ny - 1, &_pv_fg_project_k, &ctx);
+    return 0;
+}
+
+# The rows [y0, y1) of the projection (a `_pv_par_for` kernel): ctx holds vx, vy, p, nx, ny and the f64 inv_2dx.
+# Each row updates only its own interior cells of vx and vy, from p.
+fn _pv_fg_project_k(ctx, y0, y1) {
+    var vx = load64(ctx);
+    var vy = load64(ctx + 8);
+    var p = load64(ctx + 16);
+    var nx = load64(ctx + 24);
+    var inv_2dx: f64 = load64(ctx + 40);
+    for (var y = y0; y < y1; y = y + 1) {
         for (var x = 1; x < nx - 1; x = x + 1) {
             var i = y * nx + x;
             var q = p + i * 8;
@@ -1111,27 +1187,40 @@ fn _pv_fg_any_bad(p, n, all): i64 {
 
 # One advection of src into dst by the configured scheme (BFECC, then MacCormack, both only off periodic walls;
 # the wrapping sampler on periodic walls; else semi-Lagrangian), with sc and drhs as the BFECC / MacCormack scratch
-# (zeroed first, as the step does).
-fn _pv_fg_advect_by(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, config: *PvGridConfig, sc, drhs) {
+# (zeroed first, as the step does), and the advection rows split across `pool`.
+fn _pv_fg_advect_by(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, config: *PvGridConfig, sc, drhs, pool) {
     var n = nx * ny;
     var periodic = 0;
     if (config.boundary == PV_BOUNDARY_CONDITION_PERIODIC) { periodic = 1; }
     if (config.use_bfecc != 0 && periodic == 0) {
         _pv_fg_fill(sc, n, 0);
         _pv_fg_fill(drhs, n, 0);
-        _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt, inv_dx, sc, drhs);
+        _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt, inv_dx, sc, drhs, pool);
     } elif (config.use_maccormack != 0 && periodic == 0) {
         _pv_fg_fill(sc, n, 0);
-        _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt, inv_dx, sc);
+        _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt, inv_dx, sc, pool);
     } elif (periodic == 1) {
-        _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt, inv_dx);
+        _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
     } else {
-        _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx);
+        _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
     }
     return 0;
 }
 
 impl PvFluidGrid {
+    # Sets the thread count `step` uses: n ≥ 1 (a count below 1 is 1, serial). Any count gives the serial bits.
+    # The grid's pool stops now, and the next step starts one of the new size (or runs serially where threads
+    # can't start: src/par.cyr). Returns the count. Cyrius-only: Rust's `parallel` feature is compile-time (port
+    # plan D6, ADR 0002 #4).
+    fn set_threads(self, n): i64 {
+        var t = n;
+        if (t < 1) { t = 1; }
+        PvPool_drop(self.pool);
+        self.pool = 0;
+        self.threads = t;
+        return t;
+    }
+
     # nx·ny. Mirrors `FluidGrid::cell_count`.
     #must_use
     fn cell_count(self): i64 {
@@ -1285,10 +1374,17 @@ impl PvFluidGrid {
         var vx = self.vx.data;
         var vy = self.vy.data;
         var rho = self.density.data;
+        # The pool behind `threads`, started by the first step after `set_threads` (one that can't be started leaves
+        # the grid serial, which gives the same bits).
+        if (self.threads > 1 && self.pool == 0) {
+            self.pool = PvPool_new(self.threads);
+            if (self.pool == 0) { self.threads = 1; }
+        }
+        var pool = self.pool;
 
         # 1. Advect the velocity (both components from the same old field), then the ghosts.
-        _pv_fg_advect_by(sa, vx, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
-        _pv_fg_advect_by(sb, vy, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
+        _pv_fg_advect_by(sa, vx, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs, pool);
+        _pv_fg_advect_by(sb, vy, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs, pool);
         _pv_fg_copy(vx, sa, n);
         _pv_fg_copy(vy, sb, n);
         _pv_fg_enforce(vx, vy, nx, ny, bc);
@@ -1373,12 +1469,12 @@ impl PvFluidGrid {
               _pv_fg_col(self, 11), _pv_fg_col(self, 12), _pv_fg_col(self, 13));
             if (is_err_result(td) == 1) { return Err(vd2); }
         }
-        _pv_fg_project(vx, vy, pd, nx, ny, inv_2dx);
+        _pv_fg_project(vx, vy, pd, nx, ny, inv_2dx, pool);
         _pv_fg_enforce(vx, vy, nx, ny, bc);
         if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
 
         # 5. Advect the density, then its zero-gradient ghosts (except on periodic walls).
-        _pv_fg_advect_by(sa, rho, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs);
+        _pv_fg_advect_by(sa, rho, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs, pool);
         _pv_fg_copy(rho, sa, n);
         if (bc != PV_BOUNDARY_CONDITION_PERIODIC) { _pv_fg_enforce_scalar(rho, nx, ny); }
         return Ok(0);

@@ -54,7 +54,9 @@
   Rust tests of `grid.rs`)
 - [x] M3 part d: VOF and the phase field (384 rows in two new modules, 138 class S step rows, all bit-exact; 8 + 11
   Rust tests)
-- [ ] M3 part e: `src/par.cyr` and the grid's parallel loops
+- [x] M3 part e: `src/par.cyr` and the grid's parallel loops (every `FluidGrid::step` row at 2, 3, 4 and 8 threads
+  gives its one-thread words)
+- [x] **M3 done 2026-11-12.**
 
 ### 1.3.0
 
