@@ -6,7 +6,8 @@
 > ([its port plan](../../../kimiya/docs/development/kimiya-port-plan.md), in progress) and impetus
 > ([its port plan](../../../impetus/docs/development/impetus-port-plan.md), shipped 2.0.0 on 2026-11-10).
 > impetus is the closest model: it is also a stateful simulation built on hisab. Where this plan says
-> "as impetus", "as kimiya" or "as tanmatra", follow that document. §2 lists what is different here.
+> "as impetus", "as kimiya" or "as tanmatra", follow that document. §1.1 is the language review that every
+> scope decision rests on, and §2 lists what is different here.
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
@@ -15,7 +16,7 @@
 
 | Thing | Value | Source |
 |---|---|---|
-| Rust source (oracle) | pravash **1.3.0**, committed (`f481c25`) but **not tagged**: the last tag is 1.2.0, and crates.io has 1.2.0. 6,882 code lines in `src/` (no tests, comments or blank lines), 16 modules, 193 `pub fn`s, 8 public enums | `Cargo.toml`, `VERSION`, `git tag` |
+| Rust source (oracle) | pravash **1.3.0**, committed (`f481c25`) but **not tagged**: the last tag is 1.2.0, and crates.io has 1.2.0. 6,882 code lines in `src/` (no tests, comments or blank lines), 16 modules, 193 `pub fn`s, 8 public enums, 22 serde-derived types (none in `sph.rs`) | `Cargo.toml`, `VERSION`, `git tag` |
 | Features | default `sph`, `grid`, `shallow`; optional `buoyancy`, `vortex`, `coupling` (coupling + mpm), `compute` (needs `sph`), `parallel` (rayon), `ai`, `logging` (tracing-subscriber, tracing-chrome) | `Cargo.toml` |
 | Rust health, 2026-11-11 on rustc 1.99.1 | `cargo test --all-features`: 351 unit and 33 integration tests pass; all 7 doc tests are `ignore`d. fmt, clippy, audit, deny and rustdoc were clean at the 1.3.0 audit (2026-11-09) and are re-run at M0 step 0 | local run |
 | Correctness baseline | The 1.3.0 full-module audit. Every fix has a regression test; the projection, solver-sign, delta-SPH, DFSPH, implicit-viscosity, MPM-stress and wave-speed fixes are mutation-checked | `CHANGELOG.md` 1.3.0 |
@@ -25,23 +26,28 @@
 | Oracle's dependencies | hisab **1.4.0** (features `num`, `geo`, `autodiff`), which links glam **0.29.3**; serde, thiserror, tracing; rayon behind `parallel`. `Cargo.lock` is **untracked** (the library-crate rule) | `Cargo.lock` |
 | Oracle's math | Rust std → host **glibc 2.44** for `ln` (8 calls), `powf` (6), `exp` (5), `cos` (4), `hypot` (3), `sin` (2), `sin_cos` (2), `cbrt` (2), `atan2` (2), `log10` (1). glam's `DVec3` (f64) is used everywhere; its `Vec3` (**f32**) is used only for the SPH and coupling neighbour hash | `grep` of `src/` |
 | Published dependents (crates.io) | badal, pavan, khanij, soorat, kiran: all Rust, all `^1`. soorat is local and Rust; its optional `fluids` feature pulls pravash `sph` + `shallow` | crates.io reverse deps |
-| Cyrius consumers | **None.** impetus 2.0 (Cyrius) declares no pravash dependency, and kiran and joshua have no local repo | `~/Repos` |
-| Target | pravash **2.0.0**, Cyrius | this document |
+| Cyrius neighbours | None declares a pravash dependency yet. Bridge partners: **goonj is Cyrius 2.3.1**; ushma is Rust 1.4.0; pavan has no local repo. The `ai` configs point at **daimon (Cyrius 2.5.6)** and **hoosh (Cyrius 2.12.3)**. impetus 2.0 (Cyrius) has no pravash dependency. kiran and joshua have no local repo | `~/Repos` |
+| Target | pravash **2.0.0**, Cyrius, carrying **every** module and feature (§3) | this document |
 
 ## 0. Decisions
 
 ### 0.1 Carried from the sibling ports
 
+- **No deferral without a language check.** A Rust feature leaves the 2.0 scope only for a reason written
+  down against §1.1: a capability Cyrius 6.7.18 lacks (named with its guide or stdlib section), a measured
+  cost, or the lack of an oracle. The review found no language reason to drop any pravash feature. The only
+  items outside 2.0 are the 1.3.0 audit's deferred physics (D5), and the reason for those is that they have
+  no oracle.
 - **The oracle is frozen.** Rust 1.3.0 moves to `rust-old/` and is never edited. A generator crate in
   `scripts/oracle/` drives it by path. If an oracle value is wrong, it is fixed in Rust as 1.3.x and the
   corpus is regenerated (as tanmatra).
 - **No Rust 2.0** (as kimiya and impetus). API shape changes land in the Cyrius API only, accepted by
-  ADR 0002 (§3.3). New physics stays out of the port.
+  ADR 0002 (§3.3).
 - **hisab-first, but off the step path until an allocator lands.** cyrius S1 (a scoped allocator) and hisab
   H9 (allocator-scoped calls) are both still **open** (checked 2026-11-11). Until one of them lands, every hisab
   call that returns a value leaks from the global bump heap. So per-step code is pravash-owned: the neighbour
   search, the pressure solves and the vector math in loops (as impetus [ADR 0012](../../../impetus/docs/adr/0012-impetus-owned-3d-math-stopgap.md)).
-  hisab serves the calls that are not per-step. Where hisab 3.4.1 lacks a routine the oracle used, the port
+  hisab and ganita serve the calls that are not per-step. Where neither has a routine the oracle used, the port
   transcribes Rust hisab 1.4.0's routine and files the gap
   (kimiya [ADR 0003](../../../kimiya/docs/adr/0003-transcribe-missing-hisab-routines.md)).
 - **Performance is measured, not gated** (as impetus). Every Rust benchmark gets a Cyrius twin, and both
@@ -59,12 +65,14 @@
 |---|---|---|---|
 | D1 | **Tag and publish 1.3.0.** `release.yml` runs `cargo publish` on any version tag. Tagging therefore publishes 1.3.0 to crates.io, and its five Rust dependents on `^1` get the audit's behaviour changes | Land the `oracle` hooks (M0 step 0b) first. Then tag 1.3.0 on that commit and let it publish. That gives one frozen point, and Rust users get the audited physics | Tag without publishing. Or tag the current commit and add the hooks afterwards as unreleased tooling, as impetus did |
 | D2 | **Where the correctly rounded math comes from.** pravash needs exp, ln, log10, pow, sin, cos, sin_cos, hypot and atan2. impetus has its own copies (`src/crmath.cyr`, ADR 0011), and so does kimiya (ln, log10, pow, exp, sin, cos, acos, atan2). The ganita issue asking for a correctly rounded tier is open. pravash would be the **third** crate to need these, which is CLAUDE.md's cue to extract an abstraction | Extract them into ganita as a separate task, seeded from impetus's crmath and kimiya's ln/log10. Vendor a stopgap copy into `src/crmath.cyr` (ADR 0004) only if ganita hasn't landed when M1 needs them | Vendor a third copy now and extract later |
-| D3 | **The SPH neighbour hash.** The oracle hashes f32 positions (hisab 1.4.0 `SpatialHash`, with f32 cells), and the roadmap lists the resulting precision loss at large coordinates as a defect. The candidate order (by cell, then by insertion) fixes the order of every SPH sum, so it decides whether SPH steps can be compared bit for bit | Port the f32 keys bit-faithfully (probe 3). Neighbour lists are then class A and SPH steps class B/C through M5. Then switch to f64 cell keys before 2.0 as an ADR 0002 divergence, with the f32 rows remapped by name (kimiya's "noted rows mapped") | Use f64 keys from the start. This is simpler, but every SPH step row becomes class D, because the summation order changes |
-| D4 | **serde.** There are 34 `Deserialize` derives, including `FluidGrid` and `ShallowWater`, which consumers can use to save and restore state | Don't carry it in 2.0 (as kimiya): there is no Cyrius consumer and no behaviour depends on it, so it waits for demand. If it is wanted later, impetus's serde-compatible JSON is the model (ADR 0010: `fmtf.cyr`, and `json.cyr` on bayan) | Carry serde-compatible JSON now, as impetus did. That costs about one milestone part per solver |
-| D5 | **The items the 1.3.0 audit deferred.** The roadmap lists Neumann and periodic pressure, SPH 2D kernel normalisation, an external-force input to `step()`, neighbour filtering by h, quadratic B-spline MPM and others | None of them in 2.0: they are new physics with no oracle. They start after 2.0, checked by reference tests only (as impetus). The f32 hash fix (D3) is the one exception | Pull the API-shape items (the external-force input, a dimension on the SPH config) into ADR 0002 |
-| D6 | **Rust-only features** | `bridge`: deferred until a Cyrius consumer exists (as tanmatra and impetus). `parallel`: not in 2.0. The serial step is the oracle; a `thread.cyr` path is a 2.x item and must give the serial bits. `ai` (two endpoint-config structs, no behaviour): not carried. `logging`: sakshi's init replaces tracing-subscriber and tracing-chrome | Port `bridge` (10 functions, 17 tests) in 2.0 as a small parity-tested file |
+| D3 | **When to fix the f32 neighbour hash.** The oracle hashes f32 positions (hisab 1.4.0 `SpatialHash`), and the roadmap lists the resulting precision loss at large coordinates as a defect. Cyrius has a native `f32` type (§1.1), so a bit-faithful port costs nothing extra. The question is only when the defect gets fixed | Port the f32 keys bit-faithfully, so neighbour lists are class A and SPH steps class B/C through M5. Then switch to f64 cell keys before 2.0 as an ADR 0002 divergence, with the f32 rows remapped by name (kimiya's "noted rows mapped") | Port f32 keys and fix after 2.0; or use f64 keys from the start, which makes every SPH step row class D, because the summation order changes |
+| D4 | **How strict JSON compatibility is.** The port carries serde on all 22 types through `#derive(Serialize)` / `#derive(Deserialize)` (§1.1). bayan prints f64 with Grisu2, which round-trips exactly but doesn't always give the same digits as serde_json's shortest form | Require decode compatibility: every document serde_json writes from the oracle decodes to the same bits, and every Cyrius document round-trips. Text identity is not required | Byte-identical text, by reusing impetus's shortest-digit printer (`fmtf.cyr`, ADR 0010) as the second instance |
+| D5 | **The items the 1.3.0 audit deferred.** The roadmap lists Neumann and periodic pressure, SPH 2D kernel normalisation, an external-force input to `step()`, neighbour filtering by h, quadratic B-spline MPM and others. The language can express all of them; what they lack is an oracle | None of them in 2.0: they are new physics, checked by reference tests only, so they come after parity (as impetus). The f32 hash fix (D3) is the one exception | Pull the API-shape items (the external-force input, a dimension on the SPH config) into ADR 0002 |
+| D6 | **The shape of `parallel`.** Rust selects rayon with a compile-time feature. Cyrius `[features]` only switch optional dependencies, and `#define` holds 16 names including the target's (§1.1) | Make it a runtime thread count on each solver: 1 (the default) is serial, and any count gives the same bits. `THREADS_CONCURRENT == 0` targets (agnos, cx) run the work inline | A `[lib.parallel]` profile that `#define`s a name, giving two bundles |
 
-## 1. Porting models and references
+---
+
+## 1. Porting models, references and the language
 
 - **impetus 2.0.0** (`/home/macro/Repos/impetus`), the template. Copy these and adapt them:
   - `scripts/oracle/`: the generator crate, with the glibc header, the step format and the dump flattening, plus `validate.py`;
@@ -78,18 +86,50 @@
   - ADR 0002's oracle ↔ `Err` mapping and its "noted rows mapped" accounting;
   - the accuracy policy and its working scope;
   - correctly rounded ln and log10.
+- **szal** (Cyrius), the precedent for porting Rust parallelism onto `thread.cyr`. Its `src/engine_parallel.cyr`
+  uses worker threads that each write a per-worker result slot, which the joiner reads in spawn order.
 - **tanmatra 2.0.1**: the parity classes, the port-parity rule (K_F = 2·S·calls + 2) and the origin of the Rust-test ledger.
 - **hisab 3.4.1**, the dependency. Read `CLAUDE.md`, `docs/guides/migration-3.4.md` (the Result convention)
-  and the doc comment of every function pravash calls.
+  and the doc comment of every function pravash calls. Its roadmap flags process-global tables that are not
+  thread-safe (`K005`), which matters only if a worker thread ever calls hisab.
 - **Language and toolchain** (`/home/macro/Repos/cyrius`): `docs/guides/cyrius-guide.md`,
   `docs/stdlib-reference.md`, `docs/development/ecosystem-migration.md` (the 6.7.x entries),
-  `cyrius help manifest`, `BENCHMARKS.md`.
+  `cyrius help manifest`, `BENCHMARKS.md`. §1.1 summarises what pravash needs from them.
 - **Open upstream issues this port inherits:**
   - `cyrius/docs/development/issues/2026-11-08-cyrius-port-clobbers-project-docs-and-omits-bench.md`: still open, so M0 step 2 repairs what the scaffold overwrites;
   - `cyrius/…/2026-11-09-no-scoped-allocator-for-alloc.md` (S1);
   - `hisab/docs/development/issues/2026-11-09-allocator-scoped-calls.md` (H9);
   - `ganita/docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`;
   - cyrius's `memcpy` byte loop (`2026-11-02`, impetus S5).
+
+### 1.1 Language review: Cyrius 6.7.18 against pravash's Rust surface
+
+Read from the 6.7.18 guide and stdlib reference, and from the shipped `lib/` sources, on 2026-11-11. Each row
+is a Rust construct pravash uses, what Cyrius provides for it, and the verdict. Every verdict is "port".
+
+| Rust in pravash | Cyrius 6.7.18 | Where | Verdict |
+|---|---|---|---|
+| f64 arithmetic and std f64 methods | `f64` scalars (operators typed by the left operand). Builtins `f64_sqrt`, `f64_floor`, `f64_ceil`, `f64_trunc`, `f64_exp`, `f64_ln`, `f64_sin`, `f64_cos` and `f64_atan`, each within 1 ulp; the `_f64_*_polyfill` forms give the same bits on every target. ganita has pow, hypot, atan2 and cbrt | guide *Types*, *Math Builtins*; stdlib *math.cyr* | port, correctly rounded per D2 (§7.1) |
+| f32 (the neighbour hash's `as f32` and f32 multiply; `PackedParticles`) | a **native `f32` scalar type**. `f32_from` rounds f64 → f32 to nearest, ties to even; `f32_to` widens. Writes into an `f32` round. f32 arithmetic exists, but an f32 left operand reads its right operand's low 32 bits. There are also `f32v4` / `f32v8` SIMD vectors | guide *Types* (6.7.6), *SIMD Vectors* | port bit-faithfully (probe 3 confirms) |
+| float literals like `1e-9` | no exponent form, but decimal literals are correctly rounded | guide *Number Literals* | write constants positionally |
+| structs, `impl`, methods, operator traits | structs with typed fields (`f64`, `f32`, narrow ints), `impl` blocks, traits, `dyn`, generic fns and structs, operator overloads | guide *Structs*, *Traits and impl blocks*, *Generic Functions* | port |
+| data-carrying enums (`ConstitutiveModel`, `BodyShape`, `NonNewtonianViscosity`, …) | sum types. `enum …: stack` allocates nothing but carries 0–1 field per variant; a multi-field variant boxes, which allocates from the bump heap | guide *Sum Types & Tagged Unions* | a kind enum plus a payload struct, so nothing allocates per step |
+| `Result<T, PravashError>`, `?` | value-form `Result`, `?` propagation, no try/catch | guide *`?` Propagation*, *Typed errors* | port, with `PV_ERR_*` codes |
+| closures (`autodiff_gradient(f: impl Fn(&mut Tape, &[Var]) -> Var, …)`) | closure literals `\|a, b\| …`, capture by value, called through `fncallN` / `callptr`. A capturing closure takes at most 5 parameters (3 on Windows) and needs `lib/alloc.cyr` | guide *Closures*, *Function Pointers* | port as a closure |
+| serde derives (22 types) | `#derive(Serialize)` / `#derive(Deserialize)` on structs and enums, through bayan. They generate `T_to_json`, `T_from_json_str` and `T_from_json`. Fields can be integers, `f64`, `f32`, `bool`, `Str`, `cstring`, `Vec<T>` of integers, `f64` or derived structs, and nested derived structs; enums serialize as variant-name strings (serde's unit-variant form). **Not covered:** `u64` fields, `Vec<Str>`, data-carrying variants, and glam's `[x, y, z]` array form for a vector. f64 is printed with Grisu2: round-trip exact, but not always shortest | guide *Derive Serialize on a struct / an enum*; `lib/bayan.cyr` (dtoa) | port: derive where it fits, hand codecs for `DVec3` fields and data-carrying enums (D4) |
+| rayon (`parallel`: 5 `par_iter`, 2 `par_chunks`; sites in `grid.rs` and `sph.rs`) | `thread.cyr`: real OS threads on Linux, macOS and Windows (`thread_create` / `thread_join`, MPMC `chan_*`, mutexes), plus `atomic.cyr` and `thread_local.cyr`. `THREADS_CONCURRENT` is 0 on agnos and cx, where the bodies run inline. `alloc()` is thread-safe (one global lock, single-threaded fast path) | stdlib *Concurrency*; `lib/alloc.cyr` header | port as a worker pool over index ranges, each index writing its own slot, so any thread count gives the serial bits (D6, probe 6) |
+| `tracing` spans and warnings (16 sites) | sakshi: `sakshi_span_enter` / `_exit`, levels, `sakshi_warn` / `sakshi_trace`, trace ids | `lib/sakshi.cyr` | port, keeping the warn-once-per-step rules |
+| `logging` (tracing-subscriber, tracing-chrome init) | sakshi's level and sink setup | `lib/sakshi.cyr` | port the init. A Chrome-trace export is checked at M7, and filed if sakshi has none |
+| `HashMap` inside hisab 1.4.0's `SpatialHash` | `hashmap.cyr` (its seed is random per process), `hashseed.cyr`; no ordered map | stdlib *hashmap*, *hashseed* | pravash's own code needs none: the neighbour grid is sorted arrays |
+| `sort_unstable_by_key` (z-order) | `vec_sort_by`, which is introsort (unstable); there is no stable sort in `vec` or `slice` | `lib/vec.cyr` | probe 5 |
+| `Vec<T>` growth, per-step `Vec` allocation | `vec` (8-byte words, never frees); `freelist` (individual free); arenas with reset and a growth policy; the allocator vtable (`alloc_via`) | guide *Allocators & Arenas*; stdlib *freelist* | solver-owned storage plus a step arena (§7.5) |
+| Cargo features (`sph`, `grid`, `shallow`, …) | `[features]` switches optional dependencies only; `#ifdef` with at most 16 `#define` names, the target's included; `[lib.X]` bundle profiles; `[build] dce = true` dead-code elimination | guide *Manifest keys*, *Preprocessor* | one bundle, with dead-code elimination removing what a consumer doesn't call (probe 7 measures it) |
+| `hisab::num::matrix_inverse` (n×n; hisab 1.4.0 does it as LU with partial pivoting plus a per-column `lu_solve`) | ganita `mat_inv` (LU with partial pivoting), `mat_lu` and `mat_lu_solve` | stdlib *linalg.cyr* (in ganita) | use ganita if probe 8 shows the same bits on the MLS moment matrices; otherwise transcribe |
+| `hisab::num::conjugate_gradient` (matrix-free linear CG) | nothing in ganita or hisab 3.4.1: `opt_conjugate_gradient` is the nonlinear optimiser, and BiCGSTAB, GMRES and PGS take CSR matrices | hisab `dist/hisab.cyr` | transcribe (ADR 0003); file P1 |
+| `#[inline]`, `#[must_use]`, `#[non_exhaustive]` | `#inline` (never applied to a fn with defaults or a `defer`), `#must_use`, `#pure` / `#io` / `#alloc`; enums are append-only by convention | guide *Attributes* | translate |
+| `Cow<'static, str>` error detail, `String` config fields | `Str`, `cstring` | guide *Strings* | errors carry codes only; config strings are `Str` |
+| `Send + Sync` bounds | — | — | Rust-only mechanics, nothing to port |
+| `ai`: endpoint configs, no I/O | struct fields of type `Str`, with the API key as `Str` or 0; `http.cyr` exists if a client is ever wanted | stdlib *http.cyr* | port the two configs, including the redacted debug print |
 
 ---
 
@@ -110,57 +150,58 @@ functions, so six things change.
    multigrid V-cycles (at most 10 levels), the DST, PCISPH and DFSPH iterations, implicit viscosity and the FLIP
    pressure loop. An iteration count is class A, but a 1-ulp difference at a tolerance edge can change it. So
    every convergence test is a branch point (§5), and the iteration count is part of every step row.
-3. **f32 in two places:** the SPH and coupling neighbour hash (D3), and `compute`'s GPU packing
-   (`PackedParticles`, 41 f32 sites). Cyrius has f32 SIMD lanes and `f32_to_f64` (in `mabda`). Whether scalar
-   f64 → f32 rounding and f32 arithmetic match Rust is probe 3.
-4. **Particle counts.** SPH and FLIP run 10³–10⁵ particles a step. The neighbour lists keep all 27 cells
-   unfiltered, about 6× the true neighbours in 3D. Memory per step (probe 1) and the particle layout (probe 2)
-   decide most of the speed.
+3. **f32 in two places:** the neighbour hash (D3) and `compute`'s GPU packing (`PackedParticles`, 41 f32 sites).
+   Both map onto Cyrius's native `f32` (§1.1). The trap is the operator rule: an f32 left operand reads its
+   right operand's low 32 bits, so every mixed expression goes through `f32_from` explicitly.
+4. **Particle counts and threads.** SPH and FLIP run 10³–10⁵ particles a step. The neighbour lists keep all 27
+   cells unfiltered, about 6× the true neighbours in 3D. Memory per step (probe 1), the particle layout
+   (probe 2) and the worker pool (probe 6) decide most of the speed.
 5. **An unstable sort with ties.** `sort_by_zorder` uses `sort_unstable_by_key` on a Morton code. Particles in
    one cell share a key, so their order after the sort depends on Rust's sort algorithm, and every later step's
    sums follow that order (probe 5).
-6. **No snapshot format to design**, unless D4 carries serde. The state loader that the parity harness needs
-   is test-only.
+6. **JSON on simulation state.** serde reaches `FluidGrid`, `ShallowWater`, `MacGrid`, `KEpsilon`, `VofField`
+   and `PhaseField`, including their private fields, so consumers can save and restore them. The oracle writes
+   serde_json documents for every derived type, and the port has to decode them exactly (D4).
 
 ---
 
 ## 3. Scope
 
-### 3.1 In scope for 2.0.0
+### 3.1 In scope for 2.0.0: everything
 
-| Milestone | Rust module | Code lines | `pub fn` | Tests | Cyrius module(s) | hisab use |
+| Milestone | Rust module | Code lines | `pub fn` | Tests | Cyrius module(s) | Library use |
 |---|---|---|---|---|---|---|
 | M1 | `error.rs` | 26 | — | 6 | `src/error.cyr` | — |
 | M1 | *(public and private constants, presets)* | — | — | — | `src/constants.cyr` (generated) | — |
-| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr`; `src/crmath.cyr` or ganita (D2) | — |
-| M1 | `common.rs` | 611 | 35 | 49 | `src/vec3.cyr` (the `DVec3` operations pravash uses), `src/common.cyr` | none: a pravash-owned glam transcription, as impetus's `math3.cyr` |
+| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr`; `src/crmath.cyr` or ganita (D2) | ganita |
+| M1 | `common.rs` | 611 | 35 | 49 | `src/vec3.cyr` (the `DVec3` operations pravash uses), `src/common.cyr`, codecs in `src/json.cyr` | none on the step path: a pravash-owned glam transcription, as impetus's `math3.cyr` |
 | M1 | `buoyancy.rs` | 105 | 5 | 16 | `src/buoyancy.cyr` | — |
 | M1 | `vortex.rs` | 47 | 5 | 12 | `src/vortex.cyr` | — |
+| M1 | `bridge.rs` (pavan, ushma, goonj) | 98 | 10 | 17 | `src/bridge.cyr` | — |
 | M2 | `shallow.rs` | 692 | 12 | 44 | `src/shallow.cyr` | — |
 | M3 | `grid.rs` | 1,464 | 21 | 49 | `src/grid_solve.cyr` (DST, IDST and CG, §7.2), `src/grid.cyr`, `src/mac_grid.cyr`, `src/k_epsilon.cyr` | `num_dst` / `num_idst` if probe 8 allows; otherwise transcribed |
 | M3 | `vof.rs`, `phase_field.rs` | 368 | 19 | 19 | `src/vof.cyr`, `src/phase_field.cyr` | — |
-| M4 | `sph.rs`: kernels, equation of state, neighbour hash, free functions, configs | ≈ 900 | ≈ 30 | ≈ 35 | `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr` | none on the step path; the MLS 3×3 inverse is transcribed (§7.2) |
+| M3 | `parallel` in `grid.rs` (2 row loops, 1 `par_chunks_mut`) | — | — | — | `src/par.cyr` (the worker pool), used by `grid.cyr` | `thread.cyr` |
+| M4 | `sph.rs`: kernels, equation of state, neighbour hash, free functions, configs | ≈ 900 | ≈ 30 | ≈ 35 | `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr` | ganita `mat_inv` or a transcription for the MLS 3×3 inverse (§7.2) |
 | M5 | `sph.rs`: `SphSolver` and its four steps, phase change, secondary particles | ≈ 1,270 | ≈ 19 | ≈ 44 | `src/sph.cyr`, `src/sph_pcisph.cyr`, `src/sph_dfsph.cyr`, `src/sph_multiphase.cyr` | — |
+| M5 | `parallel` in `sph.rs` (`par_iter_mut`, 2 `into_par_iter` maps) | — | — | — | `src/par.cyr` | `thread.cyr` |
 | M6 | `coupling.rs` | 590 | 19 | 33 | `src/coupling.cyr` | the M4 neighbour hash |
 | M6 | `mpm.rs` | 424 | 6 | 13 | `src/mpm.cyr` | — |
-| M7 | `compute.rs` | 201 | 9 | 11 | `src/compute.cyr` | `ad_tape_*` for `autodiff_gradient` (not per-step) |
-| M7 | `logging.rs` | 20 | 3 | 1 | `src/logging.cyr` (sakshi) | — |
+| M7 | `compute.rs` | 201 | 9 | 11 | `src/compute.cyr` | hisab `ad_tape_*` for `autodiff_gradient` (not per-step) |
+| M7 | `logging.rs` | 20 | 3 | 1 | `src/logging.cyr` | sakshi |
+| M7 | `ai.rs` (`DaimonConfig`, `HooshConfig`) | 35 | — | 2 | `src/ai.cyr` | bayan (JSON) |
 
-The `sph.rs` split between M4 and M5 is an estimate; `scripts/surface_parity.py` fixes it at M4's start. The
-surface-parity check covers every `pub fn` and every `pub` method on the re-exported types. In scope: 6,718
-lines, which is the 6,882 minus `bridge`, `ai` and `lib.rs`.
+- The `sph.rs` split between M4 and M5 is an estimate; `scripts/surface_parity.py` fixes it at M4's start.
+- Each milestone also ports the serde codecs of its own types (D4).
+- The surface-parity check covers every `pub fn` and every `pub` method on the re-exported types.
+- In scope: all 6,851 library lines (the 6,882 minus `lib.rs`).
 
-### 3.2 Deferred or not carried
+### 3.2 Not carried
 
-| Rust surface | Decision | Why |
-|---|---|---|
-| `bridge.rs` (10 fns, 17 tests): pavan, ushma, goonj | **deferred** until a Cyrius consumer exists (D6) | thin primitive-value wrappers; a small parity-tested file later |
-| `parallel` (rayon: 5 `par_iter`, 2 `par_chunks`) | **not in 2.0** (D6) | probe 6 proves that Rust's parallel and serial builds give the same bits, so the serial port answers for both |
-| `ai.rs` (`DaimonConfig`, `HooshConfig`) | **not carried** (D6) | endpoint strings with no behaviour |
-| serde derives | **not carried** (D4) | no Cyrius consumer |
-| `tracing` spans and warnings (16 sites) | **sakshi** spans behind a level | the warn-once-per-step rules are kept |
-| `thiserror` text, `PravashError::Diverged { reason }` | **`PV_ERR_*`** append-only codes with no detail string (as tanmatra) | §3.3 #1 |
-| `Send + Sync`, `#[inline]`, `Cow<'static, str>` | **not carried** | Rust-only mechanics |
+| Rust surface | Why |
+|---|---|
+| `Send + Sync` bounds, `#[inline]` hints as Rust applies them, `Cow` lifetimes | Rust-only mechanics with no Cyrius counterpart to port. `#inline`, `#must_use` and `Str` cover the intent (§1.1) |
+| `thiserror` message text and `PravashError::Diverged { reason }`'s string | errors become `PV_ERR_*` append-only codes (as tanmatra); the code identifies the failure, and §3.3 #1 records the change |
 
 ### 3.3 API changes in the Cyrius version (accepted divergences, ADR 0002)
 
@@ -170,11 +211,12 @@ function, so nothing leaves parity entirely.
 | # | Rust 1.3.0 | Cyrius 2.0.0 | Golden comparison |
 |---|---|---|---|
 | 1 | `Result<T, PravashError>` carrying detail strings | value-form `Result` plus a `PV_ERR_*` code | class A on the variant |
-| 2 | closures (`autodiff_gradient(f: impl Fn(&mut Tape, &[Var]) -> Var, …)`) | a function pointer plus a context word | the gradient's own class |
-| 3 | f32 neighbour-hash keys | f64 keys before 2.0 (D3) | f32 rows mapped by name |
-| 4 | `sort_by_zorder`'s tie order (Rust's unstable sort) | a stable sort on (key, input index), if probe 5 shows Rust's order can't be reproduced cheaply | class A on the key sequence and on the multiset; later steps start from the oracle's order |
-| 5 | features select modules at compile time | one `[lib]` bundle, or profiles if probe 7 says so | — |
-| 6 | bit-identical only on one platform | **bit-identical across targets** for pravash-owned arithmetic (as impetus) | measured on x86_64 ELF, x86_64 PE and aarch64 |
+| 2 | f32 neighbour-hash keys | f64 keys before 2.0 (D3) | f32 rows mapped by name |
+| 3 | `sort_by_zorder`'s tie order (Rust's unstable sort) | a stable order on (key, input index), if probe 5 shows Rust's order can't be reproduced cheaply | class A on the key sequence and on the multiset; later steps start from the oracle's order |
+| 4 | the compile-time `parallel` feature | a runtime thread count per solver, 1 by default (D6) | the same bits for every thread count, checked against the oracle's serial and parallel builds |
+| 5 | features select modules at compile time | one `[lib]` bundle with dead-code elimination (or profiles, if probe 7 says so) | — |
+| 6 | serde_json's shortest f64 digits | bayan's Grisu2 digits (D4) | every oracle document decodes to the same bits, and every Cyrius document round-trips |
+| 7 | bit-identical only on one platform | **bit-identical across targets** for pravash-owned arithmetic (as impetus) | measured on x86_64 ELF, x86_64 PE and aarch64 |
 
 ---
 
@@ -195,10 +237,13 @@ function, so nothing leaves parity entirely.
       - each pressure solver (Gauss–Seidel, DST, CG, multigrid) on one given system, returning the solution,
         the iteration count and the residual;
       - the hisab 1.4.0 calls exactly as pravash makes them (`dst`, `idst`, `conjugate_gradient`,
-        `matrix_inverse`, `reverse_gradient`), so every transcription is compared against the oracle's own bits.
+        `matrix_inverse`, `reverse_gradient`), so every transcription or ganita substitute is compared against
+        the oracle's own bits.
 
-      `tests/oracle.rs` proves that dumping every frame leaves a 300-step run of each solver bit-identical. The
-      gates are those of step 0.1, plus clippy on `oracle` together with each solver feature.
+      `tests/oracle.rs` proves that dumping every frame leaves a 300-step run of each solver bit-identical, with
+      and without `parallel`. The gates are those of step 0.1, plus clippy on `oracle` together with each solver
+      feature. serde_json is already a dev-dependency, so the generator writes each derived type's documents
+      with no change to `src/`.
    3. **Track the lockfile for the freeze.** `Cargo.lock` is gitignored under the library-crate rule, but the
       oracle's bits depend on hisab 1.4.0 and glam 0.29.3. Commit it; it moves to `rust-old/Cargo.lock`. ADR 0001
       records the exception. The generator crate's own lock is seeded from it (as kimiya).
@@ -211,17 +256,18 @@ function, so nothing leaves parity entirely.
      `docs/{adr,architecture,guides,examples}/` and `docs/development/state.md`.
 2. **Repair what the scaffold overwrites.** The clobber issue is still open on 6.7.18; impetus's §4 step 2 is the checklist.
    - **CLAUDE.md**: merge `git show HEAD:CLAUDE.md` with the scaffold's Cyrius rules, keeping the identity, the
-     process and the DO NOT list, including "NEVER use `gh`". Translate the principles as impetus did:
+     process and the DO NOT list, including "NEVER use `gh`". Translate the principles against §1.1:
      - `#[non_exhaustive]` → append-only enum values;
      - `#[must_use]` → `#must_use` / `#pure`;
      - no `unwrap`/`panic!` → no `+?`, `-?`, `*?`, `assert_fatal`, `result_unwrap` or `panic` in `src/`;
-     - `#[inline]` → `#inline`, which takes at most two parameters;
+     - `#[inline]` → `#inline` on hot paths;
      - "Vec arena over HashMap" → typed stride arenas and sorted arrays, never `hashmap` (its seed is random per process);
      - "`write!` over `format!`" and "Cow over clone" → `str_builder` writes, borrow by pointer, copy only into owned storage;
      - "tracing on all operations" → sakshi spans, behind a level;
-     - "feature-gate optional deps" → `[features]` selects optional dependencies only.
+     - "feature-gate optional deps" → `[features]` selects optional dependencies, and dead-code elimination drops unused code.
 
-     Also replace the consumer list with the real one (header table) and replace the MSRV with the Cyrius pin.
+     Also add a rule: no feature is deferred without a check against the language (§0.1). Replace the consumer
+     list with the real one (header table) and the MSRV with the Cyrius pin.
    - **Roadmap**: restored from git, with this plan's section kept. **`state.md`**: rewritten for 1.3.0 → 2.0.0-dev.
    - **Workflows**: keep the scaffold's Cyrius CI, and add `test --bounds`, `deps --locked` and `audit`. Move the
      Rust workflows to `rust-old/.github/workflows/`, where the publish job can no longer fire.
@@ -234,9 +280,9 @@ function, so nothing leaves parity entirely.
 
      `docs/development/history.md` stays.
    - **ADRs** (pravash has none yet):
-     - 0001, the port with a Rust oracle, including the lockfile exception;
+     - 0001, the port with a Rust oracle, including the lockfile exception and the §0.1 deferral rule;
      - 0002, the §3.3 API divergences;
-     - 0003, transcribing missing hisab routines (§7.2);
+     - 0003, transcribing missing hisab routines, plus the ganita substitutes (§7.2);
      - 0004, the correctly rounded primitives (per D2).
    - **Checks**: `cyrius.cyml` reads `version = "${file:VERSION}"`, and `bench` is in `[test] stdlib`. Document the
      scaffold's stub functions so `cyrius audit` passes. Rewrite CONTRIBUTING, SECURITY and the README for Cyrius.
@@ -249,9 +295,13 @@ function, so nothing leaves parity entirely.
    language = "cyrius"
    cyrius = "6.7.18"
 
+   [build]
+   dce = true
+
    [deps]
    stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
-             "tagged", "result", "freelist", "fnptr"]   # sakshi arrives via hisab
+             "tagged", "result", "freelist", "fnptr", "atomic", "thread", "bayan"]
+             # sakshi arrives via hisab
 
    [deps.hisab]
    git = "https://github.com/MacCracken/hisab.git"
@@ -266,9 +316,9 @@ function, so nothing leaves parity entirely.
    [lib]
    modules = ["src/error.cyr", ...]
    ```
-   Module order: error → constants → mathx → crmath → vec3 → common → buoyancy → vortex → shallow → grid_solve →
-   grid → mac_grid → k_epsilon → vof → phase_field → sph_kernels → neighbor → sph_fns → sph → sph_pcisph →
-   sph_dfsph → sph_multiphase → coupling → mpm → compute → logging.
+   Module order: error → constants → mathx → crmath → vec3 → common → json → buoyancy → vortex → bridge → par →
+   shallow → grid_solve → grid → mac_grid → k_epsilon → vof → phase_field → sph_kernels → neighbor → sph_fns → sph →
+   sph_pcisph → sph_dfsph → sph_multiphase → coupling → mpm → compute → logging → ai.
 4. **Toolchain and math check.** Confirm the counterpart of every Rust f64 method in §7.1 on 6.7.18. impetus
    probed the following, and its results carry over:
    - `f64_min` / `f64_max` don't follow Rust's NaN rules;
@@ -283,9 +333,12 @@ function, so nothing leaves parity entirely.
 5. **Golden-value generator** (`scripts/oracle/`), copied from impetus's crate:
    - TSV format 1 with f64 values as bit patterns, deterministic output, a `--check` mode, and the glibc header;
    - `validate.py` recomputes the class A/B rows in Python;
-   - one build with `--features full,oracle` but without `parallel`, and a second build with `parallel` for probe 6;
+   - two builds: `--features full,oracle` without `parallel`, and the same with `parallel`, whose rows must match the
+     serial build's (probe 6);
    - the step format as impetus: each row names a scenario and a frame. Its inputs are the dump at frame k plus the
-     call's arguments; its outputs are the dump at k + 1 plus the iteration counts.
+     call's arguments; its outputs are the dump at k + 1 plus the iteration counts;
+   - a JSON table: serde_json documents for each of the 22 derived types, from seeded values, including NaN-free
+     edge values and every enum variant.
 6. **Table and constant generator** (the same crate), producing `src/constants.cyr` through the oracle's API, never
    by retyping. It covers:
    - the public constants: the `FluidMaterial` presets (`WATER`, `OIL`, `HONEY`, `AIR`, `LAVA`) and the drag
@@ -297,6 +350,7 @@ function, so nothing leaves parity entirely.
    lexer has no exponent notation), and never put a hex pattern in a `const`.
 7. **Parity harness**, from impetus: `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, plus:
    - a state loader and a step comparator per solver, with per-field classes;
+   - a JSON comparator (decode the oracle's document, compare bits, re-encode, decode again);
    - the divergence table, which names each ADR 0002 row and reports it by name.
 8. **Baseline measurements**, recorded in `docs/development/port-parity.md`:
    - the math sweep through every Cyrius counterpart against glibc, on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu);
@@ -309,21 +363,33 @@ function, so nothing leaves parity entirely.
       CG, each reach a flat heap high-water mark after warm-up.
    2. **Particle layout and vector representation.** Time the SPH density and force loops two ways: over a typed
       stride array of `PvParticle` records (array-of-structs, like Rust's `FluidParticle`) and over column arrays
-      (like `ParticleSoa`). Run each with f64 locals and with struct values; impetus measured struct values at 2.5×
-      slower than f64 locals.
-   3. **f32 fidelity.** Check f64 → f32 rounding (to nearest), f32 multiply and floor, and saturating `as i32`. The
-      test: reproduce hisab 1.4.0's `SpatialHash` cell key for 10⁶ seeded positions, including positions on cell
-      boundaries and |x| up to 10⁷. Also reproduce the bits of `PackedParticles`' f32 packing.
+      (like `ParticleSoa`). Run each with f64 locals and with struct values (impetus measured struct values at
+      2.5× slower than f64 locals), and with `f64v4` lanes where the loop allows it.
+   3. **f32 keys.** Reproduce hisab 1.4.0's `SpatialHash` cell key (`floor(x as f32 · inv_cell) as i32`) through
+      `f32_from`, f32 `*`, `f32_to`, `f64_floor` and a saturating convert. Check 10⁶ seeded positions, including
+      positions on cell boundaries and |x| up to 10⁷, plus the bits of `PackedParticles`' f32 packing. Also pin
+      the operator trap: an f32 left operand with an f64 right operand must warn.
    4. **The oracle's neighbour candidate order.** Confirm that hisab 1.4.0's query visits cells in a fixed offset
       order, and each cell in insertion order, so that no `HashMap` iteration order reaches a sum.
    5. **Z-order sort ties.** Can the port reproduce the order Rust's `sort_unstable_by_key` gives on 1.99, or does
-      it sort on (key, index) instead (ADR 0002 #4)?
-   6. **rayon.** The `parallel` build's dumps equal the serial build's, bit for bit, on every scenario in the step
-      corpus. Check the reductions as well as the ordered `par_iter` collects.
-   7. **Bundle shape.** Compare one `[lib]` holding every module with per-feature profiles (`[lib.sph]`, …). Measure
-      the compile time and binary size for a consumer that uses only `shallow`, soorat's case.
-   8. **hisab 3.4.1 against 1.4.0** for `dst`, `idst` and the autodiff tape: bits, allocations, and whether the
-      algorithm is the oracle's. The answer decides between "use" and "transcribe" in §7.2.
+      it sort on (key, index) instead (ADR 0002 #3)?
+   6. **Parallelism.**
+      - Rust's `parallel` build's dumps equal the serial build's, bit for bit, on every scenario in the step corpus
+        (the ordered `par_iter` collects, and any reductions).
+      - A Cyrius worker pool in `src/par.cyr` (persistent `thread_create` workers fed by `chan_*`, each index range
+        writing its own output slots) gives the serial bits at 1, 2, 4 and 8 threads.
+      - Measure its speedup at 10³, 10⁴ and 10⁵ particles, and its per-step cost against spawning threads for
+        each step.
+      - Confirm that workers allocate nothing: step scratch is per worker, and `alloc()`'s global lock stays off
+        the loop.
+   7. **Bundle shape.** Build one `[lib]` with `dce = true` for a consumer that uses only `shallow` (soorat's case),
+      and compare its size and compile time with a `[lib.shallow]` profile.
+   8. **hisab and ganita against 1.4.0:** `num_dst` / `num_idst` against 1.4.0's `dst` / `idst`; ganita `mat_inv`
+      against 1.4.0's `matrix_inverse` on the MLS moment matrices; the autodiff tape. Record bits and allocations.
+      The answer decides between "use" and "transcribe" in §7.2.
+   9. **JSON.** `#derive(Serialize)` on each derived type's Cyrius struct, fed the oracle's serde_json documents:
+      decoded bits, round trips, and how often bayan's Grisu2 digits differ from serde_json's. Write hand codecs
+      for `DVec3` fields (serde writes `[x, y, z]`) and for the data-carrying enums.
 
 **Gate:**
 - `cyrius build` and `cyrius bench` pass;
@@ -340,10 +406,10 @@ tanmatra's classes apply, with impetus's S and R classes for simulations:
 
 | Class | Tolerance | pravash examples |
 |---|---|---|
-| **A — exact** | bit-identical / equal integers | error variants, config validation verdicts, iteration counts, neighbour candidate lists (D3's f32 keys), z-order key sequences, arena handles and free-list order, `classify_flow` regimes, wet/dry masks, FLIP cell marks, constants and presets |
+| **A — exact** | bit-identical / equal integers | error variants, config validation verdicts, iteration counts, neighbour candidate lists (D3's f32 keys), z-order key sequences, arena handles and free-list order, `classify_flow` regimes, wet/dry masks, FLIP cell marks, constants and presets, decoded JSON, results at every thread count |
 | **B — arithmetic** | ≤ 2 ulp, expected 0 | the polynomial kernels (poly6, spiky, viscosity, cubic spline, Wendland) and their gradients, buoyancy and drag, Gauss–Seidel sweeps, advection interpolation, the shallow-water HLL fluxes (`sqrt` is exact), MPM transfers, `powi` sites |
-| **C — transcendental** | ulp ≤ K by the port-parity rule; **0** on correctly rounded primitives, against the corrected oracle | Tait EOS and non-Newtonian `powf`, the shallow-water damping `powf` and Manning `cbrt`, Lamb–Oseen `exp`, the Kolmogorov scale (`ln`, `exp`), the DST eigenvalues (`cos`), MPM's 2×2 SVD (`hypot`, `atan2`, `sin_cos`), its Hencky strain (`ln`, `exp`), Drucker–Prager's friction angle (`to_radians`, `sin`), the contact angle |
-| **D — reordered or hisab-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | sums reordered by an accepted divergence (D3's f64 keys after the switch, ADR 0002 #4); any hisab 3.x path that isn't a transcription |
+| **C — transcendental** | ulp ≤ K by the port-parity rule; **0** on correctly rounded primitives, against the corrected oracle | Tait EOS and non-Newtonian `powf`, the shallow-water damping `powf` and Manning `cbrt`, Lamb–Oseen `exp`, the Kolmogorov scale (`ln`, `exp`), the DST eigenvalues (`cos`), MPM's 2×2 SVD (`hypot`, `atan2`, `sin_cos`), its Hencky strain (`ln`, `exp`), Drucker–Prager's friction angle (`to_radians`, `sin`), the contact angle, the bridge's `powf` and `log10` |
+| **D — reordered or library-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | sums reordered by an accepted divergence (D3's f64 keys after the switch, ADR 0002 #3); any hisab 3.x or ganita path that probe 8 shows isn't bit-identical |
 | **S — single step** | per field, the class of the path that produced it | one step from an oracle dump. Iteration counts, masks and neighbour lists are class A |
 | **R — reference** | the physical tolerance stated in the test | the 33 integration tests, the 1.3.0 regression tests and the unit tests that assert physics: hydrostatic rest, wave speed √(gh), divergence after projection, VOF and shallow-water mass, Lamb–Oseen decay, terminal velocity, dam-break front position |
 
@@ -354,6 +420,8 @@ Rules:
 - **Bit-level trajectories only where the scene isn't chaotic**: a hydrostatic tank, a lake at rest, a linear
   shallow-water wave, a single droplet, Lamb–Oseen decay. They are compared over the whole horizon. Dam breaks,
   splashes and plumes get class S rows at frames {1, 2, 10, 60, 300}, plus class R.
+- **Thread count is never a parity variable.** Every step row runs at 1 thread and at the probe-6 counts, and all
+  of them must give the same bits.
 - **Branch points, tested on both sides:**
   - the solver tolerances (CG's 1e-6·‖b‖ and its 1e-14 floor, PCISPH's compression-only convergence with at least one iteration, the implicit-viscosity and FLIP checks);
   - the multigrid depth cap (10 levels);
@@ -368,7 +436,7 @@ Rules:
   - VOF's Courant ≤ 0.5 sub-cycling.
 - **The accuracy policy's scope for pravash** (§0.1):
   - correctly rounded primitives and the corrected oracle, everywhere;
-  - exact-rational and range-edge fixes, in kimiya's working scope, only in the pure functions: `buoyancy`, `vortex`, the kernels, the EOS, and `bridge` when it ports. Each one is flagged to the maintainer;
+  - exact-rational and range-edge fixes, in kimiya's working scope, only in the pure functions: `buoyancy`, `vortex`, `bridge`, the kernels and the EOS. Each one is flagged to the maintainer;
   - inside the solver chains, Rust's sequence of operations is the definition.
 
 ---
@@ -376,32 +444,34 @@ Rules:
 ## 6. Milestones
 
 Every milestone ends with impetus's gates:
-- `cyrius build`, then `cyrius test` and `test --bounds` **with no warnings** (the f64 type diagnostics appear only there);
+- `cyrius build`, then `cyrius test` and `test --bounds` **with no warnings** (the f64 and f32 type diagnostics appear only there);
 - `cyrius bench`, recorded against the Rust numbers;
 - `vet`, `lint` and `fmt --check` on the milestone's files;
 - `distlib --all`, then `distlib --check`, then `deps --locked`;
 - surface parity;
 - the soak test (probe 1) once a solver steps;
+- the JSON rows of the milestone's types;
 - the CHANGELOG and `state.md`.
 
 Large milestones go in parts, each part gated (CLAUDE.md's task sizing).
 
 | Milestone | Modules | Key work | Golden grid (minimum) |
 |---|---|---|---|
-| **M1 Foundation** | error, constants, mathx, crmath, vec3, common, buoyancy, vortex | `PravashError` → `PV_ERR_*`. `FluidParticle` as a typed stride record. `FluidConfig` and `FluidMaterial` with validation. `ParticleArena`: the free list sorted by start, adjacent runs merged, stale handles after `compact`. `ParticleSoa`. buoyancy: Archimedes force, drag, Reynolds number, terminal velocity, `classify_flow`. vortex: point vortex, Lamb–Oseen, the Kolmogorov scale | every config field at and past its limit; seeded arena alloc/free/compact sequences; buoyancy and drag across the flow regimes, including NaN and ±∞ inputs; Re on both sides of each regime threshold; Lamb–Oseen at ν·t = 0 and r → 0 |
-| **M2 Shallow water** | shallow | The first stateful solver, where the state loader and step rows are built. HLL fluxes from snapshot velocities, well-balancing, wet/dry handling, Manning friction, sediment, breaking, the implicit Peregrine dispersion filter, closed walls, CFL | lake at rest; 1D and 2D dam breaks; a linear wave (speed √(gh)); a wet/dry shoreline; a disturbance; class S at frames {1, 2, 10, 60, 300}; class R from the 44 tests |
-| **M3 Grid** (parts a–d) | grid_solve, grid, mac_grid, k_epsilon, vof, phase_field | a: `FluidGrid`'s ghost cells per `BoundaryCondition`; semi-Lagrangian, MacCormack and BFECC advection (the backtrace limiter); diffusion; buoyancy; vorticity confinement; Smagorinsky; Gauss–Seidel and multigrid projection. b: DST, IDST and CG, transcribed from hisab 1.4.0 (ADR 0003). c: `MacGrid` (Neumann pressure) and `KEpsilon`. d: VOF (sub-cycled) and the phase field (upwind) | every pressure solver on the same systems: the solution class B/C, the iterations class A; ghost-cell rules per boundary condition; step corpus: a still tank, a buoyant plume, an inflow, a vortex; divergence after projection (class R); VOF mass over 300 steps |
-| **M4 SPH foundations** | sph_kernels, neighbor, sph_fns | The kernels and their gradients and Laplacians, returning 0 for h ≤ 0. Tait EOS, including γ → 0. The neighbour hash (D3) and the lists. The free functions: `step`, `create_particle_block`, `split_particle` and merge, `sort_by_zorder`, `adaptive_dt`, the surface-tension colour field, the MLS gradient corrections (a 3×3 inverse, ADR 0003), heat, viscoelastic Oldroyd-B, delta-SPH, implicit viscosity, contact angle, non-Newtonian viscosity | kernels over r/h ∈ [0, 1.2], including 0, 1 and h ≤ 0; the EOS over γ including 0; neighbour lists for seeded clouds, including cell boundaries and large coordinates; sort ties; each free function fed the oracle's neighbour lists |
-| **M5 SPH solvers** (parts per step variant) | sph, sph_pcisph, sph_dfsph, sph_multiphase | `SphSolver`: WCSPH with symplectic Euler or velocity Verlet (`reset_integrator`); PCISPH (at least one iteration, compression only); DFSPH (Bender & Koschier's order, κ/ρ); multiphase (one colour field per phase); phase change; secondary particles (foam, spray, bubbles) | step corpus: a hydrostatic tank, a dam break, a droplet, a two-phase layer, each run through every solver variant; class S at frames {1, 2, 10, 60, 300}; class R from the 79 tests and the SPH integration tests. Then the D3 switch to f64 keys, with the rows remapped |
-| **M6 Coupling and MPM** | coupling, mpm | `FlipSolver`: the FLIP/APIC ratio, mass-weighted P2G, projection, `apic_c` auto-resize, `particle_level_set`. Rigid-body coupling: `BodyShape`, quadratic drag, added mass, nearby particles through the neighbour hash. `MpmSolver`: each `ConstitutiveModel` (fluid, elastic, Drucker–Prager in degrees), `validate`, the det(F) clamp, separating walls | FLIP: a sloshing tank and a falling block; coupling: a sphere and a box in a flow; MPM: an elastic block, a sand column and a fluid column; the refusals |
-| **M7 Compute and logging** | compute, logging | `ComputeOp`; `PackedParticles` with f32 packing (probe 3); `KernelDerivatives`, including `autodiff_gradient` on hisab's tape through a function pointer (ADR 0002 #2); the logging init on sakshi | packing round trips; derivatives against the oracle (class C) and against finite differences (class R) |
-| **M8 Release 2.0.0** | all | The Rust-test ledger: each of the 351 unit tests, 33 integration tests and 7 ignored doc tests is ported, folded into golden rows, or marked n/a or deferred. The full surface-parity diff. `docs/benchmarks-rust-v-cyrius.md` with the 23 Rust benchmarks in both columns. The README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' code examples compiled and run. VERSION 2.0.0 | the full corpus green on x86_64 ELF, x86_64 PE and aarch64 |
+| **M1 Foundation** | error, constants, mathx, crmath, vec3, common, json, buoyancy, vortex, bridge | `PravashError` → `PV_ERR_*`. `FluidParticle` as a typed stride record. `FluidConfig` and `FluidMaterial` with validation. `ParticleArena`: the free list sorted by start, adjacent runs merged, stale handles after `compact`. `ParticleSoa`. buoyancy: Archimedes force, drag, Reynolds number, terminal velocity, `classify_flow`. vortex: point vortex, Lamb–Oseen, the Kolmogorov scale. bridge: the 10 pavan / ushma / goonj conversions. JSON for the common and buoyancy types, with the `DVec3` hand codec | every config field at and past its limit; seeded arena alloc/free/compact sequences; buoyancy and drag across the flow regimes, including NaN and ±∞ inputs; Re on both sides of each regime threshold; Lamb–Oseen at ν·t = 0 and r → 0; the bridge's inputs over their physical ranges and edges; the JSON table |
+| **M2 Shallow water** | shallow | The first stateful solver, where the state loader and step rows are built. HLL fluxes from snapshot velocities, well-balancing, wet/dry handling, Manning friction, sediment, breaking, the implicit Peregrine dispersion filter, closed walls, CFL. `ShallowWater` JSON | lake at rest; 1D and 2D dam breaks; a linear wave (speed √(gh)); a wet/dry shoreline; a disturbance; class S at frames {1, 2, 10, 60, 300}; class R from the 44 tests |
+| **M3 Grid** (parts a–e) | grid_solve, grid, mac_grid, k_epsilon, vof, phase_field, par | a: `FluidGrid`'s ghost cells per `BoundaryCondition`; semi-Lagrangian, MacCormack and BFECC advection (the backtrace limiter); diffusion; buoyancy; vorticity confinement; Smagorinsky; Gauss–Seidel and multigrid projection. b: DST, IDST and CG (ADR 0003). c: `MacGrid` (Neumann pressure) and `KEpsilon`. d: VOF (sub-cycled) and the phase field (upwind). e: `src/par.cyr` and the grid's three parallel loops. JSON for every grid type, private fields included | every pressure solver on the same systems: the solution class B/C, the iterations class A; ghost-cell rules per boundary condition; step corpus: a still tank, a buoyant plume, an inflow, a vortex; divergence after projection (class R); VOF mass over 300 steps; every row at each thread count |
+| **M4 SPH foundations** | sph_kernels, neighbor, sph_fns | The kernels and their gradients and Laplacians, returning 0 for h ≤ 0. Tait EOS, including γ → 0. The neighbour hash with bit-faithful f32 keys (D3) and the lists. The free functions: `step`, `create_particle_block`, `split_particle` and merge, `sort_by_zorder`, `adaptive_dt`, the surface-tension colour field, the MLS gradient corrections (a 3×3 inverse, §7.2), heat, viscoelastic Oldroyd-B, delta-SPH, implicit viscosity, contact angle, non-Newtonian viscosity | kernels over r/h ∈ [0, 1.2], including 0, 1 and h ≤ 0; the EOS over γ including 0; neighbour lists for seeded clouds, including cell boundaries and large coordinates; sort ties; each free function fed the oracle's neighbour lists |
+| **M5 SPH solvers** (parts per step variant, then parallel) | sph, sph_pcisph, sph_dfsph, sph_multiphase | `SphSolver`: WCSPH with symplectic Euler or velocity Verlet (`reset_integrator`); PCISPH (at least one iteration, compression only); DFSPH (Bender & Koschier's order, κ/ρ); multiphase (one colour field per phase); phase change; secondary particles (foam, spray, bubbles). The last part covers the three parallel SPH loops on `src/par.cyr`, then the D3 switch to f64 keys, with the rows remapped | step corpus: a hydrostatic tank, a dam break, a droplet, a two-phase layer, each run through every solver variant; class S at frames {1, 2, 10, 60, 300}; class R from the 79 tests and the SPH integration tests; every row at each thread count |
+| **M6 Coupling and MPM** | coupling, mpm | `FlipSolver`: the FLIP/APIC ratio, mass-weighted P2G, projection, `apic_c` auto-resize, `particle_level_set`. Rigid-body coupling: `BodyShape`, quadratic drag, added mass, nearby particles through the neighbour hash. `MpmSolver`: each `ConstitutiveModel` (fluid, elastic, Drucker–Prager in degrees), `validate`, the det(F) clamp, separating walls. Hand codecs for `BodyShape` and `ConstitutiveModel` (data-carrying), derived JSON for `RigidBody` | FLIP: a sloshing tank and a falling block; coupling: a sphere and a box in a flow; MPM: an elastic block, a sand column and a fluid column; the refusals |
+| **M7 Compute, logging and ai** | compute, logging, ai | `ComputeOp`; `PackedParticles` with f32 packing (probe 3); `KernelDerivatives`, including `autodiff_gradient` on hisab's tape with a closure; JSON for the three kernel-parameter types. logging: the sakshi init (and the Chrome-trace check, §1.1). ai: `PvDaimonConfig` and `PvHooshConfig` with their defaults (`http://localhost:8090`, `http://localhost:8088`), their JSON, and a debug print that redacts the API key | packing round trips; derivatives against the oracle (class C) and against finite differences (class R); config defaults and JSON (class A); the redaction |
+| **M8 Release 2.0.0** | all | The Rust-test ledger: each of the 351 unit tests, 33 integration tests and 7 ignored doc tests is ported, folded into golden rows, or marked n/a with a reason. The full surface-parity diff. `docs/benchmarks-rust-v-cyrius.md` with the 23 Rust benchmarks in both columns, plus thread-count rows. The README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' code examples compiled and run. VERSION 2.0.0 | the full corpus green on x86_64 ELF, x86_64 PE and aarch64 |
 
 Order: M0 → M1 → … → M8.
 - Shallow water is self-contained (no hisab, no f32, no particles), so it is the cheapest place to build the
   state loader and the step rows.
-- The grid comes next, because its hisab transcriptions are small function rows.
-- SPH, the largest module at 2,170 lines, comes after probes 2–5 have settled.
+- The grid comes next, because its library questions are small function rows, and its row loops are the
+  simplest first user of the worker pool.
+- SPH, the largest module at 2,170 lines, comes after probes 2–6 have settled.
 - Coupling needs both particles and grids.
 - If a consumer needs SPH first (soorat uses `sph` + `shallow`), M4 and M5 can move ahead of M3.
 
@@ -422,25 +492,26 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 | `cbrt` (2, Manning friction) | `ganita_f64_cbrt`; its comments describe an exact rounding decision, which step 8 measures | class C |
 | `powi` (6) | explicit products in LLVM's square-and-multiply order (as tanmatra) | class B |
 | `to_radians` (1) | `x * (PI / 180.0)` in Rust's order | class B |
-| `as f32`, f32 `*` and `floor`, `as i32` (the neighbour hash and the packing) | probe 3 | class A |
+| `as f32`, f32 `*`, `floor`, `as i32` (the neighbour hash and the packing) | native `f32`: `f32_from` (round to nearest, ties to even), f32 `*`, `f32_to`, `f64_floor`, a saturating convert (probe 3) | class A |
 
-**Typing traps** (from impetus §7.1, probed on 6.7.18):
+**Typing traps** (guide *Types*):
 - An operator is typed by its left operand, so bind builtin and ganita results to a `: f64` local first, and write `-x`, not `(0 - x)`.
+- An `f32` left operand reads the low 32 bits of its right operand, so write `x * f32_from(2.0)`.
+- Comparisons on builtin results compare bit patterns; use `f64_lt` and its siblings.
 - There is no exponent notation.
 - A hex pattern in a `const` is an integer.
 - The `F64_*` stdlib constants are untyped `var`s.
-- Multi-return values are untyped words.
 
-### 7.2 hisab 1.4.0 calls → hisab 3.4.1
+### 7.2 hisab 1.4.0 calls → Cyrius
 
-| Rust (hisab 1.4.0) | hisab 3.4.1 | Plan |
+| Rust (hisab 1.4.0) | Cyrius 6.7.18 / hisab 3.4.1 | Plan |
 |---|---|---|
 | glam `DVec3` arithmetic | `hvec3_*`, which allocate on every operation | pravash-owned `src/vec3.cyr` on f64 locals (probe 2) until H1/H9 |
-| glam `Vec3` (f32) and `SpatialHash` (f32 cells, a `HashMap` of cells) | `spatial_hash_*` (f64 cells; allocates on insert and query) | a pravash-owned neighbour grid (D3) |
+| glam `Vec3` (f32) and `SpatialHash` (f32 cells, a `HashMap` of cells) | `spatial_hash_*` (f64 cells; allocates on insert and query) | a pravash-owned neighbour grid on native `f32` keys (D3), sorted arrays, no per-step allocation |
 | `num::dst`, `num::idst` | `num_dst`, `num_idst` | use them if probe 8 shows the same bits and no per-step leak; otherwise transcribe |
-| `num::conjugate_gradient` (matrix-free linear CG, operator as a closure) | **none**: `opt_conjugate_gradient` is the nonlinear optimiser, and `solve_bicgstab_checked` / `solve_gmres_checked` / `solve_pgs_checked` take CSR matrices | transcribe 1.4.0's (ADR 0003); file P1 |
-| `num::matrix_inverse` (n×n, called on a 3×3) | `m3_inverse_checked`, which decides singularity exactly (class D in impetus) | transcribe 1.4.0's for bit parity (ADR 0003); file P2 |
-| `autodiff::{Tape, Var, reverse_gradient}` | `ad_tape_*` | use it (not per-step); probe 8 checks the bits |
+| `num::conjugate_gradient` (matrix-free linear CG, operator as a closure) | **none** in hisab or ganita | transcribe 1.4.0's (ADR 0003), with the operator as a Cyrius closure; file P1 |
+| `num::matrix_inverse` (n×n by LU with partial pivoting, called on a 3×3) | ganita `mat_inv` (LU with partial pivoting); hisab `m3_inverse_checked`, which decides singularity exactly (class D in impetus) | ganita `mat_inv` if probe 8 shows the same bits and the per-call allocation stays off the step path; otherwise transcribe 1.4.0's (ADR 0003) |
+| `autodiff::{Tape, Var, reverse_gradient}` | `ad_tape_*` | use it (not per-step), with the user's function as a closure; probe 8 checks the bits |
 
 ### 7.3 Types and idioms
 
@@ -449,13 +520,15 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 | `Vec<FluidParticle>`, `&mut [FluidParticle]` | a typed stride array plus a count, per probe 2. Storage comes from freelist or the solver, never `vec` (8-byte words only, and growth never frees) |
 | `ParticleSoa` | column arrays |
 | `Vec<f64>` grid fields and scratch | solver-owned f64 arrays, allocated once and reused; nothing allocates on the step path |
-| payload enums (`BoundaryCondition`, `ConstitutiveModel`, `NonNewtonianViscosity`, `BodyShape`, …) | a kind enum (append-only) plus a payload struct with the union of the fields |
+| data-carrying enums (`BoundaryCondition`, `ConstitutiveModel`, `NonNewtonianViscosity`, `BodyShape`, …) | a kind enum (append-only) plus a payload struct with the union of the fields, because a multi-field variant boxes (§1.1) |
 | `Result<T, PravashError>` | value-form `Result` plus a `PV_ERR_*` code. No `Result` through `callptr` |
-| `Option<T>` | an out-pointer plus 1/0 |
-| closures | function pointers through `fncall*` with a context word |
+| `Option<T>` | the value-form `Option` for one word, otherwise an out-pointer plus 1/0 |
+| `impl Fn` parameters | closures, called through `fncallN` / `callptr` |
+| serde derives | `#derive(Serialize)` / `#derive(Deserialize)`, plus hand codecs in `src/json.cyr` for `DVec3` (`[x, y, z]`) and the data-carrying enums |
+| rayon `par_iter` / `par_chunks_mut` | `src/par.cyr`: a persistent worker pool on `thread_create` and `chan_*`, splitting index ranges, each index writing its own slot; a runtime thread count (D6) |
 | `sort_unstable_by_key` | per probe 5 |
 | `tracing::trace_span!`, `warn!` | sakshi spans and events behind a level |
-| rayon | serial (D6) |
+| `String` config fields | `Str` |
 
 ### 7.4 Names
 
@@ -463,7 +536,8 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
   Constructors are `PvSphSolver_new` and the like.
 - **Globals and enum members** carry `PV_`; private helpers carry `_pv_`.
 - None of the three prefixes collides with the 6.7.18 stdlib or hisab 3.4.1 (checked 2026-11-11). Re-check at
-  M1, because "last definition wins" across files is only a warning.
+  M1, because "last definition wins" across files is only a warning. The derive generates `T_to_json`-style names,
+  so check those too.
 
 ### 7.5 Memory
 
@@ -471,7 +545,8 @@ Probe 1 settles this:
 - **Solver lifetime**: particles, grid fields, neighbour structures and persistent buffers live in storage the
   solver owns, freed by its `_free`.
 - **Step lifetime**: candidate lists, the `accels` arrays (which 1.3 allocates each step) and solver scratch
-  live in a step arena that is reset at the start of every step.
+  live in a step arena that is reset at the start of every step. Each worker thread gets its own slice of it.
+- **JSON** decoding allocates (the derive returns a fresh struct), which is fine: it is never on the step path.
 - **Never `alloc_reset`**: it would wipe the consumer's heap.
 
 ---
@@ -481,20 +556,24 @@ Probe 1 settles this:
 Each gap gets an issue in the owning repo, with the probe or benchmark that shows it.
 
 **hisab**
-- **P1. A matrix-free linear CG**: an operator through a function pointer and context, a relative tolerance,
-  the iteration count returned. 1.4.0's `num::conjugate_gradient` has no 3.x counterpart.
-- **P2. A general n×n `matrix_inverse`**, or a documented statement that only `m3` / `m4` exist.
-- **P3. A spatial-hash rebuild without per-insert allocation, and a neighbour query into a caller's buffer**:
+- **P1. A matrix-free linear CG**: an operator as a closure, a relative tolerance, the iteration count
+  returned. 1.4.0's `num::conjugate_gradient` has no 3.x counterpart, and neither does ganita.
+- **P2. A spatial-hash rebuild without per-insert allocation, and a neighbour query into a caller's buffer**:
   the per-step SPH pattern. It joins impetus's H7 and H9.
 - **A fast DST**, if probe 8 shows `num_dst` is the direct O(N²) form. The roadmap already flags the Rust
   pressure solve's cost.
+
+**Cyrius stdlib**
+- **A stable sort** (`sort_by_zorder`), if probe 5 needs one; impetus asked for it too.
+- **`#derive` support for serde's other shapes**: a vector struct written as an array, and externally tagged
+  data-carrying variants. impetus listed these as not filed; pravash files them with its types as the cases.
+- **A sakshi Chrome-trace exporter**, if M7 finds none.
 
 **Add pravash as a consumer, with its own numbers**, on:
 - cyrius S1 (the scoped allocator);
 - hisab H9 (allocator-scoped calls) and H1 (allocation-free vector math);
 - the ganita correctly rounded tier (D2);
-- impetus's S5 (`memcpy` byte loops: every particle-record copy);
-- the stable-sort request (`sort_by_zorder`).
+- impetus's S5 (`memcpy` byte loops: every particle-record copy).
 
 **cyrius**
 - Add pravash's case to the `cyrius port` clobber issue: a project whose `.gitignore` ignores `Cargo.lock`
@@ -505,10 +584,7 @@ Each gap gets an issue in the owning repo, with the probe or benchmark that show
 ## 9. After 2.0.0
 
 The roadmap plans the work that follows 2.0.0:
-- the bridges;
-- the 1.3.0 audit's deferred physics (D5);
-- the `parallel` path on `thread.cyr`;
-- serde, if wanted (D4);
+- the 1.3.0 audit's deferred physics (D5), each with reference tests;
 - the switch to hisab on the step path once S1 or H9 lands;
 - retiring `rust-old/`.
 
@@ -525,5 +601,5 @@ The roadmap plans the work that follows 2.0.0:
 | M4 SPH foundations | — | — | — | — | |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |
-| M7 Compute and logging | — | — | — | — | |
+| M7 Compute, logging and ai | — | — | — | — | |
 | M8 Release 2.0.0 | — | — | — | — | |

@@ -6,8 +6,11 @@
 
 - [ ] Port to Cyrius with Rust 1.3.0 as the frozen oracle in `rust-old/`: the plan of record is
   [pravash-port-plan.md](pravash-port-plan.md). It follows tanmatra, kimiya and impetus.
+- [ ] 2.0 carries every module and feature: bridge, ai, logging, `parallel` (on `thread.cyr`) and serde (on
+  `#derive`). The plan's §1.1 language review of Cyrius 6.7.18 found no language reason to defer any of them
 - [ ] Before M0: the maintainer decides D1–D6 (plan §0.2): tag/publish 1.3.0, the source of the correctly rounded
-  math, the neighbour-hash keys, serde, the deferred audit items, and the Rust-only features
+  math, when the f32 hash is fixed, how strict JSON compatibility is, the deferred audit physics, and the shape of
+  `parallel`
 - [ ] M0 step 0 (Rust, before the freeze): the hidden `oracle` feature with state dumps for every solver, the
   tracked lockfile, glibc recorded, the 1.3.0 tag
 
