@@ -23,20 +23,34 @@
 //! - `sort_by_zorder` takes the cell size, `i:<n>` and n particles, and gives `v:<n>` the Morton codes in Rust's
 //!   output order (as words; `v:0` when it returns early) and the particles in the stable order on (code, input
 //!   index), which Rust's unstable sort need not keep for ties (ADR 0002 #3): class A on both.
+//!
+//! Part c (from its own seed, after part b's rows): the brute-force density and forces, the free step, the
+//! particle block, splitting and merging. `<ps>` is `i:<n>` and n particles.
+//! - `compute_density` and `pressure_force` take h and `<ps>`, and give each particle's value in index order:
+//!   `v:<n>` densities, `v:<3n>` forces (class B); `viscosity_force` takes h, μ and `<ps>` (class B);
+//! - `step` takes a config (14 tokens, `m_common::config`), μ, `i:<steps>` and `<ps>`, and gives the n particles
+//!   after that many steps, or the first step's `E:` (class S, a trajectory as the shallow-water rows);
+//! - `create_particle_block` takes the origin, the size, the spacing and the mass, and gives `v:<count>` and the
+//!   particles (class A);
+//! - `split_particle` takes the parent (18 tokens), `i:<children>` and the offset, and gives `v:<k>` and the
+//!   children (class C: cos and sin, the corrected oracle where glibc misrounds);
+//! - `merge_particles` takes two particles and gives the merged one (class B).
 
 use hisab::DVec3;
 use pravash::sph::SphSolver;
 use pravash::sph::{
-    NonNewtonianViscosity, batch_distance_squared, batch_poly6, equation_of_state,
-    equation_of_state_tait, kernel_poly6, kernel_spiky_grad, kernel_viscosity_laplacian,
-    kernel_wendland_c2, kernel_wendland_c2_grad, kernel_wendland_c4, kernel_wendland_c4_grad,
-    max_speed, sort_by_zorder, total_kinetic_energy,
+    NonNewtonianViscosity, batch_distance_squared, batch_poly6, compute_density,
+    create_particle_block, equation_of_state, equation_of_state_tait, kernel_poly6,
+    kernel_spiky_grad, kernel_viscosity_laplacian, kernel_wendland_c2, kernel_wendland_c2_grad,
+    kernel_wendland_c4, kernel_wendland_c4_grad, max_speed, merge_particles, pressure_force,
+    sort_by_zorder, split_particle, step, total_kinetic_energy, viscosity_force,
 };
 use pravash::{FluidConfig, FluidParticle};
 
 use crate::grids::{Rng, specials};
-use crate::m_common::particle;
-use crate::tsv::{Class, Module, Tok, f, i};
+use crate::m_common::{config, particle};
+use crate::m_grid::usz;
+use crate::tsv::{Class, Module, Tok, err, f, i};
 
 /// The smoothing radii every kernel is evaluated at: the specials (0, ±∞, NaN, the smallest values), negatives,
 /// the usual SPH range, and sizes whose h⁶ or h⁹ overflows or underflows.
@@ -740,6 +754,420 @@ fn zorder_rows(m: &mut Module, rng: &mut Rng) {
     zorder_row(m, &[], 0.1);
 }
 
+// ── Part c ──────────────────────────────────────────────────────────────────────────
+
+/// `i:<n>` and the particles.
+fn ptoks(ps: &[FluidParticle]) -> Vec<Tok> {
+    let mut v = vec![i(i64::try_from(ps.len()).unwrap_or(0))];
+    for p in ps {
+        v.extend(particle(p));
+    }
+    v
+}
+
+/// A random cloud of n particles in [off, off + l)², z 0 or (3D) in the same range, with velocities in (−1, 1),
+/// densities around ρ₀, pressures of both signs and masses near m.
+fn cloud(rng: &mut Rng, n: usize, l: f64, off: f64, three_d: bool, m: f64) -> Vec<FluidParticle> {
+    (0..n)
+        .map(|_| {
+            let mut p =
+                FluidParticle::new_2d(off + rng.uniform(0.0, l), off + rng.uniform(0.0, l), m);
+            if three_d {
+                p.position.z = off + rng.uniform(0.0, l);
+            }
+            p.velocity = DVec3::new(
+                rng.uniform(-1.0, 1.0),
+                rng.uniform(-1.0, 1.0),
+                if three_d { rng.uniform(-1.0, 1.0) } else { 0.0 },
+            );
+            p.density = rng.uniform(500.0, 1500.0);
+            p.pressure = rng.uniform(-2e3, 2e4);
+            p.mass = m * rng.uniform(0.5, 1.5);
+            p
+        })
+        .collect()
+}
+
+/// The three brute-force rows on one particle set: density, pressure force, viscosity force, for every index.
+fn force_row(m: &mut Module, ps: &[FluidParticle], h: f64, mu: f64) {
+    let n = ps.len();
+    let mut ins = vec![f(h)];
+    ins.extend(ptoks(ps));
+    let mut out = vec![Tok::V(n)];
+    out.extend((0..n).map(|k| f(compute_density(k, ps, h))));
+    m.row("compute_density", Class::B, &ins, &out);
+    let mut out = vec![Tok::V(3 * n)];
+    for k in 0..n {
+        out.extend(pressure_force(k, ps, h).map(f));
+    }
+    m.row("pressure_force", Class::B, &ins, &out);
+    let mut vins = vec![f(h), f(mu)];
+    vins.extend(ptoks(ps));
+    let mut out = vec![Tok::V(3 * n)];
+    for k in 0..n {
+        out.extend(viscosity_force(k, ps, h, mu).map(f));
+    }
+    m.row("viscosity_force", Class::B, &vins, &out);
+}
+
+fn force_rows(m: &mut Module, rng: &mut Rng) {
+    // Random clouds, 2D and 3D, at the usual radii and at ones every pair or no pair is within.
+    for &(n, l, off, three_d, h, mu) in &[
+        (40, 0.3, 0.0, false, 0.05, 0.001),
+        (60, 0.2, -0.1, false, 0.1, 0.01),
+        (50, 0.2, 0.0, true, 0.08, 1.0),
+        (30, 0.1, 5.0, true, 1.0, 0.0),
+        (25, 1.0, 0.0, false, 0.01, -0.5),
+        (1, 1.0, 0.0, false, 0.05, 0.001),
+        (0, 1.0, 0.0, false, 0.05, 0.001),
+    ] {
+        let ps = cloud(rng, n, l, off, three_d, 0.01);
+        force_row(m, &ps, h, mu);
+    }
+    // A lattice on the radius exactly (spacing h: r² = h² is inside, (h·√2)² outside), coincident particles
+    // (r² = 0 < 1e-20, skipped by the forces, counted by the density), and pairs a hair either side of 1e-20.
+    let mut lat = Vec::new();
+    for y in 0..5 {
+        for x in 0..5 {
+            let mut p = FluidParticle::new_2d(
+                crate::m_grid::fx(x) * 0.125,
+                crate::m_grid::fx(y) * 0.125,
+                0.02,
+            );
+            p.density = 1000.0 + crate::m_grid::fx(x + 3 * y);
+            p.pressure = 50.0 * crate::m_grid::fx(x * y) - 300.0;
+            p.velocity = DVec3::new(crate::m_grid::fx(x) * 0.1, -crate::m_grid::fx(y) * 0.2, 0.0);
+            lat.push(p);
+        }
+    }
+    force_row(m, &lat, 0.125, 0.01);
+    let mut dup = cloud(rng, 6, 0.05, 0.0, false, 0.01);
+    dup.push(dup[0]);
+    dup.push(dup[2]);
+    let mut near = dup[1];
+    near.position.x += 9e-11; // r² ≈ 8.1e-21: under 1e-20
+    dup.push(near);
+    let mut far = dup[3];
+    far.position.y += 1.1e-10; // r² ≈ 1.21e-20: over it
+    dup.push(far);
+    force_row(m, &dup, 0.05, 0.1);
+    // Special values: densities at and below the 1e-10 floor (0, negative, NaN, ∞), masses and pressures 0,
+    // negative, NaN and ±∞, a NaN position.
+    let sp = specials();
+    for k in 0..4 {
+        let mut ps = cloud(rng, 16, 0.1, 0.0, k % 2 == 1, 0.01);
+        for (j, p) in ps.iter_mut().enumerate() {
+            match (j + k) % 5 {
+                0 => p.density = sp[(j * 3 + k) % sp.len()],
+                1 => p.mass = sp[(j + 2 * k) % sp.len()],
+                2 => p.pressure = sp[(j * 5 + k) % sp.len()],
+                3 if j == 3 && k == 3 => p.position.x = f64::NAN,
+                _ => {}
+            }
+        }
+        force_row(m, &ps, [0.05, 0.1, 0.03, 0.05][k], 0.001);
+    }
+    // The radius itself: 0, negative, NaN, ∞, huge and tiny (the coefficients over- and underflow).
+    let small = cloud(rng, 8, 0.1, 0.0, false, 0.01);
+    for h in [0.0, -0.05, f64::NAN, f64::INFINITY, 1e40, 1e-40, 1e-3] {
+        force_row(m, &small, h, 0.001);
+    }
+}
+
+/// One step row: `steps` steps of `step` from ps (stopping at the first error, which is the row's output).
+fn step_row(m: &mut Module, ps: &[FluidParticle], cfg: &FluidConfig, mu: f64, steps: usize) {
+    let mut ins = config(cfg);
+    ins.extend([f(mu), usz(steps)]);
+    ins.extend(ptoks(ps));
+    let mut s = ps.to_vec();
+    let mut out = None;
+    for _ in 0..steps {
+        if let Err(x) = step(&mut s, cfg, mu) {
+            out = Some(vec![err(&x)]);
+            break;
+        }
+    }
+    let out = out.unwrap_or_else(|| s.iter().flat_map(particle).collect());
+    m.row("step", Class::S, &ins, &out);
+}
+
+/// A 2D block of water whose interior density is ρ₀: its mass is ρ₀ over the interior particle's density at mass 1.
+fn water_block(nx: usize, ny: usize, sp: f64, ox: f64, oy: f64, h: f64) -> Vec<FluidParticle> {
+    let size = [crate::m_grid::fx(nx) * sp, crate::m_grid::fx(ny) * sp];
+    let mut ps = create_particle_block([ox, oy], size, sp, 1.0);
+    let mid = (ny / 2) * nx + nx / 2;
+    let m = 1000.0 / compute_density(mid.min(ps.len().saturating_sub(1)), &ps, h);
+    for p in &mut ps {
+        p.mass = m;
+    }
+    ps
+}
+
+fn step_rows(m: &mut Module, rng: &mut Rng) {
+    let water = FluidConfig::water_2d();
+    // A dam break: an 8 × 8 block at the floor, its trajectory at 1, 2, 10, 60 and 300 steps.
+    let dam = water_block(8, 8, 0.025, 0.0125, 0.0125, 0.05);
+    for steps in [1, 2, 10, 60, 300] {
+        step_row(m, &dam, &water, 0.001, steps);
+    }
+    // One step from the trajectory's states at frames 1, 10 and 60 (each a row of its own).
+    let mut s = dam.clone();
+    let mut at = 0;
+    for frame in [1, 10, 60] {
+        while at < frame {
+            if step(&mut s, &water, 0.001).is_err() {
+                break;
+            }
+            at += 1;
+        }
+        step_row(m, &s, &water, 0.001, 1);
+    }
+    // A 3D cube in a closed box (every axis has hi > lo), viscous.
+    let mut cube_cfg = FluidConfig::water_2d();
+    cube_cfg.bounds_max = DVec3::new(0.5, 0.5, 0.5);
+    cube_cfg.smoothing_radius = 0.06;
+    let mut cube = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut p = FluidParticle::new_2d(
+                    0.1 + crate::m_grid::fx(x) * 0.03,
+                    0.1 + crate::m_grid::fx(y) * 0.03,
+                    0.02,
+                );
+                p.position.z = 0.1 + crate::m_grid::fx(z) * 0.03;
+                cube.push(p);
+            }
+        }
+    }
+    for steps in [1, 10, 60] {
+        step_row(m, &cube, &cube_cfg, 0.5, steps);
+    }
+    // A random splash: velocities toward and through every wall, z off the 2D plane (water_2d's z has hi = lo, so
+    // only its low wall acts), and the Rust tests' single particles (one falling, one below the floor).
+    let mut splash = cloud(rng, 24, 0.9, 0.05, false, 0.01);
+    for (j, p) in splash.iter_mut().enumerate() {
+        p.velocity = DVec3::new(rng.uniform(-40.0, 40.0), rng.uniform(-40.0, 40.0), 0.0);
+        if j % 6 == 0 {
+            p.position.z = [0.2, -0.2, 0.0, -0.0][(j / 6) % 4];
+        }
+    }
+    for steps in [1, 5, 30] {
+        step_row(m, &splash, &water, 0.01, steps);
+    }
+    let mut one = FluidParticle::new_2d(0.5, 0.5, 0.01);
+    one.density = 1000.0;
+    step_row(m, &[one], &water, 0.001, 1);
+    step_row(m, &[one], &water, 0.001, 50);
+    let mut below = FluidParticle::new_2d(0.5, -0.1, 0.01);
+    below.density = 1000.0;
+    step_row(m, &[below], &water, 0.001, 1);
+    step_row(m, &[], &water, 0.001, 1);
+    // Viscosities 0 and negative, damping 0 and 1, a box whose hi is below lo on no axis but equal on two.
+    let mut cfg = FluidConfig::water_2d();
+    cfg.boundary_damping = 0.0;
+    step_row(m, &splash, &cfg, 0.0, 5);
+    cfg.boundary_damping = 1.0;
+    step_row(m, &splash, &cfg, -0.01, 5);
+    cfg.bounds_max = DVec3::new(1.0, 0.0, 0.0);
+    step_row(m, &splash, &cfg, 0.001, 3);
+    // The errors: each of the config's checks, in its order, and a diverging step (a NaN position, an ∞ mass).
+    let small = cloud(rng, 5, 0.2, 0.3, false, 0.01);
+    for k in 0..9 {
+        let mut c = FluidConfig::water_2d();
+        match k {
+            0 => c.dt = -1.0,
+            1 => c.smoothing_radius = f64::NAN,
+            2 => c.rest_density = 0.0,
+            3 => c.gas_constant = f64::INFINITY,
+            4 => c.boundary_damping = 1.5,
+            5 => c.gravity.y = f64::NAN,
+            6 => c.bounds_min.x = f64::NEG_INFINITY,
+            7 => c.bounds_min.y = 2.0,
+            _ => c.dt = 0.0,
+        }
+        step_row(m, &small, &c, 0.001, 1);
+        step_row(m, &[], &c, 0.001, 1);
+    }
+    let mut nan = small.clone();
+    nan[2].position.y = f64::NAN;
+    step_row(m, &nan, &water, 0.001, 1);
+    // An ∞ mass beside a neighbour: its density, then its pressure, are ∞, and the neighbour's acceleration NaN.
+    let mut inf = small.clone();
+    inf[4].mass = f64::INFINITY;
+    inf[4].position = inf[1].position;
+    inf[4].position.x += 0.01;
+    step_row(m, &inf, &water, 0.001, 1);
+    let mut late = small.clone();
+    late[4].position = late[3].position;
+    late[4].position.x += 1e-3;
+    late[4].pressure = 1e308;
+    late[4].density = f64::NAN;
+    step_row(m, &late, &water, 0.001, 3);
+    // One component diverging alone: an ∞ x velocity reaches a neighbour's x acceleration through viscosity, while y
+    // and z stay finite (Rust checks each).
+    let mut one_axis = small.clone();
+    one_axis[0].position = one_axis[1].position;
+    one_axis[0].position.x += 0.01;
+    one_axis[0].velocity = DVec3::new(f64::INFINITY, 0.0, 0.0);
+    step_row(m, &one_axis, &water, 0.001, 1);
+}
+
+fn block_row(m: &mut Module, origin: [f64; 2], size: [f64; 2], spacing: f64, mass: f64) {
+    let ps = create_particle_block(origin, size, spacing, mass);
+    let ins = [
+        f(origin[0]),
+        f(origin[1]),
+        f(size[0]),
+        f(size[1]),
+        f(spacing),
+        f(mass),
+    ];
+    let mut out = vec![Tok::V(ps.len())];
+    for p in &ps {
+        out.extend(particle(p));
+    }
+    m.row("create_particle_block", Class::A, &ins, &out);
+}
+
+fn block_rows(m: &mut Module, rng: &mut Rng) {
+    // Rust's test shapes, quotients a hair under an integer (0.3/0.1 = 2.9999999999999996, ceil 3), negative and
+    // zero sizes, and the early returns.
+    block_row(m, [0.0, 0.0], [0.1, 0.1], 0.05, 0.01);
+    block_row(m, [1.0, 2.0], [0.1, 0.1], 0.05, 0.01);
+    block_row(m, [0.0, 0.0], [1.0, 1.0], 0.1, 0.01);
+    block_row(m, [0.0, 0.0], [0.3, 0.7], 0.1, 0.001);
+    block_row(m, [-0.25, 0.5], [0.6, 0.2], 0.2, 1.0);
+    block_row(m, [0.0, 0.0], [0.1 + 1e-17, 0.05], 0.05, 0.01);
+    block_row(m, [0.0, 0.0], [-0.5, 0.3], 0.1, 0.01);
+    block_row(m, [0.0, 0.0], [-0.05, 0.3], 0.1, 0.01);
+    block_row(m, [0.0, 0.0], [0.0, 0.3], 0.1, 0.01);
+    block_row(m, [0.0, 0.0], [0.3, -0.0], 0.1, 0.01);
+    for sp in [0.0, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        block_row(m, [0.0, 0.0], [0.3, 0.3], sp, 0.01);
+    }
+    for sz in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        block_row(m, [0.0, 0.0], [sz, 0.3], 0.1, 0.01);
+        block_row(m, [0.0, 0.0], [0.3, sz], 0.1, 0.01);
+    }
+    // Saturated counts: ∞ × ∞ overflows (`checked_mul`: empty) and ∞ × 0 is 0 (empty). A count of 0 along x with ∞
+    // rows would loop 2⁶⁴ times in Rust, so it has no row.
+    block_row(m, [0.0, 0.0], [1e300, 1e300], 1e-300, 0.01);
+    block_row(m, [0.0, 0.0], [1e300, 0.0], 1e-300, 0.01);
+    // NaN and huge origins, NaN and negative masses, a tiny spacing over a small size.
+    block_row(m, [f64::NAN, 0.0], [0.2, 0.2], 0.1, 0.01);
+    block_row(m, [1e300, -1e300], [0.2, 0.2], 0.1, f64::NAN);
+    block_row(m, [0.0, 0.0], [1e-9, 2e-9], 1e-10, -1.0);
+    for _ in 0..10 {
+        let sp = rng.log_uniform(-2.5, -0.5);
+        let size = [rng.uniform(0.0, 12.0) * sp, rng.uniform(0.0, 12.0) * sp];
+        let origin = [rng.uniform(-2.0, 2.0), rng.uniform(-2.0, 2.0)];
+        block_row(m, origin, size, sp, rng.log_uniform(-4.0, 0.0));
+    }
+}
+
+fn split_row(m: &mut Module, parent: &FluidParticle, n: usize, offset: f64) {
+    let mut ins = particle(parent);
+    ins.extend([usz(n), f(offset)]);
+    let ch = split_particle(parent, n, offset);
+    let mut out = vec![Tok::V(ch.len())];
+    for p in &ch {
+        out.extend(particle(p));
+    }
+    m.row("split_particle", Class::C, &ins, &out);
+}
+
+fn split_rows(m: &mut Module, rng: &mut Rng) {
+    let mut parent = FluidParticle::new_2d(0.3, 0.7, 0.04);
+    parent.velocity = DVec3::new(1.5, -0.5, 0.25);
+    parent.density = 1003.0;
+    parent.pressure = 120.0;
+    parent.temperature = 350.0;
+    parent.fuel = 0.4;
+    parent.phase = 2;
+    for n in [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 33, 64] {
+        split_row(m, &parent, n, 0.01);
+    }
+    for offset in [0.0, -0.02, 1e10, f64::NAN, f64::INFINITY] {
+        split_row(m, &parent, 6, offset);
+    }
+    // Child counts with an angle glibc misrounds (an MPFR search over n ≤ 300: n = 19's k = 11 sine, 27's k = 13
+    // sine, 39's k = 1 sine, 52's k = 13 cosine, 61's k = 19 cosine), from the origin so the ulp shows.
+    let origin = FluidParticle::new_2d(0.0, 0.0, 1.0);
+    for n in [19, 27, 39, 52, 61] {
+        split_row(m, &origin, n, 1.0);
+    }
+    // Parents with special masses and positions.
+    let sp = specials();
+    for k in 0..6 {
+        let mut p = FluidParticle::new_2d(rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0), 0.01);
+        match k {
+            0 => p.mass = 0.0,
+            1 => p.mass = f64::NAN,
+            2 => p.mass = -0.5,
+            3 => p.position.x = f64::INFINITY,
+            4 => p.mass = sp[3],
+            _ => p.position.z = 0.75,
+        }
+        split_row(m, &p, 3 + k, rng.uniform(0.0, 0.05));
+    }
+}
+
+fn merge_rows(m: &mut Module, rng: &mut Rng) {
+    let sp = specials();
+    let rnd = |rng: &mut Rng, phase: u8| {
+        let mut p = FluidParticle::new_2d(rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0), 0.0);
+        p.position.z = rng.uniform(-1.0, 1.0);
+        p.velocity = DVec3::new(
+            rng.uniform(-2.0, 2.0),
+            rng.uniform(-2.0, 2.0),
+            rng.uniform(-2.0, 2.0),
+        );
+        p.acceleration = DVec3::new(rng.uniform(-9.0, 9.0), 1.0, 2.0);
+        p.density = rng.uniform(900.0, 1100.0);
+        p.pressure = rng.uniform(-500.0, 5000.0);
+        p.mass = rng.log_uniform(-4.0, 0.0);
+        p.phase = phase;
+        p.conformation = [
+            rng.uniform(0.5, 1.5),
+            rng.uniform(-0.1, 0.1),
+            rng.uniform(0.5, 1.5),
+        ];
+        p.temperature = rng.uniform(250.0, 400.0);
+        p.fuel = rng.uniform(0.0, 1.0);
+        p
+    };
+    for k in 0..30 {
+        let a = rnd(rng, (k % 3) as u8);
+        let mut b = rnd(rng, 1);
+        match k {
+            20 => b.mass = -a.mass,
+            21 => {
+                b.mass = 0.0;
+            }
+            22 => b.mass = f64::NAN,
+            23 => b.mass = f64::INFINITY,
+            24 => b.position.x = f64::NAN,
+            25 => b.density = f64::NEG_INFINITY,
+            26 => b.mass = sp[(k * 7) % sp.len()],
+            27 => b.mass = -2.0,
+            _ => {}
+        }
+        let mut a2 = a;
+        if k == 21 {
+            a2.mass = 0.0;
+        }
+        let mut ins = particle(&a2);
+        ins.extend(particle(&b));
+        m.row(
+            "merge_particles",
+            Class::B,
+            &ins,
+            &particle(&merge_particles(&a2, &b)),
+        );
+    }
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -752,5 +1180,12 @@ pub fn emit() -> Module {
     let mut rng = Rng::new(0x0_5f4b);
     neighbor_rows(&mut m, &mut rng);
     zorder_rows(&mut m, &mut rng);
+    // Part c's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f4c);
+    force_rows(&mut m, &mut rng);
+    step_rows(&mut m, &mut rng);
+    block_rows(&mut m, &mut rng);
+    split_rows(&mut m, &mut rng);
+    merge_rows(&mut m, &mut rng);
     m
 }

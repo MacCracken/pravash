@@ -1090,6 +1090,143 @@ fn bench_sph_b() {
     return 0;
 }
 
+# ── sph, part c (M4) ──
+# Rust's criterion groups on the same inputs: `sph_density/<n>_particles` (particle 0's density in a unit block at
+# spacing 1/√n, h 0.05), `sph_step/<count>_particles` (one free step of the block at (0.1, 0.3), size 0.5, spacing
+# 1/√n for n = 25, 100, 225, under water_2d at water's viscosity) and `sph_pressure_force/625_particles` (the 0.5
+# block at 0.02, density 1000, pressure 100). Criterion's `iter_batched` clones the step's particles outside the
+# timing; here each step copies them in by assignment, about 12 ns a particle. sph_c/*: against
+# scripts/probes/rust/src/bin/bench_sph_c.rs (bodies in its header).
+
+# "<prefix><n><suffix>" as a C string (criterion's `{n}_particles` names).
+fn _bench_name_n(prefix, n, suffix): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_int(sb, n);
+    str_builder_add_cstr(sb, suffix);
+    var s = str_builder_build(sb);
+    var out = alloc(str_len(s) + 1);
+    memcpy(out, str_data(s), str_len(s));
+    store8(out + str_len(s), 0);
+    return out;
+}
+
+# One `sph_density` row: `iters` calls on a unit block at spacing 1/√n.
+fn _bench_density(n, iters) {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var sp: f64 = 1.0 / rt;
+    var bp, bn = create_particle_block(0.0, 0.0, 1.0, 1.0, sp, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var b = bench_new(_bench_name_n("sph_density/", n, "_particles"));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var d: f64 = compute_density(0, ps, bn, 0.05);
+        g_sink = g_sink ^ _pv_bits(d);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(bp);
+    return 0;
+}
+
+# One `sph_step` row: `iters` steps of a fresh copy of the block at spacing 1/√n.
+fn _bench_free_step(n, iters) {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var sp: f64 = 1.0 / rt;
+    var bp, bn = create_particle_block(0.1, 0.3, 0.5, 0.5, sp, 0.001);
+    var src: *PvFluidParticle = _pv_as_particles(bp);
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(bn * sizeof(PvFluidParticle)));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+    var b = bench_new(_bench_name_n("sph_step/", bn, "_particles"));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        for (var c = 0; c < bn; c = c + 1) {
+            var d: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *d = *e;
+        }
+        var t, v = sph_step(work, bn, &cfg, mu);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(work);
+    fl_free(bp);
+    return 0;
+}
+
+# The part c benches (M4 part c): Rust's criterion groups and the bench_sph_c.rs twins.
+fn bench_sph_c() {
+    _bench_density(100, 200000);
+    _bench_density(500, 50000);
+    _bench_density(1000, 20000);
+    _bench_free_step(25, 20000);
+    _bench_free_step(100, 5000);
+    _bench_free_step(225, 1000);
+    var fp, fcount = create_particle_block(0.0, 0.0, 0.5, 0.5, 0.02, 0.001);
+    var f: *PvFluidParticle = _pv_as_particles(fp);
+    for (var i = 0; i < fcount; i = i + 1) {
+        var q: *PvFluidParticle = f + i;
+        q.density = 1000.0;
+        q.pressure = 100.0;
+    }
+    var bf = bench_new("sph_pressure_force/625_particles");
+    bench_batch_start(bf);
+    for (var k = 0; k < 20000; k = k + 1) {
+        var pv: PvVec3 = pressure_force(0, f, fcount, 0.05);
+        g_sink = g_sink ^ _pv_bits(pv.x);
+    }
+    bench_batch_stop(bf, 20000);
+    bench_report(bf);
+    var bv = bench_new("sph_c/viscosity_force_625");
+    bench_batch_start(bv);
+    for (var k2 = 0; k2 < 20000; k2 = k2 + 1) {
+        var vv: PvVec3 = viscosity_force(0, f, fcount, 0.05, 0.001);
+        g_sink = g_sink ^ _pv_bits(vv.x);
+    }
+    bench_batch_stop(bv, 20000);
+    bench_report(bv);
+    fl_free(fp);
+    var bb = bench_new("sph_c/create_particle_block_1000");
+    bench_batch_start(bb);
+    for (var k3 = 0; k3 < 2000; k3 = k3 + 1) {
+        var cp, cn = create_particle_block(0.1, 0.3, 1.0, 0.625, 0.025, 0.001);
+        var c999: *PvFluidParticle = _pv_as_particles(cp) + 999;
+        g_sink = g_sink ^ cn ^ _pv_bits(c999.position.x);
+        fl_free(cp);
+    }
+    bench_batch_stop(bb, 2000);
+    bench_report(bb);
+    var parent: PvFluidParticle = PvFluidParticle_new_2d(0.3, 0.7, 0.04);
+    parent.velocity = PvVec3_new(1.5, -0.5, 0.25);
+    var bs = bench_new("sph_c/split_particle_8");
+    bench_batch_start(bs);
+    for (var k4 = 0; k4 < 200000; k4 = k4 + 1) {
+        var sp, sn = split_particle(&parent, 8, 0.01);
+        var s7: *PvFluidParticle = _pv_as_particles(sp) + 7;
+        g_sink = g_sink ^ _pv_bits(s7.position.y);
+        fl_free(sp);
+    }
+    bench_batch_stop(bs, 200000);
+    bench_report(bs);
+    var ma: PvFluidParticle = PvFluidParticle_new_2d(0.1, 0.2, 0.01);
+    ma.velocity = PvVec3_new(1.0, 2.0, 0.0);
+    var mb: PvFluidParticle = PvFluidParticle_new_2d(0.3, 0.1, 0.03);
+    mb.velocity = PvVec3_new(-1.0, 0.5, 0.0);
+    var bm = bench_new("sph_c/merge_particles");
+    bench_batch_start(bm);
+    for (var k5 = 0; k5 < 1000000; k5 = k5 + 1) {
+        var mm: PvFluidParticle = merge_particles(&ma, &mb);
+        g_sink = g_sink ^ _pv_bits(mm.position.x);
+    }
+    bench_batch_stop(bm, 1000000);
+    bench_report(bm);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1117,6 +1254,7 @@ fn main(): i64 {
     bench_threads();
     bench_sph_a();
     bench_sph_b();
+    bench_sph_c();
     return 0;
 }
 

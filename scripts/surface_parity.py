@@ -47,14 +47,16 @@ NOT_APPLICABLE_MODULES = {
 ENUM_NAMES = {"PravashError": "PvError"}
 ENUM_PREFIX = {"PravashError": "PV_ERR_"}
 # Rust function -> the Cyrius function that provides it, where the naming rules give another name.
-FN_RENAMES = {}
+FN_RENAMES = {
+    # sph's free `step`: one namespace serves pravash and its consumers, and a bare `step` is the likeliest to
+    # collide (ADR 0002 #17).
+    "step": "sph_step",
+}
 # Rust field -> the Cyrius fields that carry it.
 FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    **{f: "M4 part c" for f in ("compute_density", "pressure_force", "viscosity_force", "step", "split_particle",
-                                "merge_particles", "create_particle_block")},
     **{f: "M4 part d" for f in ("update_viscoelastic", "update_heat", "update_phase_change", "update_reaction",
                                 "update_combustion", "apply_contact_angle", "apply_delta_sph",
                                 "compute_gradient_corrections", "apply_gradient_correction", "apply_implicit_viscosity",

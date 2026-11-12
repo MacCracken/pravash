@@ -678,7 +678,8 @@ def fdiv(a, b):
         if a != a or a == 0.0:
             return math.nan
         return math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b))
-GLIBC = {"exp": _libm.exp, "log": _libm.log, "log10": _libm.log10, "pow": _libm.pow}
+GLIBC = {"exp": _libm.exp, "log": _libm.log, "log10": _libm.log10, "pow": _libm.pow, "sin": _libm.sin,
+         "cos": _libm.cos}
 
 
 def r_terminal(m, g, rho, cd, a):
@@ -2549,7 +2550,8 @@ def mpfr_logged(log):
             log.append(f"pow(f:{bits(x):016x}, f:{bits(y):016x}) glibc f:{bits(got):016x} "
                        f"correctly rounded f:{bits(want):016x}")
         return want
-    return {"exp": unary("exp", "exp"), "log": unary("log", "log"), "log10": unary("log10", "log10"), "pow": pw}
+    return {"exp": unary("exp", "exp"), "log": unary("log", "log"), "log10": unary("log10", "log10"), "pow": pw,
+            "sin": unary("sin", "sin"), "cos": unary("cos", "cos")}
 
 
 # ── vof and phase_field (M3 part d) ─────────────────────────────────────────────────────────
@@ -3066,6 +3068,193 @@ def sph_want(func, x, P):
         for q in ps:
             m = r_max(m, v3_len2(q["vel"]))
         return [math.sqrt(m) if m == m and m >= 0.0 else m]
+    return sph_c_want(func, x, P)
+
+
+# ── sph part c (M4): the brute-force sums, the free step, the block, split and merge ──
+# A particle is its 18 token values as a list (m_common::particle's order): position 0–2, velocity 3–5,
+# acceleration 6–8, density 9, pressure 10, mass 11, phase 12, conformation 13–15, temperature 16, fuel 17.
+
+def kc_spiky(kc, r):
+    if r > kc[0] or r <= 0.0:
+        return 0.0
+    d = kc[0] - r
+    return kc[3] * d * d
+
+
+def kc_visc(kc, r):
+    if r > kc[0] or r <= 0.0:
+        return 0.0
+    return kc[4] * (kc[0] - r)
+
+
+def pd2(a, b):
+    """`distance_squared_to`: glam's (dx² + dy²) + dz², d = a − b."""
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    return dx * dx + dy * dy + dz * dz
+
+
+def r_density(pi, ps, kc):
+    d = 0.0
+    for q in ps:
+        r2 = pd2(pi, q)
+        if r2 <= kc[1]:
+            d += q[11] * kc_poly6(kc, r2)
+    return d
+
+
+def r_pair_force(i, ps, kc, mu, kind):
+    """`pressure_force` (kind "p") or `viscosity_force` (kind "v") on particle i."""
+    pi = ps[i]
+    f = [0.0, 0.0, 0.0]
+    rho_i = r_max(pi[9], SPH_MIN_DENSITY)
+    for j, pj in enumerate(ps):
+        if j == i:
+            continue
+        r2 = pd2(pi, pj)
+        if r2 > kc[1] or r2 < 1e-20:
+            continue
+        r = math.sqrt(r2)
+        rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+        if kind == "p":
+            sym = fdiv(pi[10], rho_i * rho_i) + fdiv(pj[10], rho_j * rho_j)
+            scale = fdiv(-pi[11] * pj[11] * sym * kc_spiky(kc, r), r)
+            for a in range(3):
+                f[a] += scale * (pi[a] - pj[a])
+        else:
+            scale = fdiv(mu * pj[11] * kc_visc(kc, r), rho_j)
+            for a in range(3):
+                f[a] += scale * (pj[3 + a] - pi[3 + a])
+    return f
+
+
+def r_sph_step(ps, c, mu):
+    """sph.rs `step` on ps (lists, changed in place): None, or the error token."""
+    e = r_validate(c)
+    if e:
+        return e
+    n = len(ps)
+    if n == 0:
+        return None
+    kc = kc_new(c[4])
+    dens = [r_density(p, ps, kc) for p in ps]
+    for p, d in zip(ps, dens):
+        p[9] = d
+        p[10] = c[5] * (d - c[6])
+    snap = [list(p) for p in ps]
+    for i, pi in enumerate(snap):
+        acc = [c[1], c[2], c[3]]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        for j, pj in enumerate(snap):
+            if j == i:
+                continue
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            rho_j = r_max(pj[9], SPH_MIN_DENSITY)
+            sym = fdiv(pi[10], rho * rho) + fdiv(pj[10], rho_j * rho_j)
+            p_scale = fdiv(-pj[11] * sym * kc_spiky(kc, r), r)
+            for a in range(3):
+                acc[a] += p_scale * (pi[a] - pj[a])
+            v_scale = fdiv(fdiv(mu * pj[11] * kc_visc(kc, r), rho_j), rho)
+            for a in range(3):
+                acc[a] += v_scale * (pj[3 + a] - pi[3 + a])
+        if not all(fin(a) for a in acc):
+            return "E:Diverged"
+        ps[i][6:9] = acc
+    dt = c[0]
+    for p in ps:
+        for a in range(3):
+            p[3 + a] = p[3 + a] + p[6 + a] * dt
+        for a in range(3):
+            p[a] = p[a] + p[3 + a] * dt
+    lo, hi, damp = c[7:10], c[10:13], c[13]
+    for p in ps:
+        for a in range(3):
+            if p[a] < lo[a]:
+                p[a] = lo[a]
+                p[3 + a] *= -damp
+            elif p[a] > hi[a] and hi[a] > lo[a]:
+                p[a] = hi[a]
+                p[3 + a] *= -damp
+    return None
+
+
+def r_block(ox, oy, sx, sy, sp, m):
+    """`create_particle_block`'s particles."""
+    if not (fin(sp) and sp > 0.0) or not fin(sx) or not fin(sy):
+        return []
+    nx = r_as_usize(_libm.ceil(fdiv(sx, sp)))
+    ny = r_as_usize(_libm.ceil(fdiv(sy, sp)))
+    if nx * ny >= 2 ** 64:
+        return []
+    return [r_particle([ox + float(ix) * sp, oy + float(iy) * sp, 0.0], m) for iy in range(ny) for ix in range(nx)]
+
+
+def r_split(parent, n, off, P):
+    """`split_particle`'s children, cos and sin from P."""
+    if n == 0:
+        return []
+    if n == 1:
+        return [list(parent)]
+    cm = fdiv(parent[11], float(n))
+    out = []
+    for k in range(n):
+        angle = fdiv(2.0 * PI * float(k), float(n))
+        ch = list(parent)
+        ch[11] = cm
+        ch[0] = ch[0] + off * P["cos"](angle)
+        ch[1] = ch[1] + off * P["sin"](angle)
+        out.append(ch)
+    return out
+
+
+def r_merge(a, b):
+    """`merge_particles`."""
+    total = a[11] + b[11]
+    inv = fdiv(1.0, r_max(total, 1e-20))
+    w = lambda k: (a[k] * a[11] + b[k] * b[11]) * inv
+    return ([w(0), w(1), w(2), w(3), w(4), w(5), 0.0, 0.0, 0.0, w(9), w(10), total, a[12]]
+            + list(a[13:16]) + [w(16), w(17)])
+
+
+def sph_c_want(func, x, P):
+    """A part c sph row's recomputed outputs, or None for another function."""
+    def parts(k):
+        n = x[k]
+        return [list(x[k + 1 + 18 * j:k + 19 + 18 * j]) for j in range(n)]
+
+    if func in ("compute_density", "pressure_force"):
+        h = x[0]
+        ps = parts(1)
+        kc = kc_new(h)
+        if func == "compute_density":
+            return [("v", len(ps))] + [r_density(p, ps, kc) for p in ps]
+        return [("v", 3 * len(ps))] + [c for i in range(len(ps)) for c in r_pair_force(i, ps, kc, 0.0, "p")]
+    if func == "viscosity_force":
+        h, mu = x[0], x[1]
+        ps = parts(2)
+        kc = kc_new(h)
+        return [("v", 3 * len(ps))] + [c for i in range(len(ps)) for c in r_pair_force(i, ps, kc, mu, "v")]
+    if func == "step":
+        c, mu, steps = list(x[0:14]), x[14], x[15]
+        ps = parts(16)
+        for _ in range(steps):
+            e = r_sph_step(ps, c, mu)
+            if e:
+                return [e]
+        return [v for p in ps for v in p]
+    if func == "create_particle_block":
+        ps = r_block(*x[0:6])
+        return [("v", len(ps))] + [v for p in ps for v in p]
+    if func == "split_particle":
+        ch = r_split(list(x[0:18]), x[18], x[19], P)
+        return [("v", len(ch))] + [v for p in ch for v in p]
+    if func == "merge_particles":
+        return r_merge(list(x[0:18]), list(x[18:36]))
     return None
 
 
@@ -3127,7 +3316,8 @@ def corrections(module, rows):
             seen = list(dict.fromkeys(log))
             out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
             continue
-        if module == "sph" and fn in ("equation_of_state_tait", "NonNewtonianViscosity::effective_viscosity"):
+        if module == "sph" and fn in ("equation_of_state_tait", "NonNewtonianViscosity::effective_viscosity",
+                                      "split_particle"):
             x = [tok_val(t) for t in ins]
             want = sph_want(fn, x, mpfr_logged(log))
             got = [tok_val(t) for t in outs]

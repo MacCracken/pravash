@@ -4,8 +4,9 @@
 # `step` is an assertion that every call was Ok). M3 (parts a–b): the five grid tests, in `test_grid` (Rust's two
 # grid sections, then grid_invalid_dx_rejected from its edge cases; `is_err()` is the `PV_ERR_*` code Rust's path
 # returns), and serde_roundtrip_all_types, whose four types all read and write JSON now (serde_json is `to_json` /
-# `Pv*_from_json`). The rest arrive with their milestones:
-# - the SPH and solver tests: M4–M5;
+# `Pv*_from_json`). M4 part c: the four free-function SPH tests, in `test_sph` (Rust's `sph::step` is `sph_step`,
+# ADR 0002 #17; `.unwrap()` asserts every step was Ok). The rest arrive with their milestones:
+# - the solver tests: M5;
 # - the coupling and FLIP tests: M6.
 
 include "tests/lib.cyr"
@@ -19,6 +20,71 @@ fn near(a: f64, b: f64, tol: f64): i64 {
 }
 
 var F64_EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
+
+# `steps` free SPH steps of the n particles at ps under water_2d at viscosity mu: the number that returned Err. With
+# `ke` 1, also the largest total kinetic energy seen, and whether every one was finite.
+fn sph_run(ps: *PvFluidParticle, n, steps, mu: f64, ke) {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var errs = 0;
+    var max_ke: f64 = 0.0;
+    var finite = 1;
+    for (var k = 0; k < steps; k = k + 1) {
+        var t, v = sph_step(ps, n, &cfg, mu);
+        if (is_err_result(t) == 1) { errs = errs + 1; }
+        if (ke == 1) {
+            var e: f64 = total_kinetic_energy(ps, n);
+            if (_pv_is_finite(e) == 0) { finite = 0; }
+            max_ke = _pv_max(max_ke, e);
+        }
+    }
+    return (errs, _pv_bits(max_ke), finite);
+}
+
+# The four SPH tests of the free functions (M4 part c), in Rust's order.
+fn test_sph() {
+    var mu: f64 = PV_FLUID_MATERIAL_WATER_VISCOSITY;
+
+    test_group("sph_dam_break_energy_bounded");
+    var dp, dn = create_particle_block(0.1, 0.3, 0.2, 0.3, 0.02, 0.001);
+    var d: *PvFluidParticle = _pv_as_particles(dp);
+    var de, dk, df = sph_run(d, dn, 200, mu, 1);
+    var max_ke: f64 = dk;
+    assert_eq(de, 0, "200 steps, every one Ok");
+    assert_eq(df, 1, "the kinetic energy stays finite");
+    assert(max_ke < 1000000.0, "the kinetic energy stays bounded");
+    fl_free(dp);
+
+    test_group("sph_particles_stay_in_bounds");
+    var bp, bn = create_particle_block(0.1, 0.5, 0.3, 0.3, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var be, bk, bf = sph_run(b, bn, 500, mu, 0);
+    assert_eq(be, 0, "500 steps, every one Ok");
+    var out = 0;
+    for (var i = 0; i < bn; i = i + 1) {
+        var p: *PvFluidParticle = b + i;
+        var x: f64 = p.position.x;
+        var y: f64 = p.position.y;
+        if (x >= 0.0 && x <= 1.0 && y >= 0.0 && y <= 1.0) {} else { out = out + 1; }
+    }
+    assert_eq(out, 0, "every particle inside [0, 1]²");
+    fl_free(bp);
+
+    test_group("sph_config_validation_catches_bad_params");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    cfg.dt = 0.0;
+    var vp, vn = create_particle_block(0.1, 0.1, 0.1, 0.1, 0.05, 0.001);
+    var vt, vv = sph_step(_pv_as_particles(vp), vn, &cfg, 0.001);
+    assert_eq(is_err_result(vt), 1, "dt = 0 is refused");
+    fl_free(vp);
+
+    test_group("sph_single_particle_gravity");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.8, 0.01);
+    one.density = 1000.0;
+    var y0: f64 = one.position.y;
+    var oe, ok, of = sph_run(&one, 1, 10, 0.001, 0);
+    assert(oe == 0 && one.position.y < y0, "it falls under gravity");
+    return 0;
+}
 
 # The error code of `PvFluidGrid_new` (PV_ERR_NONE when it built: *g then holds storage to drop).
 fn grid_new_err(g: *PvFluidGrid, nx, ny, dx: f64): i64 {
@@ -237,6 +303,7 @@ fn test_shallow() {
 # Runs the ported integration tests.
 fn main() {
     alloc_init();
+    test_sph();
     test_grid();
     test_shallow();
     var pi: f64 = PV_F64_PI;

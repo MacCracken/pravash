@@ -1222,6 +1222,88 @@ fn _par_sph(fp, fl): i64 {
         fl_free(zb);
         return 1;
     }
+    if (_par_eq(fp, fl, "compute_density") == 1 || _par_eq(fp, fl, "pressure_force") == 1
+      || _par_eq(fp, fl, "viscosity_force") == 1) {
+        # Each particle's value, in index order (part c).
+        var fh: f64 = _par_in(0);
+        var fmu: f64 = 0.0;
+        var fk = 1;
+        if (_par_eq(fp, fl, "viscosity_force") == 1) {
+            fmu = _par_in(1);
+            fk = 2;
+        }
+        var fnp = _par_in(fk);
+        var fb = fl_alloc(fnp * sizeof(PvFluidParticle) + 8);
+        var fps: *PvFluidParticle = _pv_as_particles(fb);
+        for (var f1 = 0; f1 < fnp; f1 = f1 + 1) { _par_particle_in(fk + 1 + f1 * 18, fps + f1); }
+        if (_par_eq(fp, fl, "compute_density") == 1) {
+            _par_got_seq(fnp);
+            for (var f2 = 0; f2 < fnp; f2 = f2 + 1) {
+                var dv: f64 = compute_density(f2, fps, fnp, fh);
+                _par_got_f(_pv_bits(dv));
+            }
+        } else {
+            _par_got_seq(3 * fnp);
+            for (var f3 = 0; f3 < fnp; f3 = f3 + 1) {
+                var fv: PvVec3 = pressure_force(f3, fps, fnp, fh);
+                if (fk == 2) { fv = viscosity_force(f3, fps, fnp, fh, fmu); }
+                _par_got_f(_pv_bits(fv.x));
+                _par_got_f(_pv_bits(fv.y));
+                _par_got_f(_pv_bits(fv.z));
+            }
+        }
+        fl_free(fb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "step") == 1) {
+        # The free step (`sph_step`), `steps` times, stopping at the first error.
+        var sc: PvFluidConfig;
+        _par_config_in(0, &sc);
+        var smu: f64 = _par_in(14);
+        var ssteps = _par_in(15);
+        var snp = _par_in(16);
+        var sb = fl_alloc(snp * sizeof(PvFluidParticle) + 8);
+        var sps: *PvFluidParticle = _pv_as_particles(sb);
+        for (var s1 = 0; s1 < snp; s1 = s1 + 1) { _par_particle_in(17 + s1 * 18, sps + s1); }
+        for (var s2 = 0; s2 < ssteps; s2 = s2 + 1) {
+            var st, sv = sph_step(sps, snp, &sc, smu);
+            if (is_err_result(st) == 1) {
+                _par_got_err(sv);
+                fl_free(sb);
+                return 1;
+            }
+        }
+        for (var s3 = 0; s3 < snp; s3 = s3 + 1) { _par_particle_out(sps + s3); }
+        fl_free(sb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "create_particle_block") == 1) {
+        var bp, bn = create_particle_block(_par_in(0), _par_in(1), _par_in(2), _par_in(3), _par_in(4), _par_in(5));
+        _par_got_seq(bn);
+        var bps: *PvFluidParticle = _pv_as_particles(bp);
+        for (var b1 = 0; b1 < bn; b1 = b1 + 1) { _par_particle_out(bps + b1); }
+        if (bp != 0) { fl_free(bp); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "split_particle") == 1) {
+        var parent: PvFluidParticle;
+        _par_particle_in(0, &parent);
+        var cp, cn = split_particle(&parent, _par_in(18), _par_in(19));
+        _par_got_seq(cn);
+        var cps: *PvFluidParticle = _pv_as_particles(cp);
+        for (var c1 = 0; c1 < cn; c1 = c1 + 1) { _par_particle_out(cps + c1); }
+        if (cp != 0) { fl_free(cp); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "merge_particles") == 1) {
+        var ma: PvFluidParticle;
+        var mb: PvFluidParticle;
+        _par_particle_in(0, &ma);
+        _par_particle_in(18, &mb);
+        var mm: PvFluidParticle = merge_particles(&ma, &mb);
+        _par_particle_out(&mm);
+        return 1;
+    }
     if (_par_eq(fp, fl, "total_kinetic_energy") == 1 || _par_eq(fp, fl, "max_speed") == 1) {
         var np = _par_in(0);
         var buf = fl_alloc(np * sizeof(PvFluidParticle) + 8);
@@ -2165,6 +2247,11 @@ fn _par_c_bound(fp, fl): i64 {
     # oracle bit for bit (the oracle's own where glibc rounded correctly).
     if (_par_eq(fp, fl, "equation_of_state_tait") == 1) { return 0; }
     if (_par_eq(fp, fl, "NonNewtonianViscosity::effective_viscosity") == 1) { return 0; }
+    # M4 part c: the split ring's cosines and sines are correctly rounded and the rest is Rust's arithmetic in order,
+    # so each row equals the corrected oracle bit for bit. The free step (class S) is +, −, ×, ÷ and √ in Rust's
+    # order, so every particle of every row is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "split_particle") == 1) { return 0; }
+    if (_par_eq(fp, fl, "step") == 1) { return 0; }
     return 0 - 1;
 }
 

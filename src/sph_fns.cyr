@@ -1,0 +1,420 @@
+# sph_fns.cyr — the SPH free functions of rust-old/src/sph.rs (M4 parts c and d).
+#
+# Part c: the brute-force O(n²) density and forces, the free step (`sph_step`: Rust's `step`, renamed because one
+# namespace serves pravash and its consumers, ADR 0002 #17), the particle block, and adaptive splitting and
+# merging. Every formula is Rust's, in its operation order. The pair loops write the particle distance out (glam's
+# ((dx² + dy²) + dz²) with d = xᵢ − xⱼ, as `distance_squared_to`): the same bits without a call per pair.
+#
+# `step` keeps Rust's two per-call buffers (the densities, the snapshot the forces read) as one freelist block,
+# freed before it returns: the heap is flat across steps (port plan §7.5).
+#
+# UPSTREAM(L7): ganita:docs/development/issues/2026-11-11-mat-inv-allocates-per-call.md
+#   part d's MLS 3×3 inverse (an allocation-free copy of ganita's `mat_inv` algorithm) lands in this file; replace
+#   it with ganita's `mat_inv_into` once it ships; parity: the MLS gradient-correction rows.
+
+# ── density and the forces (brute force) ────────────────────────────────────────────
+
+# Σ m_j·poly6(r²) over the n particles at ps within h of *pi (r² ≤ h², *pi itself included), from +0, at the
+# coefficients kc. Mirrors the private `compute_density_inner`.
+#must_use
+fn _pv_density_sum(pi: *PvFluidParticle, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs): f64 {
+    var px: f64 = pi.position.x;
+    var py: f64 = pi.position.y;
+    var pz: f64 = pi.position.z;
+    var h2: f64 = kc.h2;
+    var density: f64 = 0.0;
+    for (var j = 0; j < n; j = j + 1) {
+        var pj: *PvFluidParticle = ps + j;
+        var dx: f64 = px - pj.position.x;
+        var dy: f64 = py - pj.position.y;
+        var dz: f64 = pz - pj.position.z;
+        var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        if (r2 <= h2) {
+            var w: f64 = _pv_kc_poly6(kc, r2);
+            var mw: f64 = pj.mass * w;
+            density = density + mw;
+        }
+    }
+    return density;
+}
+
+# The density of particle idx of the n at ps, by brute force over all n at smoothing radius h. NaN for idx outside
+# [0, n) (Rust panics; ADR 0002 #8). Mirrors `compute_density`.
+#must_use
+fn compute_density(idx, ps: *PvFluidParticle, n, h: f64): f64 {
+    if (idx < 0 || idx >= n) {
+        var nan: f64 = PV_F64_NAN;
+        return nan;
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var d: f64 = _pv_density_sum(ps + idx, ps, n, &kc);
+    return d;
+}
+
+# The symmetric, momentum-conserving pressure force on particle idx of the n at ps, by brute force:
+# Σⱼ (((−mᵢ·mⱼ)·(pᵢ/ρᵢ² + pⱼ/ρⱼ²))·∇W(r))/r · (xᵢ − xⱼ), over j ≠ idx with 1e-20 ≤ r² ≤ h², each ρ floored at
+# 1e-10 (NaN-ignoring), from +0. (NaN, NaN, NaN) for idx outside [0, n) (Rust panics). Mirrors `pressure_force`
+# (its [f64; 3] as a PvVec3, ADR 0002 #17).
+#must_use
+fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
+    if (idx < 0 || idx >= n) {
+        var nan: f64 = PV_F64_NAN;
+        return PvVec3_new(nan, nan, nan);
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var pi: *PvFluidParticle = ps + idx;
+    var px: f64 = pi.position.x;
+    var py: f64 = pi.position.y;
+    var pz: f64 = pi.position.z;
+    var rho_i: f64 = _pv_max(pi.density, lo);
+    var a: f64 = pi.pressure / (rho_i * rho_i);
+    var mi: f64 = pi.mass;
+    var nmi: f64 = -mi;
+    var fx: f64 = 0.0;
+    var fy: f64 = 0.0;
+    var fz: f64 = 0.0;
+    for (var j = 0; j < n; j = j + 1) {
+        if (j != idx) {
+            var pj: *PvFluidParticle = ps + j;
+            var dx: f64 = px - pj.position.x;
+            var dy: f64 = py - pj.position.y;
+            var dz: f64 = pz - pj.position.z;
+            var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+            if ((r2 > h2 || r2 < tiny) == 0) {
+                var r: f64 = f64_sqrt(r2);
+                var rho_j: f64 = _pv_max(pj.density, lo);
+                var b: f64 = pj.pressure / (rho_j * rho_j);
+                var sym: f64 = a + b;
+                var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                var scale: f64 = (((nmi * pj.mass) * sym) * grad) / r;
+                fx = fx + (scale * dx);
+                fy = fy + (scale * dy);
+                fz = fz + (scale * dz);
+            }
+        }
+    }
+    return PvVec3_new(fx, fy, fz);
+}
+
+# The viscosity force on particle idx of the n at ps, by brute force: Σⱼ ((μ·mⱼ)·∇²W(r))/ρⱼ · (vⱼ − vᵢ), over j ≠ idx
+# with 1e-20 ≤ r² ≤ h², ρⱼ floored at 1e-10, from +0. (NaN, NaN, NaN) for idx outside [0, n). Mirrors
+# `viscosity_force`.
+#must_use
+fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3 {
+    if (idx < 0 || idx >= n) {
+        var nan: f64 = PV_F64_NAN;
+        return PvVec3_new(nan, nan, nan);
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var pi: *PvFluidParticle = ps + idx;
+    var px: f64 = pi.position.x;
+    var py: f64 = pi.position.y;
+    var pz: f64 = pi.position.z;
+    var vx: f64 = pi.velocity.x;
+    var vy: f64 = pi.velocity.y;
+    var vz: f64 = pi.velocity.z;
+    var fx: f64 = 0.0;
+    var fy: f64 = 0.0;
+    var fz: f64 = 0.0;
+    for (var j = 0; j < n; j = j + 1) {
+        if (j != idx) {
+            var pj: *PvFluidParticle = ps + j;
+            var dx: f64 = px - pj.position.x;
+            var dy: f64 = py - pj.position.y;
+            var dz: f64 = pz - pj.position.z;
+            var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+            if ((r2 > h2 || r2 < tiny) == 0) {
+                var r: f64 = f64_sqrt(r2);
+                var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                var rho_j: f64 = _pv_max(pj.density, lo);
+                var scale: f64 = ((viscosity * pj.mass) * lap) / rho_j;
+                var ux: f64 = pj.velocity.x - vx;
+                var uy: f64 = pj.velocity.y - vy;
+                var uz: f64 = pj.velocity.z - vz;
+                fx = fx + (scale * ux);
+                fy = fy + (scale * uy);
+                fz = fz + (scale * uz);
+            }
+        }
+    }
+    return PvVec3_new(fx, fy, fz);
+}
+
+# ── the free step ───────────────────────────────────────────────────────────────────
+
+# One SPH step of the n particles at ps by brute force (O(n²)), in Rust's order:
+# - the config is validated (its error returned, nothing changed);
+# - every density by `compute_density`'s sum, then each pressure by the linear equation of state;
+# - from a snapshot of that state, each acceleration: gravity, plus over j ≠ i with 1e-20 ≤ r² ≤ h² the symmetric
+#   pressure term ((−mⱼ·(pᵢ/ρᵢ² + pⱼ/ρⱼ²))·∇W)/r·(xᵢ − xⱼ) and the viscosity term (((μ·mⱼ)·∇²W)/ρⱼ)/ρᵢ·(vⱼ − vᵢ);
+# - symplectic Euler, v += a·dt then x += v·dt;
+# - the walls, axis by axis: below the low corner, the position clamped to it and the velocity times −damping; else
+#   above the high corner (when it is above the low one), the same at the high corner.
+# Ok(0); or the config's Err; PV_ERR_OUT_OF_MEMORY when the scratch can't be allocated, before anything changes (Rust
+# aborts); or PV_ERR_DIVERGED at the first particle whose acceleration is not finite, which leaves the densities and
+# pressures set and the accelerations before it written, as Rust does. Mirrors `step` (ADR 0002 #17).
+#must_use
+fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+    var ct, cv = config.validate();
+    if (is_err_result(ct) == 1) { return Err(cv); }
+    if (n <= 0) { return Ok(0); }
+    var sz = sizeof(PvFluidParticle);
+    if (n > 9223372036854775807 / (sz + 8)) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var block = fl_alloc(n * (sz + 8));
+    if (block == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var dens = block;
+    var snap: *PvFluidParticle = _pv_as_particles(block + n * 8);
+    var h: f64 = config.smoothing_radius;
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+
+    # The densities, then the pressures.
+    for (var i = 0; i < n; i = i + 1) {
+        var d: f64 = _pv_density_sum(ps + i, ps, n, &kc);
+        store64(dens + i * 8, _pv_bits(d));
+    }
+    var rest: f64 = config.rest_density;
+    var gas: f64 = config.gas_constant;
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        var p: *PvFluidParticle = ps + i2;
+        p.density = load64(dens + i2 * 8);
+        var pr: f64 = equation_of_state(p.density, rest, gas);
+        p.pressure = pr;
+        var s: *PvFluidParticle = snap + i2;
+        *s = *p;
+    }
+
+    # The accelerations, from the snapshot.
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    for (var a = 0; a < n; a = a + 1) {
+        var pi: *PvFluidParticle = snap + a;
+        var ax: f64 = config.gravity.x;
+        var ay: f64 = config.gravity.y;
+        var az: f64 = config.gravity.z;
+        var rho: f64 = _pv_max(pi.density, lo);
+        var api: f64 = pi.pressure / (rho * rho);
+        var px: f64 = pi.position.x;
+        var py: f64 = pi.position.y;
+        var pz: f64 = pi.position.z;
+        var vx: f64 = pi.velocity.x;
+        var vy: f64 = pi.velocity.y;
+        var vz: f64 = pi.velocity.z;
+        for (var j = 0; j < n; j = j + 1) {
+            if (j != a) {
+                var pj: *PvFluidParticle = snap + j;
+                var dx: f64 = px - pj.position.x;
+                var dy: f64 = py - pj.position.y;
+                var dz: f64 = pz - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var b: f64 = pj.pressure / (rho_j * rho_j);
+                    var sym: f64 = api + b;
+                    var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                    var mj: f64 = pj.mass;
+                    var nmj: f64 = -mj;
+                    var p_scale: f64 = ((nmj * sym) * grad) / r;
+                    ax = ax + (p_scale * dx);
+                    ay = ay + (p_scale * dy);
+                    az = az + (p_scale * dz);
+                    var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                    var v_scale: f64 = (((viscosity * mj) * lap) / rho_j) / rho;
+                    var ux: f64 = pj.velocity.x - vx;
+                    var uy: f64 = pj.velocity.y - vy;
+                    var uz: f64 = pj.velocity.z - vz;
+                    ax = ax + (v_scale * ux);
+                    ay = ay + (v_scale * uy);
+                    az = az + (v_scale * uz);
+                }
+            }
+        }
+        if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
+            fl_free(block);
+            return Err(PV_ERR_DIVERGED);
+        }
+        var out: *PvFluidParticle = ps + a;
+        out.acceleration = PvVec3_new(ax, ay, az);
+    }
+    fl_free(block);
+
+    # Symplectic Euler, then the walls.
+    var dt: f64 = config.dt;
+    for (var k = 0; k < n; k = k + 1) {
+        var q: *PvFluidParticle = ps + k;
+        var nvx: f64 = q.velocity.x + (q.acceleration.x * dt);
+        var nvy: f64 = q.velocity.y + (q.acceleration.y * dt);
+        var nvz: f64 = q.velocity.z + (q.acceleration.z * dt);
+        q.velocity = PvVec3_new(nvx, nvy, nvz);
+        var nx: f64 = q.position.x + (nvx * dt);
+        var ny: f64 = q.position.y + (nvy * dt);
+        var nz: f64 = q.position.z + (nvz * dt);
+        q.position = PvVec3_new(nx, ny, nz);
+    }
+    var damp: f64 = config.boundary_damping;
+    var nd: f64 = -damp;
+    var lx: f64 = config.bounds_min.x;
+    var ly: f64 = config.bounds_min.y;
+    var lz: f64 = config.bounds_min.z;
+    var hx: f64 = config.bounds_max.x;
+    var hy: f64 = config.bounds_max.y;
+    var hz: f64 = config.bounds_max.z;
+    for (var m = 0; m < n; m = m + 1) {
+        var w: *PvFluidParticle = ps + m;
+        var wx: f64 = w.position.x;
+        var wy: f64 = w.position.y;
+        var wz: f64 = w.position.z;
+        var ux: f64 = w.velocity.x;
+        var uy: f64 = w.velocity.y;
+        var uz: f64 = w.velocity.z;
+        if (wx < lx) {
+            wx = lx;
+            ux = ux * nd;
+        } elif (wx > hx && hx > lx) {
+            wx = hx;
+            ux = ux * nd;
+        }
+        if (wy < ly) {
+            wy = ly;
+            uy = uy * nd;
+        } elif (wy > hy && hy > ly) {
+            wy = hy;
+            uy = uy * nd;
+        }
+        if (wz < lz) {
+            wz = lz;
+            uz = uz * nd;
+        } elif (wz > hz && hz > lz) {
+            wz = hz;
+            uz = uz * nd;
+        }
+        w.position = PvVec3_new(wx, wy, wz);
+        w.velocity = PvVec3_new(ux, uy, uz);
+    }
+    return Ok(0);
+}
+
+# ── splitting and merging ───────────────────────────────────────────────────────────
+
+# n_children copies of *parent with its mass split evenly (m/n), on a ring of radius `offset` about it in the xy
+# plane: child k at angle ((2π)·k)/n, moved by (offset·cos θ, offset·sin θ) (correctly rounded, ADR 0004). One child
+# is the parent unchanged; none is (0, 0). A new freelist buffer: (pointer, n_children), which the caller releases
+# with `fl_free`; (0, 0) for n_children ≤ 0 or no memory (Rust aborts). Mirrors `split_particle` (ADR 0002 #9).
+#must_use
+fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
+    if (n_children <= 0) { return (0, 0); }
+    var sz = sizeof(PvFluidParticle);
+    if (n_children > 9223372036854775807 / sz) { return (0, 0); }
+    var buf = fl_alloc(n_children * sz);
+    if (buf == 0) { return (0, 0); }
+    var out: *PvFluidParticle = _pv_as_particles(buf);
+    if (n_children == 1) {
+        *out = *parent;
+        return (buf, 1);
+    }
+    var nf: f64 = f64_from(n_children);
+    var child_mass: f64 = parent.mass / nf;
+    var two_pi: f64 = 2.0 * PV_F64_PI;
+    for (var k = 0; k < n_children; k = k + 1) {
+        var kf: f64 = f64_from(k);
+        var angle: f64 = (two_pi * kf) / nf;
+        var c: f64 = _pv_cos(angle);
+        var s: f64 = _pv_sin(angle);
+        var ch: *PvFluidParticle = out + k;
+        *ch = *parent;
+        ch.mass = child_mass;
+        var x: f64 = ch.position.x + (offset * c);
+        var y: f64 = ch.position.y + (offset * s);
+        ch.position = PvVec3_new(x, y, ch.position.z);
+    }
+    return (buf, n_children);
+}
+
+# One particle from two, conserving mass and momentum: the mass a.m + b.m; position, velocity, density, pressure,
+# temperature and fuel mass-weighted, (q_a·m_a + q_b·m_b)·(1/max(m, 1e-20)) (a NaN total gives 1e20), written out
+# per component; no acceleration; a's phase and conformation. Mirrors `merge_particles`.
+#must_use
+fn merge_particles(a: *PvFluidParticle, b: *PvFluidParticle): PvFluidParticle {
+    var ma: f64 = a.mass;
+    var mb: f64 = b.mass;
+    var total: f64 = ma + mb;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var floor: f64 = _pv_max(total, tiny);
+    var inv: f64 = 1.0 / floor;
+    var p: PvFluidParticle = *a;
+    var px: f64 = ((a.position.x * ma) + (b.position.x * mb)) * inv;
+    var py: f64 = ((a.position.y * ma) + (b.position.y * mb)) * inv;
+    var pz: f64 = ((a.position.z * ma) + (b.position.z * mb)) * inv;
+    var vx: f64 = ((a.velocity.x * ma) + (b.velocity.x * mb)) * inv;
+    var vy: f64 = ((a.velocity.y * ma) + (b.velocity.y * mb)) * inv;
+    var vz: f64 = ((a.velocity.z * ma) + (b.velocity.z * mb)) * inv;
+    p.position = PvVec3_new(px, py, pz);
+    p.velocity = PvVec3_new(vx, vy, vz);
+    p.acceleration = PvVec3_zero();
+    var d: f64 = ((a.density * ma) + (b.density * mb)) * inv;
+    var pr: f64 = ((a.pressure * ma) + (b.pressure * mb)) * inv;
+    var t: f64 = ((a.temperature * ma) + (b.temperature * mb)) * inv;
+    var fu: f64 = ((a.fuel * ma) + (b.fuel * mb)) * inv;
+    p.density = d;
+    p.pressure = pr;
+    p.mass = total;
+    p.temperature = t;
+    p.fuel = fu;
+    return p;
+}
+
+# ── the particle block ──────────────────────────────────────────────────────────────
+
+# A 2D block of particles of mass `mass` on a grid of spacing `spacing` from (ox, oy): ⌈sx/spacing⌉ × ⌈sy/spacing⌉
+# of them (each count `as usize`, saturating), row by row from the origin, at (ox + ix·spacing, oy + iy·spacing).
+# A new freelist buffer: (pointer, count), which the caller releases with `fl_free`; (0, 0) for a spacing not finite
+# and > 0, a size not finite, a count of 0, a count whose product or byte size overflows (Rust's `checked_mul`
+# returns empty for the product; the byte size aborts), or no memory (Rust aborts). Mirrors `create_particle_block`,
+# its `[f64; 2]` origin and size as two arguments each (ADR 0002 #17).
+#must_use
+fn create_particle_block(ox: f64, oy: f64, sx: f64, sy: f64, spacing: f64, mass: f64) {
+    if (_pv_is_positive(spacing) == 0 || _pv_is_finite(sx) == 0 || _pv_is_finite(sy) == 0) { return (0, 0); }
+    var qx: f64 = sx / spacing;
+    var qy: f64 = sy / spacing;
+    var cx: f64 = f64_ceil(qx);
+    var cy: f64 = f64_ceil(qy);
+    var nx = _pv_as_usize(cx);
+    var ny = _pv_as_usize(cy);
+    # A count at or above 2^63 reads negative: no block that size is allocatable.
+    if (nx <= 0 || ny <= 0) { return (0, 0); }
+    var sz = sizeof(PvFluidParticle);
+    if (nx > 9223372036854775807 / ny) { return (0, 0); }
+    var count = nx * ny;
+    if (count > 9223372036854775807 / sz) { return (0, 0); }
+    var buf = fl_alloc(count * sz);
+    if (buf == 0) { return (0, 0); }
+    var out: *PvFluidParticle = _pv_as_particles(buf);
+    # `FluidParticle::new_2d(x, y, m)` differs from new_2d(0, 0, m) only in its position: one record built, then
+    # copied whole and placed (a struct copy is word-wise, as `_pv_particles_reset`'s).
+    var tmpl: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, mass);
+    var k = 0;
+    for (var iy = 0; iy < ny; iy = iy + 1) {
+        var fy: f64 = f64_from(iy);
+        var y: f64 = oy + (fy * spacing);
+        for (var ix = 0; ix < nx; ix = ix + 1) {
+            var fxx: f64 = f64_from(ix);
+            var x: f64 = ox + (fxx * spacing);
+            var q: *PvFluidParticle = out + k;
+            *q = tmpl;
+            q.position = PvVec3_new(x, y, 0.0);
+            k = k + 1;
+        }
+    }
+    return (buf, count);
+}

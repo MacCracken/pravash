@@ -75,5 +75,6 @@ modules = [
     "src/phase_field.cyr",
     "src/sph_kernels.cyr",
     "src/neighbor.cyr",
+    "src/sph_fns.cyr",
     "src/json.cyr",
 ]

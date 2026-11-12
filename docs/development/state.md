@@ -21,7 +21,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M1 Foundation | ✅ **done 2026-11-11.** Part 1: `src/mathx.cyr`, the first `[lib]`. Part 2 (ADR 0004): the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`, L1) and the MPFR-corrected oracle. Part 3: `src/error.cyr`, `src/vec3.cyr` (L3), `src/column.cyr` (L13), `src/common.cyr`; surface parity in CI. Part 4: `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr`, `src/json.cyr` (L10; `PV_ERR_DESERIALIZE`, ADR 0002 #10). 45,232 golden rows in seven modules, identical on three targets: 42,697 ok, 72 accepted (ADR 4), 2,463 pending (the M4 cell key; three bayan JSON policies). All 100 Rust unit tests of the M1 modules and 11 integration tests ported |
 | M2 Shallow water | ✅ **done 2026-11-11.** `src/shallow.cyr`: construction, the cell reads, volumes, CFL, the disturbance, sediment, JSON and the step (default, HLL, dispersion, friction, breaking, walls). 888 golden rows bit-exact on three targets, 142 of them class S step rows (the new class), every one recomputed by a Python transcription of the step; all 44 + 3 Rust tests ported. The step runs at 7.2× Rust (call overhead `#inline` declines: filed) |
 | M3 Grid | ✅ **done 2026-11-12.** Part a ✅ 2026-11-11: `src/grid_solve.cyr` (the DST, IDST and CG transcriptions, L5 and L6) and `src/grid.cyr` (`PvFluidGrid`, `PvGridConfig`, `PvBoundaryCondition`: construction, the reads, diffuse, all four advections, Smagorinsky, buoyancy, vorticity confinement, the four projections, the wall rules, JSON); `_pv_fmod` (L14). 569 golden rows bit-exact on three targets and with rayon on, 188 of them class S step rows on the periodic and multigrid projections, every one recomputed by a Python transcription; 44 of 49 Rust tests and the 5 grid integration tests ported. Part b ✅ 2026-11-12: the DST and CG projections under parity (21 DST and 49 CG oracle-hook rows, 188 more step rows; 827 grid rows in all, 20 of them bit-exact against the corrected oracle `grid.cr.tsv`, where glibc misrounds a DST sine or cosine), and the DST plans (`dst_x`, `dst_y`: each transform length's sines and eigenvalue terms, kept across steps; the same bits), which take the 63 × 63 DST step from 719 ms to 8.6 ms (Rust 10.1 ms). Part c ✅ 2026-11-12: `src/k_epsilon.cyr` (`PvKEpsilon`), `apply_ghost_fluid` and `src/mac_grid.cyr` (`PvMacGrid`), with JSON; 293 more rows (1,120 grid rows), all bit-exact on the first replay, among them 135 class S step rows; all 49 Rust tests of `grid.rs` ported; surface parity covers all of `grid`. Part d ✅ 2026-11-12: `src/vof.cyr` (`PvVofField`) and `src/phase_field.cyr` (`PvPhaseField`), with JSON; two new golden modules, 384 rows, bit-exact on the first replay, among them 138 class S step rows; all 8 + 11 Rust tests. Part e ✅ 2026-11-12: `src/par.cyr`, the persistent worker pool, and `PvFluidGrid.set_threads` (D6) on Rust's three `parallel` loops; every `FluidGrid::step` row replayed at 2, 3, 4 and 8 threads gives its one-thread words, on three targets |
-| M4 SPH foundations | 🟡 **in progress.** Part b ✅ 2026-11-12: `src/neighbor.cyr`, the neighbour grid on bit-faithful f32 keys (L4) and `sort_by_zorder` on a stable merge sort (L9); 50 rows bit-exact (30 neighbour lists, including the D3 probe drift at large offsets and a kept grid; 20 z-order), and the 2,460 cell-key rows pending since M0; ADR 0002 #16. Part a ✅ 2026-11-12: `src/sph_kernels.cyr` (the seven kernels, `PvKernelCoeffs`, the linear and Tait equations of state, the non-Newtonian models, the batch and whole-system helpers); private constants generated (`src/constants_private.cyr`, `t_private.rs`); a new golden module `sph.tsv`, 804 rows bit-exact on the first replay, 16 of them against the corrected oracle `sph.cr.tsv`; 22 Rust tests. Parts c and d next: the core free functions (c), the physics extensions (d) |
+| M4 SPH foundations | 🟡 **in progress.** Part c ✅ 2026-11-12: `src/sph_fns.cyr`, the brute-force density and forces, the free step (`sph_step`, ADR 0002 #17), the particle block, split and merge; 198 rows (5 split rows against the corrected oracle); 10 Rust tests and the 4 free-function SPH integration tests. A cyrius miscompile (`s.f = g(t.e)`, open upstream) caught by the merge rows and worked around. Part b ✅ 2026-11-12: `src/neighbor.cyr`, the neighbour grid on bit-faithful f32 keys (L4) and `sort_by_zorder` on a stable merge sort (L9); 50 rows bit-exact (30 neighbour lists, including the D3 probe drift at large offsets and a kept grid; 20 z-order), and the 2,460 cell-key rows pending since M0; ADR 0002 #16. Part a ✅ 2026-11-12: `src/sph_kernels.cyr` (the seven kernels, `PvKernelCoeffs`, the linear and Tait equations of state, the non-Newtonian models, the batch and whole-system helpers); private constants generated (`src/constants_private.cyr`, `t_private.rs`); a new golden module `sph.tsv`, 804 rows bit-exact on the first replay, 16 of them against the corrected oracle `sph.cr.tsv`; 22 Rust tests. Part d next: the physics extensions |
 | M5–M8 | not started |
 
 ## Toolchain
@@ -41,7 +41,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   `src/column.cyr`, `src/common.cyr`, `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr`, `src/shallow.cyr`,
   `src/par.cyr`,
   `src/grid_solve.cyr`, `src/grid.cyr`, `src/mac_grid.cyr`, `src/k_epsilon.cyr`, `src/vof.cyr`, `src/phase_field.cyr`,
-  `src/sph_kernels.cyr`, `src/neighbor.cyr` and `src/json.cyr`, bundled as
+  `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr` and `src/json.cyr`, bundled as
   `dist/pravash.cyr`; the scaffold's
   `src/main.cyr` stub.
 
@@ -50,7 +50,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
 - **Cyrius**:
-  - `tests/parity.tcyr` replays the corpus: 12 modules, 0 failing; 49,177 ok, 108 accepted (ADR 4), 0 failed,
+  - `tests/parity.tcyr` replays the corpus: 12 modules, 0 failing; 49,370 ok, 113 accepted (ADR 4), 0 failed,
     0 measured, 3 pending (three JSON rows on bayan's policies). Every
     `FluidGrid::step` row also runs at 2, 3, 4 and 8 threads, 0 differing from one. Bits are identical on x86_64
     ELF, x86_64 PE and aarch64.
@@ -64,17 +64,17 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
     - `tests/vof.tcyr`: all 8 of `vof.rs` (27 checks); `tests/phase_field.tcyr`: all 11 of `phase_field.rs`
       (38 checks);
     - `tests/par.tcyr` (Cyrius-only): the worker pool and the grid's thread count (40 checks);
-    - `tests/sph.tcyr`: 23 of the 79 of `sph.rs` (parts a and b), and three Cyrius-only groups (the merge sort, the
-      lists against a brute-force search, the grid's layout): 45 checks;
-    - `tests/integration.tcyr`: 20 of `rust-old/tests/integration.rs` (59 checks).
+    - `tests/sph.tcyr`: 33 of the 79 of `sph.rs` (parts a–c), and six Cyrius-only groups (the merge sort, the lists
+      against a brute-force search, the grid's layout, and part c's no-panic paths): 69 checks;
+    - `tests/integration.tcyr`: 24 of `rust-old/tests/integration.rs` (66 checks).
   - `scripts/surface_parity.py`: error, common, buoyancy, vortex, bridge, shallow, grid, vof, phase_field and sph,
-    348 items ok (71 pending a later part of M4 or M5), 0 missing.
+    348 items ok (64 pending a later part of M4 or M5), 0 missing.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
 - **Golden corpus** (`tests/golden/`): bridge 3,964, buoyancy 1,716, common 3,683, constants 35, grid 1,120 (511 class
-  S step rows), json 302, math 34,049, phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 854, vof
+  S step rows), json 302, math 34,049, phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,052 (43 class S), vof
   224 (63 class S) and vortex 2,293 rows, and the corrected oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv`
-  3, `bridge.cr.tsv` 26, `grid.cr.tsv` 20 and `sph.cr.tsv` 16 rows.
-  `validate.py` recomputes all 49,288 rows, every solver step by transcription: 0 failures;
+  3, `bridge.cr.tsv` 26, `grid.cr.tsv` 20 and `sph.cr.tsv` 21 rows.
+  `validate.py` recomputes all 49,486 rows, every solver step by transcription: 0 failures;
   `probe_tables.py` 35 of 35.
 - **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)): the
   10 primitives against Rust's glibc, on shared seeded arguments. The correctly rounded functions run 58 ns (ln) to
@@ -91,7 +91,9 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   phase-field step 8.7–8.9×. The worker pool runs the periodic advection 4.1× faster at 8 threads (255 × 255); a
   whole grid step gains 1.07–1.15×, its serial Gauss–Seidel solves dominating, as Rust's rayon build gains nothing.
   The SPH kernels run 8–10.5× Rust, Tait 52× and the power law 27× (the correctly rounded pow). The 1,000-particle
-  neighbour build runs 1.5× (2D) and 1.9× (3D) Rust on hisab's `HashMap`, and `sort_by_zorder` 2.0×.
+  neighbour build runs 1.5× (2D) and 1.9× (3D) Rust on hisab's `HashMap`, and `sort_by_zorder` 2.0×. The
+  brute-force sums run 4.9–9.5× Rust's criterion numbers and the free step 5.2–8.1×. `split_particle` into 8 pays
+  the correctly rounded sin and cos's slow path at fl(k·π/2) (L1): 138 µs, against 3.5 µs into 7.
 
 ## Upstream requests and stand-ins
 
@@ -107,7 +109,7 @@ stand-ins so far:
 - L13: `src/column.cyr`;
 - L14: `_pv_fmod` in `src/mathx.cyr`.
 
-Each is marked. `scripts/upstream_ledger.py --check`: 14 notes, 0 failures.
+Each is marked. `scripts/upstream_ledger.py --check`: 15 notes, 0 failures (L7's in `src/sph_fns.cyr`, whose stand-in lands with part d).
 
 Filed 2026-11-11:
 - **hisab:** `2026-11-11-spatial-hash-per-step-rebuild-allocates.md`, `2026-11-11-no-matrix-free-linear-cg.md`,
@@ -117,6 +119,9 @@ Filed 2026-11-11:
   `2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md`,
   `2026-11-11-struct-values-and-f64v4-lanes-cost-in-pair-loops.md`;
 - **sakshi:** `2026-11-11-no-chrome-trace-export.md`;
+- **M4 part c, cyrius:** pravash's numbers appended to impetus's open
+  `2026-11-09-field-store-of-struct-call-copies-a-field-argument.md` (30 of 30 merge rows; no stand-in, a local
+  binding at the site, and surface parity's scan);
 - **M4 part b:** the stand-ins' numbers appended to hisab `2026-11-11-spatial-hash-per-step-rebuild-allocates.md`
   (L4: the build against hisab 1.4.0's `HashMap`) and cyrius `2026-11-11-no-stable-sort.md` (L9: the merge sort's
   cost per comparison);
@@ -155,6 +160,6 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M4 part c: `compute_density`, `pressure_force`, `viscosity_force`, the brute-force `step`, `create_particle_block`
-(and with it Rust's `test_sort_by_zorder` and `_preserves_data`), `split_particle` and `merge_particles`. Then part d
-(the physics extensions, the MLS corrections L7) and M5, the `SphSolver` on part b's grid.
+M4 part d: the physics extensions of `sph.rs`: viscoelastic (Oldroyd-B), heat, phase change, reactions and combustion,
+the contact angle, delta-SPH, the MLS gradient corrections (L7), implicit viscosity, the secondary particles, and with
+them `test_degenerate_inputs_no_panic`. Then M5, the `SphSolver` on part b's grid.

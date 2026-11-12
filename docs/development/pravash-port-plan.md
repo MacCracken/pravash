@@ -11,8 +11,9 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M4 part b complete** (2026-11-12); M4 part c (density, the forces, the brute-force step) is next.
-> Part b ported the neighbour grid on bit-faithful f32 keys (L4) and `sort_by_zorder` on a stable merge sort (L9)
+> ⏳ **Status: M4 part c complete** (2026-11-12); M4 part d (the physics extensions) is next. Part c ported the
+> brute-force density and forces, the free step (as `sph_step`, ADR 0002 #17), the particle block, split and merge
+> (`src/sph_fns.cyr`): 198 rows, 5 against the corrected oracle (port-parity §17). Part b ported the neighbour grid on bit-faithful f32 keys (L4) and `sort_by_zorder` on a stable merge sort (L9)
 > (`src/neighbor.cyr`): 50 rows bit-exact, and the 2,460 cell-key rows pending since M0 (port-parity §16). Part a
 > ported the SPH kernels, the equations of state and the non-Newtonian models (`src/sph_kernels.cyr`): 804 rows,
 > bit-exact, 16 against the corrected oracle (port-parity §15). M3 is complete. M3 part e added `src/par.cyr`, the worker
@@ -925,7 +926,12 @@ Part e (2026-11-12, port-parity §14):
   dominating, as Rust's rayon build gains nothing.
 
 **Next:** M4, SPH foundations |
-| M4 SPH foundations | 🟡 **parts a and b done 2026-11-12**; parts c and d next | sph 854. Part b: 30 neighbour-list rows (lattices on and off cell boundaries, 2D and 3D; clouds at offsets up to 3e6, where the f32 probes drift a cell, D3; h within f32::EPSILON of the fresh grid's 1, which keeps it; NaN, duplicates, edges) and 20 z-order rows (shuffled blocks, ties, NaN and ±∞ coordinates, the early returns), plus the 2,460 cell-key rows of `math.tsv`. Part a, 804: the seven kernels over 22 radii (the specials, 1e±40) and r ∈ [−0.1h, 2.4h]; the linear EOS; Tait across γ's 1e-12 limit and ρ₀'s 1e-10 floor; the non-Newtonian models; the batch and whole-system helpers. 16 rows against the corrected oracle `sph.cr.tsv` (glibc misrounds pow or ln at MPFR-found arguments); all bit-exact on the first replay | 23 of the 79 Rust tests of `sph.rs` (`tests/sph.tcyr`), and three Cyrius-only groups (the merge sort's stability, the lists against a brute-force search, the layout) | part b: the 1,000-particle neighbour build 1.5× (2D) and 1.9× (3D) Rust on hisab's `HashMap`, `sort_by_zorder` 2.0× (after the A/B, 2.2–3.8× faster with the rows unchanged); part a: `sph_kernels/*` 10–10.5× (after computing only each kernel's coefficient, 1.30–1.78×), Wendland 8–9×, Tait 52× and the power law 27× (the correctly rounded pow, L1), `batch_poly6` 54× (half of it a mapped 8 KB block) | port-parity §16 (part b):
+| M4 SPH foundations | 🟡 **parts a–c done 2026-11-12**; part d next | sph 1,052. Part c: 60 brute-force rows (each particle's density and forces on clouds, a lattice on the radius, coincident pairs, special values, special h), 43 free-step rows (trajectories to 300 steps, a 3D box, the walls, every config error, three divergences), 36 block, 29 split (5 against `sph.cr.tsv`) and 30 merge rows. Part b: 30 neighbour-list rows (lattices on and off cell boundaries, 2D and 3D; clouds at offsets up to 3e6, where the f32 probes drift a cell, D3; h within f32::EPSILON of the fresh grid's 1, which keeps it; NaN, duplicates, edges) and 20 z-order rows (shuffled blocks, ties, NaN and ±∞ coordinates, the early returns), plus the 2,460 cell-key rows of `math.tsv`. Part a, 804: the seven kernels over 22 radii (the specials, 1e±40) and r ∈ [−0.1h, 2.4h]; the linear EOS; Tait across γ's 1e-12 limit and ρ₀'s 1e-10 floor; the non-Newtonian models; the batch and whole-system helpers. 16 rows against the corrected oracle `sph.cr.tsv` (glibc misrounds pow or ln at MPFR-found arguments); all bit-exact on the first replay | 33 of the 79 Rust tests of `sph.rs` (`tests/sph.tcyr`), and six Cyrius-only groups (the merge sort's stability, the lists against a brute-force search, the layout, part c's no-panic paths); 4 SPH integration tests | part c: the brute-force sums 4.9–9.5× Rust's criterion numbers, the free step 5.2–8.1×, the block 24× (after a template particle, 1.6× faster), merge 13×, split into 8 ≈ 970× (the L1 slow path at fl(k·π/2)); part b: the 1,000-particle neighbour build 1.5× (2D) and 1.9× (3D) Rust on hisab's `HashMap`, `sort_by_zorder` 2.0× (after the A/B, 2.2–3.8× faster with the rows unchanged); part a: `sph_kernels/*` 10–10.5× (after computing only each kernel's coefficient, 1.30–1.78×), Wendland 8–9×, Tait 52× and the power law 27× (the correctly rounded pow, L1), `batch_poly6` 54× (half of it a mapped 8 KB block) | port-parity §17 (part c):
+- `src/sph_fns.cyr`; ADR 0002 #17 (`sph_step`, the `PvVec3` forces, the buffers);
+- a cyrius miscompile (`s.f = g(t.e)`) caught by the merge rows, bound to locals, pravash's numbers on the open issue;
+- the mutation tests found one corpus gap (a divergence on one axis), closed by a row drawing no random numbers.
+
+port-parity §16 (part b):
 - `src/neighbor.cyr` (`UPSTREAM(L4)`, `UPSTREAM(L9)`); ADR 0002 #16;
 - the mutation tests found two corpus gaps (the kept grid's keys; positive z-order minima), closed by four rows drawing no random numbers.
 
@@ -934,7 +940,7 @@ port-parity §15 (part a):
 - `t_private.rs` and `src/constants_private.cyr` (private constants from their Rust literals; `_PV_GRID_MIN_SIZE` replaces two hand-typed 4s), proven by `probe_tables.py`;
 - surface parity adds `sph`, the rest pending by part.
 
-**Next:** M4 part c: `compute_density`, `pressure_force`, `viscosity_force`, the brute-force `step`, `create_particle_block`, split and merge |
+**Next:** M4 part d: the physics extensions (viscoelastic, heat, phase change, reactions and combustion, contact angle, delta-SPH, the MLS corrections L7, implicit viscosity, secondary particles) |
 | M5 SPH solvers | — | — | — | — | |
 | M6 Coupling and MPM | — | — | — | — | |
 | M7 Compute, logging and ai | — | — | — | — | |

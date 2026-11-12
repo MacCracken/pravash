@@ -61,7 +61,8 @@
   against the corrected oracle, all bit-exact; 22 Rust tests); private constants generated
 - [x] M4 part b: the neighbour grid (f32 keys, L4), the cell key, the lists, `sort_by_zorder` (L9) (50 rows, all
   bit-exact, and the 2,460 cell-key rows pending since M0)
-- [ ] M4 part c: density, the forces, the brute-force `step`, the particle blocks, split and merge
+- [x] M4 part c: density, the forces, the brute-force `step` (as `sph_step`), the particle blocks, split and merge
+  (198 rows, 5 against the corrected oracle; 10 Rust tests and 4 integration tests)
 - [ ] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7),
   implicit viscosity, secondary particles
 

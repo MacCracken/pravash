@@ -1231,3 +1231,79 @@ and the sort 3.8× faster:
 - the cells are ordered z, y, x with their keys in a column, so one binary search and a short scan find a probe row's
   three cells;
 - the sort permutes in place by assignment instead of byte-wise `memcpy`.
+
+## 17. M4 part c: the brute-force sums, the free step, the block, split and merge (2026-11-12)
+
+**`src/sph_fns.cyr`:**
+- **`compute_density`, `pressure_force` and `viscosity_force`,** the O(n²) sums, in Rust's operation order: the
+  symmetric pressure term, the 1e-20 ≤ r² ≤ h² window, and ρ floored at 1e-10 by Rust's NaN-ignoring max. The pair
+  distance is written out, (dx² + dy²) + dz² as `distance_squared_to` gives it.
+- **`sph_step`,** Rust's free `step` (renamed, ADR 0002 #17):
+  - the config validated;
+  - every density, then each pressure;
+  - the accelerations from a snapshot;
+  - symplectic Euler;
+  - the walls, axis by axis, where a high corner acts only when it is above the low one. `water_2d`'s z has hi = lo,
+    so only its low wall acts.
+
+  Its densities and snapshot are one freelist block, freed before it returns. On `PV_ERR_DIVERGED` the state is
+  Rust's: every density and pressure set, and the accelerations before the failing particle written.
+- **`create_particle_block`, `split_particle` and `merge_particles`.** The split ring's cosines and sines are
+  correctly rounded.
+
+**The rows** (`m_sph.rs`, part c's seed 0x0_5f4c): 198.
+
+| Function | Rows | What they cover |
+|---|---|---|
+| `compute_density`, `pressure_force`, `viscosity_force` | 20 each | each particle's value in index order, on random clouds (2D and 3D, offsets, μ of both signs), a lattice on the radius exactly (r² = h² inside), coincident pairs and pairs either side of r² = 1e-20, special densities, masses and pressures (at and below the floor, NaN, ±∞), a NaN position, and h of 0, −0.05, NaN, ∞, 1e40 and 1e-40 |
+| `step` (class S) | 43 | a dam break whose interior density is ρ₀, its trajectory at 1, 2, 10, 60 and 300 steps, and one step from frames 1, 10 and 60; a 3D cube in a closed box; a splash through every wall, z off the plane; the Rust tests' single particles; n = 0; damping 0 and 1, μ 0 and negative, a box flat on two axes; each config error in its order, with particles and without; three divergences (a NaN position, an ∞ mass beside a neighbour, and an ∞ x velocity, whose x acceleration alone is non-finite) |
+| `create_particle_block` | 36 | the Rust tests' shapes, quotients a hair under an integer (0.3/0.1, ceil 3), negative and zero sizes, every early return, ∞ × ∞ counts (`checked_mul`, empty) and ∞ × 0, NaN and huge origins, random blocks |
+| `split_particle` (class C) | 29 | 0 to 64 children, special offsets and parents; and n = 19, 27, 39, 52 and 61 from the origin, child counts whose ring angles glibc misrounds (an MPFR search over n ≤ 300 found 89 such counts) |
+| `merge_particles` | 30 | random pairs, totals of 0, NaN, ∞ and negative (the 1e-20 floor), a NaN position, an −∞ density |
+
+`validate.py` transcribes part c from the Rust source, with glibc's sin and cos for the record and MPFR's for the
+corrected oracle. `sph.cr.tsv` gains the 5 split rows: 21 rows, which the port matches, and none matches glibc's.
+Result: 49,486 rows, 0 failures.
+
+**Result:**
+- **First replay.** Every density, force, step and block row passed. The 5 corrected split rows waited for
+  `sph.cr.tsv`. All 30 merge rows failed, and every scalar field was right.
+- **The merge failures are a cyrius miscompile.** `p.position = _pv_mass_weighted(a.position, …, b.position, …)`
+  stored `b.position`: a field store of a struct-returning call with struct-field arguments stores an argument
+  (cyrius `2026-11-09-field-store-of-struct-call-copies-a-field-argument.md`, open, filed by impetus). Binding each
+  call to a local fixed all 30, and pravash's numbers are on the issue. Surface parity's `field_store_scan` flags the
+  original line; it hadn't been run before that replay.
+- **The replay is 12 modules, 0 failing | rows: 49,370 ok, 0 failed, 0 measured, 3 pending, 113 accepted (ADR 4:
+  113)**.
+- **The mutation tests found one corpus gap.** 22 of 25 port mutations failed rows on the first run (one more mutant
+  was a control). Of the three survivors:
+  - the position integrated with the old velocity was written equivalently; its real form fails 18 rows;
+  - the divergence check needing all three components non-finite was a gap. Every diverging row was NaN on every
+    axis. A row whose ∞ x velocity diverges only x (no random numbers drawn, so no other row moved) now fails it;
+  - dropping the block's height-finiteness check changes no output. A non-finite height saturates to a count the port
+    refuses, and Rust's check only spares it a 2⁶⁴-iteration loop.
+- **Mutations of the transcription:** 6 of 6 caught (the forces' 1e-20 guard, the damping's sign, position before
+  velocity, sin and cos swapped, merge's floor, the divergence test).
+
+**Tests** (`tests/sph.tcyr`, 69 checks):
+- the 10 part c Rust tests, in Rust's order: `test_compute_density_self`, the three block tests, the four step tests,
+  `test_sort_by_zorder` and `_preserves_data`. That makes 33 of the 79;
+- Cyrius-only (ADR 0002 #8):
+  - `part_c_out_of_range_reads_nan`;
+  - `part_c_refused_sizes_are_empty`: an overflowing block, no children, 2⁶² children;
+  - `sph_step_diverged_leaves_rusts_state`.
+
+`tests/integration.tcyr` adds the four free-function SPH tests (24 of 33, 66 checks). Surface parity: 348 items ok,
+64 pending, `step` renamed `sph_step`.
+
+**Speed** (benchmarks-rust-v-cyrius, M4 part c):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| the brute-force sums | 4.9–9.5× |
+| the free step (9, 25, 64 particles) | 5.2–8.1× |
+| `create_particle_block` of 1,000 | 24× (most of it a mapped 144 KB block) |
+| `split_particle` into 8 | ≈ 970×: angles at fl(k·π/2), the L1 slow path (3.5 µs into 7) |
+| `merge_particles` | 13× |
+
+A template particle made the block 1.6× faster, and writing merge out made it 1.3× faster, with the rows unchanged.

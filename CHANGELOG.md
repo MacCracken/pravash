@@ -3,6 +3,45 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M4 part c): `src/sph_fns.cyr`.
+  - **The brute-force sums:** `compute_density`, `pressure_force` and `viscosity_force`. The forces return a `PvVec3`;
+    an index outside the slice reads NaN where Rust panics.
+  - **The free step, as `sph_step`** (ADR 0002 #17: one namespace serves pravash and its consumers, and a bare `step`
+    is the likeliest to collide). Its two per-call buffers are one freelist block, freed before it returns.
+    `PV_ERR_OUT_OF_MEMORY` arrives before anything changes, and `PV_ERR_DIVERGED` leaves the state Rust leaves.
+  - **`create_particle_block`, `split_particle` and `merge_particles`.** The block and the children are freelist
+    buffers the caller frees. The split ring's cosines and sines are correctly rounded (ADR 0004).
+  - **Parity:** 198 new `sph.tsv` rows, every one passing on the first replay of the code as it stands:
+    - 60 brute-force rows and 43 step rows (trajectories to 300 steps, a 3D box, the walls, every config error, three
+      divergences);
+    - 36 block rows and 30 merge rows;
+    - 29 split rows, 5 of them against the corrected oracle `sph.cr.tsv`, at child counts whose ring angles glibc
+      misrounds (an MPFR search).
+
+    `validate.py` transcribes part c: 49,486 rows, 0 failures.
+  - **Tests:** the 10 part c Rust tests, among them `test_sort_by_zorder` and `_preserves_data` (deferred from part
+    b), and three Cyrius-only groups for the no-panic paths. Also the four SPH tests of `rust-old/tests/integration.rs`.
+
+### Fixed
+- **`merge_particles`' position and velocity** (found by the golden rows before release). Storing a struct-returning
+  call straight into a field, with struct-field arguments, stored the argument: cyrius 6.7.18's open
+  `2026-11-09-field-store-of-struct-call-copies-a-field-argument.md`. All 30 merge rows were wrong. Each call is now
+  bound to a local, and pravash's numbers are on the issue. Surface parity's `field_store_scan` flags the pattern; it
+  simply hadn't been run before the first replay.
+
+### Performance
+- **The part c functions** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M4 part c; against
+  Rust's criterion `sph_density`, `sph_step` and `sph_pressure_force`, and a twin for the rest).
+  - The brute-force sums run 4.9–9.5× Rust and the free step 5.2–8.1×: the codegen's per-operation cost, since in
+    these blocks almost no pair is within h.
+  - `split_particle` into 8 takes 138 µs: its ring angles at fl(k·π/2) are the correctly rounded sin and cos's slow
+    path (ledger L1). Into 7 it takes 3.5 µs.
+  - Measured A/B, rows unchanged:
+    - `create_particle_block` got 1.6× faster (140–154 → 85–90 µs for 1,000): one template particle copied whole,
+      not a 144-byte struct return per particle.
+    - `merge_particles` got 1.3× faster (126–129 → 95–100 ns), written out.
+
+### Added (Cyrius)
 - **sph** (M4 part b): `src/neighbor.cyr`.
   - **The neighbour grid,** `PvNeighborGrid` (ledger L4): hisab 1.4.0's `SpatialHash` as `SphSolver` uses it,
     with its f32 cell keys reproduced bit for bit (D3), on sorted columns instead of a `HashMap`. `_pv_nb_build`

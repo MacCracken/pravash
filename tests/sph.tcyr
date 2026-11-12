@@ -1,11 +1,13 @@
 # sph.tcyr — the ported Rust tests of rust-old/src/sph.rs (M4 and M5).
 #
 # Every test keeps its Rust name as its group, in Rust's order. M4 part a ports the 22 of the kernels, the equations
-# of state, the non-Newtonian models and the totals; part b `test_zorder_negative_coordinates`. `test_sort_by_zorder`
-# and `test_sort_by_zorder_preserves_data` wait for part c, whose `create_particle_block` they build their particles
-# with; `test_degenerate_inputs_no_panic` for part d, whose free functions it also calls; the solver's for M5. Three
+# of state, the non-Newtonian models and the totals; part b `test_zorder_negative_coordinates`; part c the density,
+# block and free-step tests and the two `sort_by_zorder` tests, which build their particles with its
+# `create_particle_block`. `test_degenerate_inputs_no_panic` waits for part d, whose free functions it also calls, and
+# the solver's for M5. Three
 # Cyrius-only groups check what part b adds without an oracle: the merge sort's stability, the neighbour lists
-# against a brute-force search, and the record layout `_pv_nb_col` assumes.
+# against a brute-force search, and the record layout `_pv_nb_col` assumes. Three more check part c's no-panic paths
+# (ADR 0002 #8): the out-of-range reads, the refused sizes, and the state a diverging step leaves.
 #
 # Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): a particle slice is (pointer, count); a
 # `NonNewtonianViscosity` variant is a `PvNonNewtonianModel` made by its constructor, its method
@@ -61,8 +63,62 @@ fn test_kernels() {
     return 0;
 }
 
-# The equation-of-state and totals tests, and test_kernel_negative_r and test_poly6_kernels_consistent, in Rust's
-# order.
+# One step of the particle at *q under water_2d at viscosity 0.001: 1 for Ok.
+fn step_one(q: *PvFluidParticle): i64 {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var t, v = sph_step(q, 1, &cfg, 0.001);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# Part c's tests between test_equation_of_state_at_rest and test_total_kinetic_energy: the density of one particle,
+# the particle blocks, and the free step (`sph_step`, ADR 0002 #17).
+fn test_part_c_block_and_step() {
+    test_group("test_compute_density_self");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var d: f64 = compute_density(0, &one, 1, 1.0);
+    assert(d > 0.0, "a lone particle's own density is positive");
+
+    test_group("test_create_particle_block");
+    var bp, bn = create_particle_block(0.0, 0.0, 0.1, 0.1, 0.05, 0.01);
+    assert_eq(bn, 4, "2 × 2");
+    fl_free(bp);
+
+    test_group("test_create_particle_block_positions");
+    var cp, cn = create_particle_block(1.0, 2.0, 0.1, 0.1, 0.05, 0.01);
+    var c0: *PvFluidParticle = _pv_as_particles(cp);
+    var cx: f64 = c0.position.x;
+    var cy: f64 = c0.position.y;
+    assert(cn > 0 && near(cx, 1.0, EPS) == 1 && near(cy, 2.0, EPS) == 1, "the first particle sits at the origin");
+    fl_free(cp);
+
+    # Rust checks the Vec's capacity is the count (to 10): the block is one buffer of exactly `count` records.
+    test_group("test_create_particle_block_preallocated");
+    var pp, pn = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.1, 0.01);
+    assert(pp != 0 && pn == 100, "10 × 10 in one buffer");
+    fl_free(pp);
+
+    test_group("test_step_empty");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var et, ev = sph_step(0, 0, &cfg, 0.001);
+    assert_eq(is_ok(et), 1, "no particles: Ok");
+
+    test_group("test_step_single_particle_falls");
+    var f: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    f.density = 1000.0;
+    assert_eq(step_one(&f), 1, "Ok");
+    assert(f.velocity.y < 0.0, "gravity pulls it down");
+
+    test_group("test_step_boundary_enforcement");
+    var b: PvFluidParticle = PvFluidParticle_new_2d(0.5, -0.1, 0.01);
+    b.density = 1000.0;
+    assert_eq(step_one(&b), 1, "Ok");
+    assert(b.position.y >= 0.0, "clamped to the floor");
+    return 0;
+}
+
+# The equation-of-state and totals tests (with part c's between them), test_step_invalid_config,
+# test_kernel_negative_r and test_poly6_kernels_consistent, in Rust's order.
 fn test_eos_and_totals() {
     test_group("test_equation_of_state");
     var p: f64 = equation_of_state(1100.0, 1000.0, 2000.0);
@@ -71,6 +127,8 @@ fn test_eos_and_totals() {
     test_group("test_equation_of_state_at_rest");
     var p0: f64 = equation_of_state(1000.0, 1000.0, 2000.0);
     assert_eq(tiny(p0), 1, "0 at rest");
+
+    test_part_c_block_and_step();
 
     test_group("test_total_kinetic_energy");
     var ps[288];
@@ -90,6 +148,14 @@ fn test_eos_and_totals() {
     memcpy(a + 1, &q2, sizeof(PvFluidParticle));
     var ms: f64 = max_speed(a, 2);
     assert_eq(near(ms, 5.0, EPS), 1, "the faster particle's speed");
+
+    test_group("test_step_invalid_config");
+    var bad: PvFluidConfig = PvFluidConfig_water_2d();
+    bad.dt = -1.0;
+    var qi: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    memcpy(a, &qi, sizeof(PvFluidParticle));
+    var it, iv = sph_step(a, 1, &bad, 0.001);
+    assert_eq(is_err_result(it), 1, "dt = −1 is refused");
 
     test_group("test_kernel_negative_r");
     var n1: f64 = kernel_poly6(-1.0, 1.0);
@@ -179,7 +245,49 @@ fn test_wendland_and_viscosity() {
     return 0;
 }
 
-# test_zorder_negative_coordinates (part b; the two before it wait for part c's `create_particle_block`).
+# Σ mass over n particles, from +0.
+fn total_mass(ps: *PvFluidParticle, n): f64 {
+    var m: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        m = m + p.mass;
+    }
+    return m;
+}
+
+# test_sort_by_zorder and test_sort_by_zorder_preserves_data, on part c's blocks.
+fn test_sort_blocks() {
+    test_group("test_sort_by_zorder");
+    var ap, an = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.1, 0.001);
+    var a: *PvFluidParticle = _pv_as_particles(ap);
+    assert_eq(sort_by_zorder(a, an, 0.1), 1, "sorted");
+    var fin = 1;
+    for (var i = 0; i < an; i = i + 1) {
+        var p: *PvFluidParticle = a + i;
+        if (_pv_is_finite(p.position.x) == 0) { fin = 0; }
+    }
+    assert(an == 100 && fin == 1, "the same 100 particles, every position finite");
+    fl_free(ap);
+
+    test_group("test_sort_by_zorder_preserves_data");
+    var bp, bn = create_particle_block(0.0, 0.0, 0.5, 0.5, 0.1, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    b.velocity = PvVec3_new(99.0, 0.0, 0.0);
+    var before: f64 = total_mass(b, bn);
+    assert_eq(sort_by_zorder(b, bn, 0.1), 1, "sorted");
+    var after: f64 = total_mass(b, bn);
+    assert_eq(near(before, after, EPS), 1, "the total mass is kept");
+    var tagged = 0;
+    for (var j = 0; j < bn; j = j + 1) {
+        var q: *PvFluidParticle = b + j;
+        if (near(q.velocity.x, 99.0, EPS) == 1) { tagged = tagged + 1; }
+    }
+    assert_eq(tagged, 1, "the tagged particle is still there");
+    fl_free(bp);
+    return 0;
+}
+
+# test_zorder_negative_coordinates (part b).
 fn test_zorder() {
     test_group("test_zorder_negative_coordinates");
     var ps: *PvFluidParticle = _pv_as_particles(fl_alloc(3 * sizeof(PvFluidParticle)));
@@ -288,6 +396,55 @@ fn test_lists() {
     return 0;
 }
 
+# 1 when every component of v is NaN.
+fn all_nan(v: PvVec3): i64 {
+    if (v.x != v.x && v.y != v.y && v.z != v.z) { return 1; }
+    return 0;
+}
+
+# Cyrius-only (ADR 0002 #8): where Rust panics or aborts, part c returns a neutral value, and a diverging step leaves
+# what Rust's leaves.
+fn test_part_c_paths() {
+    test_group("part_c_out_of_range_reads_nan");
+    var one: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var d1: f64 = compute_density(1, &one, 1, 1.0);
+    var dm: f64 = compute_density(-1, &one, 1, 1.0);
+    assert(d1 != d1 && dm != dm, "compute_density: NaN for an index outside [0, n)");
+    var pf: PvVec3 = pressure_force(1, &one, 1, 1.0);
+    var vf: PvVec3 = viscosity_force(3, &one, 1, 1.0, 0.1);
+    assert(all_nan(pf) == 1 && all_nan(vf) == 1, "the forces: (NaN, NaN, NaN)");
+
+    test_group("part_c_refused_sizes_are_empty");
+    var op, on = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.0000000001, 0.01);
+    assert(op == 0 && on == 0, "a 10¹⁰ × 10¹⁰ block: its count overflows, (0, 0)");
+    var zp, zn = split_particle(&one, 0, 0.1);
+    assert(zp == 0 && zn == 0, "no children: (0, 0)");
+    var hp, hn = split_particle(&one, 4611686018427387904, 0.1);
+    assert(hp == 0 && hn == 0, "2⁶² children: their bytes overflow, (0, 0)");
+
+    test_group("sph_step_diverged_leaves_rusts_state");
+    var buf = fl_alloc(3 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var a: PvFluidParticle = PvFluidParticle_new_2d(0.1, 0.1, 0.01);
+    var b: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.5, 0.01);
+    var c: PvFluidParticle = PvFluidParticle_new_2d(0.51, 0.5, 0.01);
+    c.mass = PV_F64_INFINITY;
+    memcpy(ps, &a, sizeof(PvFluidParticle));
+    memcpy(ps + 1, &b, sizeof(PvFluidParticle));
+    memcpy(ps + 2, &c, sizeof(PvFluidParticle));
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var t, e = sph_step(ps, 3, &cfg, 0.001);
+    assert(is_err_result(t) == 1 && e == PV_ERR_DIVERGED, "particle 1's acceleration is NaN: Diverged");
+    var p0: *PvFluidParticle = ps;
+    var p1: *PvFluidParticle = ps + 1;
+    var p2: *PvFluidParticle = ps + 2;
+    assert(p0.acceleration.y == -9.81 && p1.acceleration.y == 0.0, "the acceleration before it written, its own not");
+    assert(p0.density > 0.0 && p2.density == PV_F64_INFINITY, "every density set");
+    assert(p1.position.x == 0.5 && p0.velocity.y == 0.0, "nothing integrated");
+    fl_free(buf);
+    return 0;
+}
+
 # Column k's storage pointer through `_pv_nb_col`'s byte offsets.
 fn nb_col_data(g: *PvNeighborGrid, k): i64 {
     var c: *PvColumn = _pv_nb_col(g, k);
@@ -325,10 +482,12 @@ fn main() {
     test_kernels();
     test_eos_and_totals();
     test_wendland_and_viscosity();
+    test_sort_blocks();
     test_zorder();
     test_msort();
     test_lists();
     test_layout();
+    test_part_c_paths();
     return assert_summary();
 }
 

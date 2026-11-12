@@ -482,3 +482,53 @@ All 50 rows were unchanged.
   request (`cyrius:docs/development/issues/2026-11-11-no-stable-sort.md`, ledger L9). The build's numbers are on
   hisab's spatial-hash request (L4).
 - **`memcpy` again.** A 144 KB copy took 232 µs (0.6 GB/s). The fix was M1's: move records by assignment (L12).
+
+## M4 part c: the brute-force sums, the free step, the block, split and merge (2026-11-12)
+
+Pinned to core 15.
+- **Rust:**
+  - its criterion groups `sph_density/<n>_particles` (particle 0's density in a unit block at spacing 1/√n, h 0.05),
+    `sph_step/<count>_particles` (one free step of a 0.5 block at spacing 1/√n for n = 25, 100 and 225, under
+    `water_2d` at water's viscosity) and `sph_pressure_force/625_particles`, one run;
+  - for the rest, the twin `scripts/probes/rust/src/bin/bench_sph_c.rs` (bodies in its header), two runs.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_c`, two runs interleaved with the twin's. Criterion's `iter_batched`
+  clones the step's particles outside its timing. Here each step first copies them in by assignment, about 12 ns a
+  particle (under 1% of the step).
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_density/100_particles` | 90.9 ns | 865–867 ns | 9.5× |
+| `sph_density/500_particles` | 632 ns | 4.41–4.43 µs | 7.0× |
+| `sph_density/1000_particles` | 1.21 µs | 8.53 µs | 7.1× |
+| `sph_step/9_particles` | 376 ns | 3.04–3.08 µs | 8.1× |
+| `sph_step/25_particles` | 2.13 µs | 15.3–15.5 µs | 7.2× |
+| `sph_step/64_particles` | 18.0 µs | 93–95 µs | 5.2× |
+| `sph_pressure_force/625_particles` | 1.28 µs | 6.27–6.29 µs | 4.9× |
+| `sph_c/viscosity_force_625` | 774–778 ns | 6.20–6.24 µs | 8.0× |
+| `sph_c/create_particle_block_1000` | 3.50–3.66 µs | 85–90 µs | 24× |
+| `sph_c/split_particle_8` | 142 ns | 138 µs | ≈ 970× (the L1 slow path) |
+| `sph_c/merge_particles` | 7.4 ns | 95–100 ns | 13× |
+
+**The A/B behind two rows.** The bench was built against the first `src/sph_fns.cyr` (in a copy of the tree), pinned,
+three runs interleaved. All 198 rows were unchanged.
+
+| Bench | Before | After | |
+|---|---|---|---|
+| `create_particle_block_1000` | 140–154 µs | 85–90 µs | 1.6× |
+| `merge_particles` | 126–129 ns | 95–100 ns | 1.3× |
+
+- The block had built each particle with `PvFluidParticle_new_2d`, a 144-byte struct return, about 86 ns each (M1
+  part 3). Now one template particle is built and copied whole into each record, then placed.
+- Merge's six helper calls are written out.
+
+**Reading it.**
+- **The sums and the step are the codegen's per-operation cost.** At spacing 1/√n against h 0.05, almost no pair in
+  these blocks is within h, so each pair is a distance and two compares. That costs about 8 ns a pair here and about
+  1 ns in Rust. In the step's 64-particle block (spacing 0.067), no pair is within h, and the density and force loops
+  take about 11 ns a pair each.
+- **The block is mostly its 144 KB buffer.** The freelist maps and unmaps every block over 4 KB, and each page faults
+  on first touch: about 60 µs of the 85–90 (the filed `2026-11-11-freelist-maps-every-block-over-4k.md`).
+- **Split into 8 children is the correctly rounded sin and cos's slow path.** Its ring angles k·π/4 include fl(π/2),
+  fl(π) and fl(3π/2), where cos or sin is nearly zero and the stand-in falls to its multi-precision path: one
+  `cos(fl(π/2))` takes 40 µs. Into 7 children, with no such angle, the split takes 3.5 µs. This is the same cost as
+  M3 part b's DST sines at fl(k·π/2) (ledger L1).
