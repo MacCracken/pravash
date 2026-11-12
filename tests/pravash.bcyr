@@ -281,6 +281,146 @@ fn bench_common() {
     return 0;
 }
 
+# ── buoyancy, vortex, bridge, JSON (M1 part 4) ──────────────────────────────────────────────────
+# The bodies of bench_common.rs's m1/* and json/* rows, on the same inputs (k & 1023 scaled per row).
+
+fn bench_m1b() {
+    var b = bench_new("m1/terminal_velocity");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var m: f64 = 1.0 + f64_from(i & 1023) * 0.001;
+        var t, v = terminal_velocity(m, 9.81, 1.225, 0.47, 0.01);
+        g_sink = g_sink ^ v;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("m1/reynolds_number");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var u: f64 = f64_from(i & 1023) * 0.01;
+        var t2, v2 = reynolds_number(1000.0, u, 0.1, 0.001);
+        g_sink = g_sink ^ v2;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("m1/lamb_oseen_velocity");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var r: f64 = 0.01 + f64_from(i & 1023) * 0.0001;
+        var l: f64 = lamb_oseen_velocity(1.0, r, 0.001, 1.0);
+        g_sink = g_sink ^ _pv_bits(l);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("m1/kolmogorov_scale");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var e: f64 = 0.001 + f64_from(i & 1023) * 0.001;
+        var k: f64 = kolmogorov_scale(0.000001, e);
+        g_sink = g_sink ^ _pv_bits(k);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    var field = fl_alloc(8000);
+    for (var j = 0; j < 1000; j = j + 1) {
+        var w: f64 = f64_from(j % 17) * 0.1 - 0.8;
+        store64(field + j * 8, w);
+    }
+    b = bench_new("m1/enstrophy_1000");
+    bench_batch_start(b);
+    for (var i = 0; i < 100000; i = i + 1) {
+        var en: f64 = enstrophy(field, 1000, 0.01);
+        g_sink = g_sink ^ _pv_bits(en);
+    }
+    bench_batch_stop(b, 100000);
+    bench_report(b);
+    fl_free(field);
+
+    b = bench_new("m1/water_viscosity");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var tk: f64 = 273.0 + f64_from(i & 1023) * 0.0977;
+        var mu: f64 = temperature_to_water_viscosity(tk);
+        g_sink = g_sink ^ _pv_bits(mu);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("m1/broadband_noise_db");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var ke: f64 = 0.001 + f64_from(i & 1023) * 0.01;
+        var db: f64 = tke_to_broadband_noise_db(ke);
+        g_sink = g_sink ^ _pv_bits(db);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    # JSON: a config written and read, a particle read, a 100-particle SoA read (serde_json's documents).
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    b = bench_new("json/config_write");
+    bench_batch_start(b);
+    for (var i = 0; i < 100000; i = i + 1) {
+        var sb = str_builder_new();
+        var rc = cfg.to_json(sb);
+        g_sink = g_sink ^ rc;
+    }
+    bench_batch_stop(b, 100000);
+    bench_report(b);
+
+    var sbc = str_builder_new();
+    var rcc = cfg.to_json(sbc);
+    var cdoc = str_builder_build(sbc);
+    var c2: PvFluidConfig;
+    b = bench_new("json/config_read");
+    bench_batch_start(b);
+    for (var i = 0; i < 100000; i = i + 1) {
+        var t3, v3 = PvFluidConfig_from_json(str_data(cdoc), str_len(cdoc), &c2);
+        g_sink = g_sink ^ t3;
+    }
+    bench_batch_stop(b, 100000);
+    bench_report(b);
+
+    var buf = _bench_particles();
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var p17: *PvFluidParticle = ps + 17;
+    var sbp = str_builder_new();
+    var rcp = p17.to_json(sbp);
+    var pdoc = str_builder_build(sbp);
+    var q: PvFluidParticle;
+    b = bench_new("json/particle_read");
+    bench_batch_start(b);
+    for (var i = 0; i < 100000; i = i + 1) {
+        var t4, v4 = PvFluidParticle_from_json(str_data(pdoc), str_len(pdoc), &q);
+        g_sink = g_sink ^ t4;
+    }
+    bench_batch_stop(b, 100000);
+    bench_report(b);
+
+    var small: PvParticleSoa;
+    var okf = PvParticleSoa_from_aos(&small, ps, 100);
+    var sbs = str_builder_new();
+    var rcs = small.to_json(sbs);
+    var sdoc = str_builder_build(sbs);
+    var s2: PvParticleSoa;
+    b = bench_new("json/soa_read_100");
+    bench_batch_start(b);
+    for (var i = 0; i < NB; i = i + 1) {
+        var t5, v5 = PvParticleSoa_from_json(str_data(sdoc), str_len(sdoc), &s2);
+        g_sink = g_sink ^ s2.len();
+        PvParticleSoa_drop(&s2);
+    }
+    bench_batch_stop(b, NB);
+    bench_report(b);
+    PvParticleSoa_drop(&small);
+    fl_free(buf);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -299,6 +439,7 @@ fn main(): i64 {
     bench_report(b);
     bench_math();
     bench_common();
+    bench_m1b();
     return 0;
 }
 

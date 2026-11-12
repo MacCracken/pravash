@@ -1,0 +1,115 @@
+# bridge.cyr — cross-crate bridges: primitive values from pavan (aerodynamics), ushma (thermodynamics) and goonj
+# (acoustics) to pravash's fluid parameters (port of rust-old/src/bridge.rs).
+#
+# Rust's operation order throughout; the literals are Rust's (2.414e-5 written positionally: there is no exponent
+# notation). temperature_to_water_viscosity's powf and tke_to_broadband_noise_db's log10 are the correctly rounded
+# ones (ADR 0004).
+
+# ── pavan (aerodynamics) ────────────────────────────────────────────────────────────
+
+# The surface pressure from a pressure coefficient: P = P∞ + Cp·q∞ (Pa). Mirrors `cp_to_surface_pressure`.
+#must_use
+fn cp_to_surface_pressure(cp: f64, dynamic_pressure_pa: f64, static_pressure_pa: f64): f64 {
+    var r: f64 = static_pressure_pa + (cp * dynamic_pressure_pa);
+    return r;
+}
+
+# The free-stream dynamic pressure, q = 0.5·ρ·V² (Pa). Mirrors `freestream_dynamic_pressure`.
+#must_use
+fn freestream_dynamic_pressure(velocity_ms: f64, density_kg_m3: f64): f64 {
+    var r: f64 = ((0.5 * density_kg_m3) * velocity_ms) * velocity_ms;
+    return r;
+}
+
+# The lift and drag forces from their coefficients, F = C·q·S (N): read as `var l, d = …;` and bind each to an
+# f64. Mirrors `aero_coefficients_to_forces`'s `(lift, drag)`.
+#must_use
+fn aero_coefficients_to_forces(cl: f64, cd: f64, dynamic_pressure_pa: f64, reference_area_m2: f64) {
+    var lift: f64 = (cl * dynamic_pressure_pa) * reference_area_m2;
+    var drag: f64 = (cd * dynamic_pressure_pa) * reference_area_m2;
+    return (lift, drag);
+}
+
+# The wind speed clamped to the subsonic range [−340, 340] m/s (a NaN stays NaN). Mirrors `wind_to_freestream`.
+#must_use
+fn wind_to_freestream(wind_velocity_ms: f64): f64 {
+    var r: f64 = _pv_clamp(wind_velocity_ms, -340.0, 340.0);
+    return r;
+}
+
+# ── ushma (thermodynamics) ──────────────────────────────────────────────────────────
+
+# Water's dynamic viscosity at temperature T (K), by the Vogel correlation μ = A·10^(B/(T − C)), A = 2.414e-5 Pa·s,
+# B = 247.8 K, C = 140 K, with T clamped to [273, 373]. Mirrors `temperature_to_water_viscosity`.
+#must_use
+fn temperature_to_water_viscosity(temperature_k: f64): f64 {
+    var t: f64 = _pv_clamp(temperature_k, 273.0, 373.0);
+    var a: f64 = 0.00002414;
+    var b: f64 = 247.8;
+    var c: f64 = 140.0;
+    var e: f64 = b / (t - c);
+    var p: f64 = _pv_powf(10.0, e);
+    var r: f64 = a * p;
+    return r;
+}
+
+# The thermal buoyancy forcing per unit volume over one step, g·β·Q·dt / (c_p·V) (N/m³; ρ cancels and only needs to
+# be positive). 0 unless V, c_p and ρ are all above 0 (a NaN among them included). Mirrors
+# `heat_to_buoyancy_forcing`.
+#must_use
+fn heat_to_buoyancy_forcing(heat_power_w: f64, fluid_volume_m3: f64, density_kg_m3: f64,
+  specific_heat_j_per_kg_k: f64, expansion_coeff_per_k: f64, dt_s: f64): f64 {
+    if (fluid_volume_m3 > 0.0 && specific_heat_j_per_kg_k > 0.0 && density_kg_m3 > 0.0) {} else { return 0.0; }
+    var num: f64 = ((9.81 * expansion_coeff_per_k) * heat_power_w) * dt_s;
+    var r: f64 = num / (specific_heat_j_per_kg_k * fluid_volume_m3);
+    return r;
+}
+
+# The eddy thermal diffusivity from the turbulent kinetic energy, α_t ≈ C_μ^(1/4)·√k·L / Pr_t with C_μ^(1/4) =
+# 0.5477 and Pr_t = 0.85 (m²/s); 0 for k ≤ 0. Mirrors `tke_to_eddy_diffusivity`.
+#must_use
+fn tke_to_eddy_diffusivity(tke: f64, turbulent_length_scale_m: f64): f64 {
+    if (tke <= 0.0) { return 0.0; }
+    var sk: f64 = f64_sqrt(tke);
+    var r: f64 = ((0.5477 * sk) * turbulent_length_scale_m) / 0.85;
+    return r;
+}
+
+# ── goonj (acoustics) ───────────────────────────────────────────────────────────────
+
+# Lighthill's eighth-power law: the acoustic source strength (|v|/c)^8, dimensionless; 0 for c ≤ 0. The power is
+# LLVM's three squarings. Mirrors `velocity_to_acoustic_source_strength`.
+#must_use
+fn velocity_to_acoustic_source_strength(velocity_ms: f64, speed_of_sound: f64): f64 {
+    if (speed_of_sound <= 0.0) { return 0.0; }
+    var av: f64 = f64_abs(velocity_ms);
+    var mach: f64 = av / speed_of_sound;
+    var r: f64 = _pv_powi8(mach);
+    return r;
+}
+
+# A rough broadband noise level, 20·log10(u_rms / v_ref) dB with u_rms = √((2/3)·k) and v_ref = 5e-8 m/s; 0 for
+# k ≤ 0 or u_rms ≤ v_ref. A relative loudness cue, not a calibrated SPL. Mirrors `tke_to_broadband_noise_db`.
+#must_use
+fn tke_to_broadband_noise_db(tke: f64): f64 {
+    if (tke <= 0.0) { return 0.0; }
+    var two_thirds: f64 = 2.0 / 3.0;
+    var u_rms: f64 = f64_sqrt(two_thirds * tke);
+    var v_ref: f64 = 0.00000005;
+    if (u_rms <= v_ref) { return 0.0; }
+    var l: f64 = _pv_log10(u_rms / v_ref);
+    var r: f64 = 20.0 * l;
+    return r;
+}
+
+# The acoustic pressure of a surface wave, ρ_air·g·|h|·k·|h| with k = 2πf/c, ρ_air = 1.225 and g = 9.81 (Pa); 0 for
+# c ≤ 0 or f ≤ 0. Mirrors `wave_height_to_acoustic_pressure`.
+#must_use
+fn wave_height_to_acoustic_pressure(wave_height_m: f64, frequency_hz: f64, speed_of_sound: f64): f64 {
+    if (speed_of_sound <= 0.0 || frequency_hz <= 0.0) { return 0.0; }
+    var two_pi: f64 = 2.0 * PV_F64_PI;
+    var k: f64 = (two_pi * frequency_hz) / speed_of_sound;
+    var ah: f64 = f64_abs(wave_height_m);
+    var r: f64 = (((1.225 * 9.81) * ah) * k) * ah;
+    return r;
+}

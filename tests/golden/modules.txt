@@ -1,4 +1,8 @@
 # pravash golden corpus: one module per line; tests/parity.tcyr replays each
+bridge
+buoyancy
 common
 constants
+json
 math
+vortex

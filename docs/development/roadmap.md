@@ -42,7 +42,9 @@
 - [x] M1 part 2: `src/crmath.cyr`, `src/crlog.cyr` and the MPFR-corrected oracle (ADR 0004): every class C math
   row at 0 ulp, 43 rows more accurate than the oracle
 - [x] M1 part 3: error, vec3, common (3,683 rows bit-exact, 47 + 6 Rust tests ported, surface parity in CI)
-- [ ] M1 part 4: buoyancy, vortex, bridge, the M1 JSON (and common's two serde tests)
+- [x] M1 part 4: buoyancy, vortex, bridge, the M1 JSON (7,973 + 302 rows, 45 + 2 + 11 Rust tests)
+- [x] **M1 done 2026-11-11.**
+- [ ] M2: shallow water
 
 ### 1.3.0
 

@@ -463,10 +463,266 @@ fn _par_common(fp, fl): i64 {
     return 0;
 }
 
+# ── buoyancy, vortex, bridge (M1 part 4) ─────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_buoyancy.rs, m_vortex.rs, m_bridge.rs.
+
+# Appends an f64 Result: `f:` for Ok, `E:<Variant>` for Err.
+fn _par_f64_result(t, v) {
+    if (is_err_result(t) == 1) { _par_got_err(v); return 0; }
+    _par_got_f(v);
+    return 0;
+}
+
+# The golden text `<Enum>.<Variant>` as a C string (the enum name is a C string literal).
+fn _par_enum_text(en, variant): i64 {
+    var a = strlen(en);
+    var b = strlen(variant);
+    var s = alloc(a + b + 2);
+    memcpy(s, en, a);
+    store8(s + a, 46);
+    memcpy(s + a + 1, variant, b);
+    store8(s + a + b + 1, 0);
+    return s;
+}
+
+fn _par_buoyancy(fp, fl): i64 {
+    if (_par_eq(fp, fl, "buoyancy_force") == 1) {
+        var r: f64 = buoyancy_force(_par_in(0), _par_in(1), _par_in(2));
+        _par_got_f(_pv_bits(r));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "drag_force") == 1) {
+        var d: f64 = drag_force(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(_pv_bits(d));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "terminal_velocity") == 1) {
+        var t, v = terminal_velocity(_par_in(0), _par_in(1), _par_in(2), _par_in(3), _par_in(4));
+        _par_f64_result(t, v);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "reynolds_number") == 1) {
+        var t2, v2 = reynolds_number(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_f64_result(t2, v2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "classify_flow") == 1) {
+        _par_got_e(_par_enum_text("FlowRegime", flow_regime_name(classify_flow(_par_in(0)))));
+        return 1;
+    }
+    return 0;
+}
+
+fn _par_vortex(fp, fl): i64 {
+    if (_par_eq(fp, fl, "vorticity_2d") == 1) {
+        var w: f64 = vorticity_2d(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(w));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "lamb_oseen_velocity") == 1) {
+        var l: f64 = lamb_oseen_velocity(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(_pv_bits(l));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "rankine_velocity") == 1) {
+        var r: f64 = rankine_velocity(_par_in(0), _par_in(1), _par_in(2));
+        _par_got_f(_pv_bits(r));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "enstrophy") == 1) {
+        var n = _par_in(0);
+        var buf = alloc(n * 8 + 8);
+        var k = _par_in_f64s(0, buf);
+        var e: f64 = enstrophy(buf, k, _par_in(1 + n));
+        _par_got_f(_pv_bits(e));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "kolmogorov_scale") == 1) {
+        var s: f64 = kolmogorov_scale(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(s));
+        return 1;
+    }
+    return 0;
+}
+
+fn _par_bridge(fp, fl): i64 {
+    if (_par_eq(fp, fl, "cp_to_surface_pressure") == 1) {
+        var a: f64 = cp_to_surface_pressure(_par_in(0), _par_in(1), _par_in(2));
+        _par_got_f(_pv_bits(a));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "freestream_dynamic_pressure") == 1) {
+        var b: f64 = freestream_dynamic_pressure(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(b));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "aero_coefficients_to_forces") == 1) {
+        var l, d = aero_coefficients_to_forces(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(l);
+        _par_got_f(d);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "wind_to_freestream") == 1) {
+        var w: f64 = wind_to_freestream(_par_in(0));
+        _par_got_f(_pv_bits(w));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "temperature_to_water_viscosity") == 1) {
+        var mu: f64 = temperature_to_water_viscosity(_par_in(0));
+        _par_got_f(_pv_bits(mu));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "heat_to_buoyancy_forcing") == 1) {
+        var h: f64 = heat_to_buoyancy_forcing(_par_in(0), _par_in(1), _par_in(2), _par_in(3), _par_in(4), _par_in(5));
+        _par_got_f(_pv_bits(h));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "tke_to_eddy_diffusivity") == 1) {
+        var e: f64 = tke_to_eddy_diffusivity(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(e));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "velocity_to_acoustic_source_strength") == 1) {
+        var s: f64 = velocity_to_acoustic_source_strength(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(s));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "tke_to_broadband_noise_db") == 1) {
+        var n: f64 = tke_to_broadband_noise_db(_par_in(0));
+        _par_got_f(_pv_bits(n));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "wave_height_to_acoustic_pressure") == 1) {
+        var p: f64 = wave_height_to_acoustic_pressure(_par_in(0), _par_in(1), _par_in(2));
+        _par_got_f(_pv_bits(p));
+        return 1;
+    }
+    return 0;
+}
+
+# ── json (M1 part 4) ───────────────────────────────────────────────────────────────
+# Each row decodes the oracle's document (D4: the same bits), then round-trips the port's own encoding of the
+# decoded value: write it, read it back, compare the bytes. A failed round trip makes the row unusable (-1, counted
+# as a failure). The `_bayan_*` rows (bayan's stricter policies) have no entry: pending.
+
+# The Str the builder sb holds.
+fn _par_sb_text(sb) {
+    var s = str_builder_build(sb);
+    return (str_data(s), str_len(s));
+}
+
+# A round trip of the `n`-byte record at `rec` through `to_json` / `from_json`: 1 when the bytes come back.
+fn _par_json_record(kind, rec, n): i64 {
+    var sb = str_builder_new();
+    var back = alloc(n + 8);
+    var rc = 0;
+    if (kind == 0) { var m: *PvFluidMaterial = _pv_as_material(rec); rc = m.to_json(sb); }
+    if (kind == 1) { var q: *PvFluidParticle = _pv_as_particles(rec); rc = q.to_json(sb); }
+    if (kind == 2) { var c: *PvFluidConfig = _pv_as_config(rec); rc = c.to_json(sb); }
+    if (rc != 0) { return 0; }
+    var d, dl = _par_sb_text(sb);
+    var t = 0;
+    var v = 0;
+    if (kind == 0) { t, v = PvFluidMaterial_from_json(d, dl, _pv_as_material(back)); }
+    if (kind == 1) { t, v = PvFluidParticle_from_json(d, dl, _pv_as_particles(back)); }
+    if (kind == 2) { t, v = PvFluidConfig_from_json(d, dl, _pv_as_config(back)); }
+    if (is_err_result(t) == 1) { return 0; }
+    return memeq(rec, back, n);
+}
+
+fn _par_json(fp, fl): i64 {
+    var doc = _par_in_cstr(0);
+    if (doc == 0) { return 0 - 1; }
+    var dl = strlen(doc);
+    if (_par_eq(fp, fl, "FluidMaterial::from_json") == 1) {
+        var m: PvFluidMaterial;
+        var t, v = PvFluidMaterial_from_json(doc, dl, &m);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_f(_pv_bits(m.density));
+        _par_got_f(_pv_bits(m.viscosity));
+        _par_got_f(_pv_bits(m.surface_tension));
+        _par_got_f(_pv_bits(m.speed_of_sound));
+        if (_par_json_record(0, &m, sizeof(PvFluidMaterial)) == 0) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidParticle::from_json") == 1) {
+        var p: PvFluidParticle;
+        var t2, v2 = PvFluidParticle_from_json(doc, dl, &p);
+        if (is_err_result(t2) == 1) { _par_got_err(v2); return 1; }
+        _par_particle_out(&p);
+        if (_par_json_record(1, &p, sizeof(PvFluidParticle)) == 0) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidConfig::from_json") == 1) {
+        var c: PvFluidConfig;
+        var t3, v3 = PvFluidConfig_from_json(doc, dl, &c);
+        if (is_err_result(t3) == 1) { _par_got_err(v3); return 1; }
+        _par_config_out(&c);
+        if (_par_json_record(2, &c, sizeof(PvFluidConfig)) == 0) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ParticleSoa::from_json") == 1) {
+        var s: PvParticleSoa;
+        var t4, v4 = PvParticleSoa_from_json(doc, dl, &s);
+        if (is_err_result(t4) == 1) { _par_got_err(v4); return 1; }
+        for (var k = 0; k < 18; k = k + 1) {
+            var col: *PvColumn = _pv_soa_col(&s, k);
+            _par_got_seq(col.len);
+            for (var j = 0; j < col.len; j = j + 1) {
+                if (k == 12) { _par_got_i(col.get(j)); } else { _par_got_f(col.get(j)); }
+            }
+        }
+        # The round trip: every column's length and words come back.
+        var sb = str_builder_new();
+        if (s.to_json(sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var s2: PvParticleSoa;
+        var t5, v5 = PvParticleSoa_from_json(d, n, &s2);
+        if (is_err_result(t5) == 1) { return 0 - 1; }
+        for (var k2 = 0; k2 < 18; k2 = k2 + 1) {
+            var a: *PvColumn = _pv_soa_col(&s, k2);
+            var b: *PvColumn = _pv_soa_col(&s2, k2);
+            if (a.len != b.len) { return 0 - 1; }
+            if (a.len > 0 && memeq(a.data, b.data, a.len * 8) != 1) { return 0 - 1; }
+        }
+        PvParticleSoa_drop(&s);
+        PvParticleSoa_drop(&s2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FlowRegime::from_json") == 1) {
+        var r = 0;
+        var t6, v6 = flow_regime_from_json(doc, dl, &r);
+        if (is_err_result(t6) == 1) { _par_got_err(v6); return 1; }
+        _par_got_e(_par_enum_text("FlowRegime", flow_regime_name(r)));
+        var sb2 = str_builder_new();
+        if (flow_regime_to_json(r, sb2) != 0) { return 0 - 1; }
+        var d2, n2 = _par_sb_text(sb2);
+        var r2 = 0 - 1;
+        var t7, v7 = flow_regime_from_json(d2, n2, &r2);
+        if (r2 != r) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DragCoefficient::from_json") == 1) {
+        var t8, v8 = drag_coefficient_from_json(doc, dl);
+        if (is_err_result(t8) == 1) { _par_got_err(v8); return 1; }
+        var sb3 = str_builder_new();
+        if (drag_coefficient_to_json(sb3) != 0) { return 0 - 1; }
+        var d3, n3 = _par_sb_text(sb3);
+        var t9, v9 = drag_coefficient_from_json(d3, n3);
+        if (is_err_result(t9) == 1) { return 0 - 1; }
+        return 1;
+    }
+    return 0;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
+    if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
+    if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
+    if (_par_eq(mp, ml, "vortex") == 1) { return _par_vortex(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
+    if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     return 0;
 }
@@ -579,6 +835,12 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::log10") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::cbrt") == 1) { return 0; }
+    # M1 part 4's class C functions: Rust's operations on the correctly rounded primitives, so each row equals the
+    # corrected oracle (the oracle's operations with every exp, ln, log10 and powf correctly rounded) bit for bit.
+    if (_par_eq(fp, fl, "lamb_oseen_velocity") == 1) { return 0; }
+    if (_par_eq(fp, fl, "kolmogorov_scale") == 1) { return 0; }
+    if (_par_eq(fp, fl, "temperature_to_water_viscosity") == 1) { return 0; }
+    if (_par_eq(fp, fl, "tke_to_broadband_noise_db") == 1) { return 0; }
     return 0 - 1;
 }
 

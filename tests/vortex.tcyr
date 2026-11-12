@@ -1,0 +1,96 @@
+# vortex.tcyr — the ported Rust tests of rust-old/src/vortex.rs (M1 part 4).
+#
+# `enstrophy`'s slice is (pointer, count).
+
+include "tests/lib.cyr"
+
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+var EPS: f64 = 0.0000000001;   # the Rust tests' 1e-10
+
+fn main() {
+    alloc_init();
+    var two_pi: f64 = 2.0 * PV_F64_PI;
+
+    test_group("test_vorticity_2d");
+    var a: f64 = vorticity_2d(1.0, 0.0);
+    var b: f64 = vorticity_2d(0.0, 1.0);
+    var c: f64 = vorticity_2d(2.0, 2.0);
+    assert(near(a, 1.0, EPS) == 1 && near(b, -1.0, EPS) == 1 && near(c, 0.0, EPS) == 1, "ω = ∂vy/∂x − ∂vx/∂y");
+
+    test_group("test_lamb_oseen_far_field");
+    var v: f64 = lamb_oseen_velocity(1.0, 10.0, 0.001, 1.0);
+    var irr: f64 = 1.0 / (two_pi * 10.0);
+    assert(near(v, irr, 0.01) == 1, "approaches Γ/(2πr) far from the core");
+
+    test_group("test_lamb_oseen_zero_radius");
+    var v0: f64 = lamb_oseen_velocity(1.0, 0.0, 0.001, 1.0);
+    assert(near(v0, 0.0, EPS) == 1, "0 at r = 0");
+
+    test_group("test_lamb_oseen_zero_time_is_point_vortex");
+    var expected: f64 = 1.0 / two_pi;
+    var vt0: f64 = lamb_oseen_velocity(1.0, 1.0, 0.001, 0.0);
+    var vn0: f64 = lamb_oseen_velocity(1.0, 1.0, 0.0, 1.0);
+    assert(near(vt0, expected, EPS) == 1 && near(vn0, expected, EPS) == 1, "Γ/(2πr) at t = 0 and at ν = 0");
+
+    test_group("test_rankine_inside_core");
+    var ri: f64 = rankine_velocity(two_pi, 0.5, 1.0);
+    assert(near(ri, 0.5, EPS) == 1, "Γr/(2πR²) = 0.5");
+
+    test_group("test_rankine_outside_core");
+    var ro: f64 = rankine_velocity(two_pi, 2.0, 1.0);
+    assert(near(ro, 0.5, EPS) == 1, "Γ/(2πr) = 0.5");
+
+    test_group("test_rankine_continuous_at_core");
+    var vin: f64 = rankine_velocity(5.0, 1.0, 1.0);
+    var vout: f64 = rankine_velocity(5.0, 1.0 + EPS, 1.0);
+    assert(near(vin, vout, 0.01) == 1, "continuous at r = R");
+
+    test_group("test_enstrophy_zero");
+    var z = alloc(24);
+    store64(z, 0);
+    store64(z + 8, 0);
+    store64(z + 16, 0);
+    var e0: f64 = enstrophy(z, 3, 0.1);
+    assert(near(e0, 0.0, EPS) == 1, "a still field has none");
+
+    test_group("test_enstrophy_positive");
+    var fld = alloc(32);
+    var w0: f64 = 1.0;
+    var w1: f64 = -1.0;
+    var w2: f64 = 2.0;
+    var w3: f64 = 0.5;
+    store64(fld, w0);
+    store64(fld + 8, w1);
+    store64(fld + 16, w2);
+    store64(fld + 24, w3);
+    var e: f64 = enstrophy(fld, 4, 0.1);
+    assert(e > 0.0, "positive");
+
+    test_group("test_kolmogorov_scale");
+    var eta: f64 = kolmogorov_scale(0.000001, 0.01);
+    assert(eta > 0.0 && _pv_is_finite(eta) == 1, "positive and finite");
+
+    test_group("test_kolmogorov_zero_dissipation");
+    var ki: f64 = kolmogorov_scale(0.000001, 0.0);
+    var inf: f64 = PV_F64_INFINITY;
+    assert(ki == inf, "∞ with no dissipation");
+
+    test_group("test_kolmogorov_inviscid_limit");
+    var k0: f64 = kolmogorov_scale(0.0, 0.01);
+    assert(near(k0, 0.0, EPS) == 1, "0 in the inviscid limit");
+
+    test_group("enstrophy_empty_is_negative_zero");
+    var en: f64 = enstrophy(0, 0, 1.0);
+    assert_eq(_pv_bits(en), 0x8000000000000000, "Rust's f64 Sum of nothing is −0");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

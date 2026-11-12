@@ -122,3 +122,34 @@ whose noise is ±20 %.
 - **Small bodies pay for calls and struct returns.** rustc inlines `new_2d` and `kinetic_energy` to a handful of
   instructions. Cyrius calls each function and returns the 144-byte particle through a hidden pointer. Hot loops
   read fields into f64 locals instead (port-parity §4.2).
+
+## M1a part 4: buoyancy, vortex, bridge and JSON (2026-11-11)
+
+`m1/*` and `json/*` in `tests/pravash.bcyr` against the same bodies in `bench_common.rs`. The Rust JSON rows use
+serde_json 1.0.154 with the generator's `float_roundtrip` parse. One pinned, interleaved run.
+
+| Bench | Body | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `m1/terminal_velocity` | √(2mg / ρCdA), validated | 3.6 ns | 50 ns | 14× |
+| `m1/reynolds_number` | ρ·\|v\|·L / μ, validated | 1.4 ns | 28 ns | 20× |
+| `m1/lamb_oseen_velocity` | one correctly rounded exp | 7.4 ns | 136 ns | 18× |
+| `m1/kolmogorov_scale` | two ln and one exp, correctly rounded | 12.4 ns | 264 ns | 21× |
+| `m1/enstrophy_1000` | Σ ω²·dx² over 1,000 values | 759 ns | 3.0 µs | 4.0× |
+| `m1/water_viscosity` | one correctly rounded pow | 12.4 ns | 792 ns | 64× |
+| `m1/broadband_noise_db` | a sqrt and one correctly rounded log10 | 13.5 ns | 104 ns | 7.7× |
+| `json/config_write` | `FluidConfig` to text | 408 ns | 8.3 µs | 20× |
+| `json/config_read` | text to `FluidConfig` | 329 ns | 7.8 µs | 24× |
+| `json/particle_read` | text to `FluidParticle` | 475 ns | 10.0 µs | 21× |
+| `json/soa_read_100` | a 100-particle `ParticleSoa` (18 arrays) | 31.9 µs | 572 µs | 18× |
+
+**Reading it.**
+- **The class C rows are their primitive's cost.** `lamb_oseen_velocity` is exp's 110 ns plus the arithmetic;
+  `kolmogorov_scale` is two ln (58 ns each) and an exp; `water_viscosity` is pow's 757 ns (M1 part 2). They gain
+  when ganita's tier does (ledger L1).
+- **`enstrophy` is 4×,** a plain load-multiply-add loop with no calls in it.
+- **JSON is about 20× serde_json.**
+  - **Writing** makes a builder call per token and a Grisu2 print per float. Each call goes through the
+    non-aborting `_a` path that ADR 0002 #8 requires.
+  - **Reading** builds bayan's value tree on a reset arena, then looks each field up by name.
+  - Neither is on a step path. A faster writer would batch tokens into a local buffer; that waits for a consumer
+    that needs it.

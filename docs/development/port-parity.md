@@ -500,3 +500,81 @@ anyway, and the faster column copy replaced them since.
 
 **The memcpy question (ledger L12)** is answered and closed. A struct assignment moves a 144-byte record in
 11.7 ns, `memcpy` in 245 ns, so every particle move is an assignment. Details: benchmarks-rust-v-cyrius, M1 part 3.
+
+## 8. M1a part 4: buoyancy, vortex, bridge, JSON (2026-11-11); M1 complete
+
+Four `[lib]` modules after `src/common.cyr`:
+- `src/buoyancy.cyr`: the two forces, `terminal_velocity`, `reynolds_number`, `PvFlowRegime` and `classify_flow`;
+- `src/vortex.cyr`: vorticity, Lamb–Oseen, Rankine, enstrophy, the Kolmogorov scale;
+- `src/bridge.cyr`: the ten pavan / ushma / goonj conversions;
+- `src/json.cyr`: serde-compatible codecs for the six serde types of M1 (`UPSTREAM(L10)`). The Cyrius-only
+  `PV_ERR_DESERIALIZE` is appended to the error codes as 10 (ADR 0002 #10).
+
+Every function is Rust's in Rust's order. The four that call a transcendental use the correctly rounded primitives:
+`lamb_oseen_velocity`, `kolmogorov_scale`, `temperature_to_water_viscosity` and `tke_to_broadband_noise_db`.
+
+**The golden modules:**
+- `buoyancy.tsv`: 1,716 rows;
+- `vortex.tsv`: 2,293 rows;
+- `bridge.tsv`: 3,964 rows;
+- `json.tsv`: 302 documents.
+
+`validate.py` recomputes all of them:
+- **The arithmetic** in Python, in Rust's order, with an IEEE division (Python's `/` raises at 0). One finding:
+  Rust's `f64` `Sum` folds from −0.0, so an empty enstrophy is −0, which the port matches.
+- **The four class C functions**, transcribed with their primitives as parameters. On glibc (ctypes) every one of
+  their 3,198 rows reproduces the oracle bit for bit. On MPFR they give the corrected oracle:
+  - `vortex.cr.tsv`: 3 rows, 2 kolmogorov and 1 Lamb–Oseen. In the Lamb–Oseen row a 1-ulp exp misround grows to
+    7 ulp through 1 − e^(−r²/4νt);
+  - `bridge.cr.tsv`: 26 rows, 25 `tke_to_broadband_noise_db` (a log10 misround times 20 gives 1–2 ulp) and 1 water
+    viscosity.
+- **Every JSON document**, decoded again by Python's `json` (a correctly rounded float parse) under serde's derive
+  semantics. Its verdict and values agree with serde_json's on all 302.
+
+**JSON findings:**
+- **The float parse.** serde_json's default float parse is best-effort, so the generator uses its `float_roundtrip`
+  feature, as impetus's does; serde_json and serde join the generator's dependencies at the oracle's own versions.
+- **Where serde_json and bayan agree:**
+  - a struct reads from an array of exactly its fields;
+  - unknown fields are ignored and a duplicated known field is refused;
+  - `null`, a string or a boolean is refused for an f64, and so is `1e400`;
+  - `1e-400` reads as 0;
+  - the phase refuses `256`, `-1` and `1.0`;
+  - a unit variant reads as `"Name"` or `{"Name":null}`, and the unit struct only as `null`.
+- **Where bayan's policies differ (three documents),** each a row of its own that the harness leaves pending
+  (ADR 0002 #10):
+  - an integer above `i64::MAX` into an f64, and a duplicated unknown field: impetus's S3 and S4, already at bayan;
+  - the integer `-0`, which serde_json reads as −0.0 and bayan's tree as the integer 0: filed at bayan with a repro
+    (`bayan:docs/development/issues/2026-11-11-json-integer-negative-zero-loses-its-sign.md`).
+
+**Result:** on the first replay every new row passes. All 7,973 function rows are bit-exact; the 29 corrected rows
+are accepted (ADR 4), each equal to MPFR's correction. All 299 decodes match, and each round-trips through the port's
+own writer. The replay is **7 modules, 0 failing | rows: 42,697 ok, 0 failed, 0 measured, 2,463 pending, 72 accepted
+(ADR 4: 72)**:
+- **pending:** the M4 cell key's 2,460 and the 3 bayan rows;
+- **targets:** identical on x86_64 ELF, x86_64 PE and aarch64, warning-free, and under `--bounds`.
+
+**Tests ported:**
+- all 45 Rust tests of the three modules: `tests/buoyancy.tcyr`, `vortex.tcyr`, `bridge.tcyr`, 54 checks;
+- `common.rs`'s two serde tests, completing its 49;
+- the 11 tests of `rust-old/tests/integration.rs` that use only M1 modules: `tests/integration.tcyr`, which later
+  milestones extend.
+
+Surface parity covers error, common, buoyancy, vortex and bridge: 128 items.
+
+**Mutation checks** (each restored and re-verified after):
+- Lamb–Oseen on the exp polyfill: 16 rows FAILED.
+- The phase reader taking 256: 1 JSON row FAILED.
+- `null` read as 0 for an f64: 11 JSON rows FAILED, across all four struct types.
+- `classify_flow`'s 2300 made inclusive: the 2 threshold rows FAILED.
+- A corrected bridge row's last bit: that row FAILED, and `validate.py` fails.
+- The particle writer putting mass in `fuel`: the round trip fails 82 rows. The decode alone wouldn't notice.
+
+**M1 is complete:**
+- **The library:** fourteen `[lib]` modules.
+- **The corpus:** 45,232 golden rows across seven modules. Every one recomputed by `validate.py`, and every one
+  gated:
+  - all bit-exact or accepted against the corrected oracle;
+  - the only pending rows are the M4 cell key's 2,460 and the 3 bayan rows.
+- **The Rust tests:** all 100 unit tests of the M1 modules are ported (error 6, common 49, buoyancy 16, vortex
+  12, bridge 17), and the 11 integration tests that use only them.

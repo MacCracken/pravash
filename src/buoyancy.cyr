@@ -1,0 +1,88 @@
+# buoyancy.cyr — buoyancy and drag forces on a body in a fluid (port of rust-old/src/buoyancy.rs).
+#
+# Each formula is Rust's in Rust's operation order (left to right, no fused operations), so the results have the
+# oracle's bits: buoyancy_force is (ρ·g)·V, drag_force ((((0.5·ρ)·v)·v)·Cd)·A. The drag coefficients are the
+# generated constants PV_DRAG_COEFFICIENT_* (src/constants.cyr); Rust's `DragCoefficient` is a unit struct that only
+# holds them.
+
+# Archimedes' principle, F = ρ·g·V. Mirrors `buoyancy_force`.
+#must_use
+fn buoyancy_force(fluid_density: f64, gravity: f64, displaced_volume: f64): f64 {
+    var r: f64 = (fluid_density * gravity) * displaced_volume;
+    return r;
+}
+
+# The drag magnitude, F = 0.5·ρ·v²·Cd·A (non-negative for physical inputs; the caller applies it against the
+# velocity). Mirrors `drag_force`.
+#must_use
+fn drag_force(fluid_density: f64, velocity: f64, drag_coefficient: f64, cross_section_area: f64): f64 {
+    var r: f64 = ((((0.5 * fluid_density) * velocity) * velocity) * drag_coefficient) * cross_section_area;
+    return r;
+}
+
+# 1 when x is finite and above 0.
+#must_use
+fn _pv_positive(x: f64): i64 {
+    if (_pv_is_finite(x) == 1 && x > 0.0) { return 1; }
+    return 0;
+}
+
+# The terminal velocity, √(2·m·g / (ρ·Cd·A)), as Ok(the f64's bits), or Err(PV_ERR_INVALID_PARAMETER) when m or g
+# is not finite, when ρ, Cd or A is not positive and finite, or when m·g is negative. Read the value as
+# `var t, v = terminal_velocity(..); var vt: f64 = v;`. Mirrors `terminal_velocity`.
+#must_use
+fn terminal_velocity(mass: f64, gravity: f64, fluid_density: f64, drag_coefficient: f64, area: f64): Result {
+    if (_pv_is_finite(gravity) == 0 || _pv_is_finite(mass) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_positive(fluid_density) == 0 || _pv_positive(drag_coefficient) == 0 || _pv_positive(area) == 0) {
+        return Err(PV_ERR_INVALID_PARAMETER);
+    }
+    var denom: f64 = (fluid_density * drag_coefficient) * area;
+    var arg: f64 = ((2.0 * mass) * gravity) / denom;
+    if (arg < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    var r: f64 = f64_sqrt(arg);
+    return Ok(_pv_bits(r));
+}
+
+# The Reynolds number, ρ·|v|·L / μ, as Ok(the f64's bits). Err(PV_ERR_INVALID_VISCOSITY) when μ is not finite and
+# above 0; Err(PV_ERR_INVALID_PARAMETER) when ρ, v or L is not finite, or ρ or L is negative (checked in that
+# order). Mirrors `reynolds_number`.
+#must_use
+fn reynolds_number(fluid_density: f64, velocity: f64, length: f64, viscosity: f64): Result {
+    if (_pv_is_finite(viscosity) == 0 || viscosity <= 0.0) { return Err(PV_ERR_INVALID_VISCOSITY); }
+    if (_pv_is_finite(fluid_density) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_is_finite(velocity) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_is_finite(length) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (fluid_density < 0.0 || length < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    var av: f64 = f64_abs(velocity);
+    var r: f64 = ((fluid_density * av) * length) / viscosity;
+    return Ok(_pv_bits(r));
+}
+
+# The flow regime. Append-only values. Mirrors `FlowRegime`.
+enum PvFlowRegime {
+    PV_FLOW_REGIME_LAMINAR = 0;
+    PV_FLOW_REGIME_TRANSITIONAL = 1;
+    PV_FLOW_REGIME_TURBULENT = 2;
+}
+
+# The Rust variant name of a flow regime (`"Laminar"`), or "Unknown".
+#must_use
+fn flow_regime_name(k): i64 {
+    match k {
+        PV_FLOW_REGIME_LAMINAR => { return "Laminar"; }
+        PV_FLOW_REGIME_TRANSITIONAL => { return "Transitional"; }
+        PV_FLOW_REGIME_TURBULENT => { return "Turbulent"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# The regime of |Re| by the pipe-flow thresholds: laminar below 2300, transitional below 4000, else turbulent (a NaN
+# is turbulent, as Rust's comparisons make it). Mirrors `classify_flow`.
+#must_use
+fn classify_flow(re: f64): i64 {
+    var a: f64 = f64_abs(re);
+    if (a < 2300.0) { return PV_FLOW_REGIME_LAMINAR; }
+    if (a < 4000.0) { return PV_FLOW_REGIME_TRANSITIONAL; }
+    return PV_FLOW_REGIME_TURBULENT;
+}

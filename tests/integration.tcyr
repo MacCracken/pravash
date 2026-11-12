@@ -1,0 +1,138 @@
+# integration.tcyr — the ported tests of rust-old/tests/integration.rs, as their modules land.
+#
+# M1 (part 4): the eleven that use only M1 modules. The rest arrive with their milestones:
+# - serde_roundtrip_all_types (it also needs FluidGrid and ShallowWater): M2 and M3;
+# - the shallow tests: M2;
+# - the grid tests: M3;
+# - the SPH and solver tests: M4–M5;
+# - the coupling and FLIP tests: M6.
+
+include "tests/lib.cyr"
+
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+fn invalid(c: PvFluidConfig): i64 {
+    var t, e = c.validate();
+    return is_err_result(t);
+}
+
+fn custom_err(d: f64, v: f64, s: f64, c: f64): i64 {
+    var m: PvFluidMaterial;
+    var t, e = PvFluidMaterial_custom(d, v, s, c, &m);
+    return is_err_result(t);
+}
+
+fn main() {
+    alloc_init();
+    var pi: f64 = PV_F64_PI;
+    var w: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+    var air: PvFluidMaterial = PV_FLUID_MATERIAL_AIR;
+    var honey: PvFluidMaterial = PV_FLUID_MATERIAL_HONEY;
+
+    test_group("materials_have_consistent_physics");
+    var bad = 0;
+    for (var k = 0; k < 5; k = k + 1) {
+        var m: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+        if (k == 1) { m = PV_FLUID_MATERIAL_OIL; }
+        if (k == 2) { m = PV_FLUID_MATERIAL_HONEY; }
+        if (k == 3) { m = PV_FLUID_MATERIAL_AIR; }
+        if (k == 4) { m = PV_FLUID_MATERIAL_LAVA; }
+        var d: f64 = m.density;
+        var v: f64 = m.viscosity;
+        var c: f64 = m.speed_of_sound;
+        if (d > 0.0 && v >= 0.0 && c > 0.0) {} else { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every preset is physical");
+    var ad: f64 = air.density;
+    var wd: f64 = w.density;
+    var wv: f64 = w.viscosity;
+    var hv: f64 = honey.viscosity;
+    var ac: f64 = air.speed_of_sound;
+    var wc: f64 = w.speed_of_sound;
+    assert(ad < wd && wv < hv && ac < wc, "air lighter than water, water thinner than honey, sound slower in air");
+
+    test_group("buoyancy_sphere_in_water");
+    var r: f64 = 0.062;
+    var vol: f64 = ((4.0 / 3.0) * pi) * ((r * r) * r);
+    var fb: f64 = buoyancy_force(w.density, 9.81, vol);
+    var weight: f64 = 1.0 * 9.81;
+    assert(fb > weight * 0.9, "a 1 kg sphere of radius 0.062 m floats");
+
+    test_group("buoyancy_terminal_velocity_validation");
+    var sphere: f64 = PV_DRAG_COEFFICIENT_SPHERE;
+    var t1, v1 = terminal_velocity(1.0, 9.81, 1.225, sphere, 0.01);
+    var vt: f64 = v1;
+    assert(is_err_result(t1) == 0 && vt > 0.0, "valid");
+    var t2, v2 = terminal_velocity(1.0, 9.81, 0.0, sphere, 0.01);
+    var t3, v3 = terminal_velocity(1.0, -9.81, 1.225, sphere, 0.01);
+    assert(is_err_result(t2) == 1 && is_err_result(t3) == 1, "zero density and negative m·g refused");
+
+    test_group("buoyancy_reynolds_flow_regime");
+    var ts, vs = reynolds_number(w.density, 0.001, 0.01, w.viscosity);
+    var tf, vf = reynolds_number(w.density, 10.0, 0.1, w.viscosity);
+    var tz, vz = reynolds_number(w.density, 1.0, 0.1, 0.0);
+    var res: f64 = vs;
+    var ref: f64 = vf;
+    assert_eq(classify_flow(res), PV_FLOW_REGIME_LAMINAR, "slow flow is laminar");
+    assert_eq(classify_flow(ref), PV_FLOW_REGIME_TURBULENT, "fast flow is turbulent");
+    assert_eq(is_err_result(tz), 1, "zero viscosity refused");
+
+    test_group("vortex_lamb_oseen_decays");
+    var early: f64 = lamb_oseen_velocity(1.0, 0.1, 0.01, 0.1);
+    var late: f64 = lamb_oseen_velocity(1.0, 0.1, 0.01, 10.0);
+    assert(_pv_is_finite(early) == 1 && _pv_is_finite(late) == 1, "finite early and late");
+
+    test_group("vortex_rankine_vs_lamb_oseen_convergence");
+    var vr: f64 = rankine_velocity(5.0, 100.0, 1.0);
+    var vl: f64 = lamb_oseen_velocity(5.0, 100.0, 0.001, 1.0);
+    var irr: f64 = 5.0 / ((2.0 * pi) * 100.0);
+    assert(near(vr, irr, 0.000001) == 1 && near(vl, irr, 0.001) == 1, "both approach Γ/(2πr) far out");
+
+    test_group("vortex_enstrophy_scales_with_dx");
+    var field = alloc(800);
+    var one: f64 = 1.0;
+    for (var i = 0; i < 100; i = i + 1) { store64(field + i * 8, one); }
+    var e1: f64 = enstrophy(field, 100, 0.1);
+    var e2: f64 = enstrophy(field, 100, 0.2);
+    var ratio: f64 = e2 / e1;
+    assert(near(ratio, 4.0, 0.0000000001) == 1, "enstrophy scales as dx²");
+
+    test_group("config_validation_comprehensive");
+    var c: PvFluidConfig = PvFluidConfig_water_2d();
+    assert_eq(invalid(c), 0, "valid");
+    c.gas_constant = 0.0;
+    assert_eq(invalid(c), 1, "k = 0");
+    c = PvFluidConfig_water_2d();
+    c.boundary_damping = 1.5;
+    assert_eq(invalid(c), 1, "damping 1.5");
+    c = PvFluidConfig_water_2d();
+    c.boundary_damping = -0.1;
+    assert_eq(invalid(c), 1, "damping -0.1");
+
+    test_group("custom_material_speed_of_sound_validated");
+    assert_eq(custom_err(1000.0, 0.001, 0.072, 0.0), 1, "c = 0");
+    assert_eq(custom_err(1000.0, 0.001, 0.072, -1.0), 1, "c < 0");
+    assert_eq(custom_err(1000.0, 0.001, 0.072, 1480.0), 0, "water's");
+
+    test_group("particle_is_copy");
+    var p: PvFluidParticle = PvFluidParticle_new_2d(1.0, 2.0, 0.01);
+    var p2: PvFluidParticle = p;
+    p2.mass = 5.0;
+    assert(near(p.mass, 0.01, 0.0000000001) == 1, "a copy, not an alias");
+
+    test_group("config_is_copy");
+    var c1: PvFluidConfig = PvFluidConfig_water_2d();
+    var c2: PvFluidConfig = c1;
+    c2.dt = 1.0;
+    assert(near(c1.dt, 0.001, 0.0000000001) == 1, "a copy, not an alias");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

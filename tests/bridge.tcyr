@@ -1,0 +1,95 @@
+# bridge.tcyr — the ported Rust tests of rust-old/src/bridge.rs (M1 part 4).
+
+include "tests/lib.cyr"
+
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    test_group("cp_to_pressure_stagnation");
+    var p: f64 = cp_to_surface_pressure(1.0, 500.0, 101325.0);
+    assert(near(p, 101825.0, 0.1) == 1, "Cp = 1 at the stagnation point");
+
+    test_group("dynamic_pressure_basic");
+    var q: f64 = freestream_dynamic_pressure(10.0, 1.225);
+    assert(near(q, 61.25, 0.01) == 1, "10 m/s in air: 61.25 Pa");
+
+    test_group("aero_forces_basic");
+    var l, d = aero_coefficients_to_forces(1.0, 0.05, 100.0, 10.0);
+    var lv: f64 = l;
+    var dv: f64 = d;
+    assert(near(lv, 1000.0, 0.1) == 1 && near(dv, 50.0, 0.1) == 1, "lift 1000 N, drag 50 N");
+
+    test_group("wind_to_freestream_clamps");
+    var w1: f64 = wind_to_freestream(500.0);
+    var w2: f64 = wind_to_freestream(-500.0);
+    assert(w1 == 340.0 && w2 == -340.0, "clamped to ±340 m/s");
+
+    test_group("water_viscosity_room_temp");
+    var mu: f64 = temperature_to_water_viscosity(293.0);
+    assert(mu > 0.0005 && mu < 0.002, "about 0.001 Pa·s at 293 K");
+
+    test_group("water_viscosity_decreases_with_temp");
+    var cold: f64 = temperature_to_water_viscosity(280.0);
+    var hot: f64 = temperature_to_water_viscosity(350.0);
+    assert(cold > hot, "thinner when hot");
+
+    test_group("buoyancy_forcing_positive");
+    var f: f64 = heat_to_buoyancy_forcing(1000.0, 1.0, 1000.0, 4186.0, 0.00021, 1.0);
+    assert(f > 0.0, "positive");
+
+    test_group("buoyancy_forcing_zero_volume");
+    var f0: f64 = heat_to_buoyancy_forcing(1000.0, 0.0, 1000.0, 4186.0, 0.00021, 1.0);
+    assert(f0 == 0.0, "0 for no volume");
+
+    test_group("eddy_diffusivity_zero_tke");
+    var e0: f64 = tke_to_eddy_diffusivity(0.0, 1.0);
+    assert(e0 == 0.0, "0 for k = 0");
+
+    test_group("eddy_diffusivity_positive");
+    var a: f64 = tke_to_eddy_diffusivity(1.0, 0.1);
+    assert(a > 0.0, "positive");
+
+    test_group("acoustic_source_strength_subsonic");
+    var s: f64 = velocity_to_acoustic_source_strength(34.3, 343.0);
+    assert(near(s, 0.00000001, 0.000000001) == 1, "Mach 0.1: 0.1^8 = 1e-8");
+
+    test_group("acoustic_source_zero_velocity");
+    var s0: f64 = velocity_to_acoustic_source_strength(0.0, 343.0);
+    assert(s0 == 0.0, "0 at rest");
+
+    test_group("tke_noise_zero");
+    var n0: f64 = tke_to_broadband_noise_db(0.0);
+    assert(n0 == 0.0, "0 dB for k = 0");
+
+    test_group("tke_noise_increases_with_tke");
+    var lo: f64 = tke_to_broadband_noise_db(1.0);
+    var hi: f64 = tke_to_broadband_noise_db(10.0);
+    assert(hi > lo, "louder with more energy");
+
+    test_group("wave_acoustic_pressure_positive");
+    var wp: f64 = wave_height_to_acoustic_pressure(0.1, 100.0, 343.0);
+    assert(wp > 0.0, "positive");
+
+    test_group("wave_acoustic_pressure_zero_freq");
+    var wz: f64 = wave_height_to_acoustic_pressure(0.1, 0.0, 343.0);
+    assert(wz == 0.0, "0 for f = 0");
+
+    test_group("heat_buoyancy_zero_density_no_nan");
+    var hz: f64 = heat_to_buoyancy_forcing(1000.0, 1.0, 0.0, 4186.0, 0.00021, 0.01);
+    assert(hz == 0.0, "0 for ρ = 0, not NaN");
+    var h: f64 = heat_to_buoyancy_forcing(1000.0, 1.0, 1000.0, 4186.0, 0.00021, 0.01);
+    var expected: f64 = (((9.81 * 0.00021) * 1000.0) * 0.01) / (4186.0 * 1.0);
+    assert(near(h, expected, 0.000000000000001) == 1, "g·β·Q·dt / (c_p·V)");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

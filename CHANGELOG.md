@@ -3,6 +3,46 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **buoyancy, vortex, bridge, json** (M1 part 4, which completes M1).
+  - **`src/buoyancy.cyr`:**
+    - `buoyancy_force` and `drag_force`;
+    - `terminal_velocity` and `reynolds_number`, which return an f64 `Result`;
+    - `PvFlowRegime` with `classify_flow`.
+  - **`src/vortex.cyr`:** `vorticity_2d`, `lamb_oseen_velocity`, `rankine_velocity`, `enstrophy` (Rust's `Sum`:
+    an empty field is −0) and `kolmogorov_scale`.
+  - **`src/bridge.cyr`:** the ten pavan / ushma / goonj conversions.
+  - **Exact arithmetic:** each function follows Rust's operation order, and the four that call a transcendental use
+    the correctly rounded primitives (ADR 0004).
+  - **`src/json.cyr`:** serde-compatible JSON for `FluidMaterial`, `FluidParticle`, `FluidConfig`, `ParticleSoa`,
+    `FlowRegime` and `DragCoefficient`.
+    - `x.to_json(sb)` writes, and `PvX_from_json(buf, len, out)` reads with serde's derive semantics (both struct
+      forms, unknown fields ignored, the u8 range, `null` refused for an f64).
+    - Every serde_json document decodes to the same bits, and every Cyrius document round-trips. The digits are
+      bayan's Grisu2, not serde_json's text (D4).
+    - It is a marked stand-in (`UPSTREAM(L10)`). The new Cyrius-only code `PV_ERR_DESERIALIZE` (10) comes with ADR
+      0002 #10.
+  - **Parity:** 8,275 new golden rows in `buoyancy.tsv` (1,716), `vortex.tsv` (2,293), `bridge.tsv` (3,964) and
+    `json.tsv` (302).
+    - Every row is recomputed by `validate.py`. The class C functions use glibc for the record and MPFR for the
+      corrected oracle, which gains `vortex.cr.tsv` (3) and `bridge.cr.tsv` (26).
+    - All rows pass on the first replay, on three targets.
+    - Three JSON documents that bayan's policies read otherwise than serde_json (S3, S4, the integer `-0`) are rows
+      of their own, pending until bayan changes.
+  - **Tests:**
+    - all 45 Rust tests of the three modules;
+    - `common.rs`'s two serde tests, so all 49 of its tests are ported;
+    - 11 of `rust-old/tests/integration.rs`, in the new `tests/integration.tcyr`.
+  - **Surface parity:** 128 items.
+
+### Performance
+- **The M1 part 4 benchmarks** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md)), against
+  Rust 1.3.0:
+  - `terminal_velocity` 50 ns (Rust 3.6), `lamb_oseen_velocity` 136 ns (7.4), `enstrophy` of 1,000 values 3.0 µs
+    (759 ns);
+  - JSON about 20× serde_json: a config read 7.8 µs (329 ns), a 100-particle SoA read 572 µs (31.9 µs).
+
+  The class C rows cost their correctly rounded primitive (ledger L1).
+
 - **error, vec3, common** (M1 part 3): the shared fluid types, the port of `rust-old/src/error.rs` and
   `common.rs`.
   - **`src/error.cyr`:** the `PV_ERR_*` codes in Rust's variant order, append-only, with `pv_error_name` and

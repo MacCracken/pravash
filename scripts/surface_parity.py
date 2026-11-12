@@ -30,9 +30,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
-MODULES = ["error", "common"]
+MODULES = ["error", "common", "buoyancy", "vortex", "bridge"]
 PENDING_MODULES = {
-    "buoyancy": "M1 part 4", "vortex": "M1 part 4", "bridge": "M1 part 4",
     "shallow": "M2", "grid": "M3", "vof": "M3", "phase_field": "M3", "sph": "M4–M5",
     "coupling": "M6", "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
 }
@@ -55,6 +54,8 @@ PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {}
 EXCEPTIONS = {
+    "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "
+                                 "(src/constants.cyr); its serde form is drag_coefficient_to_json / _from_json",
     "error::type Result": "the stdlib's value-form Result, whose Err payload is a PV_ERR_* code (ADR 0002 #1)",
 }
 

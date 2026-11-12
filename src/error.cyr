@@ -9,6 +9,9 @@
 # (`InvalidParameter { reason }`); the code carries neither (ADR 0002 #1). Every payload restates what the
 # caller passed in, so the caller already has it. `pv_error_message(code)` gives thiserror's message up to its
 # first field, the part that doesn't depend on the payload.
+#
+# PV_ERR_DESERIALIZE is Cyrius-only (ADR 0002 #10): a JSON reader's refusal, where Rust's serde_json returns its own
+# error type rather than a PravashError.
 
 enum PvError {
     PV_ERR_NONE = 0;
@@ -21,10 +24,11 @@ enum PvError {
     PV_ERR_CFL_VIOLATION = 7;
     PV_ERR_DIVERGED = 8;
     PV_ERR_INVALID_PARAMETER = 9;
+    PV_ERR_DESERIALIZE = 10;
 }
 
-# The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, or "Unknown" for a value
-# that is no code.
+# The Rust variant name of an error code (`"InvalidTimestep"`), "None" for PV_ERR_NONE, "Deserialize" for the
+# Cyrius-only JSON code, or "Unknown" for a value that is no code.
 #must_use
 fn pv_error_name(code): i64 {
     match code {
@@ -38,6 +42,7 @@ fn pv_error_name(code): i64 {
         PV_ERR_CFL_VIOLATION => { return "CflViolation"; }
         PV_ERR_DIVERGED => { return "Diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "InvalidParameter"; }
+        PV_ERR_DESERIALIZE => { return "Deserialize"; }
         _ => { return "Unknown"; }
     }
     return "Unknown";
@@ -58,6 +63,7 @@ fn pv_error_message(code): i64 {
         PV_ERR_CFL_VIOLATION => { return "CFL condition violated"; }
         PV_ERR_DIVERGED => { return "simulation diverged"; }
         PV_ERR_INVALID_PARAMETER => { return "invalid parameter"; }
+        PV_ERR_DESERIALIZE => { return "deserialization error"; }
         _ => { return "unknown error"; }
     }
     return "unknown error";

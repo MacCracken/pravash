@@ -1,8 +1,8 @@
 # common.tcyr — the ported Rust tests of rust-old/src/common.rs (M1 part 3).
 #
-# Every test keeps its Rust name as its group. The two serde tests (test_material_serde, test_config_serde) arrive
-# with the JSON codecs in part 4. Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): `is_err()` is
-# `is_err_result`, `Option<ArenaHandle>` is alloc's 1/0, a slice is (pointer, count).
+# Every test keeps its Rust name as its group; all 49 are ported. The two serde tests go through src/json.cyr (part
+# 4). Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9, #10): `is_err()` is `is_err_result`,
+# `Option<ArenaHandle>` is alloc's 1/0, a slice is (pointer, count), serde_json is `to_json` / `PvX_from_json`.
 
 include "tests/lib.cyr"
 
@@ -444,6 +444,41 @@ fn test_arena() {
     return 0;
 }
 
+fn test_serde() {
+    test_group("test_material_serde");
+    var m: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+    var sb = str_builder_new();
+    assert_eq(m.to_json(sb), 0, "written");
+    var s = str_builder_build(sb);
+    var m2: PvFluidMaterial;
+    var t, e = PvFluidMaterial_from_json(str_data(s), str_len(s), &m2);
+    assert_eq(is_err_result(t), 0, "read back");
+    assert(near(m2.density, m.density, EPS) == 1, "density round-trips");
+
+    test_group("test_config_serde");
+    var c: PvFluidConfig = PvFluidConfig_water_2d();
+    var sc = str_builder_new();
+    assert_eq(c.to_json(sc), 0, "written");
+    var cs = str_builder_build(sc);
+    var c2: PvFluidConfig;
+    var t2, e2 = PvFluidConfig_from_json(str_data(cs), str_len(cs), &c2);
+    assert_eq(is_err_result(t2), 0, "read back");
+    assert(near(c2.dt, c.dt, EPS) == 1, "dt round-trips");
+
+    test_group("json_nan_is_written_null_and_refused");
+    # serde_json's behaviour: NaN and ±∞ are written null, and null is no f64.
+    var n: PvFluidMaterial = PV_FLUID_MATERIAL_AIR;
+    n.viscosity = PV_F64_NAN;
+    var sn = str_builder_new();
+    assert_eq(n.to_json(sn), 0, "written");
+    var ns = str_builder_build(sn);
+    assert(str_contains_cstr(ns, "\"viscosity\":null") == 1, "NaN is null");
+    var n2: PvFluidMaterial;
+    var t3, e3 = PvFluidMaterial_from_json(str_data(ns), str_len(ns), &n2);
+    assert(is_err_result(t3) == 1 && e3 == PV_ERR_DESERIALIZE, "and doesn't read back: Deserialize");
+    return 0;
+}
+
 # Runs the ported common tests.
 fn main() {
     alloc_init();
@@ -452,6 +487,7 @@ fn main() {
     test_configs();
     test_soa();
     test_arena();
+    test_serde();
     return assert_summary();
 }
 

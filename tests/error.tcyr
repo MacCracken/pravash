@@ -56,7 +56,9 @@ fn main() {
         if (cs_eq(pv_error_name(c), "Unknown") == 0) { named = named + 1; }
     }
     assert_eq(named, 9, "every code 1 … 9 has a Rust name");
-    assert(cs_eq(pv_error_name(10), "Unknown") == 1, "10 is no code");
+    assert_eq(PV_ERR_DESERIALIZE, 10, "the Cyrius-only JSON code is appended as 10");
+    assert(cs_eq(pv_error_name(10), "Deserialize") == 1, "10 is Deserialize");
+    assert(cs_eq(pv_error_name(11), "Unknown") == 1, "11 is no code");
     assert(cs_eq(pv_error_message(0 - 1), "unknown error") == 1, "-1 is no code");
 
     return assert_summary();

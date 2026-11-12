@@ -1,0 +1,473 @@
+# json.cyr — serde-compatible JSON for the M1 types (port plan D4, ADR 0002 #6 and #10): the documents the Rust
+# crate's serde_json writes decode to the same bits, and every document written here decodes back to the same bits.
+#
+# Types: `FluidMaterial`, `FluidParticle`, `FluidConfig`, `ParticleSoa` (src/common.cyr), `FlowRegime` and the unit
+# struct `DragCoefficient` (src/buoyancy.cyr). The text is not serde_json's byte for byte (D4): floats are bayan's
+# Grisu2 digits, which round-trip exactly; NaN and ±∞ are written `null`, as serde_json writes them, and like
+# serde_json's such a document doesn't read back.
+#
+# Writers: `x.to_json(sb)` appends to a `str_builder` through its non-aborting `_a` calls (the default allocator) and
+# returns 0, or -1 when a grow failed (ADR 0002 #8: nothing aborts). Fields go in Rust's declaration order; a
+# `DVec3` and a `[f64; 3]` are `[x,y,z]` (glam's and serde's array forms).
+#
+# Readers: `PvX_from_json(buf, len, out)` parses with bayan's value tree (never the derive's scanner, whose open
+# defects malformed input could reach: impetus ADR 0010) and applies serde's derive semantics, as serde_json 1.0.154
+# reads (its `float_roundtrip` parse, which is correctly rounded, as bayan's is):
+# - a struct reads from an object, by field name (unknown fields ignored), or from an array of exactly its fields,
+#   by position (serde's sequence form). None of the M1 types has a `#[serde(default)]` field, so every field is
+#   required;
+# - an f64 takes a JSON integer or float whose value is finite; `null` is refused (serde_json writes NaN and ±∞ as
+#   `null` and can't read them back), and so is a number beyond f64's range (`1e400`);
+# - a u8 (the phase) takes a JSON integer in 0 … 255 only (`1.0`, `-1` and `256` are refused);
+# - a vector takes an array of exactly 3 numbers; a `Vec<f64>` / `Vec<u8>` any number;
+# - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`; the unit struct `DragCoefficient`
+#   is `null`.
+# Anything else is Err(PV_ERR_DESERIALIZE), and *out is then untouched (a `ParticleSoa` holds no storage). Two bayan
+# policies are stricter than serde_json, so a few documents serde_json reads are refused here (impetus port plan §8,
+# S3 and S4, filed at bayan): an integer above i64::MAX (serde_json reads one into an f64), and a duplicated unknown
+# field (serde_json ignores it).
+#
+# Not thread-safe: the decode arena is module state, reset by each read.
+#
+# UPSTREAM(L10): cyrius:docs/development/issues/2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md
+#   replace with `#derive(Serialize)` / `#derive(Deserialize)` once the derive has the array form for a vector struct
+#   (and the tagged form for M6's data-carrying enums); parity: tests/golden/json.tsv (class A).
+
+# ── writer ──────────────────────────────────────────────────────────────────────────
+
+# Appends the C string s: 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_jw(sb, s): i64 {
+    if (str_builder_add_cstr_a(default_alloc(), sb, s) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Appends `,"name":` (no comma when `first` is 1).
+#must_use
+fn _pv_jw_key(sb, name, first): i64 {
+    var rc = 0;
+    if (first == 0) { rc = rc | _pv_jw(sb, ","); }
+    rc = rc | _pv_jw(sb, "\"");
+    rc = rc | _pv_jw(sb, name);
+    rc = rc | _pv_jw(sb, "\":");
+    return rc;
+}
+
+# Appends x in bayan's round-trip digits, or `null` when x is NaN or ±∞.
+#must_use
+fn _pv_jw_f64(sb, x: f64): i64 {
+    var buf[40];
+    var n = bayan_f64_to_json(_pv_bits(x), &buf);
+    store8(&buf + n, 0);
+    return _pv_jw(sb, &buf);
+}
+
+# Appends the integer n.
+#must_use
+fn _pv_jw_int(sb, n): i64 {
+    if (str_builder_add_int_a(default_alloc(), sb, n) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Appends `[x,y,z]`.
+#must_use
+fn _pv_jw_f64x3(sb, x: f64, y: f64, z: f64): i64 {
+    var rc = _pv_jw(sb, "[");
+    rc = rc | _pv_jw_f64(sb, x);
+    rc = rc | _pv_jw(sb, ",");
+    rc = rc | _pv_jw_f64(sb, y);
+    rc = rc | _pv_jw(sb, ",");
+    rc = rc | _pv_jw_f64(sb, z);
+    rc = rc | _pv_jw(sb, "]");
+    return rc;
+}
+
+# Appends a column as a JSON array: of f64s, or of integers when `ints` is 1.
+#must_use
+fn _pv_jw_col(sb, c: *PvColumn, ints): i64 {
+    var rc = _pv_jw(sb, "[");
+    for (var i = 0; i < c.len; i = i + 1) {
+        if (i > 0) { rc = rc | _pv_jw(sb, ","); }
+        if (ints == 1) {
+            rc = rc | _pv_jw_int(sb, c.get(i));
+        } else {
+            var x: f64 = c.get_f(i);
+            rc = rc | _pv_jw_f64(sb, x);
+        }
+    }
+    rc = rc | _pv_jw(sb, "]");
+    return rc;
+}
+
+# ── reader ──────────────────────────────────────────────────────────────────────────
+
+var _pv_json_arena = 0;
+
+# The parsed tree of [buf, buf + len), on the decode arena (reset first), or 0 when the text is not one JSON value
+# (or there is no memory).
+#must_use
+fn _pv_jr_parse(buf, len): i64 {
+    if (_pv_json_arena == 0) { _pv_json_arena = arena_allocator_growable(4096); }
+    if (_pv_json_arena == 0) { return 0; }
+    reset_via(_pv_json_arena);
+    return bayan_json_v_parse_buf_a(_pv_json_arena, buf, len);
+}
+
+# The form of a struct node with `n` fields: 1 an object, 2 an array of exactly n elements, 0 anything else.
+#must_use
+fn _pv_jr_form(v, n): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    if (tag == JTAG_OBJ) { return 1; }
+    if (tag == JTAG_ARR && bayan_json_v_arr_len(v) == n) { return 2; }
+    return 0;
+}
+
+# Field i, named `name`, of a struct node in `form`: its value, or 0 when absent.
+#must_use
+fn _pv_jr_at(v, form, i, name): i64 {
+    if (form == 1) { return bayan_json_v_obj_get_by_cstr(v, name); }
+    return bayan_json_v_arr_get(v, i);
+}
+
+# A JSON number with a finite value into *out (its f64 bits): 1, or 0 for anything else.
+fn _pv_jr_f64(v, out): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    if (tag != JTAG_INT && tag != JTAG_FLOAT) { return 0; }
+    var x: f64 = bayan_json_v_float(v);
+    if (_pv_is_finite(x) == 0) { return 0; }
+    store64(out, _pv_bits(x));
+    return 1;
+}
+
+# A JSON integer in 0 … 255 into *out: 1, or 0.
+fn _pv_jr_u8(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_INT) { return 0; }
+    var n = bayan_json_v_int(v);
+    if (n < 0 || n > 255) { return 0; }
+    store64(out, n);
+    return 1;
+}
+
+# A JSON array of exactly 3 numbers into the 3 words at out: 1, or 0.
+fn _pv_jr_f64x3(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != 3) { return 0; }
+    for (var i = 0; i < 3; i = i + 1) {
+        if (_pv_jr_f64(bayan_json_v_arr_get(v, i), out + i * 8) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Typed views of a word buffer laid out as the record (each record is a fixed run of 8-byte words).
+#must_use
+fn _pv_as_material(p): *PvFluidMaterial {
+    return p;
+}
+
+#must_use
+fn _pv_as_config(p): *PvFluidConfig {
+    return p;
+}
+
+# A JSON array into the empty column *c: of finite numbers, or of integers in 0 … 255 when `bytes` is 1. 1, or 0
+# (the column may hold part of it; the caller drops it).
+fn _pv_jr_col(v, c: *PvColumn, bytes): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_ARR) { return 0; }
+    var n = bayan_json_v_arr_len(v);
+    if (c.reserve(n) == 0) { return 0; }
+    var w[8];
+    for (var i = 0; i < n; i = i + 1) {
+        var e = bayan_json_v_arr_get(v, i);
+        var ok = 0;
+        if (bytes == 1) { ok = _pv_jr_u8(e, &w); } else { ok = _pv_jr_f64(e, &w); }
+        if (ok == 0) { return 0; }
+        if (c.push(load64(&w)) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# A unit variant: the string naming one of the `count` variants (`name_fn(k)`), or the one-key object
+# `{"Name":null}`, into *out. 1, or 0.
+fn _pv_jr_enum(v, name_fn, count, out): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    var s = 0;
+    if (tag == JTAG_STR) {
+        s = bayan_json_v_str(v);
+    } elif (tag == JTAG_OBJ && bayan_json_v_obj_len(v) == 1) {
+        var p = bayan_json_v_obj_val(v, 0);
+        if (p == 0 || bayan_json_v_tag(p) != JTAG_NULL) { return 0; }
+        s = bayan_json_v_obj_key(v, 0);
+    } else {
+        return 0;
+    }
+    for (var k = 0; k < count; k = k + 1) {
+        if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
+            store64(out, k);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# Ok(0) when ok is 1, else Err(PV_ERR_DESERIALIZE).
+#must_use
+fn _pv_jr_result(ok): Result {
+    if (ok == 1) { return Ok(0); }
+    return Err(PV_ERR_DESERIALIZE);
+}
+
+# ── FluidMaterial ───────────────────────────────────────────────────────────────────
+
+impl PvFluidMaterial {
+    # Appends the material as serde_json writes a `FluidMaterial`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "density", 1);
+        rc = rc | _pv_jw_f64(sb, self.density);
+        rc = rc | _pv_jw_key(sb, "viscosity", 0);
+        rc = rc | _pv_jw_f64(sb, self.viscosity);
+        rc = rc | _pv_jw_key(sb, "surface_tension", 0);
+        rc = rc | _pv_jw_f64(sb, self.surface_tension);
+        rc = rc | _pv_jw_key(sb, "speed_of_sound", 0);
+        rc = rc | _pv_jw_f64(sb, self.speed_of_sound);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `FluidMaterial` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched. (No validation:
+# serde fills the fields as `custom` would not; validate with `PvFluidMaterial_custom` when that matters.)
+#must_use
+fn PvFluidMaterial_from_json(buf, len, out: *PvFluidMaterial): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 4);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # Read into the record's four words, then copy it whole.
+    var w[32];
+    var ok = _pv_jr_f64(_pv_jr_at(v, f, 0, "density"), &w);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 1, "viscosity"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "surface_tension"), &w + 16);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "speed_of_sound"), &w + 24);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var src: *PvFluidMaterial = _pv_as_material(&w);
+    *out = *src;
+    return Ok(0);
+}
+
+# ── FluidParticle ───────────────────────────────────────────────────────────────────
+
+impl PvFluidParticle {
+    # Appends the particle as serde_json writes a `FluidParticle`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "position", 1);
+        rc = rc | _pv_jw_f64x3(sb, self.position.x, self.position.y, self.position.z);
+        rc = rc | _pv_jw_key(sb, "velocity", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.velocity.x, self.velocity.y, self.velocity.z);
+        rc = rc | _pv_jw_key(sb, "acceleration", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.acceleration.x, self.acceleration.y, self.acceleration.z);
+        rc = rc | _pv_jw_key(sb, "density", 0);
+        rc = rc | _pv_jw_f64(sb, self.density);
+        rc = rc | _pv_jw_key(sb, "pressure", 0);
+        rc = rc | _pv_jw_f64(sb, self.pressure);
+        rc = rc | _pv_jw_key(sb, "mass", 0);
+        rc = rc | _pv_jw_f64(sb, self.mass);
+        rc = rc | _pv_jw_key(sb, "phase", 0);
+        rc = rc | _pv_jw_int(sb, self.phase);
+        rc = rc | _pv_jw_key(sb, "conformation", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.conformation.0, self.conformation.1, self.conformation.2);
+        rc = rc | _pv_jw_key(sb, "temperature", 0);
+        rc = rc | _pv_jw_f64(sb, self.temperature);
+        rc = rc | _pv_jw_key(sb, "fuel", 0);
+        rc = rc | _pv_jw_f64(sb, self.fuel);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `FluidParticle` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched.
+#must_use
+fn PvFluidParticle_from_json(buf, len, out: *PvFluidParticle): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 10);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # Read into the record's 18 words (position 0–2, velocity 3–5, acceleration 6–8, density, pressure, mass,
+    # phase, conformation 13–15, temperature, fuel), then copy it whole.
+    var w[144];
+    var ok = _pv_jr_f64x3(_pv_jr_at(v, f, 0, "position"), &w);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 1, "velocity"), &w + 24);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 2, "acceleration"), &w + 48);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "density"), &w + 72);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "pressure"), &w + 80);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 5, "mass"), &w + 88);
+    ok = ok & _pv_jr_u8(_pv_jr_at(v, f, 6, "phase"), &w + 96);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 7, "conformation"), &w + 104);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 8, "temperature"), &w + 128);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 9, "fuel"), &w + 136);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var src: *PvFluidParticle = _pv_as_particles(&w);
+    *out = *src;
+    return Ok(0);
+}
+
+# ── FluidConfig ─────────────────────────────────────────────────────────────────────
+
+impl PvFluidConfig {
+    # Appends the config as serde_json writes a `FluidConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "dt", 1);
+        rc = rc | _pv_jw_f64(sb, self.dt);
+        rc = rc | _pv_jw_key(sb, "gravity", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.gravity.x, self.gravity.y, self.gravity.z);
+        rc = rc | _pv_jw_key(sb, "smoothing_radius", 0);
+        rc = rc | _pv_jw_f64(sb, self.smoothing_radius);
+        rc = rc | _pv_jw_key(sb, "gas_constant", 0);
+        rc = rc | _pv_jw_f64(sb, self.gas_constant);
+        rc = rc | _pv_jw_key(sb, "rest_density", 0);
+        rc = rc | _pv_jw_f64(sb, self.rest_density);
+        rc = rc | _pv_jw_key(sb, "bounds_min", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.bounds_min.x, self.bounds_min.y, self.bounds_min.z);
+        rc = rc | _pv_jw_key(sb, "bounds_max", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.bounds_max.x, self.bounds_max.y, self.bounds_max.z);
+        rc = rc | _pv_jw_key(sb, "boundary_damping", 0);
+        rc = rc | _pv_jw_f64(sb, self.boundary_damping);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `FluidConfig` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched. (No validation:
+# call `validate` after.)
+#must_use
+fn PvFluidConfig_from_json(buf, len, out: *PvFluidConfig): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 8);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # Read into the record's 14 words (dt, gravity 1–3, h, gas constant, rest density, bounds_min 7–9, bounds_max
+    # 10–12, damping), then copy it whole.
+    var w[112];
+    var ok = _pv_jr_f64(_pv_jr_at(v, f, 0, "dt"), &w);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 1, "gravity"), &w + 8);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "smoothing_radius"), &w + 32);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "gas_constant"), &w + 40);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "rest_density"), &w + 48);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 5, "bounds_min"), &w + 56);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 6, "bounds_max"), &w + 80);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 7, "boundary_damping"), &w + 104);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var src: *PvFluidConfig = _pv_as_config(&w);
+    *out = *src;
+    return Ok(0);
+}
+
+# ── ParticleSoa ─────────────────────────────────────────────────────────────────────
+
+# The SoA's field names, in declaration order (column k is field k).
+#must_use
+fn _pv_soa_field(k): i64 {
+    match k {
+        0 => { return "pos_x"; }
+        1 => { return "pos_y"; }
+        2 => { return "pos_z"; }
+        3 => { return "vel_x"; }
+        4 => { return "vel_y"; }
+        5 => { return "vel_z"; }
+        6 => { return "accel_x"; }
+        7 => { return "accel_y"; }
+        8 => { return "accel_z"; }
+        9 => { return "density"; }
+        10 => { return "pressure"; }
+        11 => { return "mass"; }
+        12 => { return "phase"; }
+        13 => { return "conf_xx"; }
+        14 => { return "conf_xy"; }
+        15 => { return "conf_yy"; }
+        16 => { return "temperature"; }
+        _ => { return "fuel"; }
+    }
+    return "fuel";
+}
+
+impl PvParticleSoa {
+    # Appends the store as serde_json writes a `ParticleSoa`: 18 arrays, the phase as integers. 0, or -1 when the
+    # builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+            var first = 0;
+            if (k == 0) { first = 1; }
+            rc = rc | _pv_jw_key(sb, _pv_soa_field(k), first);
+            var ints = 0;
+            if (k == 12) { ints = 1; }
+            rc = rc | _pv_jw_col(sb, _pv_soa_col(self, k), ints);
+        }
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `ParticleSoa` document into *out, a fresh store that the caller drops with `PvParticleSoa_drop`: Ok(0),
+# or Err(PV_ERR_DESERIALIZE) with *out holding no storage. The columns' lengths are the document's (they need not
+# agree, as Rust's public Vecs need not).
+#must_use
+fn PvParticleSoa_from_json(buf, len, out: *PvParticleSoa): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, _PV_SOA_COLUMNS);
+    var s: PvParticleSoa = PvParticleSoa_new();
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var bytes = 0;
+        if (k == 12) { bytes = 1; }
+        if (_pv_jr_col(_pv_jr_at(v, f, k, _pv_soa_field(k)), _pv_soa_col(&s, k), bytes) == 0) {
+            PvParticleSoa_drop(&s);
+            return Err(PV_ERR_DESERIALIZE);
+        }
+    }
+    *out = s;
+    return Ok(0);
+}
+
+# ── FlowRegime, DragCoefficient ─────────────────────────────────────────────────────
+
+# Appends the flow regime as serde_json writes a `FlowRegime` (`"Laminar"`): 0, or -1.
+#must_use
+fn flow_regime_to_json(k, sb): i64 {
+    var rc = _pv_jw(sb, "\"");
+    rc = rc | _pv_jw(sb, flow_regime_name(k));
+    rc = rc | _pv_jw(sb, "\"");
+    return rc;
+}
+
+# Reads a `FlowRegime` document (`"Laminar"` or `{"Laminar":null}`) into *out: Ok(0), or Err(PV_ERR_DESERIALIZE).
+#must_use
+fn flow_regime_from_json(buf, len, out): Result {
+    var v = _pv_jr_parse(buf, len);
+    var k = 0;
+    if (_pv_jr_enum(v, &flow_regime_name, 3, &k) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    store64(out, k);
+    return Ok(0);
+}
+
+# Appends the unit struct `DragCoefficient` as serde_json writes it: `null`. 0, or -1.
+#must_use
+fn drag_coefficient_to_json(sb): i64 {
+    return _pv_jw(sb, "null");
+}
+
+# Reads a `DragCoefficient` document: Ok(0) for `null`, else Err(PV_ERR_DESERIALIZE).
+#must_use
+fn drag_coefficient_from_json(buf, len): Result {
+    var v = _pv_jr_parse(buf, len);
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_NULL) { return Err(PV_ERR_DESERIALIZE); }
+    return Ok(0);
+}

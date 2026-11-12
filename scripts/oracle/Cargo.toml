@@ -19,6 +19,12 @@ pravash = { path = "../../rust-old", default-features = false, features = [
 ] }
 # glam's DVec3, to build the inputs of `common`'s rows; exactly the oracle's hisab (it re-exports glam 0.29.3).
 hisab = { version = "=1.4.0", default-features = false }
+# serde_json for the JSON rows (json.tsv): the oracle's own version (its dev-dependency), with `float_roundtrip`, whose
+# parse is correctly rounded as the port's (bayan's) is. The default parse is best-effort, 1 ulp off on some long
+# decimals (impetus port-parity §6).
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
+# serde, for the `DeserializeOwned` bound of the JSON rows: the oracle's own version.
+serde = "=1.0.229"
 
 # The generator runs twice (port plan §4 step 5): the serial build writes the corpus, and the
 # `parallel` build may only `--check` it, so every row must come out the same with rayon on

@@ -1,0 +1,109 @@
+# buoyancy.tcyr — the ported Rust tests of rust-old/src/buoyancy.rs (M1 part 4).
+#
+# `is_err()` is `is_err_result`; an Ok f64 is the Result's payload word, bound to an f64 local.
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+var EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
+
+# 1 when terminal_velocity fails.
+fn tv_err(m: f64, g: f64, rho: f64, cd: f64, a: f64): i64 {
+    var t, v = terminal_velocity(m, g, rho, cd, a);
+    return is_err_result(t);
+}
+
+# 1 when reynolds_number fails.
+fn re_err(rho: f64, v: f64, l: f64, mu: f64): i64 {
+    var t, x = reynolds_number(rho, v, l, mu);
+    return is_err_result(t);
+}
+
+fn main() {
+    alloc_init();
+    var sphere: f64 = PV_DRAG_COEFFICIENT_SPHERE;
+
+    test_group("test_buoyancy_water");
+    var f: f64 = buoyancy_force(1000.0, 9.81, 1.0);
+    assert(near(f, 9810.0, 0.1) == 1, "1 m³ of water: 9810 N");
+
+    test_group("test_buoyancy_zero_volume");
+    var f0: f64 = buoyancy_force(1000.0, 9.81, 0.0);
+    assert(near(f0, 0.0, EPS) == 1, "no volume, no force");
+
+    test_group("test_drag_force");
+    var d: f64 = drag_force(1.225, 10.0, sphere, 0.01);
+    assert(d > 0.0, "positive");
+
+    test_group("test_drag_zero_velocity");
+    var d0: f64 = drag_force(1.225, 0.0, sphere, 0.01);
+    assert(near(d0, 0.0, EPS) == 1, "zero at rest");
+
+    test_group("test_terminal_velocity");
+    var t, v = terminal_velocity(1.0, 9.81, 1.225, sphere, 0.01);
+    var vt: f64 = v;
+    assert(is_err_result(t) == 0, "Ok");
+    assert(vt > 0.0 && _pv_is_finite(vt) == 1, "positive and finite");
+
+    test_group("test_terminal_velocity_zero_denom");
+    assert(tv_err(1.0, 9.81, 0.0, sphere, 0.01) == 1, "ρ = 0");
+    var t1, v1 = terminal_velocity(1.0, 9.81, 0.0, sphere, 0.01);
+    assert_eq(v1, PV_ERR_INVALID_PARAMETER, "InvalidParameter");
+
+    test_group("test_terminal_velocity_negative_gravity");
+    assert(tv_err(1.0, -9.81, 1.225, sphere, 0.01) == 1, "m·g < 0");
+
+    test_group("test_reynolds_number");
+    var tr, vr = reynolds_number(1000.0, 1.0, 0.1, 0.001);
+    var re: f64 = vr;
+    assert(is_err_result(tr) == 0 && near(re, 100000.0, 1.0) == 1, "water at 1 m/s in a 0.1 m pipe");
+
+    test_group("test_reynolds_number_zero_viscosity");
+    assert(re_err(1000.0, 1.0, 0.1, 0.0) == 1, "μ = 0");
+    var tz, vz = reynolds_number(1000.0, 1.0, 0.1, 0.0);
+    assert_eq(vz, PV_ERR_INVALID_VISCOSITY, "InvalidViscosity");
+
+    test_group("test_reynolds_number_nan_viscosity");
+    var nan: f64 = PV_F64_NAN;
+    assert(re_err(1000.0, 1.0, 0.1, nan) == 1, "μ NaN");
+
+    test_group("test_reynolds_number_negative_velocity");
+    var tn, vn = reynolds_number(1000.0, -1.0, 0.1, 0.001);
+    var ren: f64 = vn;
+    assert(near(ren, 100000.0, 1.0) == 1, "|v| is used");
+    assert_eq(classify_flow(-10000000.0), PV_FLOW_REGIME_TURBULENT, "-1e7 is turbulent");
+
+    test_group("test_terminal_velocity_two_negative_terms_rejected");
+    assert(tv_err(1.0, 9.81, -1.225, -0.47, 0.01) == 1, "ρ, Cd both negative");
+    assert(tv_err(nan, 9.81, 1.225, 0.47, 0.01) == 1, "NaN mass");
+
+    test_group("test_flow_regime_laminar");
+    assert_eq(classify_flow(1000.0), PV_FLOW_REGIME_LAMINAR, "1000");
+
+    test_group("test_flow_regime_transitional");
+    assert_eq(classify_flow(3000.0), PV_FLOW_REGIME_TRANSITIONAL, "3000");
+
+    test_group("test_flow_regime_turbulent");
+    assert_eq(classify_flow(10000.0), PV_FLOW_REGIME_TURBULENT, "10000");
+
+    test_group("test_drag_coefficients");
+    var st: f64 = PV_DRAG_COEFFICIENT_STREAMLINED;
+    var fp: f64 = PV_DRAG_COEFFICIENT_FLAT_PLATE;
+    assert(st < sphere && sphere < fp, "streamlined < sphere < flat plate");
+
+    test_group("flow_regime_names");
+    assert_eq(memeq(flow_regime_name(PV_FLOW_REGIME_TRANSITIONAL), "Transitional", 13), 1, "Transitional");
+    assert_eq(classify_flow(nan), PV_FLOW_REGIME_TURBULENT, "NaN is turbulent, as Rust's comparisons make it");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

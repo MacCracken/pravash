@@ -11,15 +11,19 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M1 in progress** (2026-11-11). M0 is complete (§4). M1 parts 1–3 are done:
+> ⏳ **Status: M1 complete** (2026-11-11); M2 (shallow water) is next. M0 is complete (§4). M1 delivered, in four
+> parts:
 > - `src/mathx.cyr`, the first `[lib]` and the bundle;
 > - the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`), gated at 0 ulp against the MPFR-corrected
 >   oracle (ADR 0004);
-> - `src/error.cyr`, `src/vec3.cyr` and `src/common.cyr`: 3,683 common rows bit-exact, 47 Rust tests ported, surface
->   parity in CI.
+> - `src/error.cyr`, `src/vec3.cyr`, `src/column.cyr` and `src/common.cyr`;
+> - `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr` and `src/json.cyr`.
 >
-> 34,454 rows ok and 43 accepted (ADR 4), identical on three targets; only the M4 cell key is pending. Next is part
-> 4 (buoyancy, vortex, bridge, the M1 JSON).
+> The result: fourteen `[lib]` modules and 45,232 golden rows in seven modules, identical on three targets:
+> - 42,697 rows ok and 72 accepted (ADR 4);
+> - pending: the M4 cell key's 2,460 and three bayan-policy JSON rows.
+>
+> All 100 Rust unit tests of the M1 modules are ported, plus 11 integration tests, and surface parity is in CI.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -775,6 +779,8 @@ in `src/` has a row below, and that every open row has at least one note. It run
 **Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
 
+**Also filed at M1 part 4, outside the ledger:** `bayan:docs/development/issues/2026-11-11-json-integer-negative-zero-loses-its-sign.md` (the integer `-0` reads as +0, where serde_json reads −0.0; one pending JSON row, with impetus's S3 and S4).
+
 **Also filed at M1, outside the ledger** (a finding with no stand-in): `cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`. `fl_alloc` maps and unmaps every block over 4 KB, so building and dropping an arena or an SoA store pays an mmap and a page fault per page. Solvers allocate once, so the step path is untouched.
 
 ---
@@ -804,7 +810,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
   - nine upstream requests filed, four open issues extended, and the ledger seeded and checked in CI.
 
   Next: M1 |
-| M1 Foundation | ⏳ in progress | common 3,683 + math: 34,454 ok, 43 accepted (ADR 4), 0 failed, 0 measured, 2,460 pending (the M4 cell key) | `tests/crmath.tcyr` (85 checks), `tests/common.tcyr` (47 Rust tests, 108 checks), `tests/error.tcyr` (6, 15) | `math/*` (10 primitives against Rust's glibc); `common/*`, `soa/*`, `arena/*` (9 against Rust 1.3.0) | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
+| M1 Foundation | ✅ **done 2026-11-11** | bridge 3,964 + buoyancy 1,716 + common 3,683 + json 302 + vortex 2,293 + math 33,239: **42,697 ok, 72 accepted (ADR 4), 0 failed, 0 measured, 2,463 pending** (the M4 cell key 2,460; bayan S3, S4, −0) on x86_64 ELF, x86_64 PE and aarch64 | all 100 Rust unit tests of the M1 modules and 11 integration tests: `tests/error`, `common`, `buoyancy`, `vortex`, `bridge`, `integration` `.tcyr`, plus `tests/crmath.tcyr` (85) | `math/*` (10 primitives against glibc); `common/*`, `soa/*`, `arena/*` (9); `m1/*` (7) and `json/*` (4) against Rust 1.3.0 | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
 
 **Part 2 done 2026-11-11** (port-parity §6, ADR 0004): the correctly rounded primitives (`UPSTREAM(L1)`):
 - `src/crmath.cyr` (impetus's crmath: exp, sin, cos, sin_cos, hypot, pow, atan2) and `src/crlog.cyr` (kimiya's ln, log10);
@@ -822,7 +828,17 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 - L12 closed: struct assignment copies records word-wise, 21× faster than `memcpy`;
 - the freelist's large-block cost filed upstream.
 
-**Then:** part 4 (buoyancy, vortex, bridge, the M1 JSON and the two serde tests) |
+**Part 4 done 2026-11-11** (port-parity §8): `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr` and `src/json.cyr` (`UPSTREAM(L10)`):
+- the golden modules `buoyancy`, `vortex`, `bridge` (7,973 rows) and `json` (302 documents), every one recomputed by `validate.py`;
+- the corrected oracle extended to `vortex.cr.tsv` (3) and `bridge.cr.tsv` (26);
+- serde_json (`float_roundtrip`) and serde in the generator, at the oracle's versions;
+- `PV_ERR_DESERIALIZE` and ADR 0002 #10;
+- the bayan `-0` request filed;
+- 45 + 2 + 11 Rust tests ported;
+- surface parity 128.
+
+**Next:** M2, shallow water |
+
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |
 | M4 SPH foundations | — | — | — | — | |

@@ -11,9 +11,11 @@ description = "M0 step 9 probes on the frozen Rust pravash 1.3.0 oracle (rust-ol
 # itself seeded from rust-old/Cargo.lock, so hisab is exactly 1.4.0 (and glam 0.29.3).
 [dependencies]
 pravash = { path = "../../../rust-old", default-features = false, features = [
-    "oracle", "sph", "grid", "shallow", "coupling", "compute",
+    "oracle", "sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute",
 ] }
 hisab = { version = "=1.4.0", features = ["num", "geo", "autodiff"] }
+# serde_json for bench_common's json/* rows: the oracle's version, with the generator's float_roundtrip parse.
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 
 # Probe 6 builds p6_parallel twice, without and with rayon, and compares the two outputs.
 [features]

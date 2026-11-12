@@ -60,4 +60,8 @@ modules = [
     "src/vec3.cyr",
     "src/column.cyr",
     "src/common.cyr",
+    "src/buoyancy.cyr",
+    "src/vortex.cyr",
+    "src/bridge.cyr",
+    "src/json.cyr",
 ]

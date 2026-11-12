@@ -1,0 +1,75 @@
+# vortex.cyr — vortex dynamics: vorticity, the Lamb–Oseen and Rankine vortices, enstrophy and the Kolmogorov scale
+# (port of rust-old/src/vortex.rs).
+#
+# Rust's operation order throughout. The transcendentals are the correctly rounded ones (src/mathx.cyr, ADR 0004), so
+# lamb_oseen_velocity and kolmogorov_scale equal the oracle's operations with every exp and ln correctly rounded (the
+# corrected oracle where glibc misrounds). 2π is `2.0 * PI`, exact.
+
+# The 2D vorticity, ω = ∂vy/∂x − ∂vx/∂y. Mirrors `vorticity_2d`.
+#must_use
+fn vorticity_2d(dvydx: f64, dvxdy: f64): f64 {
+    var r: f64 = dvydx - dvxdy;
+    return r;
+}
+
+# The tangential velocity of a Lamb–Oseen vortex at radius r: Γ/(2πr)·(1 − e^(−r²/(4νt))). 0 for r ≤ 0; the
+# point-vortex limit Γ/(2πr) when 4νt ≤ 0. Mirrors `lamb_oseen_velocity`.
+#must_use
+fn lamb_oseen_velocity(circulation: f64, radius: f64, viscosity: f64, time: f64): f64 {
+    if (radius <= 0.0) { return 0.0; }
+    var two_pi: f64 = 2.0 * PV_F64_PI;
+    var point_vortex: f64 = circulation / (two_pi * radius);
+    var core: f64 = (4.0 * viscosity) * time;
+    if (core <= 0.0) { return point_vortex; }
+    var rr: f64 = radius * radius;
+    var nrr: f64 = -rr;
+    var q: f64 = nrr / core;
+    var e: f64 = _pv_exp(q);
+    var r: f64 = point_vortex * (1.0 - e);
+    return r;
+}
+
+# The tangential velocity of a Rankine vortex: Γ·r/(2π·R²) inside the core (r ≤ R), Γ/(2πr) outside, 0 for r ≤ 0.
+# Mirrors `rankine_velocity`.
+#must_use
+fn rankine_velocity(circulation: f64, radius: f64, core_radius: f64): f64 {
+    if (radius <= 0.0) { return 0.0; }
+    var two_pi: f64 = 2.0 * PV_F64_PI;
+    if (radius <= core_radius) {
+        var r: f64 = (circulation * radius) / ((two_pi * core_radius) * core_radius);
+        return r;
+    }
+    var o: f64 = circulation / (two_pi * radius);
+    return o;
+}
+
+# The enstrophy of the `n` vorticity values at `field`: Σ ω²·dx², summed in order from −0 (Rust's `f64` `Sum`, so an
+# empty field gives −0). Mirrors `enstrophy` (Rust's `&[f64]` is the pointer and the count).
+#must_use
+fn enstrophy(field, n, dx: f64): f64 {
+    var dx2: f64 = dx * dx;
+    var s: f64 = 0x8000000000000000;   # −0
+    for (var i = 0; i < n; i = i + 1) {
+        var w: f64 = load64(field + i * 8);
+        var t: f64 = (w * w) * dx2;
+        s = s + t;
+    }
+    return s;
+}
+
+# The Kolmogorov microscale, η = (ν³/ε)^(1/4), as exp(0.75·ln ν − 0.25·ln ε): +∞ for ε ≤ 0, 0 for ν ≤ 0. Mirrors
+# `kolmogorov_scale`.
+#must_use
+fn kolmogorov_scale(viscosity: f64, dissipation_rate: f64): f64 {
+    if (dissipation_rate <= 0.0) {
+        var inf: f64 = PV_F64_INFINITY;
+        return inf;
+    }
+    if (viscosity <= 0.0) { return 0.0; }
+    var lv: f64 = _pv_ln(viscosity);
+    var le: f64 = _pv_ln(dissipation_rate);
+    var a: f64 = 0.75 * lv;
+    var b: f64 = 0.25 * le;
+    var r: f64 = _pv_exp(a - b);
+    return r;
+}

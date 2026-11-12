@@ -17,8 +17,9 @@ python3 -I -B scripts/oracle/validate.py . --write                              
 python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
 ```
 
-The generator depends on the oracle by path and on `hisab =1.4.0` (for glam's `DVec3`, to build `common`'s
-inputs), both resolved through `Cargo.lock`, which was seeded from `rust-old/Cargo.lock`.
+The generator depends on the oracle by path, on `hisab =1.4.0` (for glam's `DVec3`, to build `common`'s inputs), and
+on `serde =1.0.229` and `serde_json =1.0.154` with `float_roundtrip` (the JSON rows: the oracle's own versions; the
+default float parse is best-effort). All resolve through `Cargo.lock`, seeded from `rust-old/Cargo.lock`.
 
 The format, the comparison rules and the generator's structure are impetus's
 (`/home/macro/Repos/impetus/scripts/oracle/`), which are kimiya's and tanmatra's: every port's harness reads the
@@ -106,6 +107,11 @@ oracle:
   exactly the files present;
 - it checks `constants.tsv` against the literals in `rust-old/src`;
 - it recomputes every class-A/B `math` row in Python, in Rust's operation order;
+- it recomputes every `buoyancy`, `vortex` and `bridge` row, the class C ones through glibc (ctypes) for the record
+  and MPFR for their corrected oracle (`vortex.cr.tsv`, `bridge.cr.tsv`);
+- it decodes every `json` document again with Python's `json` (a correctly rounded float parse) under serde's
+  derive semantics, and compares its verdict and values with serde_json's (the generator uses serde_json's
+  `float_roundtrip` feature);
 - it recomputes every `common` row in Python, in Rust's and glam's order: the validation rules, the defaults, the
   vector arithmetic, and the particle arena through a transcription of its free-list logic (the token layouts
   and the arena's op codes are in `src/m_common.rs`'s module comment);

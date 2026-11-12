@@ -27,9 +27,13 @@
 mod cyr;
 mod glibc;
 mod grids;
+mod m_bridge;
+mod m_buoyancy;
 mod m_common;
 mod m_constants;
+mod m_json;
 mod m_math;
+mod m_vortex;
 mod t_constants;
 mod tsv;
 
@@ -44,9 +48,13 @@ const PARALLEL: bool = cfg!(feature = "parallel");
 /// Every golden emitter, in file-name order.
 fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
     Ok(vec![
+        m_bridge::emit(),
+        m_buoyancy::emit(),
         m_common::emit(),
         m_constants::emit(root)?,
+        m_json::emit(),
         m_math::emit(),
+        m_vortex::emit(),
     ])
 }
 

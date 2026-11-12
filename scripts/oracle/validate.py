@@ -37,6 +37,7 @@ import ctypes
 import ctypes.util
 import importlib.util
 from fractions import Fraction
+import json
 import math
 import re
 import struct
@@ -660,6 +661,309 @@ def check_common(rows):
     return counts
 
 
+# ── buoyancy, vortex, bridge (M1 part 4) ───────────────────────────────────────────────────
+# Each function transcribed from rust-old/src/{buoyancy,vortex,bridge}.rs in Rust's operation order. A
+# transcendental goes through `P`, a dict of primitives: glibc's (ctypes, the oracle's own libm) reproduces the
+# golden row bit for bit, and MPFR's gives the corrected oracle (ADR 0004).
+
+PI = math.pi           # std::f64::consts::PI
+
+
+def fdiv(a, b):
+    """IEEE a / b: Python raises on b = 0, where IEEE gives ±∞ (by the signs) or NaN (0/0, NaN/0)."""
+    try:
+        return a / b
+    except ZeroDivisionError:
+        if a != a or a == 0.0:
+            return math.nan
+        return math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b))
+GLIBC = {"exp": _libm.exp, "log": _libm.log, "log10": _libm.log10, "pow": _libm.pow}
+
+
+def r_terminal(m, g, rho, cd, a):
+    if not fin(g) or not fin(m):
+        return "E:InvalidParameter"
+    if not (fin(rho) and rho > 0.0 and fin(cd) and cd > 0.0 and fin(a) and a > 0.0):
+        return "E:InvalidParameter"
+    arg = fdiv((2.0 * m) * g, (rho * cd) * a)
+    if arg < 0.0:
+        return "E:InvalidParameter"
+    return r_sqrt(arg)
+
+
+def r_reynolds(rho, v, length, mu):
+    if not fin(mu) or mu <= 0.0:
+        return "E:InvalidViscosity"
+    if not fin(rho) or not fin(v) or not fin(length):
+        return "E:InvalidParameter"
+    if rho < 0.0 or length < 0.0:
+        return "E:InvalidParameter"
+    return fdiv((rho * abs(v)) * length, mu)
+
+
+def r_classify(re):
+    a = abs(re)
+    if a < 2300.0:
+        return "e:FlowRegime.Laminar"
+    if a < 4000.0:
+        return "e:FlowRegime.Transitional"
+    return "e:FlowRegime.Turbulent"
+
+
+def r_lamb_oseen(gam, r, nu, t, P):
+    if r <= 0.0:
+        return 0.0
+    pv = fdiv(gam, (2.0 * PI) * r)
+    core = (4.0 * nu) * t
+    if core <= 0.0:
+        return pv
+    return pv * (1.0 - P["exp"](fdiv(-(r * r), core)))
+
+
+def r_rankine(gam, r, core):
+    if r <= 0.0:
+        return 0.0
+    if r <= core:
+        return fdiv(gam * r, ((2.0 * PI) * core) * core)
+    return fdiv(gam, (2.0 * PI) * r)
+
+
+def r_enstrophy(field, dx):
+    dx2 = dx * dx
+    s = -0.0           # Rust's f64 Sum folds from -0.0
+    for w in field:
+        s = s + (w * w) * dx2
+    return s
+
+
+def r_kolmogorov(nu, eps, P):
+    if eps <= 0.0:
+        return math.inf
+    if nu <= 0.0:
+        return 0.0
+    return P["exp"]((0.75 * P["log"](nu)) - (0.25 * P["log"](eps)))
+
+
+def r_water_viscosity(temp, P):
+    tc = r_clamp(temp, 273.0, 373.0)
+    return 2.414e-5 * P["pow"](10.0, fdiv(247.8, tc - 140.0))
+
+
+def r_heat(q, vol, rho, cp, beta, dt):
+    if not (vol > 0.0 and cp > 0.0 and rho > 0.0):
+        return 0.0
+    return fdiv(((9.81 * beta) * q) * dt, cp * vol)
+
+
+def r_eddy(k, length):
+    if k <= 0.0:
+        return 0.0
+    return fdiv((0.5477 * r_sqrt(k)) * length, 0.85)
+
+
+def r_acoustic(v, c):
+    if c <= 0.0:
+        return 0.0
+    return r_powi8(fdiv(abs(v), c))
+
+
+def r_noise_db(k, P):
+    if k <= 0.0:
+        return 0.0
+    u = r_sqrt((2.0 / 3.0) * k)
+    if u <= 5e-8:
+        return 0.0
+    return 20.0 * P["log10"](fdiv(u, 5e-8))
+
+
+def r_wave(h, freq, c):
+    if c <= 0.0 or freq <= 0.0:
+        return 0.0
+    k = fdiv((2.0 * PI) * freq, c)
+    return (((1.225 * 9.81) * abs(h)) * k) * abs(h)
+
+
+# fn -> (inputs -> outputs). The class C ones take the primitives.
+M1B = {
+    "buoyancy_force": lambda x: [(x[0] * x[1]) * x[2]],
+    "drag_force": lambda x: [((((0.5 * x[0]) * x[1]) * x[1]) * x[2]) * x[3]],
+    "terminal_velocity": lambda x: [r_terminal(*x)],
+    "reynolds_number": lambda x: [r_reynolds(*x)],
+    "classify_flow": lambda x: [r_classify(x[0])],
+    "vorticity_2d": lambda x: [x[0] - x[1]],
+    "rankine_velocity": lambda x: [r_rankine(*x)],
+    "enstrophy": lambda x: [r_enstrophy(x[1:1 + x[0][1]], x[1 + x[0][1]])],
+    "cp_to_surface_pressure": lambda x: [x[2] + (x[0] * x[1])],
+    "freestream_dynamic_pressure": lambda x: [((0.5 * x[1]) * x[0]) * x[0]],
+    "aero_coefficients_to_forces": lambda x: [(x[0] * x[2]) * x[3], (x[1] * x[2]) * x[3]],
+    "wind_to_freestream": lambda x: [r_clamp(x[0], -340.0, 340.0)],
+    "heat_to_buoyancy_forcing": lambda x: [r_heat(*x)],
+    "tke_to_eddy_diffusivity": lambda x: [r_eddy(*x)],
+    "velocity_to_acoustic_source_strength": lambda x: [r_acoustic(*x)],
+    "wave_height_to_acoustic_pressure": lambda x: [r_wave(*x)],
+}
+M1B_C = {
+    "lamb_oseen_velocity": lambda x, P: [r_lamb_oseen(*x, P)],
+    "kolmogorov_scale": lambda x, P: [r_kolmogorov(*x, P)],
+    "temperature_to_water_viscosity": lambda x, P: [r_water_viscosity(x[0], P)],
+    "tke_to_broadband_noise_db": lambda x, P: [r_noise_db(x[0], P)],
+}
+
+
+def check_m1b(rows):
+    """buoyancy, vortex and bridge rows, recomputed (class C on glibc, as the oracle ran)."""
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        x = [tok_val(t) for t in ins]
+        got = [tok_val(t) for t in outs]
+        if func in M1B:
+            want = M1B[func](x)
+        elif func in M1B_C:
+            want = M1B_C[func](x, GLIBC)
+        else:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
+# ── json (M1 part 4) ───────────────────────────────────────────────────────────────────────
+# Each document decoded again by Python's json module (its float parse is correctly rounded, as serde_json's
+# `float_roundtrip` and bayan's are) under serde's derive semantics for these types: an object by field name
+# (unknown fields ignored, a duplicated known field refused) or an array of exactly the fields; an f64 from a finite
+# number (an integer `-0` is −0.0, as serde_json reads it), never null; a u8 from an integer in 0 … 255; a vector
+# of exactly 3; a unit variant as "Name" or {"Name": null}; the unit struct as null.
+
+class JsonRefused(Exception):
+    pass
+
+
+def _j_obj(pairs):
+    return ("obj", pairs)
+
+
+def _j_const(name):
+    raise JsonRefused(name)
+
+
+def j_load(doc):
+    try:
+        return json.loads(doc, object_pairs_hook=_j_obj, parse_int=lambda s: ("int", s),
+                          parse_float=lambda s: ("float", s), parse_constant=_j_const)
+    except (ValueError, JsonRefused):
+        raise JsonRefused("not JSON")
+
+
+def j_f64(v):
+    if isinstance(v, tuple) and v[0] == "int":
+        x = -0.0 if v[1] == "-0" else float(int(v[1]))
+    elif isinstance(v, tuple) and v[0] == "float":
+        x = float(v[1])
+    else:
+        raise JsonRefused("not a number")
+    if not math.isfinite(x):
+        raise JsonRefused("out of range")
+    return x
+
+
+def j_u8(v):
+    if not (isinstance(v, tuple) and v[0] == "int"):
+        raise JsonRefused("not an integer")
+    n = int(v[1])
+    if not 0 <= n <= 255:
+        raise JsonRefused("out of range")
+    return n
+
+
+def j_arr(v, n=None):
+    if not isinstance(v, list) or (n is not None and len(v) != n):
+        raise JsonRefused("not an array of the length")
+    return v
+
+
+def j_struct(v, names):
+    """The field values of struct node v, in declaration order."""
+    if isinstance(v, list):
+        return j_arr(v, len(names))
+    if not (isinstance(v, tuple) and v[0] == "obj"):
+        raise JsonRefused("not a struct")
+    out = []
+    for name in names:
+        hits = [val for key, val in v[1] if key == name]
+        if len(hits) != 1:
+            raise JsonRefused("missing or duplicated field")
+        out.append(hits[0])
+    return out
+
+
+MATERIAL_FIELDS = ["density", "viscosity", "surface_tension", "speed_of_sound"]
+PARTICLE_FIELDS = ["position", "velocity", "acceleration", "density", "pressure", "mass", "phase",
+                   "conformation", "temperature", "fuel"]
+CONFIG_FIELDS = ["dt", "gravity", "smoothing_radius", "gas_constant", "rest_density", "bounds_min",
+                 "bounds_max", "boundary_damping"]
+SOA_FIELDS = ["pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "accel_x", "accel_y", "accel_z",
+              "density", "pressure", "mass", "phase", "conf_xx", "conf_xy", "conf_yy", "temperature", "fuel"]
+REGIMES = ["Laminar", "Transitional", "Turbulent"]
+
+
+def j_decode(func, doc):
+    """The tokens serde_json reads from doc as func's type, or ["E:Deserialize"]."""
+    try:
+        v = j_load(doc)
+        base = func.split("::")[0]
+        if base == "FluidMaterial":
+            return [j_f64(x) for x in j_struct(v, MATERIAL_FIELDS)]
+        if base == "FluidParticle":
+            f = j_struct(v, PARTICLE_FIELDS)
+            out = []
+            for k in range(3):
+                out += [j_f64(x) for x in j_arr(f[k], 3)]
+            out += [j_f64(f[3]), j_f64(f[4]), j_f64(f[5]), j_u8(f[6])]
+            out += [j_f64(x) for x in j_arr(f[7], 3)]
+            return out + [j_f64(f[8]), j_f64(f[9])]
+        if base == "FluidConfig":
+            f = j_struct(v, CONFIG_FIELDS)
+            out = [j_f64(f[0])] + [j_f64(x) for x in j_arr(f[1], 3)]
+            out += [j_f64(f[2]), j_f64(f[3]), j_f64(f[4])]
+            out += [j_f64(x) for x in j_arr(f[5], 3)] + [j_f64(x) for x in j_arr(f[6], 3)]
+            return out + [j_f64(f[7])]
+        if base == "ParticleSoa":
+            out = []
+            for k, col in enumerate(j_struct(v, SOA_FIELDS)):
+                vals = [j_u8(x) if k == 12 else j_f64(x) for x in j_arr(col)]
+                out += [("v", len(vals))] + vals
+            return out
+        if base == "FlowRegime":
+            if isinstance(v, str) and v in REGIMES:
+                return [f"e:FlowRegime.{v}"]
+            if isinstance(v, tuple) and v[0] == "obj" and len(v[1]) == 1:
+                key, val = v[1][0]
+                if key in REGIMES and val is None:
+                    return [f"e:FlowRegime.{key}"]
+            raise JsonRefused("no variant")
+        if base == "DragCoefficient":
+            if v is None:
+                return []
+            raise JsonRefused("not null")
+    except JsonRefused:
+        return ["E:Deserialize"]
+    raise ValueError(func)
+
+
+def check_json(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        doc = unpct(ins[0][2:])
+        got = [tok_val(t) for t in outs]
+        want = j_decode(func, doc)
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, decoded {want!r}")
+    return counts
+
+
 # ── the correctly rounded math (ADR 0004) ─────────────────────────────────────────────────────
 # The corrected oracle: the oracle's own operations with every exp, ln, log10, sin, cos, hypot, pow and
 # atan2 result correctly rounded (MPFR). Where glibc rounded every call correctly the row is unchanged
@@ -671,12 +975,43 @@ CR_UNARY = {"f64::exp": "exp", "f64::ln": "log", "f64::log10": "log10", "f64::si
 CR_BINARY = {"f64::hypot": "hypot", "f64::powf": "pow", "f64::atan2": "atan2"}
 
 
+def mpfr_logged(log):
+    """MPFR's correctly rounded primitives, each call glibc rounds otherwise recorded into `log`."""
+    def unary(name, mp):
+        def f(x):
+            want = MPFR.cr(mp, x)
+            got = GLIBC[name](x)
+            if not same(got, want):
+                log.append(f"{name}(f:{bits(x):016x}) glibc f:{bits(got):016x} correctly rounded f:{bits(want):016x}")
+            return want
+        return f
+
+    def pw(x, y):
+        want = MPFR.cr2("pow", x, y)
+        got = GLIBC["pow"](x, y)
+        if not same(got, want):
+            log.append(f"pow(f:{bits(x):016x}, f:{bits(y):016x}) glibc f:{bits(got):016x} "
+                       f"correctly rounded f:{bits(want):016x}")
+        return want
+    return {"exp": unary("exp", "exp"), "log": unary("log", "log"), "log10": unary("log10", "log10"), "pow": pw}
+
+
 def corrections(module, rows):
     """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
     when every transcendental result is correctly rounded."""
     out = []
     for fn, cls, ins, outs, where in rows:
         log = []
+        if module in ("vortex", "bridge") and fn in M1B_C:
+            x = [tok_val(t) for t in ins]
+            want = M1B_C[fn](x, mpfr_logged(log))
+            got = [tok_f(t) for t in outs]
+            if len(got) == len(want) and all(same(a, b) for a, b in zip(got, want)):
+                continue
+            new = " ".join(f"f:{bits(w):016x}" for w in want)
+            seen = list(dict.fromkeys(log))
+            out.append((fn, " ".join(ins), new, "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
+            continue
         if module != "math":
             continue
         if fn in CR_BINARY:
@@ -834,6 +1169,16 @@ def main():
             counts = check_common(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"common: {len(rows)} rows recomputed ({summary})")
+        elif path.stem in ("buoyancy", "vortex", "bridge"):
+            counts = check_m1b(rows)
+            summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+            print(f"{path.stem}: {len(rows)} rows recomputed ({summary})")
+            if path.stem != "buoyancy":
+                check_corrections(root, path.stem, path, rows)
+        elif path.stem == "json":
+            counts = check_json(rows)
+            summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+            print(f"json: {len(rows)} documents decoded again ({summary})")
         elif path.stem == "math":
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

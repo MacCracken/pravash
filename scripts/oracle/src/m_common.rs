@@ -35,7 +35,7 @@ fn gen_tok(x: u64) -> Tok {
     i(i64::from_ne_bytes(x.to_ne_bytes()))
 }
 
-fn material(m: &FluidMaterial) -> Vec<Tok> {
+pub fn material(m: &FluidMaterial) -> Vec<Tok> {
     vec![
         f(m.density),
         f(m.viscosity),
@@ -44,7 +44,7 @@ fn material(m: &FluidMaterial) -> Vec<Tok> {
     ]
 }
 
-fn particle(p: &FluidParticle) -> Vec<Tok> {
+pub fn particle(p: &FluidParticle) -> Vec<Tok> {
     vec![
         f(p.position.x),
         f(p.position.y),
@@ -67,7 +67,7 @@ fn particle(p: &FluidParticle) -> Vec<Tok> {
     ]
 }
 
-fn config(c: &FluidConfig) -> Vec<Tok> {
+pub fn config(c: &FluidConfig) -> Vec<Tok> {
     vec![
         f(c.dt),
         f(c.gravity.x),
