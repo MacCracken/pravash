@@ -57,15 +57,9 @@ FIELD_RENAMES = {}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    **{f: "M4 part d" for f in ("update_viscoelastic", "update_heat", "update_phase_change", "update_reaction",
-                                "update_combustion", "apply_contact_angle", "apply_delta_sph",
-                                "compute_gradient_corrections", "apply_gradient_correction", "apply_implicit_viscosity",
-                                "generate_secondary_particles", "update_secondary_particles")},
 }
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
 PENDING_TYPES = {
-    **{f"sph::{t}": "M4 part d" for t in ("ViscoelasticConfig", "HeatConfig", "PhaseChangeConfig", "CombustionConfig",
-                                         "SecondaryType", "SecondaryParticle")},
     **{f"sph::{t}": "M5" for t in ("PhaseProperties", "MultiPhaseConfig", "SphSolver")},
 }
 EXCEPTIONS = {
@@ -90,6 +84,16 @@ def snake(camel):
 def library_part(text):
     cut = text.find("#[cfg(test)]\nmod ")
     return text if cut < 0 else text[:cut]
+
+
+def cyrius_traits():
+    """The traits src/ declares, and its (trait, type) impls."""
+    traits, impls = set(), set()
+    for path in sorted((root / "src").glob("*.cyr")):
+        text = path.read_text()
+        traits |= set(re.findall(r"^trait (\w+) \{", text, re.M))
+        impls |= set(re.findall(r"^impl (\w+) for (\w+) \{", text, re.M))
+    return traits, impls
 
 
 def cyrius_index():
@@ -158,6 +162,9 @@ def rust_items(module):
             continue
         if (m := re.match(r"impl(?:<[^>]*>)? (\w+)(?:<[^>]*>)? \{", s)):
             owner, trait = m.group(1), None
+            continue
+        if (m := re.match(VIS + r" trait (\w+)", s)):
+            items.append(("trait decl", None, m.group(1), None))
             continue
         if (m := re.match(VIS + r" enum (\w+)", s)):
             enum_name, struct_name = m.group(1), None
@@ -259,6 +266,7 @@ def field_store_scan():
 
 def main():
     fns, consts, members, enums, structs = cyrius_index()
+    traits, impls = cyrius_traits()
     enum_owners = set()
     missing, ok = [], 0
     used_exceptions = set()
@@ -286,6 +294,10 @@ def main():
                 else:
                     missing.append(label)
                 continue
+            if kind == "trait decl":
+                # `pub trait X` is `trait PvX` (a Rust `&dyn X` is a `dyn PvX`).
+                (ok := ok + 1) if f"Pv{name}" in traits else missing.append(f"{label} -> trait Pv{name}")
+                continue
             if kind == "trait":
                 ex = f"{module}::impl {name} for {owner}"
                 if ex in EXCEPTIONS:
@@ -293,8 +305,10 @@ def main():
                     ok += 1
                 elif name == "Default" and f"Pv{owner}_default" in fns:
                     ok += 1
+                elif (f"Pv{name}", f"Pv{owner}") in impls:
+                    ok += 1
                 else:
-                    missing.append(label)
+                    missing.append(f"{label} -> impl Pv{name} for Pv{owner}")
                 continue
             ex = f"{module}::{owner + '::' if owner else ''}{name}"
             if ex in EXCEPTIONS:

@@ -63,8 +63,11 @@
   bit-exact, and the 2,460 cell-key rows pending since M0)
 - [x] M4 part c: density, the forces, the brute-force `step` (as `sph_step`), the particle blocks, split and merge
   (198 rows, 5 against the corrected oracle; 10 Rust tests and 4 integration tests)
-- [ ] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7),
-  implicit viscosity, secondary particles
+- [x] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7, the
+  oracle's own LU), implicit viscosity, secondary particles (318 rows, 1 against the corrected oracle; 11 Rust tests)
+- [x] **M4 done 2026-11-12.**
+- [ ] M5: the `SphSolver` (WCSPH, PCISPH, DFSPH and multiphase steps, surface tension, adaptive dt, Verlet) on part
+  b's neighbour grid, with the five part d tests that build their lists with `SphSolver::step`
 
 ### 1.3.0
 

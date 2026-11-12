@@ -1100,6 +1100,202 @@ fn _par_nn_kind(k): i64 {
     return 0 - 1;
 }
 
+# The CSR lists whose `v:` offsets start at input k, as two new word buffers: (offsets, indices). Their counts are
+# `_par_in(k)` and `_par_in(k + 1 + offsets' count)`. The caller frees both buffers.
+fn _par_lists_in(k) {
+    var no = _par_in(k);
+    var off = fl_alloc(no * 8 + 8);
+    for (var a = 0; a < no; a = a + 1) { store64(off + a * 8, _par_in(k + 1 + a)); }
+    var ni = _par_in(k + 1 + no);
+    var idx = fl_alloc(ni * 8 + 8);
+    for (var b = 0; b < ni; b = b + 1) { store64(idx + b * 8, _par_in(k + 2 + no + b)); }
+    return (off, idx);
+}
+
+# The n particles whose 18 tokens each follow the `i:<n>` at input k, as a new buffer: (pointer, n, the input after).
+fn _par_particles_in(k) {
+    var n = _par_in(k);
+    var buf = fl_alloc(n * sizeof(PvFluidParticle) + 8);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var j = 0; j < n; j = j + 1) { _par_particle_in(k + 1 + j * 18, ps + j); }
+    return (buf, n, k + 1 + n * 18);
+}
+
+# A `SecondaryType` variant's Rust name.
+fn _par_secondary_name(kind): i64 {
+    if (kind == PV_SECONDARY_TYPE_FOAM) { return "Foam"; }
+    if (kind == PV_SECONDARY_TYPE_SPRAY) { return "Spray"; }
+    if (kind == PV_SECONDARY_TYPE_BUBBLE) { return "Bubble"; }
+    return "?";
+}
+
+# The secondary particle whose 8 tokens start at input k, into *s.
+fn _par_secondary_in(k, s: *PvSecondaryParticle) {
+    s.position = PvVec3_new(_par_in(k), _par_in(k + 1), _par_in(k + 2));
+    s.velocity = PvVec3_new(_par_in(k + 3), _par_in(k + 4), _par_in(k + 5));
+    s.lifetime = _par_in(k + 6);
+    var p = _par_in(k + 7);
+    var n = load64(_par_in_l + (k + 7) * 8);
+    s.kind = 0 - 1;
+    if (_par_eq(p, n, "SecondaryType.Foam") == 1) { s.kind = PV_SECONDARY_TYPE_FOAM; }
+    if (_par_eq(p, n, "SecondaryType.Spray") == 1) { s.kind = PV_SECONDARY_TYPE_SPRAY; }
+    if (_par_eq(p, n, "SecondaryType.Bubble") == 1) { s.kind = PV_SECONDARY_TYPE_BUBBLE; }
+    return 0;
+}
+
+# Appends the secondary particle's 8 tokens.
+fn _par_secondary_out(s: *PvSecondaryParticle) {
+    _par_got_f(_pv_bits(s.position.x));
+    _par_got_f(_pv_bits(s.position.y));
+    _par_got_f(_pv_bits(s.position.z));
+    _par_got_f(_pv_bits(s.velocity.x));
+    _par_got_f(_pv_bits(s.velocity.y));
+    _par_got_f(_pv_bits(s.velocity.z));
+    _par_got_f(_pv_bits(s.lifetime));
+    _par_got_e(_par_enum_text("SecondaryType", _par_secondary_name(s.kind)));
+    return 0;
+}
+
+# The part d rows that take lists (M4 part d): 1 handled, 0 another function.
+fn _par_sph_listed(fp, fl): i64 {
+    var lead = 0;
+    if (_par_eq(fp, fl, "update_viscoelastic") == 1 || _par_eq(fp, fl, "apply_delta_sph") == 1
+      || _par_eq(fp, fl, "apply_implicit_viscosity") == 1) { lead = 4; }
+    if (_par_eq(fp, fl, "update_heat") == 1) { lead = 3; }
+    if (_par_eq(fp, fl, "compute_gradient_corrections") == 1) { lead = 1; }
+    if (lead == 0) { return 0; }
+    var buf, n, k = _par_particles_in(lead);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var off, idx = _par_lists_in(k);
+    var no = _par_in(k);
+    var ni = _par_in(k + 1 + no);
+    var h: f64 = _par_in(0);
+    if (_par_eq(fp, fl, "compute_gradient_corrections") == 1) {
+        var cp, cn = compute_gradient_corrections(ps, n, off, no, idx, ni, h);
+        _par_got_seq(9 * cn);
+        for (var c = 0; c < 9 * cn; c = c + 1) { _par_got_f(load64(cp + c * 8)); }
+        if (cp != 0) { fl_free(cp); }
+    } else {
+        if (_par_eq(fp, fl, "update_viscoelastic") == 1) {
+            var ve: PvViscoelasticConfig = PvViscoelasticConfig_new(_par_in(1), _par_in(2));
+            var r1 = update_viscoelastic(ps, n, off, no, idx, ni, h, &ve, _par_in(3));
+        }
+        if (_par_eq(fp, fl, "update_heat") == 1) {
+            var hc: PvHeatConfig = PvHeatConfig_new(_par_in(1));
+            var r2 = update_heat(ps, n, off, no, idx, ni, h, &hc, _par_in(2));
+        }
+        if (_par_eq(fp, fl, "apply_delta_sph") == 1) {
+            var r3 = apply_delta_sph(ps, n, off, no, idx, ni, h, _par_in(1), _par_in(2), _par_in(3));
+        }
+        if (_par_eq(fp, fl, "apply_implicit_viscosity") == 1) {
+            var r4 = apply_implicit_viscosity(ps, n, off, no, idx, ni, h, _par_in(1), _par_in(2), _par_in(3));
+        }
+        for (var j = 0; j < n; j = j + 1) { _par_particle_out(ps + j); }
+    }
+    fl_free(off);
+    fl_free(idx);
+    fl_free(buf);
+    return 1;
+}
+
+# The other part d rows (M4 part d): 1 handled, 0 another function.
+fn _par_sph_d(fp, fl): i64 {
+    if (_par_sph_listed(fp, fl) == 1) { return 1; }
+    if (_par_eq(fp, fl, "oracle::invert_3x3") == 1) {
+        var m[72];
+        var out[72];
+        for (var a = 0; a < 9; a = a + 1) { store64(&m + a * 8, _par_in(a)); }
+        if (_pv_invert_3x3(&m, &out) == 1) {
+            for (var b = 0; b < 9; b = b + 1) { _par_got_f(load64(&out + b * 8)); }
+        } else {
+            _par_got_none();
+        }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "apply_gradient_correction") == 1) {
+        var cm[72];
+        for (var c = 0; c < 9; c = c + 1) { store64(&cm + c * 8, _par_in(c)); }
+        var gw: PvVec3 = PvVec3_new(_par_in(9), _par_in(10), _par_in(11));
+        var r: PvVec3 = apply_gradient_correction(&cm, gw);
+        _par_got_f(_pv_bits(r.x));
+        _par_got_f(_pv_bits(r.y));
+        _par_got_f(_pv_bits(r.z));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "update_phase_change") == 1) {
+        var pt: f64 = _par_in(0);
+        var pl: f64 = _par_in(1);
+        var pcp: f64 = _par_in(2);
+        var pc: PvPhaseChangeConfig = PvPhaseChangeConfig_new(pt, pl, pcp, _par_in(3), _par_in(4));
+        var pb, pn, pk = _par_particles_in(6);
+        var pps: *PvFluidParticle = _pv_as_particles(pb);
+        update_phase_change(pps, pn, &pc, _par_in(5));
+        for (var j = 0; j < pn; j = j + 1) { _par_particle_out(pps + j); }
+        fl_free(pb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "update_reaction") == 1 || _par_eq(fp, fl, "update_combustion") == 1) {
+        var cc: PvCombustionConfig;
+        cc.ignition_temperature = _par_in(0);
+        cc.reaction_rate = _par_in(1);
+        cc.heat_release = _par_in(2);
+        var cb, cn, ck = _par_particles_in(4);
+        var cps: *PvFluidParticle = _pv_as_particles(cb);
+        if (_par_eq(fp, fl, "update_reaction") == 1) {
+            update_reaction(cps, cn, &cc, _par_in(3));
+        } else {
+            update_combustion(cps, cn, &cc, _par_in(3));
+        }
+        for (var j2 = 0; j2 < cn; j2 = j2 + 1) { _par_particle_out(cps + j2); }
+        fl_free(cb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "CombustionConfig::react") == 1) {
+        var rc: PvCombustionConfig;
+        rc.ignition_temperature = _par_in(0);
+        rc.reaction_rate = _par_in(1);
+        rc.heat_release = _par_in(2);
+        var rr: PvReaction = rc.react(_par_in(3), _par_in(4), _par_in(5));
+        _par_got_f(_pv_bits(rr.consumed));
+        _par_got_f(_pv_bits(rr.heat));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "apply_contact_angle") == 1) {
+        var ac: PvFluidConfig;
+        _par_config_in(0, &ac);
+        var ab, an, ak = _par_particles_in(16);
+        var aps: *PvFluidParticle = _pv_as_particles(ab);
+        apply_contact_angle(aps, an, &ac, _par_in(14), _par_in(15));
+        for (var j3 = 0; j3 < an; j3 = j3 + 1) { _par_particle_out(aps + j3); }
+        fl_free(ab);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "generate_secondary_particles") == 1) {
+        var gb, gn, gk = _par_particles_in(2);
+        var gps: *PvFluidParticle = _pv_as_particles(gb);
+        var sp, sn = generate_secondary_particles(gps, gn, _par_in(0), _par_in(1));
+        _par_got_seq(sn);
+        var ss: *PvSecondaryParticle = _pv_as_secondaries(sp);
+        for (var j4 = 0; j4 < sn; j4 = j4 + 1) { _par_secondary_out(ss + j4); }
+        if (sp != 0) { fl_free(sp); }
+        fl_free(gb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "update_secondary_particles") == 1) {
+        var g: PvVec3 = PvVec3_new(_par_in(0), _par_in(1), _par_in(2));
+        var un = _par_in(4);
+        var ub = fl_alloc(un * sizeof(PvSecondaryParticle) + 8);
+        var us: *PvSecondaryParticle = _pv_as_secondaries(ub);
+        for (var j5 = 0; j5 < un; j5 = j5 + 1) { _par_secondary_in(5 + j5 * 8, us + j5); }
+        var kept = update_secondary_particles(us, un, g, _par_in(3));
+        _par_got_seq(kept);
+        for (var j6 = 0; j6 < kept; j6 = j6 + 1) { _par_secondary_out(us + j6); }
+        fl_free(ub);
+        return 1;
+    }
+    return 0;
+}
+
 fn _par_sph(fp, fl): i64 {
     if (_par_eq(fp, fl, "kernel_poly6") == 1 || _par_eq(fp, fl, "kernel_spiky_grad") == 1
       || _par_eq(fp, fl, "kernel_viscosity_laplacian") == 1 || _par_eq(fp, fl, "kernel_wendland_c2") == 1
@@ -1304,6 +1500,7 @@ fn _par_sph(fp, fl): i64 {
         _par_particle_out(&mm);
         return 1;
     }
+    if (_par_sph_d(fp, fl) == 1) { return 1; }
     if (_par_eq(fp, fl, "total_kinetic_energy") == 1 || _par_eq(fp, fl, "max_speed") == 1) {
         var np = _par_in(0);
         var buf = fl_alloc(np * sizeof(PvFluidParticle) + 8);
@@ -2252,6 +2449,9 @@ fn _par_c_bound(fp, fl): i64 {
     # order, so every particle of every row is the oracle's bit for bit.
     if (_par_eq(fp, fl, "split_particle") == 1) { return 0; }
     if (_par_eq(fp, fl, "step") == 1) { return 0; }
+    # M4 part d: the contact angle's cosine is correctly rounded and the rest is Rust's arithmetic in order, so each
+    # row equals the corrected oracle bit for bit.
+    if (_par_eq(fp, fl, "apply_contact_angle") == 1) { return 0; }
     return 0 - 1;
 }
 

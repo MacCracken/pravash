@@ -3,6 +3,50 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **sph** (M4 part d, which completes M4): the physics extensions, in `src/sph_fns.cyr`.
+  - **On caller CSR lists:** `update_viscoelastic` (Oldroyd-B), `update_heat`, `apply_delta_sph`,
+    `apply_implicit_viscosity` and `compute_gradient_corrections`, with `apply_gradient_correction`.
+    - The lists are (pointer, count) words, validated as Rust's `neighbor_lists_valid` does (ADR 0002 #18).
+    - The functions return 1, or 0 with nothing changed where Rust warns or would abort.
+  - **Per particle:** `update_phase_change`, `update_combustion`, `update_reaction` and `apply_contact_angle`.
+    - Rust's `ReactionProvider` trait is a Cyrius trait, `PvReactionProvider`, taken as a `dyn`.
+    - `impl PvReactionProvider for PvCombustionConfig` mirrors Rust's impl. Its `react` returns a `PvReaction`,
+      since a call through a `dyn` returns one value.
+    - The contact angle's cosine is correctly rounded.
+  - **The secondary particles:** `PvSecondaryType`, `PvSecondaryParticle`, `generate_secondary_particles`, and
+    `update_secondary_particles`, which compacts the survivors in place.
+  - **The configs:** `PvViscoelasticConfig`, `PvHeatConfig`, `PvPhaseChangeConfig` (with `_water_ice`) and
+    `PvCombustionConfig` (with `_default`).
+  - **The 3×3 inverse, ledger L7.** `_pv_invert_3x3` transcribes the oracle's own `matrix_inverse` (hisab 1.4.0: LU
+    with an absolute 1e-12 pivot test), allocation-free.
+    - ganita's `mat_inv`, the planned conversion target, differs on 12 of the 60 inverse rows: it refuses non-finite
+      entries and scales its threshold. The correction is on the ganita request.
+  - **Parity:** 318 new `sph.tsv` rows, 1,370 in all.
+    - 315 of the first 316 passed on the first replay. The other was a contact-angle row at a cosine glibc misrounds,
+      which matches the corrected oracle (`sph.cr.tsv`, now 22 rows).
+    - `validate.py` transcribes part d: 49,804 rows, 0 failures.
+    - The mutation tests found two gaps, exact ties no random row hits, closed by two rows that draw no random
+      numbers.
+  - **Tests:** 11 Rust tests, `test_degenerate_inputs_no_panic` among them. The five that build their lists with
+    `SphSolver::step` wait for M5.
+  - **Surface parity** checks Rust traits now: a `pub trait X` must be a `trait PvX`, and an `impl X for T` an
+    `impl PvX for PvT`.
+
+### Performance
+- **The physics extensions** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M4 part d;
+  against a twin, since Rust's criterion suite times none of them).
+  - The list functions run 8.4–9.1× Rust, and the gradient corrections 5.7×.
+  - The per-particle updates run 4.3–9×, and generating secondaries 15× (its 40 KB result is a block mapped per call).
+  - The 3×3 inverse runs 1.5× (Rust allocates its `Vec<Vec>`).
+  - Measured A/B, rows unchanged:
+    - the gradient corrections got 2.1× faster (1.90–1.95 → 0.89–0.91 ms for 625), their moment matrix held in nine
+      locals instead of stack words;
+    - `update_secondary_particles` got 2.2× faster (20.9–21.8 → 9.4–9.7 µs), storing each field instead of building
+      a `PvVec3`.
+  - Two of Rust's criterion groups that part c's record missed, now recorded: `sph_viscosity_force` 8.2× and
+    `create_particle_block` 25–35×. They agree with part c's twins.
+
+### Added (Cyrius)
 - **sph** (M4 part c): `src/sph_fns.cyr`.
   - **The brute-force sums:** `compute_density`, `pressure_force` and `viscosity_force`. The forces return a `PvVec3`;
     an index outside the slice reads NaN where Rust panics.

@@ -3255,6 +3255,393 @@ def sph_c_want(func, x, P):
         return [("v", len(ch))] + [v for p in ch for v in p]
     if func == "merge_particles":
         return r_merge(list(x[0:18]), list(x[18:36]))
+    return sph_d_want(func, x, P)
+
+
+# ── sph part d (M4): the physics extensions ──
+
+def lists_valid(o, idx, n):
+    """sph.rs's private `neighbor_lists_valid`."""
+    return (len(o) == n + 1 and all(o[k] <= o[k + 1] for k in range(len(o) - 1)) and o[-1] <= len(idx)
+            and all(0 <= j < n for j in idx))
+
+
+def r_viscoelastic(ps, o, idx, h, g, lam, dt):
+    n = len(ps)
+    if n == 0 or not lists_valid(o, idx, n):
+        return
+    kc = kc_new(h)
+    inv_l = fdiv(1.0, r_max(lam, 1e-20))
+    snap = [list(p) for p in ps]
+    for i in range(n):
+        pi = snap[i]
+        rho = r_max(pi[9], SPH_MIN_DENSITY)
+        a, b = o[i], o[i + 1]
+        dudx = dudy = dvdx = dvdy = 0.0
+        for j in idx[a:b]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            scale = fdiv(fdiv(pj[11], r_max(pj[9], SPH_MIN_DENSITY)) * kc_spiky(kc, r), r)
+            dx, dy = pi[0] - pj[0], pi[1] - pj[1]
+            dvx, dvy = pj[3] - pi[3], pj[4] - pi[4]
+            dudx += dvx * scale * dx
+            dudy += dvx * scale * dy
+            dvdx += dvy * scale * dx
+            dvdy += dvy * scale * dy
+        cxx, cxy, cyy = pi[13], pi[14], pi[15]
+        dcxx = 2.0 * (dudx * cxx + dudy * cxy) - (cxx - 1.0) * inv_l
+        dcxy = dudx * cxy + dudy * cyy + dvdx * cxx + dvdy * cxy - cxy * inv_l
+        dcyy = 2.0 * (dvdx * cxy + dvdy * cyy) - (cyy - 1.0) * inv_l
+        ps[i][13:16] = [cxx + dcxx * dt, cxy + dcxy * dt, cyy + dcyy * dt]
+        fx = fy = 0.0
+        for j in idx[a:b]:
+            if j == i:
+                continue
+            pj = snap[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            scale = fdiv(fdiv(pj[11], r_max(pj[9], SPH_MIN_DENSITY)) * kc_spiky(kc, r), r)
+            dx, dy = pi[0] - pj[0], pi[1] - pj[1]
+            dxx, dxy, dyy = pj[13] - cxx, pj[14] - cxy, pj[15] - cyy
+            fx += fdiv(g * (dxx * dx + dxy * dy) * scale, rho)
+            fy += fdiv(g * (dxy * dx + dyy * dy) * scale, rho)
+        ps[i][6] += fx
+        ps[i][7] += fy
+
+
+def r_sph_heat(ps, o, idx, h, kappa, dt):
+    n = len(ps)
+    if n == 0 or not (fin(kappa) and kappa > 0.0) or not lists_valid(o, idx, n):
+        return
+    kc = kc_new(h)
+    snap = [p[16] for p in ps]
+    for i in range(n):
+        pi = ps[i]
+        acc = 0.0
+        for j in idx[o[i]:o[i + 1]]:
+            if j == i:
+                continue
+            pj = ps[j]
+            r2 = pd2(pi, pj)
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            acc += fdiv(pj[11], r_max(pj[9], SPH_MIN_DENSITY)) * (snap[j] - snap[i]) * kc_visc(kc, r)
+        ps[i][16] += kappa * acc * dt
+
+
+def r_delta(ps, o, idx, h, c0, delta, dt):
+    n = len(ps)
+    if n == 0 or not (fin(delta) and delta > 0.0) or not lists_valid(o, idx, n):
+        return
+    kc = kc_new(h)
+    eps = 0.01 * h * h
+    snap = [(p[9], p[0], p[1], p[2], p[11]) for p in ps]
+    for i in range(n):
+        rho_i, xi, yi, zi, _ = snap[i]
+        corr = 0.0
+        for j in idx[o[i]:o[i + 1]]:
+            if j == i:
+                continue
+            rho_j, xj, yj, zj, mj = snap[j]
+            dx, dy, dz = xi - xj, yi - yj, zi - zj
+            r2 = dx * dx + dy * dy + dz * dz
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            vol = fdiv(mj, r_max(rho_j, SPH_MIN_DENSITY))
+            psi = fdiv(2.0 * (rho_j - rho_i), r2 + eps)
+            corr -= vol * psi * r * kc_spiky(kc, r)
+        ps[i][9] += delta * h * c0 * corr * dt
+
+
+def r_implicit(ps, o, idx, h, nu, dt, iters):
+    n = len(ps)
+    pos = lambda x: fin(x) and x > 0.0
+    if n == 0 or not pos(nu) or not pos(h) or not pos(dt) or not lists_valid(o, idx, n):
+        return
+    kc = kc_new(h)
+    c = nu * dt
+    stop = 1e-8 * 1e-8
+    v_old = [tuple(p[3:6]) for p in ps]
+    for _ in range(iters):
+        mx = 0.0
+        for i in range(n):
+            pi = ps[i]
+            rho = r_max(pi[9], SPH_MIN_DENSITY)
+            w = [0.0, 0.0, 0.0]
+            diag = 0.0
+            for j in idx[o[i]:o[i + 1]]:
+                if j == i:
+                    continue
+                pj = ps[j]
+                r2 = pd2(pi, pj)
+                if r2 > kc[1] or r2 < 1e-20:
+                    continue
+                r = math.sqrt(r2)
+                a = fdiv(pj[11] * kc_visc(kc, r), r_max(pj[9], SPH_MIN_DENSITY) * rho)
+                for k in range(3):
+                    w[k] += pj[3 + k] * a
+                diag += a
+            den = 1.0 + c * diag
+            nv = [fdiv(v_old[i][k] + w[k] * c, den) for k in range(3)]
+            ch = sum_sq(nv[0] - pi[3], nv[1] - pi[4], nv[2] - pi[5])
+            mx = r_max(mx, ch)
+            pi[3:6] = nv
+        if mx < stop:
+            break
+
+
+def sum_sq(x, y, z):
+    return x * x + y * y + z * z
+
+
+def r_invert3(m):
+    """hisab 1.4.0 `matrix_inverse` on a 3×3 (LU with partial pivoting, then a dense solve per unit column)."""
+    lu = [list(m[0:3]), list(m[3:6]), list(m[6:9])]
+    piv = [0, 1, 2]
+    for col in range(3):
+        mr, mv = col, abs(lu[col][col])
+        for row in range(col + 1, 3):
+            v = abs(lu[row][col])
+            if v > mv:
+                mv, mr = v, row
+        if mv < 1e-12:
+            return None
+        if mr != col:
+            lu[col], lu[mr] = lu[mr], lu[col]
+            piv[col], piv[mr] = piv[mr], piv[col]
+        d = lu[col][col]
+        for row in range(col + 1, 3):
+            lu[row][col] = fdiv(lu[row][col], d)
+            fct = lu[row][col]
+            for j in range(col + 1, 3):
+                lu[row][j] -= fct * lu[col][j]
+    inv = [[0.0] * 3 for _ in range(3)]
+    for col in range(3):
+        e = [1.0 if k == col else 0.0 for k in range(3)]
+        x = [e[i] for i in piv]
+        for i in range(1, 3):
+            sm = x[i]
+            for j in range(i):
+                sm -= lu[i][j] * x[j]
+            x[i] = sm
+        for i in (2, 1, 0):
+            sm = x[i]
+            for j in range(i + 1, 3):
+                sm -= lu[i][j] * x[j]
+            x[i] = fdiv(sm, lu[i][i])
+        for row in range(3):
+            inv[row][col] = x[row]
+    return [v for r in inv for v in r]
+
+
+def r_mls(ps, o, idx, h):
+    n = len(ps)
+    ident = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    out = [list(ident) for _ in range(n)]
+    if not (fin(h) and h > 0.0) or not lists_valid(o, idx, n):
+        return out
+    kc = kc_new(h)
+    for i in range(n):
+        pi = ps[i]
+        m = [0.0] * 9
+        for j in idx[o[i]:o[i + 1]]:
+            if j == i:
+                continue
+            pj = ps[j]
+            d = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]]
+            r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+            if r2 > kc[1] or r2 < 1e-20:
+                continue
+            r = math.sqrt(r2)
+            vol = fdiv(pj[11], r_max(pj[9], SPH_MIN_DENSITY))
+            gr = fdiv(kc_spiky(kc, r), r)
+            gw = [(pi[k] - pj[k]) * gr for k in range(3)]
+            for row in range(3):
+                for col in range(3):
+                    m[row * 3 + col] += vol * d[row] * gw[col]
+        inv = r_invert3(m)
+        if inv is not None:
+            out[i] = inv
+    return out
+
+
+def r_phase_change(ps, t, lh, cp, below, above):
+    l_heat = r_max(lh, 1e-20)
+    c = r_max(cp, 1e-10)
+    for p in ps:
+        if p[12] == below:
+            other, heating = above, True
+        elif p[12] == above:
+            other, heating = below, False
+        else:
+            continue
+        toward = (p[16] - t) * c if heating else (t - p[16]) * c
+        prog = r_clamp(p[17], 0.0, 1.0)
+        if toward > 0.0:
+            need = (1.0 - prog) * l_heat
+            if toward >= need:
+                p[12] = other
+                p[17] = 0.0
+                extra = fdiv(toward - need, c)
+                p[16] = t + extra if heating else t - extra
+            else:
+                p[17] = prog + fdiv(toward, l_heat)
+                p[16] = t
+        elif prog > 0.0:
+            stored = prog * l_heat
+            back = -toward
+            if back >= stored:
+                p[17] = 0.0
+                extra = fdiv(back - stored, c)
+                p[16] = t - extra if heating else t + extra
+            else:
+                p[17] = prog - fdiv(back, l_heat)
+                p[16] = t
+
+
+def r_react(ign, rate, heat, t, fuel, dt):
+    """`impl ReactionProvider for CombustionConfig`."""
+    if t <= ign or fuel <= 0.0:
+        return 0.0, 0.0
+    cons = fuel - fdiv(fuel, 1.0 + rate * dt)
+    return cons, heat * cons
+
+
+def r_contact(ps, c, theta, sigma, P):
+    h = c[4]
+    if not (fin(h) and h > 0.0) or not fin(sigma) or not fin(theta):
+        return
+    accel = fdiv(sigma * P["cos"](theta), h)
+    lo, hi = c[7:10], c[10:13]
+    for p in ps:
+        w = [0.0, 0.0, 0.0]
+        for a in range(3):
+            if hi[a] <= lo[a]:
+                continue
+            if p[a] - lo[a] < h:
+                w[a] += 1.0
+            if hi[a] - p[a] < h:
+                w[a] -= 1.0
+        l2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2]
+        if l2 < 1e-20:
+            continue
+        inv = fdiv(1.0, math.sqrt(l2))
+        for a in range(3):
+            p[6 + a] = p[6 + a] - (w[a] * inv) * accel
+
+
+SEC_KINDS = ("SecondaryType.Foam", "SecondaryType.Spray", "SecondaryType.Bubble")
+
+
+def r_gen_secondary(ps, thr, life):
+    out = []
+    for p in ps:
+        am = math.sqrt(sum_sq(p[6], p[7], p[8]))
+        if am > thr:
+            out.append([p[0], p[1], p[2], p[3] * 1.2, p[4] * 1.2, p[5] * 1.2, life * 0.5, "e:SecondaryType.Spray"])
+        elif am > thr * 0.3:
+            out.append([p[0], p[1], p[2], p[3] * 0.1, p[4] * 0.1, p[5] * 0.1, life, "e:SecondaryType.Foam"])
+    return out
+
+
+def r_upd_secondary(ss, g, dt):
+    out = []
+    for s in ss:
+        v = s[3:6]
+        kind = s[7]
+        if kind.endswith("Spray"):
+            v = [v[k] + g[k] * dt for k in range(3)]
+        elif kind.endswith("Foam"):
+            v = [x * 0.98 for x in v]
+        elif kind.endswith("Bubble"):
+            v = [v[0], v[1] + 0.5 * dt, v[2]]
+            v = [x * 0.95 for x in v]
+        pos = [s[k] + v[k] * dt for k in range(3)]
+        life = s[6] - dt
+        if life > 0.0:
+            out.append(pos + v + [life, kind])
+    return out
+
+
+def sph_d_want(func, x, P):
+    """A part d sph row's recomputed outputs, or None for another function."""
+    def parts(k):
+        n = x[k]
+        return [list(x[k + 1 + 18 * j:k + 19 + 18 * j]) for j in range(n)], k + 1 + 18 * n
+
+    def lists(k):
+        no = x[k][1]
+        o = list(x[k + 1:k + 1 + no])
+        ni = x[k + 1 + no][1]
+        return o, list(x[k + 2 + no:k + 2 + no + ni])
+
+    flat = lambda ps: [v for p in ps for v in p]
+    lead = {"update_viscoelastic": 4, "update_heat": 3, "apply_delta_sph": 4, "apply_implicit_viscosity": 4,
+            "compute_gradient_corrections": 1}
+    if func in lead:
+        ps, k = parts(lead[func])
+        o, idx = lists(k)
+        if func == "update_viscoelastic":
+            r_viscoelastic(ps, o, idx, x[0], x[1], x[2], x[3])
+        elif func == "update_heat":
+            r_sph_heat(ps, o, idx, x[0], x[1], x[2])
+        elif func == "apply_delta_sph":
+            r_delta(ps, o, idx, x[0], x[1], x[2], x[3])
+        elif func == "apply_implicit_viscosity":
+            r_implicit(ps, o, idx, x[0], x[1], x[2], x[3])
+        else:
+            mats = r_mls(ps, o, idx, x[0])
+            return [("v", 9 * len(mats))] + [v for m in mats for v in m]
+        return flat(ps)
+    if func == "oracle::invert_3x3":
+        inv = r_invert3(list(x[0:9]))
+        return ["n:"] if inv is None else inv
+    if func == "apply_gradient_correction":
+        c, g = x[0:9], x[9:12]
+        return [c[0] * g[0] + c[1] * g[1] + c[2] * g[2], c[3] * g[0] + c[4] * g[1] + c[5] * g[2],
+                c[6] * g[0] + c[7] * g[1] + c[8] * g[2]]
+    if func == "update_phase_change":
+        ps, _ = parts(6)
+        r_phase_change(ps, x[0], x[1], x[2], x[3], x[4])
+        return flat(ps)
+    if func in ("update_reaction", "update_combustion"):
+        ign, rate, heat, dt = x[0:4]
+        ps, _ = parts(4)
+        for p in ps:
+            if func == "update_reaction":
+                if p[17] > 0.0:
+                    cons, dh = r_react(ign, rate, heat, p[16], p[17], dt)
+                    p[17] = r_max(p[17] - cons, 0.0)
+                    p[16] += dh
+            elif p[16] > ign and p[17] > 0.0:
+                cons = p[17] - fdiv(p[17], 1.0 + rate * dt)
+                p[17] = r_max(p[17] - cons, 0.0)
+                p[16] += heat * cons
+        return flat(ps)
+    if func == "CombustionConfig::react":
+        return list(r_react(*x[0:6]))
+    if func == "apply_contact_angle":
+        ps, _ = parts(16)
+        r_contact(ps, list(x[0:14]), x[14], x[15], P)
+        return flat(ps)
+    if func == "generate_secondary_particles":
+        ps, _ = parts(2)
+        out = r_gen_secondary(ps, x[0], x[1])
+        return [("v", len(out))] + [v for s in out for v in s]
+    if func == "update_secondary_particles":
+        n = x[4][1]
+        ss = [list(x[5 + 8 * j:13 + 8 * j]) for j in range(n)]
+        out = r_upd_secondary(ss, x[0:3], x[3])
+        return [("v", len(out))] + [v for s in out for v in s]
     return None
 
 
@@ -3317,7 +3704,7 @@ def corrections(module, rows):
             out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
             continue
         if module == "sph" and fn in ("equation_of_state_tait", "NonNewtonianViscosity::effective_viscosity",
-                                      "split_particle"):
+                                      "split_particle", "apply_contact_angle"):
             x = [tok_val(t) for t in ins]
             want = sph_want(fn, x, mpfr_logged(log))
             got = [tok_val(t) for t in outs]

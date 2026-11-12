@@ -35,15 +35,40 @@
 //! - `split_particle` takes the parent (18 tokens), `i:<children>` and the offset, and gives `v:<k>` and the
 //!   children (class C: cos and sin, the corrected oracle where glibc misrounds);
 //! - `merge_particles` takes two particles and gives the merged one (class B).
+//!
+//! Part d (from its own seed, after part c's rows): the physics extensions. `<lists>` is CSR neighbour lists:
+//! `v:<n+1>` offsets and `v:<m>` indices, brute-force (every pair within h, self included, as Rust's tests build
+//! them), shuffled per particle on some rows (the sums follow the list order), and invalid on others (the functions
+//! then change nothing). Each gives the n particles after the call (class B) unless stated:
+//! - `update_viscoelastic` takes h, G, λ, dt, `<ps>`, `<lists>`; `update_heat` h, κ, dt, `<ps>`, `<lists>`;
+//!   `apply_delta_sph` h, c₀, δ, dt, `<ps>`, `<lists>`; `apply_implicit_viscosity` h, ν, dt, `i:<iterations>`,
+//!   `<ps>`, `<lists>`;
+//! - `compute_gradient_corrections` takes h, `<ps>`, `<lists>` and gives `v:<9n>` row-major matrices (class B);
+//!   `oracle::invert_3x3` takes 9 values and gives 9 or `n:` (class B); `apply_gradient_correction` takes 9 values
+//!   and a vector and gives a vector (class B);
+//! - `update_phase_change` takes T*, L, c, `i:` below, `i:` above, dt, `<ps>`;
+//! - `update_reaction` (through `CombustionConfig`'s `ReactionProvider`) and `update_combustion` take the ignition
+//!   temperature, the rate, the heat release, dt, `<ps>`; `CombustionConfig::react` takes those three, T, fuel, dt
+//!   and gives (consumed, heat) (class B);
+//! - `apply_contact_angle` takes a config (14), θ, σ, `<ps>` (class C: cos, the corrected oracle where glibc
+//!   misrounds);
+//! - `generate_secondary_particles` takes the threshold, the lifetime, `<ps>` and gives `v:<k>` secondaries (8
+//!   tokens: position, velocity, lifetime, `e:SecondaryType.<Kind>`); `update_secondary_particles` takes gravity,
+//!   dt, `v:<k>` secondaries and gives the survivors (class B).
 
 use hisab::DVec3;
 use pravash::sph::SphSolver;
 use pravash::sph::{
-    NonNewtonianViscosity, batch_distance_squared, batch_poly6, compute_density,
-    create_particle_block, equation_of_state, equation_of_state_tait, kernel_poly6,
-    kernel_spiky_grad, kernel_viscosity_laplacian, kernel_wendland_c2, kernel_wendland_c2_grad,
-    kernel_wendland_c4, kernel_wendland_c4_grad, max_speed, merge_particles, pressure_force,
-    sort_by_zorder, split_particle, step, total_kinetic_energy, viscosity_force,
+    CombustionConfig, HeatConfig, NonNewtonianViscosity, PhaseChangeConfig, ReactionProvider,
+    SecondaryParticle, SecondaryType, ViscoelasticConfig, apply_contact_angle, apply_delta_sph,
+    apply_gradient_correction, apply_implicit_viscosity, batch_distance_squared, batch_poly6,
+    compute_density, compute_gradient_corrections, create_particle_block, equation_of_state,
+    equation_of_state_tait, generate_secondary_particles, kernel_poly6, kernel_spiky_grad,
+    kernel_viscosity_laplacian, kernel_wendland_c2, kernel_wendland_c2_grad, kernel_wendland_c4,
+    kernel_wendland_c4_grad, max_speed, merge_particles, pressure_force, sort_by_zorder,
+    split_particle, step, total_kinetic_energy, update_combustion, update_heat,
+    update_phase_change, update_reaction, update_secondary_particles, update_viscoelastic,
+    viscosity_force,
 };
 use pravash::{FluidConfig, FluidParticle};
 
@@ -1168,6 +1193,731 @@ fn merge_rows(m: &mut Module, rng: &mut Rng) {
     }
 }
 
+// ── Part d ──────────────────────────────────────────────────────────────────────────
+
+/// A part d call on particles and CSR lists.
+type ListedFn<'a> = &'a dyn Fn(&mut [FluidParticle], &[u32], &[usize]);
+/// A part d call taking its scalars (h first) as well.
+type ParamFn<'a> = &'a dyn Fn(&[f64], &mut [FluidParticle], &[u32], &[usize]);
+
+/// Brute-force CSR lists: for each particle, every particle within h (`distance_to <= h`, itself included), in index
+/// order, or shuffled per particle when `rng` is given.
+fn brute_lists(ps: &[FluidParticle], h: f64, mut rng: Option<&mut Rng>) -> (Vec<u32>, Vec<usize>) {
+    let mut offsets = vec![0u32];
+    let mut indices = Vec::new();
+    for pi in ps {
+        let mut l: Vec<usize> = (0..ps.len())
+            .filter(|&j| pi.distance_to(&ps[j]) <= h)
+            .collect();
+        if let Some(r) = rng.as_deref_mut() {
+            for k in (1..l.len()).rev() {
+                let j = usize::try_from(r.int(0, i64::try_from(k).unwrap_or(0))).unwrap_or(0);
+                l.swap(k, j);
+            }
+        }
+        indices.extend(l);
+        offsets.push(u32::try_from(indices.len()).unwrap_or(u32::MAX));
+    }
+    (offsets, indices)
+}
+
+fn lists_tok(o: &[u32], idx: &[usize]) -> Vec<Tok> {
+    let mut v = vec![Tok::V(o.len())];
+    v.extend(o.iter().map(|&x| i(x)));
+    v.push(Tok::V(idx.len()));
+    v.extend(idx.iter().map(|&x| usz(x)));
+    v
+}
+
+/// The four invalid list shapes for n particles from valid ones: too few offsets, a decreasing pair, a last offset
+/// past the indices, an index at n.
+fn invalid_lists(o: &[u32], idx: &[usize], n: usize) -> Vec<(Vec<u32>, Vec<usize>)> {
+    let mut out = vec![(o[..o.len() - 1].to_vec(), idx.to_vec())];
+    if o.len() >= 3 {
+        let mut d = o.to_vec();
+        d.swap(1, 2);
+        if d[1] > d[2] {
+            out.push((d, idx.to_vec()));
+        }
+    }
+    let mut past = o.to_vec();
+    if let Some(l) = past.last_mut() {
+        *l += 1;
+    }
+    out.push((past, idx.to_vec()));
+    if !idx.is_empty() {
+        let mut bad = idx.to_vec();
+        bad[0] = n;
+        out.push((o.to_vec(), bad));
+    }
+    out
+}
+
+/// A cloud with the fields part d reads varied: conformation, temperature, fuel, acceleration, density.
+fn rich_cloud(rng: &mut Rng, n: usize, l: f64, three_d: bool) -> Vec<FluidParticle> {
+    let mut ps = cloud(rng, n, l, 0.0, three_d, 0.01);
+    for p in &mut ps {
+        p.conformation = [
+            rng.uniform(0.5, 2.0),
+            rng.uniform(-0.5, 0.5),
+            rng.uniform(0.5, 2.0),
+        ];
+        p.temperature = rng.uniform(250.0, 700.0);
+        p.fuel = rng.uniform(0.0, 1.0);
+        p.acceleration = DVec3::new(
+            rng.uniform(-30.0, 30.0),
+            rng.uniform(-30.0, 30.0),
+            rng.uniform(-3.0, 3.0),
+        );
+    }
+    ps
+}
+
+/// A row taking `lead` scalars, `<ps>` and `<lists>`, giving the particles after `f`.
+fn listed_row(
+    m: &mut Module,
+    name: &str,
+    lead: &[Tok],
+    ps: &[FluidParticle],
+    o: &[u32],
+    idx: &[usize],
+    f: ListedFn,
+) {
+    let mut ins = lead.to_vec();
+    ins.extend(ptoks(ps));
+    ins.extend(lists_tok(o, idx));
+    let mut out = ps.to_vec();
+    f(&mut out, o, idx);
+    let toks: Vec<Tok> = out.iter().flat_map(particle).collect();
+    m.row(name, Class::B, &ins, &toks);
+}
+
+/// The listed rows of one function: random clouds (2D and 3D) with index-order and shuffled lists, a lattice, the
+/// invalid shapes, n = 0, and the scalars' specials through `vary`.
+fn listed_rows(m: &mut Module, rng: &mut Rng, name: &str, base: &[f64], call: ParamFn) {
+    let h = base[0];
+    let lead = |v: &[f64]| -> Vec<Tok> {
+        v.iter()
+            .enumerate()
+            .map(|(k, &x)| {
+                if name == "apply_implicit_viscosity" && k == 3 {
+                    usz(x as usize)
+                } else {
+                    f(x)
+                }
+            })
+            .collect()
+    };
+    let run = |m: &mut Module, v: &[f64], ps: &[FluidParticle], o: &[u32], idx: &[usize]| {
+        listed_row(m, name, &lead(v), ps, o, idx, &|q, a, b| call(v, q, a, b));
+    };
+    for &(n, l, three_d) in &[(30, 0.15, false), (40, 0.12, true), (12, 0.06, false)] {
+        let ps = rich_cloud(rng, n, l, three_d);
+        let (o, idx) = brute_lists(&ps, h, None);
+        run(m, base, &ps, &o, &idx);
+        let (o2, idx2) = brute_lists(&ps, h, Some(rng));
+        run(m, base, &ps, &o2, &idx2);
+    }
+    let mut lat = create_particle_block([0.0, 0.0], [0.2, 0.2], 0.02, 0.001);
+    for (k, p) in lat.iter_mut().enumerate() {
+        p.density = 1000.0 + crate::m_grid::fx(k % 7);
+        p.velocity.x = p.position.y;
+        p.temperature = 293.15 + crate::m_grid::fx(k % 5);
+    }
+    let (o, idx) = brute_lists(&lat, h, None);
+    run(m, base, &lat, &o, &idx);
+    // Valid lists that start past index 0 (Rust allows a first offset above 0).
+    let small = rich_cloud(rng, 6, 0.05, false);
+    let (o, idx) = brute_lists(&small, h, None);
+    let mut shifted_idx = vec![0usize, 1];
+    shifted_idx.extend(&idx);
+    let shifted_o: Vec<u32> = o.iter().map(|&x| x + 2).collect();
+    run(m, base, &small, &shifted_o, &shifted_idx);
+    for (bo, bi) in invalid_lists(&o, &idx, small.len()) {
+        run(m, base, &small, &bo, &bi);
+    }
+    run(m, base, &[], &[0], &[]);
+    // Specials of each scalar after h, one at a time.
+    let sp = [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-30, 1e30];
+    for k in 1..base.len() {
+        if name == "apply_implicit_viscosity" && k == 3 {
+            continue;
+        }
+        for &x in &sp {
+            let mut v = base.to_vec();
+            v[k] = x;
+            run(m, &v, &small, &o, &idx);
+        }
+    }
+    for hv in [0.0, f64::NAN, 1.0] {
+        let mut v = base.to_vec();
+        v[0] = hv;
+        run(m, &v, &small, &o, &idx);
+    }
+}
+
+fn viscoelastic_rows(m: &mut Module, rng: &mut Rng) {
+    listed_rows(
+        m,
+        rng,
+        "update_viscoelastic",
+        &[0.05, 100.0, 0.05, 0.001],
+        &|v, ps, o, idx| {
+            update_viscoelastic(ps, o, idx, v[0], &ViscoelasticConfig::new(v[1], v[2]), v[3]);
+        },
+    );
+    // Rust's simple-shear test shape: u = γ·y, no relaxation, G 0.
+    let mut shear = create_particle_block([0.0, 0.0], [0.2, 0.2], 0.02, 0.001);
+    for p in &mut shear {
+        p.density = 1000.0;
+        p.velocity.x = p.position.y;
+    }
+    let (o, idx) = brute_lists(&shear, 0.05, None);
+    listed_row(
+        m,
+        "update_viscoelastic",
+        &[f(0.05), f(0.0), f(1e12), f(0.01)],
+        &shear,
+        &o,
+        &idx,
+        &|q, a, b| update_viscoelastic(q, a, b, 0.05, &ViscoelasticConfig::new(0.0, 1e12), 0.01),
+    );
+}
+
+fn heat_rows(m: &mut Module, rng: &mut Rng) {
+    listed_rows(
+        m,
+        rng,
+        "update_heat",
+        &[0.05, 0.01, 0.001],
+        &|v, ps, o, idx| {
+            update_heat(ps, o, idx, v[0], &HeatConfig::new(v[1]), v[2]);
+        },
+    );
+}
+
+fn delta_rows(m: &mut Module, rng: &mut Rng) {
+    listed_rows(
+        m,
+        rng,
+        "apply_delta_sph",
+        &[0.05, 10.0, 0.1, 0.001],
+        &|v, ps, o, idx| {
+            apply_delta_sph(ps, o, idx, v[0], v[1], v[2], v[3]);
+        },
+    );
+    // Rust's test shape: two particles 0.02 apart, densities 1000 and 1100.
+    let mut two = vec![
+        FluidParticle::new_2d(0.0, 0.0, 1.0),
+        FluidParticle::new_2d(0.02, 0.0, 1.0),
+    ];
+    two[0].density = 1000.0;
+    two[1].density = 1100.0;
+    let (o, idx) = brute_lists(&two, 0.05, None);
+    listed_row(
+        m,
+        "apply_delta_sph",
+        &[f(0.05), f(10.0), f(0.1), f(1e-3)],
+        &two,
+        &o,
+        &idx,
+        &|q, a, b| apply_delta_sph(q, a, b, 0.05, 10.0, 0.1, 1e-3),
+    );
+}
+
+fn implicit_rows(m: &mut Module, rng: &mut Rng) {
+    listed_rows(
+        m,
+        rng,
+        "apply_implicit_viscosity",
+        &[0.05, 0.5, 0.01, 5.0],
+        &|v, ps, o, idx| {
+            apply_implicit_viscosity(ps, o, idx, v[0], v[1], v[2], v[3] as usize);
+        },
+    );
+    // Rust's test shape (alternating velocities, ν·dt far past the explicit limit, 200 sweeps), and 0, 1 and 50
+    // sweeps of a cloud (the early exit included).
+    let mut alt = create_particle_block([0.0, 0.0], [0.1, 0.1], 0.02, 0.001);
+    for (k, p) in alt.iter_mut().enumerate() {
+        p.density = 100.0;
+        p.velocity.x = if k % 2 == 0 { 1.0 } else { -1.0 };
+    }
+    let (o, idx) = brute_lists(&alt, 0.05, None);
+    for iters in [200usize, 0, 1, 50] {
+        listed_row(
+            m,
+            "apply_implicit_viscosity",
+            &[f(0.05), f(10.0), f(1.0), usz(iters)],
+            &alt,
+            &o,
+            &idx,
+            &|q, a, b| apply_implicit_viscosity(q, a, b, 0.05, 10.0, 1.0, iters),
+        );
+    }
+}
+
+fn mls_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, ps: &[FluidParticle], o: &[u32], idx: &[usize], h: f64| {
+        let mut ins = vec![f(h)];
+        ins.extend(ptoks(ps));
+        ins.extend(lists_tok(o, idx));
+        let c = compute_gradient_corrections(ps, o, idx, h);
+        let mut out = vec![Tok::V(9 * c.len())];
+        for mat in &c {
+            out.extend(mat.iter().map(|&x| f(x)));
+        }
+        m.row("compute_gradient_corrections", Class::B, &ins, &out);
+    };
+    // 3D clouds (invertible moments), a 2D lattice (z has no moment: singular, the identity kept), mixed lists.
+    for &(n, l, three_d, h) in &[
+        (30, 0.1, true, 0.06),
+        (25, 0.08, true, 0.05),
+        (20, 0.1, false, 0.05),
+    ] {
+        let ps = rich_cloud(rng, n, l, three_d);
+        let (o, idx) = brute_lists(&ps, h, None);
+        row(m, &ps, &o, &idx, h);
+        let (o2, idx2) = brute_lists(&ps, h, Some(rng));
+        row(m, &ps, &o2, &idx2, h);
+    }
+    let mut cube = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut p = FluidParticle::new_2d(
+                    crate::m_grid::fx(x) * 0.02,
+                    crate::m_grid::fx(y) * 0.02,
+                    0.001,
+                );
+                p.position.z = crate::m_grid::fx(z) * 0.02;
+                p.density = 1000.0;
+                cube.push(p);
+            }
+        }
+    }
+    let (o, idx) = brute_lists(&cube, 0.05, None);
+    row(m, &cube, &o, &idx, 0.05);
+    let small = rich_cloud(rng, 6, 0.04, true);
+    let (o, idx) = brute_lists(&small, 0.05, None);
+    for (bo, bi) in invalid_lists(&o, &idx, small.len()) {
+        row(m, &small, &bo, &bi, 0.05);
+    }
+    for h in [0.0, f64::NAN, -0.05, f64::INFINITY] {
+        row(m, &small, &o, &idx, h);
+    }
+    let mut odd = small.clone();
+    odd[2].density = f64::NAN;
+    odd[3].mass = f64::INFINITY;
+    row(m, &odd, &o, &idx, 0.05);
+    row(m, &[], &[0], &[], 0.05);
+}
+
+fn invert_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, a: [f64; 9]| {
+        let ins: Vec<Tok> = a.iter().map(|&x| f(x)).collect();
+        let out = match pravash::oracle::invert_3x3(&a) {
+            Some(inv) => inv.iter().map(|&x| f(x)).collect(),
+            None => vec![Tok::None],
+        };
+        m.row("oracle::invert_3x3", Class::B, &ins, &out);
+    };
+    for _ in 0..40 {
+        let mut a = [0.0; 9];
+        for x in &mut a {
+            *x = rng.uniform(-2.0, 2.0);
+        }
+        row(m, a);
+    }
+    // Pivoting (a 0 and a tiny leading entry), the identity, a permutation, rank 2, the zero matrix, a uniformly tiny
+    // matrix (singular by the absolute 1e-12 threshold), pivots either side of 1e-12, huge entries.
+    row(m, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 9.0]);
+    row(m, [1e-14, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
+    row(m, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    row(m, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    row(m, [1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 1.0, 0.0, 1.0]);
+    row(m, [0.0; 9]);
+    row(m, [1e-13, 0.0, 0.0, 0.0, 1e-13, 0.0, 0.0, 0.0, 1e-13]);
+    for d in [1e-12, 0.999_999e-12, 1.000_001e-12] {
+        row(m, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, d]);
+    }
+    row(m, [1e300, 2e300, 0.0, 1.0, 3.0, 0.5, 0.25, 1e-300, 4.0]);
+    // Non-finite entries: hisab's dense substitution multiplies ±∞ by the unit vector's zeros (NaN).
+    for k in 0..9 {
+        let mut a = [2.0, 0.5, 0.1, 0.3, 3.0, 0.7, 0.2, 0.4, 5.0];
+        a[k] = [f64::INFINITY, f64::NAN, f64::NEG_INFINITY][k % 3];
+        row(m, a);
+    }
+}
+
+fn gradient_correction_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, c: [f64; 9], g: DVec3| {
+        let mut ins: Vec<Tok> = c.iter().map(|&x| f(x)).collect();
+        ins.extend([f(g.x), f(g.y), f(g.z)]);
+        let r = apply_gradient_correction(&c, g);
+        m.row(
+            "apply_gradient_correction",
+            Class::B,
+            &ins,
+            &[f(r.x), f(r.y), f(r.z)],
+        );
+    };
+    row(
+        m,
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        DVec3::new(2.0, 3.0, 4.0),
+    );
+    let sp = specials();
+    for k in 0..20 {
+        let mut c = [0.0; 9];
+        for x in &mut c {
+            *x = rng.uniform(-3.0, 3.0);
+        }
+        let mut g = DVec3::new(
+            rng.uniform(-50.0, 50.0),
+            rng.uniform(-50.0, 50.0),
+            rng.uniform(-50.0, 50.0),
+        );
+        if k >= 14 {
+            c[k % 9] = sp[k % sp.len()];
+            g.y = sp[(k * 3) % sp.len()];
+        }
+        row(m, c, g);
+    }
+}
+
+fn phase_change_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, c: &PhaseChangeConfig, ps: &[FluidParticle]| {
+        let mut ins = vec![
+            f(c.transition_temperature),
+            f(c.latent_heat),
+            f(c.heat_capacity),
+            i(c.phase_below),
+            i(c.phase_above),
+            f(0.01),
+        ];
+        ins.extend(ptoks(ps));
+        let mut out = ps.to_vec();
+        update_phase_change(&mut out, c, 0.01);
+        let toks: Vec<Tok> = out.iter().flat_map(particle).collect();
+        m.row("update_phase_change", Class::B, &ins, &toks);
+    };
+    // Every branch: below and above the phases (and a third), temperatures either side of T* by up to a full latent
+    // heat's worth, progress from −0.5 to 1.5 and NaN, a NaN temperature.
+    let water = PhaseChangeConfig::water_ice(0, 1);
+    let sp = specials();
+    let mut ps = Vec::new();
+    for k in 0..60 {
+        let mut p = FluidParticle::new_2d(0.0, 0.0, 1.0);
+        p.phase = [0, 1, 2][k % 3];
+        p.temperature = 273.15 + rng.uniform(-200.0, 200.0);
+        p.fuel = [0.0, 0.3, 0.97, 1.0, -0.5, 1.5, rng.uniform(0.0, 1.0)][k % 7];
+        if k % 13 == 5 {
+            p.fuel = f64::NAN;
+        }
+        if k % 17 == 3 {
+            p.temperature = sp[k % sp.len()];
+        }
+        if k % 11 == 4 {
+            p.temperature = 273.15;
+        }
+        ps.push(p);
+    }
+    row(m, &water, &ps);
+    for (lh, cp) in [
+        (0.0, 2090.0),
+        (334_000.0, 0.0),
+        (f64::NAN, 1.0),
+        (1.0, f64::NAN),
+        (-5.0, -5.0),
+    ] {
+        row(m, &PhaseChangeConfig::new(273.15, lh, cp, 0, 1), &ps);
+    }
+    row(
+        m,
+        &PhaseChangeConfig::new(373.15, 2.26e6, 4186.0, 1, 1),
+        &ps,
+    );
+    row(
+        m,
+        &PhaseChangeConfig::new(f64::NAN, 1000.0, 10.0, 0, 2),
+        &ps,
+    );
+    row(m, &PhaseChangeConfig::new(500.0, 1000.0, 10.0, 2, 0), &[]);
+    // Exact ties, in binary-exact numbers (T* 0, L 10, c 2): the energy toward the other phase equal to the latent heat
+    // still needed (heating from 0 and from half way, cooling), and the energy back equal to the stored heat. No RNG.
+    let tie = PhaseChangeConfig::new(0.0, 10.0, 2.0, 0, 1);
+    let mut ties = Vec::new();
+    for &(phase, t, fuel) in &[
+        (0u8, 5.0, 0.0),
+        (0, 2.5, 0.5),
+        (1, -5.0, 0.0),
+        (0, -2.5, 0.5),
+        (1, 2.5, 0.5),
+    ] {
+        let mut p = FluidParticle::new_2d(0.0, 0.0, 1.0);
+        p.phase = phase;
+        p.temperature = t;
+        p.fuel = fuel;
+        ties.push(p);
+    }
+    row(m, &tie, &ties);
+}
+
+fn combustion_rows(m: &mut Module, rng: &mut Rng) {
+    let sp = specials();
+    let mut ps = Vec::new();
+    for k in 0..40 {
+        let mut p = FluidParticle::new_2d(0.0, 0.0, 1.0);
+        p.temperature = [
+            300.0,
+            499.0,
+            500.0,
+            501.0,
+            600.0,
+            1000.0,
+            rng.uniform(200.0, 900.0),
+        ][k % 7];
+        p.fuel = [1.0, 0.0, 0.001, -0.2, 0.5, rng.uniform(0.0, 1.0)][k % 6];
+        if k % 9 == 4 {
+            p.temperature = sp[k % sp.len()];
+        }
+        if k % 10 == 7 {
+            p.fuel = sp[(k * 3) % sp.len()];
+        }
+        ps.push(p);
+    }
+    let mut fast = CombustionConfig::default();
+    fast.reaction_rate = 1000.0;
+    let mut nan_ign = CombustionConfig::default();
+    nan_ign.ignition_temperature = f64::NAN;
+    let mut negative = CombustionConfig::default();
+    negative.reaction_rate = -150.0;
+    negative.heat_release = -10.0;
+    let configs = [CombustionConfig::default(), fast, nan_ign, negative];
+    for (k, c) in configs.iter().enumerate() {
+        let dt = [0.01, 1.0, 0.01, 0.01][k];
+        let mut ins = vec![
+            f(c.ignition_temperature),
+            f(c.reaction_rate),
+            f(c.heat_release),
+            f(dt),
+        ];
+        ins.extend(ptoks(&ps));
+        let mut a = ps.clone();
+        update_reaction(&mut a, c, dt);
+        m.row(
+            "update_reaction",
+            Class::B,
+            &ins,
+            &a.iter().flat_map(particle).collect::<Vec<_>>(),
+        );
+        let mut b = ps.clone();
+        update_combustion(&mut b, c, dt);
+        m.row(
+            "update_combustion",
+            Class::B,
+            &ins,
+            &b.iter().flat_map(particle).collect::<Vec<_>>(),
+        );
+    }
+    for k in 0..30 {
+        let c = configs[k % 4];
+        let t = if k < 20 {
+            rng.uniform(300.0, 800.0)
+        } else {
+            sp[k % sp.len()]
+        };
+        let fuel = [rng.uniform(0.0, 1.0), 0.0, -1.0, 1.0][k % 4];
+        let dt = [0.01, 0.0, 1e6, -0.01][k % 4];
+        let (cons, heat) = c.react(t, fuel, dt);
+        m.row(
+            "CombustionConfig::react",
+            Class::B,
+            &[
+                f(c.ignition_temperature),
+                f(c.reaction_rate),
+                f(c.heat_release),
+                f(t),
+                f(fuel),
+                f(dt),
+            ],
+            &[f(cons), f(heat)],
+        );
+    }
+}
+
+fn contact_angle_rows(m: &mut Module, rng: &mut Rng) {
+    let row = |m: &mut Module, cfg: &FluidConfig, theta: f64, sigma: f64, ps: &[FluidParticle]| {
+        let mut ins = config(cfg);
+        ins.extend([f(theta), f(sigma)]);
+        ins.extend(ptoks(ps));
+        let mut out = ps.to_vec();
+        apply_contact_angle(&mut out, cfg, theta, sigma);
+        m.row(
+            "apply_contact_angle",
+            Class::C,
+            &ins,
+            &out.iter().flat_map(particle).collect::<Vec<_>>(),
+        );
+    };
+    // Particles near each wall, in corners (two walls: the normal normalised), mid-domain, outside it.
+    let mut near = Vec::new();
+    for k in 0..30 {
+        let mut p = FluidParticle::new_2d(rng.uniform(-0.1, 1.1), rng.uniform(-0.1, 1.1), 0.001);
+        p.position.z = rng.uniform(-0.05, 0.55);
+        if k % 5 == 0 {
+            p.position.x = rng.uniform(0.0, 0.04);
+            p.position.y = rng.uniform(0.96, 1.0);
+        }
+        p.acceleration = DVec3::new(rng.uniform(-1.0, 1.0), -9.81, 0.0);
+        near.push(p);
+    }
+    let water = FluidConfig::water_2d();
+    let mut cube = FluidConfig::water_2d();
+    cube.bounds_max = DVec3::new(1.0, 1.0, 0.5);
+    let q = std::f64::consts::FRAC_PI_4;
+    for theta in [
+        q,
+        std::f64::consts::FRAC_PI_2,
+        3.0 * q,
+        0.0,
+        std::f64::consts::PI,
+        -1.0,
+        7.0,
+    ] {
+        row(m, &water, theta, 0.07, &near);
+        row(m, &cube, theta, 0.07, &near);
+    }
+    // Angles whose cosine glibc misrounds (an MPFR search over k·π/4096: k = 1729, 2171, 2554).
+    for k in [1729u32, 2171, 2554] {
+        row(
+            m,
+            &cube,
+            std::f64::consts::PI * f64::from(k) / 4096.0,
+            0.07,
+            &near,
+        );
+    }
+    // The early returns and odd configs: NaN θ or σ, h 0, a NaN bound (Rust's `hi <= lo` keeps that axis's walls), an
+    // inverted box, σ negative.
+    row(m, &cube, f64::NAN, 0.07, &near);
+    row(m, &cube, q, f64::INFINITY, &near);
+    row(m, &cube, q, -0.5, &near);
+    let mut zero_h = cube;
+    zero_h.smoothing_radius = 0.0;
+    row(m, &zero_h, q, 0.07, &near);
+    let mut nan_hi = cube;
+    nan_hi.bounds_max.z = f64::NAN;
+    row(m, &nan_hi, q, 0.07, &near);
+    let mut inverted = cube;
+    inverted.bounds_min.x = 2.0;
+    row(m, &inverted, q, 0.07, &near);
+    row(m, &cube, q, 0.07, &[]);
+    // Particles exactly h from a wall (h 0.0625, so x − lo and hi − x are exact): `< h` leaves them out. No RNG.
+    let mut exact = cube;
+    exact.smoothing_radius = 0.0625;
+    let at: Vec<FluidParticle> = [
+        (0.0625, 0.5),
+        (0.9375, 0.5),
+        (0.5, 0.0625),
+        (0.0625, 0.9375),
+        (0.06, 0.5),
+    ]
+    .iter()
+    .map(|&(x, y)| {
+        let mut p = FluidParticle::new_2d(x, y, 0.001);
+        p.position.z = 0.25;
+        p
+    })
+    .collect();
+    row(m, &exact, q, 0.07, &at);
+}
+
+fn secondary_tok(s: &SecondaryParticle) -> Vec<Tok> {
+    vec![
+        f(s.position.x),
+        f(s.position.y),
+        f(s.position.z),
+        f(s.velocity.x),
+        f(s.velocity.y),
+        f(s.velocity.z),
+        f(s.lifetime),
+        Tok::E("SecondaryType", format!("{:?}", s.kind)),
+    ]
+}
+
+fn secondary_rows(m: &mut Module, rng: &mut Rng) {
+    let gen_row = |m: &mut Module, thr: f64, life: f64, ps: &[FluidParticle]| {
+        let mut ins = vec![f(thr), f(life)];
+        ins.extend(ptoks(ps));
+        let s = generate_secondary_particles(ps, thr, life);
+        let mut out = vec![Tok::V(s.len())];
+        for x in &s {
+            out.extend(secondary_tok(x));
+        }
+        m.row("generate_secondary_particles", Class::B, &ins, &out);
+    };
+    let sp = specials();
+    let mut ps = rich_cloud(rng, 40, 1.0, true);
+    ps[3].acceleration.x = f64::NAN;
+    ps[7].acceleration.y = f64::INFINITY;
+    ps[11].acceleration = DVec3::ZERO;
+    for thr in [10.0, 30.0, 0.0, -1.0, f64::NAN, f64::INFINITY, sp[3]] {
+        gen_row(m, thr, 2.0, &ps);
+    }
+    gen_row(m, 10.0, f64::NAN, &ps);
+    gen_row(m, 10.0, 2.0, &[]);
+    let upd_row = |m: &mut Module, g: DVec3, dt: f64, ss: &[SecondaryParticle]| {
+        let mut ins = vec![f(g.x), f(g.y), f(g.z), f(dt), Tok::V(ss.len())];
+        for x in ss {
+            ins.extend(secondary_tok(x));
+        }
+        let mut v = ss.to_vec();
+        update_secondary_particles(&mut v, g, dt);
+        let mut out = vec![Tok::V(v.len())];
+        for x in &v {
+            out.extend(secondary_tok(x));
+        }
+        m.row("update_secondary_particles", Class::B, &ins, &out);
+    };
+    let mut ss = Vec::new();
+    for k in 0..45 {
+        ss.push(SecondaryParticle {
+            position: DVec3::new(
+                rng.uniform(0.0, 1.0),
+                rng.uniform(0.0, 1.0),
+                rng.uniform(0.0, 1.0),
+            ),
+            velocity: DVec3::new(
+                rng.uniform(-2.0, 2.0),
+                rng.uniform(-2.0, 2.0),
+                rng.uniform(-2.0, 2.0),
+            ),
+            lifetime: [
+                0.02,
+                0.01,
+                0.005,
+                1.0,
+                0.0,
+                -1.0,
+                f64::NAN,
+                rng.uniform(0.0, 0.05),
+            ][k % 8],
+            kind: [
+                SecondaryType::Foam,
+                SecondaryType::Spray,
+                SecondaryType::Bubble,
+            ][k % 3],
+        });
+    }
+    let g = DVec3::new(0.0, -9.81, 0.0);
+    for dt in [0.01, 0.0, 0.03, 1.0, -0.01, f64::NAN] {
+        upd_row(m, g, dt, &ss);
+    }
+    upd_row(m, DVec3::new(f64::NAN, 1.0, -2.0), 0.01, &ss);
+    upd_row(m, g, 0.01, &[]);
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("sph");
     let mut rng = Rng::new(0x0_5f4a);
@@ -1187,5 +1937,18 @@ pub fn emit() -> Module {
     block_rows(&mut m, &mut rng);
     split_rows(&mut m, &mut rng);
     merge_rows(&mut m, &mut rng);
+    // Part d's rows, from their own seed.
+    let mut rng = Rng::new(0x0_5f4d);
+    viscoelastic_rows(&mut m, &mut rng);
+    heat_rows(&mut m, &mut rng);
+    delta_rows(&mut m, &mut rng);
+    implicit_rows(&mut m, &mut rng);
+    mls_rows(&mut m, &mut rng);
+    invert_rows(&mut m, &mut rng);
+    gradient_correction_rows(&mut m, &mut rng);
+    phase_change_rows(&mut m, &mut rng);
+    combustion_rows(&mut m, &mut rng);
+    contact_angle_rows(&mut m, &mut rng);
+    secondary_rows(&mut m, &mut rng);
     m
 }

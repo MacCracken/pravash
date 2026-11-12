@@ -532,3 +532,65 @@ three runs interleaved. All 198 rows were unchanged.
   fl(π) and fl(3π/2), where cos or sin is nearly zero and the stand-in falls to its multi-precision path: one
   `cos(fl(π/2))` takes 40 µs. Into 7 children, with no such angle, the split takes 3.5 µs. This is the same cost as
   M3 part b's DST sines at fl(k·π/2) (ledger L1).
+
+## M4 part d: the physics extensions (2026-11-12)
+
+Pinned to core 15. Rust's criterion suite times none of part d.
+- **Rust:** the twin `scripts/probes/rust/src/bin/bench_sph_d.rs` (bodies in its header). The particles are the
+  25 × 25 block at spacing 0.02 (625 particles; Rust's `sph_viscosity_force` bench block) with brute-force lists at
+  h 0.05.
+- **Cyrius:** `tests/pravash.bcyr`'s `bench_sph_d`. The functions change the particles, so each row starts from a fresh
+  copy and both sides make the same sequence of calls. Their states, and so their work, are the same, the implicit
+  solve's early exit included.
+
+Two runs, interleaved with the twin's. The gradient-correction and secondary-update rows are after the A/B below.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_d/viscoelastic_625` | 163–166 µs | 1.48 ms | 9.1× |
+| `sph_d/heat_625` | 49.5 µs | 452 µs | 9.1× |
+| `sph_d/delta_sph_625` | 64.4–64.9 µs | 578–587 µs | 8.9× |
+| `sph_d/implicit_viscosity_625` (5 sweeps) | 186–188 µs | 1.56–1.68 ms | 8.4× |
+| `sph_d/gradient_corrections_625` | 157–158 µs | 888–909 µs | 5.7× |
+| `sph_d/invert_3x3` | 269–297 ns | 426–428 ns | 1.5× |
+| `sph_d/phase_change_625` | 1.03–1.22 µs | 10.3 µs | ≈ 9× |
+| `sph_d/combustion_625` | 2.08 µs | 8.9–9.0 µs | 4.3× |
+| `sph_d/reaction_625` (through a `dyn`) | 3.33–3.48 µs | 14.7–15.0 µs | 4.4× |
+| `sph_d/contact_angle_625` | 2.24–2.30 µs | 16.5–16.7 µs | 7.3× |
+| `sph_d/generate_secondary_625` | 3.10–3.38 µs | 50–51 µs | 15× |
+| `sph_d/update_secondary_625` | 1.18–1.23 µs | 9.4–9.7 µs | 8× |
+
+**The A/B behind two rows.** The bench was built against the first part d code (in a copy of the tree), pinned,
+three runs interleaved. Every row was unchanged.
+
+| Bench | Before | After | |
+|---|---|---|---|
+| `gradient_corrections_625` | 1.90–1.95 ms | 888–909 µs | 2.1× |
+| `update_secondary_625` | 20.9–21.8 µs | 9.4–9.7 µs | 2.2× |
+
+- The moment matrix had been accumulated in nine stack words, a load and a store per term per pair. It is now nine
+  f64 locals, stored once per particle for the inverse.
+- The secondary update had built two `PvVec3` struct returns per particle. It now stores each field.
+
+**Reading it.**
+- **The list functions are the pair loop's cost,** like part c's sums: about 21 neighbours a particle, each a distance,
+  two compares and the kernel. Their snapshots (up to 90 KB) are one mapped freelist block per call.
+- **The 3×3 inverse is close to Rust's,** which allocates two `Vec<Vec<f64>>` and two vectors per call (L7's reason).
+- **Generating secondaries is mostly allocation.** Every particle sheds one here, so its 40 KB result is a block mapped
+  per call (the filed freelist finding).
+- **A per-component field store beats a `PvVec3` store.** `s.velocity.x = vx` for each component was 2.2× faster than
+  `s.velocity = PvVec3_new(..)` on the secondary update. Part c's step and the other per-particle writes use the
+  struct form in O(n) loops, where it costs little.
+
+**Two criterion groups part c's record missed.** Part c timed `viscosity_force` and `create_particle_block` with a
+twin, but Rust's suite has groups for both. Pinned, criterion one run, Cyrius two:
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_viscosity_force/625_particles` (velocity (sin 0.1i, cos 0.1i, 0)) | 765 ns | 6.23–6.27 µs | 8.2× |
+| `create_particle_block/100_particles` | 388 ns | 13.4–13.6 µs | 35× |
+| `create_particle_block/500_particles` | 1.81 µs | 48.5–49.1 µs | 27× |
+| `create_particle_block/1000_particles` | 3.55 µs | 89.2–89.6 µs | 25× |
+
+They agree with part c's twins (8.0× and 24×). Even the 100-particle block is 14 KB, so it too is a block mapped and
+unmapped per call.

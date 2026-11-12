@@ -10303,8 +10303,9 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
 # freed before it returns: the heap is flat across steps (port plan §7.5).
 #
 # UPSTREAM(L7): ganita:docs/development/issues/2026-11-11-mat-inv-allocates-per-call.md
-#   part d's MLS 3×3 inverse (an allocation-free copy of ganita's `mat_inv` algorithm) lands in this file; replace
-#   it with ganita's `mat_inv_into` once it ships; parity: the MLS gradient-correction rows.
+#   `_pv_invert_3x3`, the MLS 3×3 inverse: an allocation-free transcription of the oracle's (hisab 1.4.0
+#   `matrix_inverse`); replace it with ganita's `mat_inv_into` once it ships with hisab's absolute 1e-12 pivot test
+#   and non-finite behaviour, or as an ADR divergence; parity: the `oracle::invert_3x3` and MLS rows (class B).
 
 # ── density and the forces (brute force) ────────────────────────────────────────────
 
@@ -10711,6 +10712,945 @@ fn create_particle_block(ox: f64, oy: f64, sx: f64, sy: f64, spacing: f64, mass:
         }
     }
     return (buf, count);
+}
+
+# ── part d: the caller-supplied neighbour lists ─────────────────────────────────────
+
+# 1 when CSR lists fit n particles, as Rust's private `neighbor_lists_valid` checks: n + 1 offsets, never
+# decreasing, the last within the indices, and every index in [0, n). The lists are 8-byte words (Rust's `u32`
+# offsets and `usize` indices), so an offset outside [0, 2³²) or an index read as unsigned at n or more is invalid,
+# values Rust's types can't hold or that index past n. (Rust also logs a warning; logging arrives with M7.)
+#must_use
+fn _pv_lists_valid(offsets, n_off, indices, n_idx, n): i64 {
+    if (n_off != n + 1 || n_idx < 0) { return 0; }
+    var prev = load64(offsets);
+    if (prev < 0) { return 0; }
+    for (var k = 1; k < n_off; k = k + 1) {
+        var o = load64(offsets + k * 8);
+        if (o < prev) { return 0; }
+        prev = o;
+    }
+    if (prev > 4294967295 || prev > n_idx) { return 0; }
+    for (var j = 0; j < n_idx; j = j + 1) {
+        var x = load64(indices + j * 8);
+        if (x < 0 || x >= n) { return 0; }
+    }
+    return 1;
+}
+
+# ── part d: viscoelasticity (Oldroyd-B) ─────────────────────────────────────────────
+
+# Viscoelastic fluid properties: the elastic modulus G (Pa) and the relaxation time λ (s). Mirrors
+# `ViscoelasticConfig`.
+struct PvViscoelasticConfig {
+    elastic_modulus: f64;
+    relaxation_time: f64;
+}
+
+# A viscoelastic config. Mirrors `ViscoelasticConfig::new`.
+#must_use
+fn PvViscoelasticConfig_new(elastic_modulus: f64, relaxation_time: f64): PvViscoelasticConfig {
+    var c: PvViscoelasticConfig;
+    c.elastic_modulus = elastic_modulus;
+    c.relaxation_time = relaxation_time;
+    return c;
+}
+
+# Evolves each particle's conformation tensor (upper-convected Oldroyd-B, in the xy plane) and adds the elastic
+# stress divergence to its x and y acceleration, from a snapshot of the n particles, over the CSR lists at smoothing
+# radius h (pairs with 1e-20 ≤ r² ≤ h², j ≠ i), with 1/λ = 1/max(λ, 1e-20):
+# - ∇u from Σ ((mⱼ/ρⱼ)·∇W)/r · (vⱼ − vᵢ) ⊗ (xᵢ − xⱼ);
+# - dC = L·C + C·Lᵀ − (C − I)/λ, C += dC·dt;
+# - a += Σ ((G·(ΔC·d))·scale)/ρᵢ with the snapshot's C.
+# 1, or 0 with nothing changed for invalid lists or no memory for the snapshot (Rust warns or aborts); n = 0 does
+# nothing (1). Mirrors `update_viscoelastic` (ADR 0002 #18).
+#must_use
+fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, ve: *PvViscoelasticConfig,
+  dt: f64): i64 {
+    if (n <= 0) { return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    var sz = sizeof(PvFluidParticle);
+    if (n > 9223372036854775807 / sz) { return 0; }
+    var buf = fl_alloc(n * sz);
+    if (buf == 0) { return 0; }
+    var snap: *PvFluidParticle = _pv_as_particles(buf);
+    for (var c = 0; c < n; c = c + 1) {
+        var d: *PvFluidParticle = snap + c;
+        var e: *PvFluidParticle = ps + c;
+        *d = *e;
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var lam: f64 = _pv_max(ve.relaxation_time, tiny);
+    var inv_lambda: f64 = 1.0 / lam;
+    var g: f64 = ve.elastic_modulus;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = snap + i;
+        var rho: f64 = _pv_max(pi.density, lo);
+        var start = load64(offsets + i * 8);
+        var end = load64(offsets + (i + 1) * 8);
+        var dudx: f64 = 0.0;
+        var dudy: f64 = 0.0;
+        var dvdx: f64 = 0.0;
+        var dvdy: f64 = 0.0;
+        for (var k = start; k < end; k = k + 1) {
+            var j = load64(indices + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = snap + j;
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                    var scale: f64 = ((pj.mass / rho_j) * grad) / r;
+                    var dvx: f64 = pj.velocity.x - pi.velocity.x;
+                    var dvy: f64 = pj.velocity.y - pi.velocity.y;
+                    dudx = dudx + ((dvx * scale) * dx);
+                    dudy = dudy + ((dvx * scale) * dy);
+                    dvdx = dvdx + ((dvy * scale) * dx);
+                    dvdy = dvdy + ((dvy * scale) * dy);
+                }
+            }
+        }
+        var cxx: f64 = pi.conformation.0;
+        var cxy: f64 = pi.conformation.1;
+        var cyy: f64 = pi.conformation.2;
+        var dcxx: f64 = (2.0 * ((dudx * cxx) + (dudy * cxy))) - ((cxx - 1.0) * inv_lambda);
+        var dcxy: f64 = ((((dudx * cxy) + (dudy * cyy)) + (dvdx * cxx)) + (dvdy * cxy)) - (cxy * inv_lambda);
+        var dcyy: f64 = (2.0 * ((dvdx * cxy) + (dvdy * cyy))) - ((cyy - 1.0) * inv_lambda);
+        var nxx: f64 = cxx + (dcxx * dt);
+        var nxy: f64 = cxy + (dcxy * dt);
+        var nyy: f64 = cyy + (dcyy * dt);
+        var out: *PvFluidParticle = ps + i;
+        out.conformation = (nxx, nxy, nyy);
+        var fx: f64 = 0.0;
+        var fy: f64 = 0.0;
+        for (var k2 = start; k2 < end; k2 = k2 + 1) {
+            var j2 = load64(indices + k2 * 8);
+            if (j2 != i) {
+                var qj: *PvFluidParticle = snap + j2;
+                var ex: f64 = pi.position.x - qj.position.x;
+                var ey: f64 = pi.position.y - qj.position.y;
+                var ez: f64 = pi.position.z - qj.position.z;
+                var s2: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+                if ((s2 > h2 || s2 < tiny) == 0) {
+                    var s: f64 = f64_sqrt(s2);
+                    var rho_q: f64 = _pv_max(qj.density, lo);
+                    var gq: f64 = _pv_kc_spiky_grad(&kc, s);
+                    var sc: f64 = ((qj.mass / rho_q) * gq) / s;
+                    var dxx: f64 = qj.conformation.0 - cxx;
+                    var dxy: f64 = qj.conformation.1 - cxy;
+                    var dyy: f64 = qj.conformation.2 - cyy;
+                    var tx: f64 = (dxx * ex) + (dxy * ey);
+                    var ty: f64 = (dxy * ex) + (dyy * ey);
+                    fx = fx + (((g * tx) * sc) / rho);
+                    fy = fy + (((g * ty) * sc) / rho);
+                }
+            }
+        }
+        var ax: f64 = out.acceleration.x + fx;
+        var ay: f64 = out.acceleration.y + fy;
+        out.acceleration = PvVec3_new(ax, ay, out.acceleration.z);
+    }
+    fl_free(buf);
+    return 1;
+}
+
+# ── part d: heat conduction ─────────────────────────────────────────────────────────
+
+# SPH heat conduction: the thermal diffusivity κ (m²/s). Mirrors `HeatConfig`.
+struct PvHeatConfig {
+    diffusivity: f64;
+}
+
+# A heat-conduction config. Mirrors `HeatConfig::new`.
+#must_use
+fn PvHeatConfig_new(diffusivity: f64): PvHeatConfig {
+    var c: PvHeatConfig;
+    c.diffusivity = diffusivity;
+    return c;
+}
+
+# Conducts heat between the n particles over the CSR lists at smoothing radius h: Tᵢ += (κ·Σ ((mⱼ/ρⱼ)·(Tⱼ −
+# Tᵢ))·∇²W)·dt, the temperatures from a snapshot, over pairs with 1e-20 ≤ r² ≤ h², j ≠ i, ρⱼ floored at 1e-10. Nothing
+# for n = 0 or κ not finite and > 0 (1). 1, or 0 with nothing changed for invalid lists or no memory for the snapshot.
+# Mirrors `update_heat` (ADR 0002 #18).
+#must_use
+fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, heat: *PvHeatConfig, dt: f64): i64 {
+    if (n <= 0 || _pv_is_positive(heat.diffusivity) == 0) { return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    if (n > 9223372036854775807 / 8) { return 0; }
+    var snap = fl_alloc(n * 8);
+    if (snap == 0) { return 0; }
+    for (var c = 0; c < n; c = c + 1) {
+        var q: *PvFluidParticle = ps + c;
+        store64(snap + c * 8, _pv_bits(q.temperature));
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var kappa: f64 = heat.diffusivity;
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        var ti: f64 = load64(snap + i * 8);
+        var start = load64(offsets + i * 8);
+        var end = load64(offsets + (i + 1) * 8);
+        var acc: f64 = 0.0;
+        for (var k = start; k < end; k = k + 1) {
+            var j = load64(indices + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = ps + j;
+                var dx: f64 = pi.position.x - pj.position.x;
+                var dy: f64 = pi.position.y - pj.position.y;
+                var dz: f64 = pi.position.z - pj.position.z;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                    var tj: f64 = load64(snap + j * 8);
+                    var term: f64 = ((pj.mass / rho_j) * (tj - ti)) * lap;
+                    acc = acc + term;
+                }
+            }
+        }
+        var dtemp: f64 = (kappa * acc) * dt;
+        pi.temperature = pi.temperature + dtemp;
+    }
+    fl_free(snap);
+    return 1;
+}
+
+# ── part d: phase change ────────────────────────────────────────────────────────────
+
+# Phase change at one threshold: the transition temperature (K), the latent heat (J/kg), the specific heat capacity
+# (J/(kg·K)), and the phase indices below and above it. Mirrors `PhaseChangeConfig`.
+struct PvPhaseChangeConfig {
+    transition_temperature: f64;
+    latent_heat: f64;
+    heat_capacity: f64;
+    phase_below;
+    phase_above;
+}
+
+# A phase-change config. Mirrors `PhaseChangeConfig::new`.
+#must_use
+fn PvPhaseChangeConfig_new(transition_temperature: f64, latent_heat: f64, heat_capacity: f64, phase_below,
+  phase_above): PvPhaseChangeConfig {
+    var c: PvPhaseChangeConfig;
+    c.transition_temperature = transition_temperature;
+    c.latent_heat = latent_heat;
+    c.heat_capacity = heat_capacity;
+    c.phase_below = phase_below;
+    c.phase_above = phase_above;
+    return c;
+}
+
+# Water ice ⇄ liquid water at 273.15 K (L = 334 kJ/kg, c_p of ice 2090 J/(kg·K)). Mirrors
+# `PhaseChangeConfig::water_ice`.
+#must_use
+fn PvPhaseChangeConfig_water_ice(phase_ice, phase_water): PvPhaseChangeConfig {
+    var c: PvPhaseChangeConfig = PvPhaseChangeConfig_new(273.15, 334000.0, 2090.0, phase_ice, phase_water);
+    return c;
+}
+
+# The Stefan condition on each of the n particles in phase_below or phase_above (phase_below first when they are
+# equal), with the fuel field as the latent-heat accumulator (the fraction of the transition done, clamped to [0, 1];
+# NaN stays NaN), L = max(latent heat, 1e-20) and c = max(heat capacity, 1e-10): energy past the transition point,
+# (T − T*)·c heating or (T* − T)·c cooling, first fills the remaining latent heat (the temperature held at T*), then
+# flips the phase (fuel 0) and moves the temperature by what is left over c; energy back returns stored latent heat
+# first. dt is unused, as Rust's. Mirrors `update_phase_change`.
+fn update_phase_change(ps: *PvFluidParticle, n, config: *PvPhaseChangeConfig, dt: f64) {
+    var t_trans: f64 = config.transition_temperature;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var l_heat: f64 = _pv_max(config.latent_heat, tiny);
+    var cfloor: f64 = 0x3DDB7CDFD9D7BDBB;   # 1e-10
+    var cp: f64 = _pv_max(config.heat_capacity, cfloor);
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var other = 0;
+        var heating = 0;
+        var known = 1;
+        if (p.phase == config.phase_below) {
+            other = config.phase_above;
+            heating = 1;
+        } elif (p.phase == config.phase_above) {
+            other = config.phase_below;
+        } else {
+            known = 0;
+        }
+        if (known == 1) {
+            var toward: f64 = (t_trans - p.temperature) * cp;
+            if (heating == 1) { toward = (p.temperature - t_trans) * cp; }
+            var progress: f64 = _pv_clamp(p.fuel, 0.0, 1.0);
+            if (toward > 0.0) {
+                var needed: f64 = (1.0 - progress) * l_heat;
+                if (toward >= needed) {
+                    p.phase = other;
+                    p.fuel = 0.0;
+                    var extra: f64 = (toward - needed) / cp;
+                    var tu: f64 = t_trans - extra;
+                    if (heating == 1) { tu = t_trans + extra; }
+                    p.temperature = tu;
+                } else {
+                    var part: f64 = toward / l_heat;
+                    p.fuel = progress + part;
+                    p.temperature = t_trans;
+                }
+            } elif (progress > 0.0) {
+                var stored: f64 = progress * l_heat;
+                var back: f64 = -toward;
+                if (back >= stored) {
+                    p.fuel = 0.0;
+                    var extra2: f64 = (back - stored) / cp;
+                    var td: f64 = t_trans + extra2;
+                    if (heating == 1) { td = t_trans - extra2; }
+                    p.temperature = td;
+                } else {
+                    var part2: f64 = back / l_heat;
+                    p.fuel = progress - part2;
+                    p.temperature = t_trans;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ── part d: reactions and combustion ────────────────────────────────────────────────
+
+# A reaction's result for one particle: the fuel consumed and the temperature increase. Rust's `(f64, f64)`: a call
+# through a `dyn` returns one value, so the pair is a struct (ADR 0002 #18).
+struct PvReaction {
+    consumed: f64;
+    heat: f64;
+}
+
+# A pluggable chemistry backend: `react(temperature, fuel, dt)` gives the fuel consumed and the temperature increase
+# for one particle. Mirrors the trait `ReactionProvider` (a `dyn PvReactionProvider` is Rust's `&dyn`).
+trait PvReactionProvider {
+    # One particle's reaction: the fuel consumed and the temperature increase at this temperature (K), fuel (0–1) and
+    # dt (s). Mirrors `ReactionProvider::react`.
+    fn react(self, temperature: f64, fuel: f64, dt: f64): PvReaction;
+}
+
+# One-step combustion, fuel → products + heat: the ignition temperature (K), the reaction rate (1/s), and the heat
+# released per unit fuel (K). Mirrors `CombustionConfig`.
+struct PvCombustionConfig {
+    ignition_temperature: f64;
+    reaction_rate: f64;
+    heat_release: f64;
+}
+
+# Ignition at 500 K, rate 10/s, 1000 K per unit fuel. Mirrors `CombustionConfig::default`.
+#must_use
+fn PvCombustionConfig_default(): PvCombustionConfig {
+    var c: PvCombustionConfig;
+    c.ignition_temperature = 500.0;
+    c.reaction_rate = 10.0;
+    c.heat_release = 1000.0;
+    return c;
+}
+
+impl PvReactionProvider for PvCombustionConfig {
+    # Nothing at or below ignition or without fuel (a NaN temperature reacts, as Rust's `<=` lets it); else the
+    # implicit depletion consumed = fuel − fuel/(1 + rate·dt) and heat = heat_release·consumed. Mirrors
+    # `impl ReactionProvider for CombustionConfig`.
+    fn react(self, temperature: f64, fuel: f64, dt: f64): PvReaction {
+        var r: PvReaction;
+        r.consumed = 0.0;
+        r.heat = 0.0;
+        if (temperature <= self.ignition_temperature || fuel <= 0.0) { return r; }
+        var d: f64 = 1.0 + (self.reaction_rate * dt);
+        var q: f64 = fuel / d;
+        var c: f64 = fuel - q;
+        r.consumed = c;
+        r.heat = self.heat_release * c;
+        return r;
+    }
+}
+
+# Each of the n particles with fuel > 0 reacts through the provider: fuel = max(fuel − consumed, 0) (NaN-ignoring),
+# temperature += heat. Mirrors `update_reaction`.
+fn update_reaction(ps: *PvFluidParticle, n, provider: dyn PvReactionProvider, dt: f64) {
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        if (p.fuel > 0.0) {
+            var r: PvReaction = provider.react(p.temperature, p.fuel, dt);
+            var left: f64 = p.fuel - r.consumed;
+            var zero: f64 = 0.0;
+            p.fuel = _pv_max(left, zero);
+            p.temperature = p.temperature + r.heat;
+        }
+    }
+    return 0;
+}
+
+# Combustion on each of the n particles above ignition with fuel > 0 (a NaN temperature does not burn here):
+# consumed = fuel − fuel/(1 + rate·dt), fuel = max(fuel − consumed, 0), temperature += heat_release·consumed.
+# Mirrors `update_combustion`.
+fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f64) {
+    var t_ign: f64 = config.ignition_temperature;
+    var rate: f64 = config.reaction_rate;
+    var heat: f64 = config.heat_release;
+    var d: f64 = 1.0 + (rate * dt);
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        if (p.temperature > t_ign && p.fuel > 0.0) {
+            var fuel: f64 = p.fuel;
+            var q: f64 = fuel / d;
+            var consumed: f64 = fuel - q;
+            var left: f64 = fuel - consumed;
+            var zero: f64 = 0.0;
+            p.fuel = _pv_max(left, zero);
+            var dtemp: f64 = heat * consumed;
+            p.temperature = p.temperature + dtemp;
+        }
+    }
+    return 0;
+}
+
+# ── part d: the contact angle ───────────────────────────────────────────────────────
+
+# Young's contact angle at the domain's walls: each of the n particles within h of a wall (on an axis whose high corner
+# is not at or below its low one: a NaN corner keeps its walls, as Rust's `hi <= lo` test does) is accelerated by
+# −n̂·((σ·cos θ)/h), n̂ the normalised sum of the inward normals of its walls (glam's v·(1/|v|)), skipped when that
+# sum's |·|² < 1e-20. cos θ is correctly rounded (ADR 0004). Nothing for h not finite and > 0, or σ or θ not finite.
+# Mirrors `apply_contact_angle`.
+fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_angle: f64, surface_tension: f64) {
+    var h: f64 = config.smoothing_radius;
+    if (_pv_is_positive(h) == 0 || _pv_is_finite(surface_tension) == 0 || _pv_is_finite(contact_angle) == 0) {
+        return 0;
+    }
+    var cos_theta: f64 = _pv_cos(contact_angle);
+    var accel: f64 = (surface_tension * cos_theta) / h;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lx: f64 = config.bounds_min.x;
+    var ly: f64 = config.bounds_min.y;
+    var lz: f64 = config.bounds_min.z;
+    var hx: f64 = config.bounds_max.x;
+    var hy: f64 = config.bounds_max.y;
+    var hz: f64 = config.bounds_max.z;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var wx: f64 = 0.0;
+        var wy: f64 = 0.0;
+        var wz: f64 = 0.0;
+        if ((hx <= lx) == 0) {
+            if (p.position.x - lx < h) { wx = wx + 1.0; }
+            if (hx - p.position.x < h) { wx = wx - 1.0; }
+        }
+        if ((hy <= ly) == 0) {
+            if (p.position.y - ly < h) { wy = wy + 1.0; }
+            if (hy - p.position.y < h) { wy = wy - 1.0; }
+        }
+        if ((hz <= lz) == 0) {
+            if (p.position.z - lz < h) { wz = wz + 1.0; }
+            if (hz - p.position.z < h) { wz = wz - 1.0; }
+        }
+        var l2: f64 = ((wx * wx) + (wy * wy)) + (wz * wz);
+        if ((l2 < tiny) == 0) {
+            var len: f64 = f64_sqrt(l2);
+            var inv: f64 = 1.0 / len;
+            var nx: f64 = (wx * inv) * accel;
+            var ny: f64 = (wy * inv) * accel;
+            var nz: f64 = (wz * inv) * accel;
+            var ax: f64 = p.acceleration.x - nx;
+            var ay: f64 = p.acceleration.y - ny;
+            var az: f64 = p.acceleration.z - nz;
+            p.acceleration = PvVec3_new(ax, ay, az);
+        }
+    }
+    return 0;
+}
+
+# ── part d: delta-SPH density diffusion ─────────────────────────────────────────────
+
+# Molteni & Colagrossi's density diffusion on the n particles over the CSR lists: ρᵢ += (((δ·h)·c₀)·Σ)·dt with Σ = −Σⱼ
+# ((Vⱼ·ψ)·r)·∇W(r), ψ = (2·(ρⱼ − ρᵢ))/(r² + (0.01·h)·h), Vⱼ = mⱼ/max(ρⱼ, 1e-10), from a snapshot of the densities,
+# positions and masses, over pairs with 1e-20 ≤ r² ≤ h², j ≠ i. Nothing for n = 0 or δ not finite and > 0 (1). 1, or 0
+# with nothing changed for invalid lists or no memory for the snapshot. Mirrors `apply_delta_sph` (ADR 0002 #18).
+#must_use
+fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, speed_of_sound: f64, delta: f64,
+  dt: f64): i64 {
+    if (n <= 0 || _pv_is_positive(delta) == 0) { return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    if (n > 9223372036854775807 / 40) { return 0; }
+    var snap = fl_alloc(n * 40);   # density, x, y, z, mass
+    if (snap == 0) { return 0; }
+    for (var c = 0; c < n; c = c + 1) {
+        var q: *PvFluidParticle = ps + c;
+        var w = snap + c * 40;
+        store64(w, _pv_bits(q.density));
+        store64(w + 8, _pv_bits(q.position.x));
+        store64(w + 16, _pv_bits(q.position.y));
+        store64(w + 24, _pv_bits(q.position.z));
+        store64(w + 32, _pv_bits(q.mass));
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var eps: f64 = (0.01 * h) * h;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var gain: f64 = ((delta * h) * speed_of_sound);
+    for (var i = 0; i < n; i = i + 1) {
+        var wi = snap + i * 40;
+        var rho_i: f64 = load64(wi);
+        var xi: f64 = load64(wi + 8);
+        var yi: f64 = load64(wi + 16);
+        var zi: f64 = load64(wi + 24);
+        var start = load64(offsets + i * 8);
+        var end = load64(offsets + (i + 1) * 8);
+        var corr: f64 = 0.0;
+        for (var k = start; k < end; k = k + 1) {
+            var j = load64(indices + k * 8);
+            if (j != i) {
+                var wj = snap + j * 40;
+                var rho_j: f64 = load64(wj);
+                var xj: f64 = load64(wj + 8);
+                var yj: f64 = load64(wj + 16);
+                var zj: f64 = load64(wj + 24);
+                var dx: f64 = xi - xj;
+                var dy: f64 = yi - yj;
+                var dz: f64 = zi - zj;
+                var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var safe: f64 = _pv_max(rho_j, lo);
+                    var mj: f64 = load64(wj + 32);
+                    var vol: f64 = mj / safe;
+                    var psi: f64 = (2.0 * (rho_j - rho_i)) / (r2 + eps);
+                    var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                    var term: f64 = ((vol * psi) * r) * grad;
+                    corr = corr - term;
+                }
+            }
+        }
+        var p: *PvFluidParticle = ps + i;
+        var dd: f64 = (gain * corr) * dt;
+        p.density = p.density + dd;
+    }
+    fl_free(snap);
+    return 1;
+}
+
+# ── part d: the MLS gradient corrections ────────────────────────────────────────────
+
+# The inverse of the 3×3 row-major matrix at m into out (9 words): 1, or 0 for a largest pivot below 1e-12 (hisab's
+# `EPSILON_F64`, an absolute threshold; out unchanged). The oracle's own algorithm, allocation-free: hisab 1.4.0
+# `matrix_inverse`, an LU decomposition with partial pivoting (the first largest |pivot| below the diagonal; a NaN pivot
+# stays, as `val > NaN` never holds), then a dense forward and back substitution of each unit column, `a − b·c` as
+# written (no fused multiply-add). ganita's `mat_inv` is not the same function at the edges: it refuses any non-finite
+# entry and scales its singular threshold by the matrix, so it differs from the oracle on 12 of the 60 inverse rows (a
+# 1e-13 diagonal, a 1e-12 pivot, 1e300 entries, every ±∞ and NaN entry; port-parity §18). Mirrors `invert_3x3`.
+#must_use
+fn _pv_invert_3x3(m, out): i64 {
+    var lu[72];
+    var piv[24];
+    for (var k = 0; k < 9; k = k + 1) { store64(&lu + k * 8, load64(m + k * 8)); }
+    for (var p = 0; p < 3; p = p + 1) { store64(&piv + p * 8, p); }
+    var eps: f64 = 0x3D719799812DEA11;   # 1e-12: hisab 1.4.0's `EPSILON_F64` (not f64::EPSILON)
+    for (var col = 0; col < 3; col = col + 1) {
+        var max_row = col;
+        var mv: f64 = load64(&lu + (col * 3 + col) * 8);
+        var max_val: f64 = f64_abs(mv);
+        for (var row = col + 1; row < 3; row = row + 1) {
+            var rv: f64 = load64(&lu + (row * 3 + col) * 8);
+            var val: f64 = f64_abs(rv);
+            if (val > max_val) {
+                max_val = val;
+                max_row = row;
+            }
+        }
+        if (max_val < eps) { return 0; }
+        if (max_row != col) {
+            for (var c = 0; c < 3; c = c + 1) {
+                var a = load64(&lu + (col * 3 + c) * 8);
+                store64(&lu + (col * 3 + c) * 8, load64(&lu + (max_row * 3 + c) * 8));
+                store64(&lu + (max_row * 3 + c) * 8, a);
+            }
+            var t = load64(&piv + col * 8);
+            store64(&piv + col * 8, load64(&piv + max_row * 8));
+            store64(&piv + max_row * 8, t);
+        }
+        var diag: f64 = load64(&lu + (col * 3 + col) * 8);
+        for (var r = col + 1; r < 3; r = r + 1) {
+            var l: f64 = load64(&lu + (r * 3 + col) * 8);
+            var factor: f64 = l / diag;
+            store64(&lu + (r * 3 + col) * 8, _pv_bits(factor));
+            for (var j = col + 1; j < 3; j = j + 1) {
+                var u: f64 = load64(&lu + (col * 3 + j) * 8);
+                var x: f64 = load64(&lu + (r * 3 + j) * 8);
+                var nx: f64 = x - (factor * u);
+                store64(&lu + (r * 3 + j) * 8, _pv_bits(nx));
+            }
+        }
+    }
+    var xv[24];
+    for (var e = 0; e < 3; e = e + 1) {
+        # x = P·e_e, then L·y = x forward, U·x = y back (hisab's `lu_solve`).
+        for (var i = 0; i < 3; i = i + 1) {
+            var one: f64 = 0.0;
+            if (load64(&piv + i * 8) == e) { one = 1.0; }
+            store64(&xv + i * 8, _pv_bits(one));
+        }
+        for (var i2 = 1; i2 < 3; i2 = i2 + 1) {
+            var sum: f64 = load64(&xv + i2 * 8);
+            for (var j2 = 0; j2 < i2; j2 = j2 + 1) {
+                var lij: f64 = load64(&lu + (i2 * 3 + j2) * 8);
+                var xj: f64 = load64(&xv + j2 * 8);
+                sum = sum - (lij * xj);
+            }
+            store64(&xv + i2 * 8, _pv_bits(sum));
+        }
+        for (var i3 = 2; i3 >= 0; i3 = i3 - 1) {
+            var bs: f64 = load64(&xv + i3 * 8);
+            for (var j3 = i3 + 1; j3 < 3; j3 = j3 + 1) {
+                var uij: f64 = load64(&lu + (i3 * 3 + j3) * 8);
+                var xk: f64 = load64(&xv + j3 * 8);
+                bs = bs - (uij * xk);
+            }
+            var uii: f64 = load64(&lu + (i3 * 3 + i3) * 8);
+            var xi: f64 = bs / uii;
+            store64(&xv + i3 * 8, _pv_bits(xi));
+        }
+        for (var i4 = 0; i4 < 3; i4 = i4 + 1) { store64(out + (i4 * 3 + e) * 8, load64(&xv + i4 * 8)); }
+    }
+    return 1;
+}
+
+# The MLS gradient correction of each of the n particles, Lᵢ = Mᵢ⁻¹ with Mᵢ = Σⱼ Vⱼ·(xⱼ − xᵢ) ⊗ ∇Wᵢⱼ (Vⱼ = mⱼ/max(ρⱼ,
+# 1e-10), ∇W = (xᵢ − xⱼ)·(W'(r)/r), M[row][col] += (Vⱼ·d[row])·∇W[col]) over pairs with 1e-20 ≤ r² ≤ h², j ≠ i; the
+# identity where M is singular (`_pv_invert_3x3`). A new freelist buffer of n row-major 3×3 matrices (9 words
+# each): (pointer, n), every one the identity for h not finite and > 0 or invalid lists (Rust warns for the lists);
+# (0, 0) for n ≤ 0 or no memory (Rust aborts). Mirrors `compute_gradient_corrections` (ADR 0002 #18).
+#must_use
+fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64) {
+    if (n <= 0 || n > 9223372036854775807 / 72) { return (0, 0); }
+    var out = fl_alloc(n * 72);
+    if (out == 0) { return (0, 0); }
+    for (var c = 0; c < n; c = c + 1) {
+        for (var e = 0; e < 9; e = e + 1) {
+            var v: f64 = 0.0;
+            if (e == 0 || e == 4 || e == 8) { v = 1.0; }
+            store64(out + (c * 9 + e) * 8, _pv_bits(v));
+        }
+    }
+    if (_pv_is_positive(h) == 0 || _pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return (out, n); }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var mm[72];
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        # M, row-major, in nine locals: M[row][col] += (Vⱼ·d[row])·∇W[col], as Rust's two loops add it.
+        var m00: f64 = 0.0;
+        var m01: f64 = 0.0;
+        var m02: f64 = 0.0;
+        var m10: f64 = 0.0;
+        var m11: f64 = 0.0;
+        var m12: f64 = 0.0;
+        var m20: f64 = 0.0;
+        var m21: f64 = 0.0;
+        var m22: f64 = 0.0;
+        var start = load64(offsets + i * 8);
+        var end = load64(offsets + (i + 1) * 8);
+        for (var k = start; k < end; k = k + 1) {
+            var j = load64(indices + k * 8);
+            if (j != i) {
+                var pj: *PvFluidParticle = ps + j;
+                var fx: f64 = pj.position.x - pi.position.x;
+                var fy: f64 = pj.position.y - pi.position.y;
+                var fz: f64 = pj.position.z - pi.position.z;
+                var r2: f64 = ((fx * fx) + (fy * fy)) + (fz * fz);
+                if ((r2 > h2 || r2 < tiny) == 0) {
+                    var r: f64 = f64_sqrt(r2);
+                    var rho_j: f64 = _pv_max(pj.density, lo);
+                    var vol: f64 = pj.mass / rho_j;
+                    var grad: f64 = _pv_kc_spiky_grad(&kc, r);
+                    var gr: f64 = grad / r;
+                    var bx: f64 = pi.position.x - pj.position.x;
+                    var by: f64 = pi.position.y - pj.position.y;
+                    var bz: f64 = pi.position.z - pj.position.z;
+                    var g0: f64 = bx * gr;
+                    var g1: f64 = by * gr;
+                    var g2: f64 = bz * gr;
+                    var v0: f64 = vol * fx;
+                    var v1: f64 = vol * fy;
+                    var v2: f64 = vol * fz;
+                    m00 = m00 + (v0 * g0);
+                    m01 = m01 + (v0 * g1);
+                    m02 = m02 + (v0 * g2);
+                    m10 = m10 + (v1 * g0);
+                    m11 = m11 + (v1 * g1);
+                    m12 = m12 + (v1 * g2);
+                    m20 = m20 + (v2 * g0);
+                    m21 = m21 + (v2 * g1);
+                    m22 = m22 + (v2 * g2);
+                }
+            }
+        }
+        store64(&mm, _pv_bits(m00));
+        store64(&mm + 8, _pv_bits(m01));
+        store64(&mm + 16, _pv_bits(m02));
+        store64(&mm + 24, _pv_bits(m10));
+        store64(&mm + 32, _pv_bits(m11));
+        store64(&mm + 40, _pv_bits(m12));
+        store64(&mm + 48, _pv_bits(m20));
+        store64(&mm + 56, _pv_bits(m21));
+        store64(&mm + 64, _pv_bits(m22));
+        var tmp[72];
+        if (_pv_invert_3x3(&mm, &tmp) == 1) {
+            for (var t = 0; t < 9; t = t + 1) { store64(out + (i * 9 + t) * 8, load64(&tmp + t * 8)); }
+        }
+    }
+    return (out, n);
+}
+
+# L·∇W for the row-major 3×3 matrix at correction: each row ((r₀·x) + (r₁·y)) + (r₂·z). Mirrors
+# `apply_gradient_correction` (its `&[f64; 9]` a pointer to 9 words).
+#must_use
+fn apply_gradient_correction(correction, gw: PvVec3): PvVec3 {
+    var c0: f64 = load64(correction);
+    var c1: f64 = load64(correction + 8);
+    var c2: f64 = load64(correction + 16);
+    var c3: f64 = load64(correction + 24);
+    var c4: f64 = load64(correction + 32);
+    var c5: f64 = load64(correction + 40);
+    var c6: f64 = load64(correction + 48);
+    var c7: f64 = load64(correction + 56);
+    var c8: f64 = load64(correction + 64);
+    var x: f64 = ((c0 * gw.x) + (c1 * gw.y)) + (c2 * gw.z);
+    var y: f64 = ((c3 * gw.x) + (c4 * gw.y)) + (c5 * gw.z);
+    var z: f64 = ((c6 * gw.x) + (c7 * gw.y)) + (c8 * gw.z);
+    return PvVec3_new(x, y, z);
+}
+
+# ── part d: implicit viscosity ──────────────────────────────────────────────────────
+
+# Backward-Euler viscosity v = v_old + (ν·dt)·∇²v by Gauss–Seidel sweeps over the n particles and the CSR lists:
+# vᵢ = (v_oldᵢ + Σ (vⱼ·aᵢⱼ)·c)/(1 + c·Σ aᵢⱼ), aᵢⱼ = (mⱼ·∇²W)/(ρⱼ·ρᵢ), c = ν·dt, each ρ floored at 1e-10, the current
+# velocities (sweep order), at most `iterations` sweeps, stopping after one whose largest |Δv|² (NaN-ignoring) is below
+# (1e-8)². Nothing for n = 0 or ν, h or dt not finite and > 0 (1). 1, or 0 with nothing changed for invalid lists or no
+# memory for v_old. Mirrors `apply_implicit_viscosity` (ADR 0002 #18).
+#must_use
+fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, viscosity: f64, dt: f64,
+  iterations): i64 {
+    if (n <= 0 || _pv_is_positive(viscosity) == 0 || _pv_is_positive(h) == 0 || _pv_is_positive(dt) == 0) {
+        return 1;
+    }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    if (n > 9223372036854775807 / 24) { return 0; }
+    var v_old = fl_alloc(n * 24);
+    if (v_old == 0) { return 0; }
+    for (var c0 = 0; c0 < n; c0 = c0 + 1) {
+        var q: *PvFluidParticle = ps + c0;
+        store64(v_old + c0 * 24, _pv_bits(q.velocity.x));
+        store64(v_old + c0 * 24 + 8, _pv_bits(q.velocity.y));
+        store64(v_old + c0 * 24 + 16, _pv_bits(q.velocity.z));
+    }
+    var kc: PvKernelCoeffs;
+    _pv_kc_init(&kc, h);
+    var h2: f64 = kc.h2;
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var lo: f64 = _PV_SPH_MIN_DENSITY;
+    var c: f64 = viscosity * dt;
+    var thr: f64 = _PV_SPH_CONVERGENCE_THRESHOLD;
+    var stop: f64 = thr * thr;
+    for (var it = 0; it < iterations; it = it + 1) {
+        var max_change: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var pi: *PvFluidParticle = ps + i;
+            var px: f64 = pi.position.x;
+            var py: f64 = pi.position.y;
+            var pz: f64 = pi.position.z;
+            var rho: f64 = _pv_max(pi.density, lo);
+            var start = load64(offsets + i * 8);
+            var end = load64(offsets + (i + 1) * 8);
+            var wx: f64 = 0.0;
+            var wy: f64 = 0.0;
+            var wz: f64 = 0.0;
+            var diag: f64 = 0.0;
+            for (var k = start; k < end; k = k + 1) {
+                var j = load64(indices + k * 8);
+                if (j != i) {
+                    var pj: *PvFluidParticle = ps + j;
+                    var dx: f64 = px - pj.position.x;
+                    var dy: f64 = py - pj.position.y;
+                    var dz: f64 = pz - pj.position.z;
+                    var r2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+                    if ((r2 > h2 || r2 < tiny) == 0) {
+                        var r: f64 = f64_sqrt(r2);
+                        var rho_j: f64 = _pv_max(pj.density, lo);
+                        var lap: f64 = _pv_kc_visc_lap(&kc, r);
+                        var a: f64 = (pj.mass * lap) / (rho_j * rho);
+                        wx = wx + (pj.velocity.x * a);
+                        wy = wy + (pj.velocity.y * a);
+                        wz = wz + (pj.velocity.z * a);
+                        diag = diag + a;
+                    }
+                }
+            }
+            var den: f64 = 1.0 + (c * diag);
+            var ox: f64 = load64(v_old + i * 24);
+            var oy: f64 = load64(v_old + i * 24 + 8);
+            var oz: f64 = load64(v_old + i * 24 + 16);
+            var nx: f64 = (ox + (wx * c)) / den;
+            var ny: f64 = (oy + (wy * c)) / den;
+            var nz: f64 = (oz + (wz * c)) / den;
+            var ex: f64 = nx - pi.velocity.x;
+            var ey: f64 = ny - pi.velocity.y;
+            var ez: f64 = nz - pi.velocity.z;
+            var change: f64 = ((ex * ex) + (ey * ey)) + (ez * ez);
+            max_change = _pv_max(max_change, change);
+            pi.velocity = PvVec3_new(nx, ny, nz);
+        }
+        if (max_change < stop) { it = iterations; }
+    }
+    fl_free(v_old);
+    return 1;
+}
+
+# ── part d: secondary particles (foam, spray, bubbles) ──────────────────────────────
+
+# The kind of a secondary particle: explicit, append-only values (Rust's `#[non_exhaustive]` enum in declaration
+# order). Mirrors `SecondaryType`.
+enum PvSecondaryType {
+    PV_SECONDARY_TYPE_FOAM = 0;
+    PV_SECONDARY_TYPE_SPRAY = 1;
+    PV_SECONDARY_TYPE_BUBBLE = 2;
+}
+
+# A decorative secondary particle: position, velocity, remaining lifetime (s) and kind (`PvSecondaryType`). Mirrors
+# `SecondaryParticle`.
+struct PvSecondaryParticle {
+    position: PvVec3;
+    velocity: PvVec3;
+    lifetime: f64;
+    kind;
+}
+
+# A typed view of a word: the secondary-particle records at p.
+#must_use
+fn _pv_as_secondaries(p): *PvSecondaryParticle {
+    return p;
+}
+
+# The secondary particles the n fluid particles shed, in their order: spray (velocity·1.2, lifetime·0.5) where |a| >
+# threshold, else foam (velocity·0.1, the full lifetime) where |a| > threshold·0.3. A new freelist buffer: (pointer,
+# count), which the caller releases with `fl_free`; (0, 0) when none is shed, or no memory (Rust aborts). Mirrors
+# `generate_secondary_particles` (ADR 0002 #9).
+#must_use
+fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, max_lifetime: f64) {
+    var sz = sizeof(PvSecondaryParticle);
+    if (n <= 0 || n > 9223372036854775807 / sz) { return (0, 0); }
+    var foam_thr: f64 = accel_threshold * 0.3;
+    var count = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var a: f64 = p.acceleration.length();
+        if (a > accel_threshold || a > foam_thr) { count = count + 1; }
+    }
+    if (count == 0) { return (0, 0); }
+    var buf = fl_alloc(count * sz);
+    if (buf == 0) { return (0, 0); }
+    var k = 0;
+    var half: f64 = max_lifetime * 0.5;
+    for (var j = 0; j < n; j = j + 1) {
+        var q: *PvFluidParticle = ps + j;
+        var am: f64 = q.acceleration.length();
+        var kind = 0 - 1;
+        var gain: f64 = 0.0;
+        var life: f64 = 0.0;
+        if (am > accel_threshold) {
+            kind = PV_SECONDARY_TYPE_SPRAY;
+            gain = 1.2;
+            life = half;
+        } elif (am > foam_thr) {
+            kind = PV_SECONDARY_TYPE_FOAM;
+            gain = 0.1;
+            life = max_lifetime;
+        }
+        if (kind >= 0) {
+            var s: *PvSecondaryParticle = _pv_as_secondaries(buf) + k;
+            s.position = q.position;
+            var vx: f64 = q.velocity.x * gain;
+            var vy: f64 = q.velocity.y * gain;
+            var vz: f64 = q.velocity.z * gain;
+            s.velocity = PvVec3_new(vx, vy, vz);
+            s.lifetime = life;
+            s.kind = kind;
+            k = k + 1;
+        }
+    }
+    return (buf, count);
+}
+
+# Advects and ages the n secondary particles at ss, then keeps those still alive (lifetime > 0; NaN is not) in their
+# order: spray falls (v + g·dt), foam damps (v·0.98), a bubble rises (v_y + 0.5·dt) then damps (v·0.95); then x +=
+# v·dt and lifetime −= dt. A kind outside `PvSecondaryType` (which Rust can't hold) only moves and ages. Returns the
+# new count. Mirrors `update_secondary_particles` (its `&mut Vec` as (pointer, count), `retain` in place).
+#must_use
+fn update_secondary_particles(ss: *PvSecondaryParticle, n, gravity: PvVec3, dt: f64): i64 {
+    var gx: f64 = gravity.x * dt;
+    var gy: f64 = gravity.y * dt;
+    var gz: f64 = gravity.z * dt;
+    var rise: f64 = 0.5 * dt;
+    var kept = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var s: *PvSecondaryParticle = ss + i;
+        var vx: f64 = s.velocity.x;
+        var vy: f64 = s.velocity.y;
+        var vz: f64 = s.velocity.z;
+        match s.kind {
+            PV_SECONDARY_TYPE_SPRAY => {
+                vx = vx + gx;
+                vy = vy + gy;
+                vz = vz + gz;
+            }
+            PV_SECONDARY_TYPE_FOAM => {
+                vx = vx * 0.98;
+                vy = vy * 0.98;
+                vz = vz * 0.98;
+            }
+            PV_SECONDARY_TYPE_BUBBLE => {
+                vy = vy + rise;
+                vx = vx * 0.95;
+                vy = vy * 0.95;
+                vz = vz * 0.95;
+            }
+            _ => {}
+        }
+        s.velocity.x = vx;
+        s.velocity.y = vy;
+        s.velocity.z = vz;
+        var px: f64 = s.position.x + (vx * dt);
+        var py: f64 = s.position.y + (vy * dt);
+        var pz: f64 = s.position.z + (vz * dt);
+        s.position.x = px;
+        s.position.y = py;
+        s.position.z = pz;
+        s.lifetime = s.lifetime - dt;
+        if (s.lifetime > 0.0) {
+            if (kept != i) {
+                var d: *PvSecondaryParticle = ss + kept;
+                *d = *s;
+            }
+            kept = kept + 1;
+        }
+    }
+    return kept;
 }
 
 # --- json.cyr ---

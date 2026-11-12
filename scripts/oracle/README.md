@@ -129,7 +129,8 @@ oracle:
   pow for the record and MPFR's for the corrected oracle (`sph.cr.tsv`); and part b's neighbour lists, from a
   transcription of `build_neighbors` on a dict of cells (f32 keys and probes, the kept grid), and the z-order sort
   (the Morton codes, stable on input index); and part c's brute-force sums, free step, block, split (glibc's sin and
-  cos for the record, MPFR's for `sph.cr.tsv`) and merge;
+  cos for the record, MPFR's for `sph.cr.tsv`) and merge; and part d's physics extensions, the 3×3 inverse
+  (hisab 1.4.0's LU) and the contact angle (its cosine from glibc and MPFR);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;

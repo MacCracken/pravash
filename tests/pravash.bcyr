@@ -1227,6 +1227,195 @@ fn bench_sph_c() {
     return 0;
 }
 
+# ── sph, part d (M4) ──
+# sph_d/*: against scripts/probes/rust/src/bin/bench_sph_d.rs (bodies in its header): the 25 × 25 block at spacing 0.02
+# (density 1000, velocity (sin 0.1i, cos 0.1i, 0)), brute-force lists at h 0.05, and the same sequence of calls on a
+# fresh copy per row. Also two of Rust's criterion groups part c's record missed: `sph_viscosity_force/625_particles`
+# (the same block) and `create_particle_block/<n>_particles` (a unit block at spacing 1/√n).
+
+# The part d bench block: 625 particles, the fields the functions read set; `hot` 1 for 600–610 K (above ignition).
+fn _bench_d_block(hot) {
+    var bp, bn = create_particle_block(0.0, 0.0, 0.5, 0.5, 0.02, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    for (var i = 0; i < bn; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var a: f64 = f64_from(i) * 0.1;
+        var sv: f64 = _pv_sin(a);
+        var cv: f64 = _pv_cos(a);
+        p.density = 1000.0;
+        p.velocity = PvVec3_new(sv, cv, 0.0);
+        var t: f64 = 293.15 + f64_from(i % 11);
+        if (hot == 1) { t = 600.0 + f64_from(i % 11); }
+        p.temperature = t;
+        p.fuel = 0.5;
+        p.acceleration = PvVec3_new(0.0, -9.81, 0.0);
+    }
+    return bp;
+}
+
+# Every pair of the n particles at ps within h (itself included), in index order: (offsets, indices, index count).
+fn _bench_brute(ps: *PvFluidParticle, n, h: f64) {
+    var off = fl_alloc((n + 1) * 8);
+    var idx = fl_alloc(n * n * 8 + 8);
+    var m = 0;
+    store64(off, 0);
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        for (var j = 0; j < n; j = j + 1) {
+            var pj: *PvFluidParticle = ps + j;
+            var d: f64 = pi.distance_to(pj);
+            if (d <= h) {
+                store64(idx + m * 8, j);
+                m = m + 1;
+            }
+        }
+        store64(off + (i + 1) * 8, m);
+    }
+    return (off, idx, m);
+}
+
+# One listed part d row: `iters` calls of function `which` (0 viscoelastic, 1 heat, 2 delta-SPH, 3 implicit viscosity,
+# 4 the gradient corrections) on a fresh copy of the block.
+fn _bench_d_listed(name, which, iters) {
+    var bp = _bench_d_block(0);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var off, idx, m = _bench_brute(ps, 625, 0.05);
+    var ve: PvViscoelasticConfig = PvViscoelasticConfig_new(100.0, 0.05);
+    var hc: PvHeatConfig = PvHeatConfig_new(0.01);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        if (which == 0) { g_sink = g_sink ^ update_viscoelastic(ps, 625, off, 626, idx, m, 0.05, &ve, 0.001); }
+        if (which == 1) { g_sink = g_sink ^ update_heat(ps, 625, off, 626, idx, m, 0.05, &hc, 0.001); }
+        if (which == 2) { g_sink = g_sink ^ apply_delta_sph(ps, 625, off, 626, idx, m, 0.05, 10.0, 0.1, 0.001); }
+        if (which == 3) { g_sink = g_sink ^ apply_implicit_viscosity(ps, 625, off, 626, idx, m, 0.05, 0.5, 0.01, 5); }
+        if (which == 4) {
+            var cp, cn = compute_gradient_corrections(ps, 625, off, 626, idx, m, 0.05);
+            g_sink = g_sink ^ load64(cp + (312 * 9 + 4) * 8);
+            fl_free(cp);
+        }
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(off);
+    fl_free(idx);
+    fl_free(bp);
+    return 0;
+}
+
+# One per-particle part d row: `iters` calls of function `which` (0 phase change, 1 combustion, 2 reaction through a
+# `dyn`, 3 contact angle, 4 generate secondaries) on a fresh copy of the block (hot for 1 and 2).
+fn _bench_d_each(name, which, iters) {
+    var hot = 0;
+    if (which == 1 || which == 2) { hot = 1; }
+    var bp = _bench_d_block(hot);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var pc: PvPhaseChangeConfig = PvPhaseChangeConfig_water_ice(0, 1);
+    var cc: PvCombustionConfig = PvCombustionConfig_default();
+    var water: PvFluidConfig = PvFluidConfig_water_2d();
+    var quarter: f64 = PV_F64_PI * 0.25;
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        if (which == 0) { update_phase_change(ps, 625, &pc, 0.001); }
+        if (which == 1) { update_combustion(ps, 625, &cc, 0.001); }
+        if (which == 2) { update_reaction(ps, 625, &cc, 0.001); }
+        if (which == 3) { apply_contact_angle(ps, 625, &water, quarter, 0.07); }
+        if (which == 4) {
+            var sp, sn = generate_secondary_particles(ps, 625, 0.5, 2.0);
+            g_sink = g_sink ^ sn;
+            fl_free(sp);
+        }
+        g_sink = g_sink ^ _pv_bits(ps.fuel);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(bp);
+    return 0;
+}
+
+# The part d benches (M4 part d): the bench_sph_d.rs twins, and the two criterion groups part c missed.
+fn bench_sph_d() {
+    _bench_d_listed("sph_d/viscoelastic_625", 0, 200);
+    _bench_d_listed("sph_d/heat_625", 1, 500);
+    _bench_d_listed("sph_d/delta_sph_625", 2, 500);
+    _bench_d_listed("sph_d/implicit_viscosity_625", 3, 100);
+    _bench_d_listed("sph_d/gradient_corrections_625", 4, 200);
+    var m[72];
+    var out[72];
+    var mv[9];
+    store64(&m, _pv_bits(2.0));
+    store64(&m + 8, _pv_bits(0.5));
+    store64(&m + 16, _pv_bits(0.1));
+    store64(&m + 24, _pv_bits(0.3));
+    store64(&m + 32, _pv_bits(3.0));
+    store64(&m + 40, _pv_bits(0.7));
+    store64(&m + 48, _pv_bits(0.2));
+    store64(&m + 56, _pv_bits(0.4));
+    store64(&m + 64, _pv_bits(5.0));
+    var bi = bench_new("sph_d/invert_3x3");
+    bench_batch_start(bi);
+    for (var k = 0; k < 200000; k = k + 1) {
+        g_sink = g_sink ^ _pv_invert_3x3(&m, &out);
+        g_sink = g_sink ^ load64(&out + 32);
+    }
+    bench_batch_stop(bi, 200000);
+    bench_report(bi);
+    _bench_d_each("sph_d/phase_change_625", 0, 20000);
+    _bench_d_each("sph_d/combustion_625", 1, 20000);
+    _bench_d_each("sph_d/reaction_625", 2, 20000);
+    _bench_d_each("sph_d/contact_angle_625", 3, 20000);
+    _bench_d_each("sph_d/generate_secondary_625", 4, 20000);
+    var gp = _bench_d_block(0);
+    var ss, sn = generate_secondary_particles(_pv_as_particles(gp), 625, 0.5, 2.0);
+    var sv: *PvSecondaryParticle = _pv_as_secondaries(ss);
+    for (var j = 0; j < sn; j = j + 1) {
+        var q: *PvSecondaryParticle = sv + j;
+        q.lifetime = 1000000000.0;
+    }
+    var grav: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var bu = bench_new("sph_d/update_secondary_625");
+    bench_batch_start(bu);
+    for (var k2 = 0; k2 < 20000; k2 = k2 + 1) { g_sink = g_sink ^ update_secondary_particles(sv, sn, grav, 0.001); }
+    bench_batch_stop(bu, 20000);
+    bench_report(bu);
+    fl_free(ss);
+    fl_free(gp);
+    # Rust's criterion `sph_viscosity_force/625_particles` and `create_particle_block/<n>_particles`.
+    var vp = _bench_d_block(0);
+    var vps: *PvFluidParticle = _pv_as_particles(vp);
+    var bv = bench_new("sph_viscosity_force/625_particles");
+    bench_batch_start(bv);
+    for (var k3 = 0; k3 < 20000; k3 = k3 + 1) {
+        var vf: PvVec3 = viscosity_force(0, vps, 625, 0.05, 0.001);
+        g_sink = g_sink ^ _pv_bits(vf.x);
+    }
+    bench_batch_stop(bv, 20000);
+    bench_report(bv);
+    fl_free(vp);
+    _bench_block_n(100, 20000);
+    _bench_block_n(500, 5000);
+    _bench_block_n(1000, 2000);
+    return 0;
+}
+
+# One `create_particle_block/<n>_particles` row: a unit block at spacing 1/√n, freed per call.
+fn _bench_block_n(n, iters) {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var sp: f64 = 1.0 / rt;
+    var b = bench_new(_bench_name_n("create_particle_block/", n, "_particles"));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        var bp, bn = create_particle_block(0.0, 0.0, 1.0, 1.0, sp, 0.001);
+        g_sink = g_sink ^ bn;
+        fl_free(bp);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    return 0;
+}
+
 # A typed view of a word.
 #must_use
 fn _bench_handles(p): *PvArenaHandle {
@@ -1255,6 +1444,7 @@ fn main(): i64 {
     bench_sph_a();
     bench_sph_b();
     bench_sph_c();
+    bench_sph_d();
     return 0;
 }
 

@@ -3,8 +3,9 @@
 # Every test keeps its Rust name as its group, in Rust's order. M4 part a ports the 22 of the kernels, the equations
 # of state, the non-Newtonian models and the totals; part b `test_zorder_negative_coordinates`; part c the density,
 # block and free-step tests and the two `sort_by_zorder` tests, which build their particles with its
-# `create_particle_block`. `test_degenerate_inputs_no_panic` waits for part d, whose free functions it also calls, and
-# the solver's for M5. Three
+# `create_particle_block`; part d the 11 of its tests that make their lists by brute force (Rust's
+# `brute_neighbors`), `test_degenerate_inputs_no_panic` among them. The five that make them with `SphSolver::step`
+# wait for M5, with the solver's own. Three
 # Cyrius-only groups check what part b adds without an oracle: the merge sort's stability, the neighbour lists
 # against a brute-force search, and the record layout `_pv_nb_col` assumes. Three more check part c's no-panic paths
 # (ADR 0002 #8): the out-of-range reads, the refused sizes, and the state a diverging step leaves.
@@ -287,6 +288,230 @@ fn test_sort_blocks() {
     return 0;
 }
 
+# One particle at the origin with mass 1, its fuel and temperature set, after one `update_combustion` at dt.
+fn burn(fuel: f64, temp: f64, cfg: *PvCombustionConfig, dt: f64): PvFluidParticle {
+    var p: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    p.fuel = fuel;
+    p.temperature = temp;
+    update_combustion(&p, 1, cfg, dt);
+    return p;
+}
+
+# The four combustion tests (part d), between test_poly6_kernels_consistent and the Wendland tests in Rust's order.
+fn test_combustion() {
+    var cfg: PvCombustionConfig = PvCombustionConfig_default();
+
+    test_group("test_combustion_below_ignition_no_reaction");
+    var a: PvFluidParticle = burn(1.0, 300.0, &cfg, 0.01);
+    assert(near(a.fuel, 1.0, EPS) == 1 && near(a.temperature, 300.0, EPS) == 1, "nothing below ignition");
+
+    test_group("test_combustion_above_ignition_consumes_fuel");
+    var b: PvFluidParticle = burn(1.0, 600.0, &cfg, 0.01);
+    assert(b.fuel < 1.0, "fuel depletes");
+    assert(b.temperature > 600.0, "it heats up");
+
+    test_group("test_combustion_fuel_never_negative");
+    var fast: PvCombustionConfig = PvCombustionConfig_default();
+    fast.reaction_rate = 1000.0;
+    var c: PvFluidParticle = burn(0.001, 1000.0, &fast, 1.0);
+    assert(c.fuel >= 0.0, "fuel never negative");
+
+    test_group("test_combustion_no_fuel_no_reaction");
+    var d: PvFluidParticle = burn(0.0, 800.0, &cfg, 0.01);
+    assert_eq(near(d.temperature, 800.0, EPS), 1, "no fuel, no heat");
+    return 0;
+}
+
+# Rust's test helper `brute_neighbors`: CSR lists of every pair within h (`distance_to <= h`, itself included), in
+# index order, as two new word buffers (offsets: n + 1 words; indices). Returns (offsets, indices, index count).
+fn brute_lists(ps: *PvFluidParticle, n, h: f64) {
+    var off = fl_alloc((n + 1) * 8);
+    var idx = fl_alloc(n * n * 8 + 8);
+    var m = 0;
+    store64(off, 0);
+    for (var i = 0; i < n; i = i + 1) {
+        var pi: *PvFluidParticle = ps + i;
+        for (var j = 0; j < n; j = j + 1) {
+            var pj: *PvFluidParticle = ps + j;
+            var d: f64 = pi.distance_to(pj);
+            if (d <= h) {
+                store64(idx + m * 8, j);
+                m = m + 1;
+            }
+        }
+        store64(off + (i + 1) * 8, m);
+    }
+    return (off, idx, m);
+}
+
+# The part d tests after test_sort_by_zorder_preserves_data, in Rust's order: test_apply_gradient_correction_identity
+# through test_degenerate_inputs_no_panic. (test_heat_*, two viscoelastic tests and test_mls_correction_interior build
+# their lists with `SphSolver::step`: they arrive with M5.)
+fn test_part_d() {
+    test_group("test_apply_gradient_correction_identity");
+    var ident[72];
+    for (var e = 0; e < 9; e = e + 1) {
+        var v: f64 = 0.0;
+        if (e == 0 || e == 4 || e == 8) { v = 1.0; }
+        store64(&ident + e * 8, _pv_bits(v));
+    }
+    var g: PvVec3 = apply_gradient_correction(&ident, PvVec3_new(2.0, 3.0, 4.0));
+    assert(near(g.x, 2.0, EPS) == 1 && near(g.y, 3.0, EPS) == 1 && near(g.z, 4.0, EPS) == 1, "the identity keeps it");
+
+    test_group("test_delta_sph_diffuses_toward_neighbor");
+    var two = fl_alloc(2 * sizeof(PvFluidParticle));
+    var t: *PvFluidParticle = _pv_as_particles(two);
+    var t0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    var t1: PvFluidParticle = PvFluidParticle_new_2d(0.02, 0.0, 1.0);
+    t0.density = 1000.0;
+    t1.density = 1100.0;
+    *t = t0;
+    var tb: *PvFluidParticle = t + 1;
+    *tb = t1;
+    var o2, i2, m2 = brute_lists(t, 2, 0.05);
+    assert_eq(apply_delta_sph(t, 2, o2, 3, i2, m2, 0.05, 10.0, 0.1, 0.001), 1, "applied");
+    assert(t.density > 1000.0 && tb.density < 1100.0, "the densities move toward each other");
+    fl_free(o2);
+    fl_free(i2);
+    fl_free(two);
+
+    test_group("test_viscoelastic_simple_shear_upper_convected");
+    var sp, sn = create_particle_block(0.0, 0.0, 0.2, 0.2, 0.02, 0.001);
+    var sh: *PvFluidParticle = _pv_as_particles(sp);
+    var mid = 0 - 1;
+    for (var k = 0; k < sn; k = k + 1) {
+        var q: *PvFluidParticle = sh + k;
+        q.density = 1000.0;
+        q.velocity = PvVec3_new(q.position.y, 0.0, 0.0);
+        if (near(q.position.x, 0.1, 0.000000001) == 1 && near(q.position.y, 0.1, 0.000000001) == 1) { mid = k; }
+    }
+    var so, si, sm = brute_lists(sh, sn, 0.05);
+    var ve: PvViscoelasticConfig = PvViscoelasticConfig_new(0.0, 1000000000000.0);
+    assert_eq(update_viscoelastic(sh, sn, so, sn + 1, si, sm, 0.05, &ve, 0.01), 1, "applied");
+    var c: *PvFluidParticle = sh + mid;
+    var cxx: f64 = c.conformation.0;
+    var cxy: f64 = c.conformation.1;
+    var cyy: f64 = c.conformation.2;
+    assert(mid >= 0 && near(cyy, 1.0, 0.000000001) == 1, "C_yy stays 1 in simple shear");
+    assert_eq(near(cxx, 1.0, 0.000000001), 1, "C_xx stays 1");
+    assert(cxy > 0.0, "C_xy grows with the shear");
+    fl_free(so);
+    fl_free(si);
+    fl_free(sp);
+
+    test_group("test_phase_change_accumulates_latent_heat");
+    var pc: PvPhaseChangeConfig = PvPhaseChangeConfig_new(273.15, 334000.0, 2090.0, 0, 1);
+    var ice: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    ice.temperature = 273.15;
+    var steps = 0;
+    while (ice.phase == 0 && steps < 1000) {
+        ice.temperature = ice.temperature + 1.0;
+        update_phase_change(&ice, 1, &pc, 0.01);
+        steps = steps + 1;
+    }
+    assert_eq(ice.phase, 1, "slow heating melts it");
+    var need: f64 = 334000.0 / 2090.0;
+    var want = _pv_as_usize(f64_ceil(need));
+    var gap = steps - want;
+    if (gap < 0) { gap = 0 - gap; }
+    assert(gap <= 1 && ice.fuel == 0.0, "in L/c steps, the accumulator reset");
+
+    test_group("test_contact_angle_2d_and_neutral");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var quarter: f64 = PV_F64_PI * 0.25;
+    var w: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.01, 0.001);
+    apply_contact_angle(&w, 1, &cfg, quarter, 0.07);
+    assert(w.acceleration.z == 0.0 && w.acceleration.y < 0.0, "wetting pulls toward the wall, in the plane");
+    var nt: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.01, 0.001);
+    var half: f64 = PV_F64_PI * 0.5;
+    apply_contact_angle(&nt, 1, &cfg, half, 0.07);
+    var na: f64 = nt.acceleration.length();
+    assert(na < 0.000000000001, "a neutral angle gives no force");
+    var nw: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.01, 0.001);
+    var three: f64 = 3.0 * quarter;
+    apply_contact_angle(&nw, 1, &cfg, three, 0.07);
+    assert(nw.acceleration.y > 0.0, "non-wetting pushes away");
+
+    test_group("test_implicit_viscosity_large_dt_is_stable");
+    var ip, inn = create_particle_block(0.0, 0.0, 0.1, 0.1, 0.02, 0.001);
+    var iv: *PvFluidParticle = _pv_as_particles(ip);
+    for (var k2 = 0; k2 < inn; k2 = k2 + 1) {
+        var r: *PvFluidParticle = iv + k2;
+        r.density = 100.0;
+        var vx: f64 = 1.0;
+        if (k2 % 2 == 1) { vx = -1.0; }
+        r.velocity = PvVec3_new(vx, 0.0, 0.0);
+    }
+    var io, ii, im = brute_lists(iv, inn, 0.05);
+    assert_eq(apply_implicit_viscosity(iv, inn, io, inn + 1, ii, im, 0.05, 10.0, 1.0, 200), 1, "applied");
+    var finite = 1;
+    var vmax: f64 = 0.0;
+    var hi: f64 = PV_F64_NEG_INFINITY;
+    var lo: f64 = PV_F64_INFINITY;
+    for (var k3 = 0; k3 < inn; k3 = k3 + 1) {
+        var u: *PvFluidParticle = iv + k3;
+        var ux: f64 = u.velocity.x;
+        if (_pv_is_finite(ux) == 0 || _pv_is_finite(u.velocity.y) == 0 || _pv_is_finite(u.velocity.z) == 0) {
+            finite = 0;
+        }
+        var au: f64 = f64_abs(ux);
+        vmax = _pv_max(vmax, au);
+        hi = _pv_max(hi, ux);
+        lo = _pv_min(lo, ux);
+    }
+    var spread: f64 = hi - lo;
+    assert_eq(finite, 1, "the implicit solve stays finite");
+    assert(vmax <= 1.000000001, "it doesn't overshoot");
+    assert(spread < 0.5, "strong viscosity smooths the velocities");
+    fl_free(io);
+    fl_free(ii);
+    fl_free(ip);
+
+    test_group("test_degenerate_inputs_no_panic");
+    var e1, n1 = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.0, 1.0);
+    var nan: f64 = PV_F64_NAN;
+    var e2, n2 = create_particle_block(0.0, 0.0, 1.0, 1.0, nan, 1.0);
+    assert(n1 == 0 && n2 == 0, "a spacing of 0 or NaN gives no block");
+    var parent: PvFluidParticle = PvFluidParticle_new_2d(1.0, 2.0, 3.0);
+    var cp, cn = split_particle(&parent, 1, 0.5);
+    var child: *PvFluidParticle = _pv_as_particles(cp);
+    assert(cn == 1 && child.position.x == 1.0 && child.position.y == 2.0 && child.position.z == 0.0,
+      "one child sits at its parent");
+    fl_free(cp);
+    var tait: f64 = equation_of_state_tait(1010.0, 1000.0, 10.0, 0.0);
+    assert_eq(_pv_is_finite(tait), 1, "Tait at γ = 0 is finite");
+    var k1: f64 = kernel_poly6(0.0, 0.0);
+    var k2: f64 = kernel_spiky_grad(0.0, -1.0);
+    var k3: f64 = kernel_viscosity_laplacian(0.0, 0.0);
+    assert(k1 == 0.0 && k2 == 0.0 && k3 == 0.0, "the kernels give 0 for h ≤ 0");
+    var buf = fl_alloc(3 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var p0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    for (var k4 = 0; k4 < 3; k4 = k4 + 1) {
+        var dst: *PvFluidParticle = ps + k4;
+        *dst = p0;
+    }
+    var words[32];
+    store64(&words, 0);
+    store64(&words + 8, 1);
+    store64(&words + 16, 2);
+    store64(&words + 24, 9);
+    var five[8];
+    store64(&five, 5);
+    var zero[8];
+    store64(&zero, 0);
+    var hc: PvHeatConfig = PvHeatConfig_new(1.0);
+    assert_eq(update_heat(ps, 3, &words, 2, &five, 1, 0.05, &hc, 0.01), 0, "update_heat ignores [0, 1] / [5]");
+    assert_eq(apply_delta_sph(ps, 3, &words, 1, &zero, 0, 0.05, 10.0, 0.1, 0.01), 0, "delta-SPH ignores [0] / []");
+    assert_eq(apply_implicit_viscosity(ps, 3, &words, 4, &zero, 1, 0.05, 1.0, 0.01, 5), 0,
+      "implicit viscosity ignores [0, 1, 2, 9] / [0]");
+    var mp, mn = compute_gradient_corrections(ps, 3, &words, 0, &zero, 0, 0.05);
+    assert_eq(mn, 3, "three corrections, every one the identity");
+    fl_free(mp);
+    fl_free(buf);
+    return 0;
+}
+
 # test_zorder_negative_coordinates (part b).
 fn test_zorder() {
     test_group("test_zorder_negative_coordinates");
@@ -481,8 +706,10 @@ fn main() {
     alloc_init();
     test_kernels();
     test_eos_and_totals();
+    test_combustion();
     test_wendland_and_viscosity();
     test_sort_blocks();
+    test_part_d();
     test_zorder();
     test_msort();
     test_lists();

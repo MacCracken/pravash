@@ -1307,3 +1307,81 @@ Result: 49,486 rows, 0 failures.
 | `merge_particles` | 13× |
 
 A template particle made the block 1.6× faster, and writing merge out made it 1.3× faster, with the rows unchanged.
+
+## 18. M4 part d: the physics extensions (2026-11-12); M4 complete
+
+**`src/sph_fns.cyr`, part d:**
+- **The list functions:** `update_viscoelastic`, `update_heat`, `apply_delta_sph`, `apply_implicit_viscosity` and
+  `compute_gradient_corrections`. They take caller CSR lists as (pointer, count) words, which `_pv_lists_valid`
+  checks as Rust's private `neighbor_lists_valid` does. Words Rust's `u32` and `usize` can't hold are refused too.
+  Each copies Rust's per-call snapshot into one freelist block, freed before it returns. Each returns 1, or 0 with
+  nothing changed where Rust warns (invalid lists) or would abort (no memory).
+- **The per-particle functions:** `update_phase_change` (the Stefan condition, with the fuel field as the latent-heat
+  accumulator), `update_reaction`, `update_combustion`, `apply_contact_angle`, and the secondary particles.
+- **A Rust trait as a Cyrius trait.** `ReactionProvider` is `trait PvReactionProvider`, taken as a `dyn` (Cyrius
+  6.7.8's checked trait objects), and `impl PvReactionProvider for PvCombustionConfig` is Rust's impl. A call through
+  a `dyn` returns one value, so `react`'s `(f64, f64)` is a `PvReaction` struct (a probe confirmed both: a
+  multi-value return through a `dyn` is refused by name).
+- **The 3×3 inverse (L7), `_pv_invert_3x3`,** transcribes the oracle's own function, hisab 1.4.0's `matrix_inverse`:
+  - LU with partial pivoting; the first largest |pivot| wins, and a NaN pivot stays, since `val > NaN` never holds;
+  - an **absolute** singular test, `max_val < 1e-12`. hisab's `EPSILON_F64` is 1e-12, not `f64::EPSILON`; the first
+    draft assumed the latter, and checking the constant caught it before any row ran;
+  - a dense forward and back substitution of each unit column.
+
+**ganita's `mat_inv` is not the oracle's function.** Probe 8 (§4.8) found it bit-identical on 300 moment matrices,
+and L7 was planned as a copy of it. Run against part d's 60 inverse rows, it agrees on the 48 ordinary ones and
+differs on 12:
+- a 1e-13 diagonal and a pivot of exactly 1e-12: ganita scales its tolerance by the matrix;
+- 1e300 entries;
+- all 9 matrices with a ±∞ or NaN entry: ganita refuses non-finite input.
+
+So the stand-in follows hisab. The correction is on ganita's request: an `into` form with hisab's pivot test would
+keep the rows, or pravash adopts ganita's behaviour as an ADR divergence when it converts.
+
+**The rows** (`m_sph.rs`, part d's seed 0x0_5f4d): 318.
+
+| Function | Rows | What they cover |
+|---|---|---|
+| the four list functions | 35, 28, 35, 32 | 2D and 3D clouds with index-order and shuffled lists (the sums follow the list order), a lattice, lists whose first offset is past 0, the four invalid shapes (too few offsets, a decreasing pair, a last offset past the indices, an index at n: each row shows the particles unchanged), n = 0, and each scalar's specials (0, −1, NaN, ∞, 1e±30); Rust's test shapes (simple shear, two particles, alternating velocities at 0–200 sweeps) |
+| `compute_gradient_corrections` | 17 | 3D clouds and a 4³ cube (invertible moments), a 2D cloud (z has no moment: the identity), shuffled and invalid lists, special h, NaN densities and ∞ masses |
+| `oracle::invert_3x3` | 60 | random matrices, pivoting, the identity, a permutation, rank 2, zero, a 1e-13 diagonal, pivots either side of 1e-12, 1e300 entries, ±∞ and NaN in each position |
+| `apply_gradient_correction` | 21 | the identity, random matrices and vectors, special values |
+| `update_phase_change` | 10 | every branch (below, above, a third phase), temperatures either side of T*, progress from −0.5 to 1.5 and NaN, the floors (L and c of 0, NaN, negative), phase_below = phase_above, and exact ties in binary-exact numbers |
+| `update_reaction`, `update_combustion`, `CombustionConfig::react` | 4, 4, 30 | temperatures at and around ignition (NaN: the reaction runs through `react`'s `<=`, and combustion's `>` skips it), fuel 0, negative and NaN, a NaN ignition, negative rates |
+| `apply_contact_angle` (class C) | 25 | walls, corners (the normal normalised), 2D (z degenerate) and 3D boxes, angles 0 to π and outside, three angles whose cosine glibc misrounds (an MPFR search over k·π/4096 found 7), the early returns, a NaN bound (Rust's `hi <= lo` keeps that axis's walls), an inverted box, particles exactly h from a wall |
+| the secondary particles | 9, 8 | thresholds through 0, negative, NaN and ∞, NaN and ∞ accelerations; lifetimes at, below and around dt, NaN, every kind, dt 0, negative and NaN, a NaN gravity |
+
+`validate.py` transcribes part d from the Rust source; result: 49,804 rows, 0 failures. `sph.cr.tsv` gains one
+contact-angle row, 22 rows in all: of the three misrounded angles, only one's ulp survives the arithmetic after it.
+
+**Result:**
+- **First replay:** 315 of 316 rows passed. The 316th is that contact-angle row, which matches the corrected oracle.
+  All 60 inverse rows passed, the non-finite ones included, which confirms the dense transcription.
+- **The replay is 12 modules, 0 failing | rows: 49,687 ok, 0 failed, 0 measured, 3 pending, 114 accepted (ADR 4:
+  114)**.
+- **The mutation tests found two gaps,** both exact ties: no random row puts the energy toward the other phase exactly
+  at the latent heat still needed, or a particle exactly h from a wall. Two rows in binary-exact numbers (T* 0, L 10,
+  c 2; h 0.0625) close them, drawing no random numbers. Then:
+  - 36 of 36 port mutations fail rows: the list checks, every term of the viscoelastic, heat, delta-SPH and implicit
+    updates, the inverse's pivot test, ties, permutation and substitution, the identity default, the phase-change
+    branches, the reaction floors and NaN semantics, the contact angle's walls, normalisation and NaN bounds, and the
+    secondaries' gains, order and compaction;
+  - 5 of 5 against the faster code (a transposed moment, a dropped one, a misplaced store, two field stores);
+  - 6 of 6 against the transcription.
+
+**Tests** (`tests/sph.tcyr`, 98 checks): 11 more Rust tests, in Rust's order, through a `brute_lists` helper that
+mirrors Rust's test `brute_neighbors`:
+- the four combustion tests;
+- `test_apply_gradient_correction_identity`, `test_delta_sph_diffuses_toward_neighbor`,
+  `test_viscoelastic_simple_shear_upper_convected`, `test_phase_change_accumulates_latent_heat`,
+  `test_contact_angle_2d_and_neutral` and `test_implicit_viscosity_large_dt_is_stable`;
+- `test_degenerate_inputs_no_panic`.
+
+That makes 44 of the 79. The five that make their lists with `SphSolver::step` (`test_heat_uniform_no_change`,
+`test_heat_conducts_from_hot_to_cold`, `test_viscoelastic_relaxes_to_identity`,
+`test_viscoelastic_elastic_stress_finite`, `test_mls_correction_interior`) wait for M5, with the solver's own.
+
+Surface parity: 349 items ok, 22 pending, all of them M5's solver types. It now checks Rust traits too: a
+`pub trait X` must be a `trait PvX`, and an `impl X for T` an `impl PvX for PvT`.
+
+**M4 is complete:** `sph.tsv` has 1,370 rows, every one passing, 22 of them against the corrected oracle.
