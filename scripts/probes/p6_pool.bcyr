@@ -1,0 +1,249 @@
+# Probe 6, the Cyrius side (port plan §4 step 9.6): a worker pool for the runtime thread count
+# (ADR 0002 #4).
+#
+# The density pass of probe 2 (array-of-structs, f64 locals), split over T threads by fixed index
+# ranges. Each particle's density is written by exactly one worker, from its own candidate list in
+# Rust's order, so every T must give the serial bits. Two pool shapes:
+# - persistent: T threads started once, each fed a step number through its own channel and
+#   answering on a shared one (szal's pattern, src/engine_parallel.cyr);
+# - spawn per step: T threads created and joined for every pass.
+# For 1,024, 16,384 and 102,400 particles it checks the digest at T = 1, 2, 4, 8, times both shapes,
+# and measures the global heap the persistent pool's passes take (it must be 0: workers allocate
+# nothing).
+#
+#   cyrius bench scripts/probes/p6_pool.bcyr
+
+struct PvV3 { x: f64; y: f64; z: f64; }
+struct PvParticle { pos: PvV3; vel: PvV3; acc: PvV3; density: f64; pressure: f64; mass: f64; phase: i64; c0: f64; c1: f64; c2: f64; temperature: f64; fuel: f64; }
+
+fn as_particles(p): *PvParticle { return p; }
+fn as_i64s(p): *i64 { return p; }
+
+var SIDE = 0;
+var N = 0;
+var g_aos = 0;
+var g_off = 0;
+var g_idx = 0;
+var g_h2: f64 = 0.0;
+
+# The probe-2 lattice and its candidate lists, for SIDE × SIDE particles.
+fn setup(side) {
+    SIDE = side;
+    N = side * side;
+    var h: f64 = 0.05;
+    g_h2 = h * h;
+    g_aos = fl_alloc(N * sizeof(PvParticle));
+    var base: *PvParticle = as_particles(g_aos);
+    for (var i = 0; i < N; i = i + 1) {
+        var fi: f64 = f64_from(i % SIDE);
+        var fj: f64 = f64_from(i / SIDE);
+        var jit: f64 = f64_from((i * 37) % 11) * 0.0001;
+        var p: *PvParticle = base + i;
+        p.pos.x = fi * 0.025 + jit;
+        p.pos.y = fj * 0.025 - jit;
+        p.pos.z = 0.0;
+        p.mass = 0.625 + f64_from(i % 3) * 0.001;
+        p.density = 0.0;
+    }
+    g_off = fl_alloc((N + 1) * 8);
+    g_idx = fl_alloc(N * 36 * 8);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var n = 0;
+    for (var i = 0; i < N; i = i + 1) {
+        off[i] = n;
+        var ci = (i % SIDE) / 2;
+        var cj = (i / SIDE) / 2;
+        for (var dj = -1; dj <= 1; dj = dj + 1) {
+            for (var di = -1; di <= 1; di = di + 1) {
+                var a = ci + di;
+                var b = cj + dj;
+                if (a >= 0 && b >= 0 && a < SIDE / 2 && b < SIDE / 2) {
+                    for (var q = 0; q < 4; q = q + 1) {
+                        idx[n] = (b * 2 + q / 2) * SIDE + a * 2 + q % 2;
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+    }
+    off[N] = n;
+    return 0;
+}
+
+# The density of particles [lo, hi), each from its own list in order.
+fn pass_range(lo, hi) {
+    var base: *PvParticle = as_particles(g_aos);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var h2: f64 = g_h2;
+    for (var i = lo; i < hi; i = i + 1) {
+        var pi: *PvParticle = base + i;
+        var xi: f64 = pi.pos.x;
+        var yi: f64 = pi.pos.y;
+        var zi: f64 = pi.pos.z;
+        var rho: f64 = 0.0;
+        for (var k = off[i]; k < off[i + 1]; k = k + 1) {
+            var pj: *PvParticle = base + idx[k];
+            var dx: f64 = xi - pj.pos.x;
+            var dy: f64 = yi - pj.pos.y;
+            var dz: f64 = zi - pj.pos.z;
+            var r2: f64 = dx * dx + dy * dy + dz * dz;
+            if (r2 < h2) {
+                var d: f64 = h2 - r2;
+                var w: f64 = d * d * d;
+                rho = rho + pj.mass * w;
+            }
+        }
+        pi.density = rho;
+    }
+    return 0;
+}
+
+fn digest(): i64 {
+    var base: *PvParticle = as_particles(g_aos);
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < N; i = i + 1) {
+        var p: *PvParticle = base + i;
+        var mb[8];
+        store64(&mb, p.density);
+        h = (h ^ load64(&mb)) * 0x100000001b3;
+    }
+    return h;
+}
+
+fn clear() {
+    var base: *PvParticle = as_particles(g_aos);
+    for (var i = 0; i < N; i = i + 1) { var p: *PvParticle = base + i; p.density = 0.0; }
+    return 0;
+}
+
+# ── the persistent pool ─────────────────────────────────────────────────────────────
+var POOL_T = 0;
+var g_jobs = 0;   # one channel per worker
+var g_done = 0;   # the answers
+var g_threads = 0;
+
+# Worker `w`: its range of [0, N) under T workers, for every step number it receives; 0 ends it.
+fn _pool_worker(w): i64 {
+    var ch = load64(g_jobs + w * 8);
+    loop {
+        var job = chan_recv(ch);
+        if (job == 0) { break; }
+        var lo = (N * w) / POOL_T;
+        var hi = (N * (w + 1)) / POOL_T;
+        pass_range(lo, hi);
+        chan_send(g_done, 1);
+    }
+    return 0;
+}
+
+fn pool_start(t) {
+    POOL_T = t;
+    g_jobs = fl_alloc(t * 8);
+    g_threads = fl_alloc(t * 8);
+    g_done = chan_new(t);
+    for (var w = 0; w < t; w = w + 1) { store64(g_jobs + w * 8, chan_new(2)); }
+    for (var w = 0; w < t; w = w + 1) { store64(g_threads + w * 8, thread_create(&_pool_worker, w)); }
+    return 0;
+}
+
+fn pool_pass(step) {
+    for (var w = 0; w < POOL_T; w = w + 1) { chan_send(load64(g_jobs + w * 8), step); }
+    for (var w = 0; w < POOL_T; w = w + 1) { chan_recv(g_done); }
+    return 0;
+}
+
+fn pool_stop() {
+    for (var w = 0; w < POOL_T; w = w + 1) { chan_send(load64(g_jobs + w * 8), 0); }
+    for (var w = 0; w < POOL_T; w = w + 1) { thread_join(load64(g_threads + w * 8)); }
+    return 0;
+}
+
+# ── spawn per step ──────────────────────────────────────────────────────────────────
+var SPAWN_T = 0;
+
+fn _spawn_worker(w): i64 {
+    pass_range((N * w) / SPAWN_T, (N * (w + 1)) / SPAWN_T);
+    return 0;
+}
+
+fn spawn_pass(t) {
+    SPAWN_T = t;
+    var hs[64];
+    for (var w = 0; w < t; w = w + 1) { store64(&hs + w * 8, thread_create(&_spawn_worker, w)); }
+    for (var w = 0; w < t; w = w + 1) { thread_join(load64(&hs + w * 8)); }
+    return 0;
+}
+
+fn put(s: cstring): i64 {
+    print(s, strlen(s));
+    return 0;
+}
+
+fn put_us(ns) {
+    fmt_int(ns / 1000);
+    put(".");
+    var frac = (ns % 1000) / 10;
+    if (frac < 10) { put("0"); }
+    fmt_int(frac);
+    put(" us");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    fl_init();
+    put("THREADS_CONCURRENT = ");
+    fmt_int(THREADS_CONCURRENT);
+    println("");
+    var ts: i64[4];
+    store64(&ts, 1); store64(&ts + 8, 2); store64(&ts + 16, 4); store64(&ts + 24, 8);
+    var side_list = fl_alloc(24);
+    store64(side_list, 32); store64(side_list + 8, 128); store64(side_list + 16, 320);
+    for (var s = 0; s < 3; s = s + 1) {
+        setup(load64(side_list + s * 8));
+        clear();
+        pass_range(0, N);
+        var serial = digest();
+        put("N = ");
+        fmt_int(N);
+        put(", serial digest 0x");
+        fmt_hex(serial);
+        println("");
+        var passes = 20;
+        if (N > 50000) { passes = 5; }
+        for (var k = 0; k < 4; k = k + 1) {
+            var t = load64(&ts + k * 8);
+            clear();
+            pool_start(t);
+            var heap0 = alloc_used();
+            var t0 = now_ns();
+            for (var p = 1; p <= passes; p = p + 1) { pool_pass(p); }
+            var pool_ns = (now_ns() - t0) / passes;
+            var heap = alloc_used() - heap0;
+            pool_stop();
+            var dp = digest();
+            clear();
+            var t1 = now_ns();
+            for (var p = 0; p < passes; p = p + 1) { spawn_pass(t); }
+            var spawn_ns = (now_ns() - t1) / passes;
+            var ds = digest();
+            put("  T = ");
+            fmt_int(t);
+            put(": pool ");
+            put_us(pool_ns);
+            put(" per pass, spawn-per-pass ");
+            put_us(spawn_ns);
+            put(", digests ");
+            if (dp == serial && ds == serial) { put("= serial"); } else { put("DIFFER"); }
+            put(", pool heap growth ");
+            fmt_int(heap);
+            println(" B");
+        }
+    }
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);

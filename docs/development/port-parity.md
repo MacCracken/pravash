@@ -164,3 +164,156 @@ about the oracle, not the port.
 - **Thread count changes no row.** The generator's `parallel` build (rayon on in the oracle) reproduces the serial
   corpus byte for byte; it is check-only. No row in the M0 modules runs through a parallel loop yet; the step rows
   from M2 on do.
+
+## 4. Probes (M0 step 9, 2026-11-11, x86_64 Linux ELF unless noted)
+
+Each probe is a small program, answered with numbers before M1 writes code. The Cyrius programs are
+`scripts/probes/p*.cyr`, `.tcyr` and `.bcyr`; the Rust sides are the `scripts/probes/rust/` crate (on the frozen
+oracle, its lock seeded from `rust-old/Cargo.lock`) and the single-file `scripts/probes/p3_keys.rs`. Timings are
+pinned with `taskset` and repeated where noted. The box is shared, so differences under ±20% are noise.
+
+### 4.1 Memory on the step path (`p1_memory.tcyr`)
+
+| Call (as a pravash step would make it) | Global heap per call, never returned |
+|---|---|
+| `hvec3_add` (glam's DVec3 arithmetic) | 24 B |
+| hisab `spatial_hash`: clear, insert 1,000 particles, 27 `query_cell` each, one step | **4,117,081 B** (≈ 41 MB a step at 10⁴ particles) |
+| `num_dst` / `num_idst`, n = 62 | 10,208 B (≈ 2.5 MB a step for a 64² DST solve) |
+| `num_dst`, n = 126 | 20,448 B |
+| ganita `mat_inv`, 3×3 (the MLS correction: one per particle per step) | 248 B (≈ 2.5 MB a step at 10⁴ particles) |
+| `ad_tape` gradient: reset, 18 operations, `ad_grad` | **0 B** |
+| freelist: 100,000 alloc/free pairs of 64 B | 0 B of global heap growth |
+| a growable step arena, 300 steps of 10,000 × 240 B | capacity 2,424,832 B after step 1 and after step 300 |
+
+**Decision.** This confirms §0.1 of the port plan with pravash's own numbers:
+- solver storage goes on freelist, and step scratch in a solver-owned arena reset every step;
+- no hisab or ganita call that returns a value goes on the step path while cyrius S1 / hisab H9 are open;
+- ledger rows L3 (vectors), L4 (the neighbour grid), L6 (the DST) and L7 (the 3×3 inverse) are needed on memory
+  grounds alone;
+- the autodiff tape allocates nothing once reset, and is not per-step anyway, so it stays on hisab.
+
+### 4.2 Particle layout and vector form (`p2_layout.bcyr`)
+
+One SPH density pass: 4,096 particles, 141,376 candidate pairs, the sum in Rust's order. All four forms give
+**the same bits** (digest `0xb7fa6660c11c64c7`). Three pinned runs, load average under 1.6:
+
+| Form | Per pass | Per pair | vs (a) |
+|---|---|---|---|
+| (a) array-of-structs (`FluidParticle`'s 144 B layout), fields read into `f64` locals | **1.83 ms** | 12.9 ns | 1× |
+| (b) structure-of-arrays (`ParticleSoa`'s columns), `f64` locals | 2.01 ms | 14.2 ns | 1.1× |
+| (c) array-of-structs, struct values (`PvV3` with `-` overloaded) | 4.6 ms | 32.5 ns | 2.5× |
+| (d) the pair difference in an `f64v4`, lanes summed in Rust's order | 6.45 ms | 45.6 ns | 3.5× |
+
+**Decision.** Particles are typed stride arrays of `PvParticle` records in `FluidParticle`'s layout, which is also
+the Rust API's shape, and hot loops read fields into `f64` locals. Struct values cost 2.5× here, the same as
+impetus measured: they are the readable form off the hot path, and the cost is a compiler finding (filed at
+step 10). SIMD can't vectorize a sum without changing Rust's summation order, and within one pair `f64v4_make` and
+the lane reads cost more than they save (also filed at step 10).
+
+### 4.3 f32 cell keys at scale (`p3_keys.rs`, `p3_keys.cyr`)
+
+10⁶ positions: 600,000 in a box, every cell boundary ±2 doubles for six smoothing radii, and the rest log-uniform up
+to |x| = 10⁷. Rust's key and the Cyrius key (`f32_from`, f32 `/` and `*`, `f32_to`, `f64_floor`, a saturating
+convert) agree on **all 10⁶ on x86_64 ELF, x86_64 PE and aarch64**. The operator trap warns as documented: an f32
+left operand with an f64 right operand gives *f32 arithmetic with a non-f32 right operand*. The `as f32` packing of
+`PackedParticles` is the `f64::as_f32` rows, all bit-exact (§2).
+
+**Decision.** D3's bit-faithful f32 keys port with no risk.
+
+### 4.4 The neighbour candidate order (`p4_neighbor_order`)
+
+The expectation uses no hash map: particle indices grouped by cell key, in index order, concatenated over the 27
+offsets in `build_neighbors`' order. Every list the oracle dumped equals it:
+
+| Scenario | Particles | Every list equal | Probe points that land outside their intended cell |
+|---|---|---|---|
+| 2D block at the origin | 1,600 | yes | 0 of 43,200 |
+| 3D cloud at the origin | 2,744 | yes | 0 of 74,088 |
+| 2D block at 10³ | 1,600 | yes | 0 of 43,200 |
+| 2D block at 10⁵ | 1,600 | yes | 0 of 43,200 |
+| 2D block at 10⁶ | 1,600 | yes | **38,400 of 43,200** |
+
+**Decision.** The order is (cell offset, insertion), so the port builds it from sorted arrays with no hash map.
+
+The last column measures the roadmap's precision defect (D3). At |x| ≈ 10⁶ the f32 spacing (0.0625) exceeds
+h = 0.05, so the probe point `(cx + dx) · h + h/2` rounds into another cell for 89% of lookups. Each neighbour list
+there comes from the wrong cells. That is what D3's switch to f64 keys before 2.0 fixes.
+
+### 4.5 Z-order sort ties (`p5_sort_ties`)
+
+`sort_by_zorder` sorts with `sort_unstable_by_key` (ipnsort on rustc 1.99). Against the stable order on (key, input
+index), with the key sequences checked non-decreasing through a replica of the private Morton code:
+
+| Input | Particles | Tie groups (particles) | Positions differing from the stable order |
+|---|---|---|---|
+| 40 × 40 lattice at h/2 | 1,600 | 400 (1,600) | 1,200 |
+| 100 × 100 lattice at h/4 | 10,000 | 625 (10,000) | 9,382 |
+| random cloud of 5,000 | 5,000 | 400 (5,000) | 4,577 |
+| the 40 × 40 lattice, sorted once already | 1,600 | 400 (1,600) | **0** |
+
+**Decision.**
+- **Rust's tie order can't be reproduced cheaply.** It is ipnsort's, so matching it means transcribing core's sort.
+  ADR 0002 #3 applies: the port sorts stably on (key, input index). The golden rows compare the key sequence and
+  the multiset (class A), and later steps start from the oracle's order.
+- **An already-sorted input** (what a solver sees from its second sort on) comes back unchanged from both sorts.
+- **Ledger row L9** (a stable sort) is definite.
+
+### 4.6 Parallelism (`p6_parallel`, `p6_pool.bcyr`)
+
+**Rust.** The oracle's serial and `parallel` (rayon) builds give **identical final-state digests on all 14
+scenarios**: the five SPH variants, six `FluidGrid` variants, `MacGrid`, `ShallowWater` and `FlipSolver` (APIC),
+300 steps each. Thread count is not a parity variable on the oracle side.
+
+**Cyrius.** A pool over `thread_create` and `chan_*`, splitting the density pass into fixed index ranges: each
+particle's density is written by one worker, from its own list in Rust's order. Cores 8–15, one run, load
+average 3.3:
+
+| Particles | T | Persistent pool | Spawn per pass | Digest | Pool heap growth |
+|---|---|---|---|---|---|
+| 1,024 | 1 / 2 / 4 / 8 | 488 / 249 / 207 / 181 µs | 565 / 304 / 262 / 303 µs | = serial at every T | 0 B |
+| 16,384 | 1 / 2 / 4 / 8 | 7.61 / 3.84 / 2.32 / 2.10 ms | 8.07 / 4.22 / 2.05 / 1.98 ms | = serial at every T | 0 B |
+| 102,400 | 1 / 2 / 4 / 8 | 47.6 / 24.0 / 15.7 / 12.2 ms | 47.7 / 24.2 / 12.2 / 11.3 ms | = serial at every T | 0 B |
+
+**Decision** (ADR 0002 #4):
+- **Shape:** a persistent pool (`src/par.cyr`). It costs the same as spawning per pass at N ≥ 16k, within noise,
+  and much less at small N. Speedup is 2× at T = 2 and 3–3.9× at T = 8, so the loop is memory-bound past four
+  threads.
+- **Bits:** every T gives the serial bits.
+- **Memory:** workers allocate nothing.
+- **Targets:** `THREADS_CONCURRENT` is 1 on Linux.
+
+### 4.7 Bundle shape (probe 7)
+
+A consumer built with the project's `[deps]`, with and without dead-code elimination:
+
+| Consumer | `CYRIUS_DCE=0` | `[build] dce = true` | Compile |
+|---|---|---|---|
+| uses nothing (the stdlib prepend only) | 1,218,896 B | **407,888 B** (−67%) | 0.9 s |
+| includes all of hisab (70,654 lines), calls `hvec3_add` | 3,056,544 B | **676,768 B** (−78%) | 1.7 s |
+
+**Decision** (ADR 0002 #5). One `[lib]` bundle, with no profiles: dead-code elimination drops what a consumer doesn't
+call. What a large bundle costs is compile time, about 0.8 s per 70k lines, which is small at pravash's size.
+
+### 4.8 hisab and ganita against hisab 1.4.0 (`p8_hisab`, `p8_hisab.tcyr`)
+
+| Candidate | Against (hisab 1.4.0, as the oracle calls it) | Records | Same bits | Largest distance |
+|---|---|---|---|---|
+| `num_dst`, n ≤ 14 | `dst` | 36 | 20 | 384 ulp |
+| `num_idst`, n ≤ 14 | `idst` | 36 | 21 | 410 ulp |
+| `num_dst`, n = 30 … 126 | `dst` | 12 | 0 | 66,671 ulp |
+| `num_idst`, n = 30 … 126 | `idst` | 12 | 0 | 67,196 ulp |
+| ganita `mat_inv` | `matrix_inverse` (through `invert_3x3`), 300 moment matrices, singular ones included | 300 | **300** | 0 |
+| `ad_tape` gradient, arithmetic only | `reverse_gradient` | 100 | 84 | 3 ulp |
+| `ad_tape` gradient, through sin and exp | `reverse_gradient` | 100 | 93 | 1 ulp |
+
+**Decision.**
+- **DST, ledger L6, definite:** hisab 1.4.0's DST is the direct O(N²) sum with a glibc `sin` per term.
+  hisab 3.4.1's is a different algorithm (an FFT past small n), and it allocates 10–20 KB a call. The port
+  transcribes 1.4.0's operation order on the correctly rounded `sin` (L1).
+- **The 3×3 inverse, L7, definite on memory grounds only:** ganita's `mat_inv` gives the oracle's bits on every
+  matrix, singular verdicts included. The stand-in is an allocation-free copy of the same algorithm, with the same
+  bits, until ganita has a caller-buffer variant.
+- **Autodiff, no stand-in:** `KernelDerivatives::autodiff_gradient` uses hisab's `ad_tape`, which takes 0 B per
+  evaluation and is not per-step. Its reverse pass accumulates in a different order from 1.4.0's (3 ulp at most on
+  arithmetic-only gradients), so its rows are **class D**: plan §5's library-backed path, set here before their
+  first comparison.

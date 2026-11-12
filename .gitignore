@@ -27,3 +27,5 @@ benchmarks.md
 /build/
 /scripts/oracle/target/
 __pycache__/
+
+/scripts/probes/rust/target/

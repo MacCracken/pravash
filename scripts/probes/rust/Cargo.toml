@@ -1,0 +1,23 @@
+[package]
+name = "pravash-probes"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-only"
+publish = false
+description = "M0 step 9 probes on the frozen Rust pravash 1.3.0 oracle (rust-old/)"
+
+# The oracle by path, never edited (CLAUDE.md). Cargo.lock was seeded from scripts/oracle/Cargo.lock,
+# itself seeded from rust-old/Cargo.lock, so hisab is exactly 1.4.0 (and glam 0.29.3).
+[dependencies]
+pravash = { path = "../../../rust-old", default-features = false, features = [
+    "oracle", "sph", "grid", "shallow", "coupling", "compute",
+] }
+hisab = { version = "=1.4.0", features = ["num", "geo", "autodiff"] }
+
+# Probe 6 builds p6_parallel twice, without and with rayon, and compares the two outputs.
+[features]
+parallel = ["pravash/parallel"]
+
+[profile.release]
+overflow-checks = true

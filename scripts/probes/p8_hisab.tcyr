@@ -1,0 +1,147 @@
+# Probe 8 (port plan §4 step 9.8): hisab 3.4.1 and ganita against hisab 1.4.0, the oracle's.
+#
+# Replays the records scripts/probes/rust/src/bin/p8_hisab.rs writes (build/p8.bin):
+# - `num_dst` / `num_idst` (hisab 3.4.1) against 1.4.0's `dst` / `idst`, for n = 1 … 126;
+# - `mat_inv` (ganita) against 1.4.0's `matrix_inverse` on 3×3 moment matrices, singular ones too;
+# - an `ad_tape` gradient (hisab 3.4.1) against 1.4.0's `reverse_gradient`, for one arithmetic-only
+#   function and one through sin and exp.
+# Per group it prints the records, how many give the oracle's bits, and the largest ulp distance.
+#
+#   cargo run --release --locked --manifest-path scripts/probes/rust/Cargo.toml --bin p8_hisab -- build/p8.bin
+#   cyrius test scripts/probes/p8_hisab.tcyr
+
+include "tests/ulp.cyr"
+
+var g_buf = 0;
+var g_at = 0;
+
+fn word(): i64 {
+    var w = load64(g_buf + g_at * 8);
+    g_at = g_at + 1;
+    return w;
+}
+
+# Per-group tallies: records, records with every output bit-identical, the largest ulp distance.
+var g_rec: i64[8];
+var g_same: i64[8];
+var g_max: i64[8];
+
+fn tally(grp, same, maxd) {
+    store64(&g_rec + grp * 8, load64(&g_rec + grp * 8) + 1);
+    if (same == 1) { store64(&g_same + grp * 8, load64(&g_same + grp * 8) + 1); }
+    if (maxd > load64(&g_max + grp * 8)) { store64(&g_max + grp * 8, maxd); }
+    return 0;
+}
+
+fn put(s: cstring): i64 {
+    print(s, strlen(s));
+    return 0;
+}
+
+fn show(grp, name: cstring) {
+    put(name);
+    put(": ");
+    fmt_int(load64(&g_rec + grp * 8));
+    put(" records, ");
+    fmt_int(load64(&g_same + grp * 8));
+    put(" with the oracle's bits, largest distance ");
+    var m = load64(&g_max + grp * 8);
+    if (m == 0x7FFFFFFFFFFFFFFF) { put("NaN/inf mismatch"); } else { fmt_int(m); put(" ulp"); }
+    println("");
+    return 0;
+}
+
+# Compares n f64 words at `got` with n read from the stream; returns the largest distance.
+fn cmp_words(got, n): i64 {
+    var maxd = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var d = ulp_distance(load64(got + k * 8), word());
+        if (d > maxd) { maxd = d; }
+    }
+    return maxd;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var lenw[8];
+    g_buf = file_read_whole("build/p8.bin", &lenw);
+    if (g_buf == 0) { println("p8: cannot read build/p8.bin (run the Rust side first)"); return 1; }
+    var words = load64(&lenw) / 8;
+    var tmp = alloc(256 * 8);
+    var tape = ad_tape_new(64);
+    var m = mat_new(3, 3);
+    while (g_at < words) {
+        var kind = word();
+        if (kind == 1 || kind == 2) {
+            var n = word();
+            for (var k = 0; k < n; k = k + 1) { store64(tmp + k * 8, word()); }
+            if (kind == 1) { var t1, e1 = num_dst(tmp, n); } else { var t2, e2 = num_idst(tmp, n); }
+            var d = cmp_words(tmp, n);
+            var grp = kind - 1;
+            if (n >= 30) { grp = grp + 2; }
+            var same = 0;
+            if (d == 0) { same = 1; }
+            tally(grp, same, d);
+        } elif (kind == 3) {
+            var nine = word();
+            for (var k = 0; k < 9; k = k + 1) { mat_set(m, k / 3, k % 3, word()); }
+            var ok = word();
+            var inv = mat_inv(m);
+            var maxd = 0;
+            if ((inv != 0 && ok == 0) || (inv == 0 && ok == 1)) {
+                maxd = 0x7FFFFFFFFFFFFFFF;
+                for (var k = 0; k < 9; k = k + 1) { word(); }
+            } elif (inv == 0) {
+                for (var k = 0; k < 9; k = k + 1) { word(); }
+            } else {
+                for (var k = 0; k < 9; k = k + 1) { store64(tmp + k * 8, mat_get(inv, k / 3, k % 3)); }
+                maxd = cmp_words(tmp, 9);
+            }
+            var same = 0;
+            if (maxd == 0) { same = 1; }
+            tally(4, same, maxd);
+        } elif (kind == 4) {
+            var fid = word();
+            ad_tape_reset(tape);
+            var x0 = ad_var(tape, word());
+            var x1 = ad_var(tape, word());
+            var x2 = ad_var(tape, word());
+            var root = 0;
+            if (fid == 0) {
+                var a = ad_mul(tape, x0, x1);
+                var b = ad_mul(tape, x2, x2);
+                var c = ad_mul(tape, b, x0);
+                var dd = ad_div(tape, x1, x2);
+                var e = ad_add(tape, a, c);
+                root = ad_sub(tape, e, dd);
+            } else {
+                var sn = ad_sin(tape, x0);
+                var ex = ad_exp(tape, x1);
+                var p = ad_mul(tape, sn, ex);
+                root = ad_add(tape, p, x2);
+            }
+            var gt, gv = ad_grad(tape, root);
+            store64(tmp, ad_grad_of(tape, x0));
+            store64(tmp + 8, ad_grad_of(tape, x1));
+            store64(tmp + 16, ad_grad_of(tape, x2));
+            var d = cmp_words(tmp, 3);
+            var same = 0;
+            if (d == 0) { same = 1; }
+            tally(5 + fid, same, d);
+        } else {
+            println("p8: malformed stream");
+            return 1;
+        }
+    }
+    show(0, "num_dst, n <= 14 (1.4.0 dst)");
+    show(1, "num_idst, n <= 14 (1.4.0 idst)");
+    show(2, "num_dst, n = 30 .. 126");
+    show(3, "num_idst, n = 30 .. 126");
+    show(4, "ganita mat_inv (1.4.0 matrix_inverse, through invert_3x3)");
+    show(5, "ad_tape gradient, arithmetic only (1.4.0 reverse_gradient)");
+    show(6, "ad_tape gradient, through sin and exp");
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);

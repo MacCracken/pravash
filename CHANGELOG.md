@@ -53,6 +53,23 @@
   - **Bounds:** K = 2 for sin, cos, sin_cos, atan2, exp, ln and hypot (measured max 1, hypot 2), and K = 0 for
     cbrt. powf stays measured until its correctly rounded M1 counterpart.
   - **Gated:** 21,852 ok, 0 failed on all three targets. Both bounds are mutation-checked.
+- **Probes** (port plan M0 step 9; `scripts/probes/`, `docs/development/port-parity.md` §4):
+  - **Memory:** every hisab or ganita return leaks on the step path. The neighbour-hash rebuild leaks 4.1 MB per
+    1,000-particle step, `num_dst` 10–20 KB per call, and the 3×3 `mat_inv` 248 B. Freelist and a step arena
+    are flat.
+  - **Layout:** all four forms give the same bits. AoS with f64 locals is fastest (12.9 ns a pair); struct
+    values are 2.5× slower and f64v4 3.5×.
+  - **f32 keys:** 10⁶ of 10⁶ match Rust on x86_64 ELF, x86_64 PE and aarch64.
+  - **Neighbour order:** (cell offset, insertion); at |x| ≈ 10⁶, 89% of the probe points miss their cell, the
+    defect D3 fixes.
+  - **Sort ties:** Rust's ipnsort leaves a different order at 75–94% of positions on tie-heavy inputs, so the
+    stable (key, index) order applies (ADR 0002 #3).
+  - **Parallel:** the Rust oracle's serial and parallel builds give the same digests on 14 scenarios. A Cyrius
+    persistent pool gives the serial bits at 1–8 threads, allocates nothing, and is 3.9× at 8 for 10⁵ particles.
+  - **Bundle:** DCE takes a full-hisab consumer from 3.06 MB to 677 KB, so there is one bundle (ADR 0002 #5).
+  - **Libraries vs hisab 1.4.0:** hisab 3.4.1's DST is another algorithm, so ledger L6 transcribes 1.4.0's.
+    ganita's `mat_inv` gives the oracle's bits on all 300 matrices, so L7 is needed for memory only. The
+    autodiff tape is within 3 ulp, so it stays on hisab as class D.
 
 ## [1.3.0] - 2026-11-09
 

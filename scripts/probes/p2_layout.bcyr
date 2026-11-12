@@ -1,0 +1,292 @@
+# Probe 2 (port plan §4 step 9.2): the particle layout and the vector form for SPH's inner loop.
+#
+# One density pass: for each particle i, over its candidate list (CSR, as SphSolver keeps it), add
+# m_j · (h² − r²)³ wherever r² = |x_i − x_j|² < h². 4,096 particles on a 64 × 64 lattice at h/2
+# spacing (z = 0, as 2D SPH runs), with the 3×3 cells of candidates each. Four forms:
+# (a) array-of-structs: a typed stride array of `PvParticle` records laid out as Rust's FluidParticle
+#     (144 B), fields read into f64 locals;
+# (b) structure-of-arrays: one f64 column each for x, y, z, m and the density (ParticleSoa);
+# (c) array-of-structs with struct values: the position a `PvV3` with `-` overloaded, the squared
+#     length a dot product;
+# (d) the pair difference in an f64v4 (x, y, z, 0), squared and summed lane by lane in Rust's order.
+# A form only counts if its densities have the same bits as (a)'s: the sum's order is Rust's
+# (sequential over the list), so SIMD across neighbours is not an option.
+#
+#   cyrius bench scripts/probes/p2_layout.bcyr
+
+struct PvV3 { x: f64; y: f64; z: f64; }
+# FluidParticle's layout: position, velocity, acceleration, density, pressure, mass, phase (u8, padded
+# to a word), conformation [f64; 3], temperature, fuel.
+struct PvParticle { pos: PvV3; vel: PvV3; acc: PvV3; density: f64; pressure: f64; mass: f64; phase: i64; c0: f64; c1: f64; c2: f64; temperature: f64; fuel: f64; }
+
+fn PvV3_sub(a: PvV3, b: PvV3): PvV3 { var r: PvV3; r.x = a.x - b.x; r.y = a.y - b.y; r.z = a.z - b.z; return r; }
+fn v3_len2(a: PvV3): f64 { var d: f64 = a.x * a.x + a.y * a.y + a.z * a.z; return d; }
+
+fn as_f64s(p): *f64 { return p; }
+fn as_particles(p): *PvParticle { return p; }
+fn as_i64s(p): *i64 { return p; }
+
+var SIDE = 64;
+var N = 4096;
+var g_aos = 0;
+var g_x = 0;
+var g_y = 0;
+var g_z = 0;
+var g_m = 0;
+var g_rho = 0;
+var g_off = 0;
+var g_idx = 0;
+var g_h2: f64 = 0.0;
+
+fn setup() {
+    var h: f64 = 0.05;
+    g_h2 = h * h;
+    g_aos = fl_alloc(N * sizeof(PvParticle));
+    g_x = fl_alloc(N * 8);
+    g_y = fl_alloc(N * 8);
+    g_z = fl_alloc(N * 8);
+    g_m = fl_alloc(N * 8);
+    g_rho = fl_alloc(N * 8);
+    var base: *PvParticle = as_particles(g_aos);
+    var xs: *f64 = as_f64s(g_x);
+    var ys: *f64 = as_f64s(g_y);
+    var zs: *f64 = as_f64s(g_z);
+    var ms: *f64 = as_f64s(g_m);
+    for (var i = 0; i < N; i = i + 1) {
+        var fi: f64 = f64_from(i % SIDE);
+        var fj: f64 = f64_from(i / SIDE);
+        var jit: f64 = f64_from((i * 37) % 11) * 0.0001;
+        var x: f64 = fi * 0.025 + jit;
+        var y: f64 = fj * 0.025 - jit;
+        var m: f64 = 0.625 + f64_from(i % 3) * 0.001;
+        var p: *PvParticle = base + i;
+        p.pos.x = x; p.pos.y = y; p.pos.z = 0.0;
+        p.mass = m;
+        p.density = 0.0;
+        xs[i] = x; ys[i] = y; zs[i] = 0.0; ms[i] = m;
+    }
+    # Candidates: the 3 × 3 lattice cells of 2 × 2 particles around each one (cell = h).
+    g_off = fl_alloc((N + 1) * 8);
+    g_idx = fl_alloc(N * 36 * 8);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var n = 0;
+    for (var i = 0; i < N; i = i + 1) {
+        off[i] = n;
+        var ci = (i % SIDE) / 2;
+        var cj = (i / SIDE) / 2;
+        for (var dj = -1; dj <= 1; dj = dj + 1) {
+            for (var di = -1; di <= 1; di = di + 1) {
+                var a = ci + di;
+                var b = cj + dj;
+                if (a >= 0 && b >= 0 && a < SIDE / 2 && b < SIDE / 2) {
+                    for (var q = 0; q < 4; q = q + 1) {
+                        var gx = a * 2 + q % 2;
+                        var gy = b * 2 + q / 2;
+                        idx[n] = gy * SIDE + gx;
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+    }
+    off[N] = n;
+    return 0;
+}
+
+# (a) array-of-structs, f64 locals.
+fn pass_aos() {
+    var base: *PvParticle = as_particles(g_aos);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var h2: f64 = g_h2;
+    for (var i = 0; i < N; i = i + 1) {
+        var pi: *PvParticle = base + i;
+        var xi: f64 = pi.pos.x;
+        var yi: f64 = pi.pos.y;
+        var zi: f64 = pi.pos.z;
+        var rho: f64 = 0.0;
+        for (var k = off[i]; k < off[i + 1]; k = k + 1) {
+            var pj: *PvParticle = base + idx[k];
+            var dx: f64 = xi - pj.pos.x;
+            var dy: f64 = yi - pj.pos.y;
+            var dz: f64 = zi - pj.pos.z;
+            var r2: f64 = dx * dx + dy * dy + dz * dz;
+            if (r2 < h2) {
+                var d: f64 = h2 - r2;
+                var w: f64 = d * d * d;
+                rho = rho + pj.mass * w;
+            }
+        }
+        pi.density = rho;
+    }
+    return 0;
+}
+
+# (b) structure-of-arrays, f64 locals.
+fn pass_soa() {
+    var xs: *f64 = as_f64s(g_x);
+    var ys: *f64 = as_f64s(g_y);
+    var zs: *f64 = as_f64s(g_z);
+    var ms: *f64 = as_f64s(g_m);
+    var rs: *f64 = as_f64s(g_rho);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var h2: f64 = g_h2;
+    for (var i = 0; i < N; i = i + 1) {
+        var xi: f64 = xs[i];
+        var yi: f64 = ys[i];
+        var zi: f64 = zs[i];
+        var rho: f64 = 0.0;
+        for (var k = off[i]; k < off[i + 1]; k = k + 1) {
+            var j = idx[k];
+            var dx: f64 = xi - xs[j];
+            var dy: f64 = yi - ys[j];
+            var dz: f64 = zi - zs[j];
+            var r2: f64 = dx * dx + dy * dy + dz * dz;
+            if (r2 < h2) {
+                var d: f64 = h2 - r2;
+                var w: f64 = d * d * d;
+                rho = rho + ms[j] * w;
+            }
+        }
+        rs[i] = rho;
+    }
+    return 0;
+}
+
+# (c) array-of-structs, struct values with an overloaded `-`.
+fn pass_struct() {
+    var base: *PvParticle = as_particles(g_aos);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var h2: f64 = g_h2;
+    for (var i = 0; i < N; i = i + 1) {
+        var pi: *PvParticle = base + i;
+        var rho: f64 = 0.0;
+        for (var k = off[i]; k < off[i + 1]; k = k + 1) {
+            var pj: *PvParticle = base + idx[k];
+            var dv: PvV3 = pi.pos - pj.pos;
+            var r2: f64 = v3_len2(dv);
+            if (r2 < h2) {
+                var d: f64 = h2 - r2;
+                var w: f64 = d * d * d;
+                rho = rho + pj.mass * w;
+            }
+        }
+        pi.density = rho;
+    }
+    return 0;
+}
+
+# (d) the pair difference in an f64v4, squared lane by lane, summed in Rust's order.
+fn pass_simd() {
+    var xs: *f64 = as_f64s(g_x);
+    var ys: *f64 = as_f64s(g_y);
+    var zs: *f64 = as_f64s(g_z);
+    var ms: *f64 = as_f64s(g_m);
+    var rs: *f64 = as_f64s(g_rho);
+    var off: *i64 = as_i64s(g_off);
+    var idx: *i64 = as_i64s(g_idx);
+    var h2: f64 = g_h2;
+    for (var i = 0; i < N; i = i + 1) {
+        var vi: f64v4 = f64v4_make(xs[i], ys[i], zs[i], 0);
+        var rho: f64 = 0.0;
+        for (var k = off[i]; k < off[i + 1]; k = k + 1) {
+            var j = idx[k];
+            var vj: f64v4 = f64v4_make(xs[j], ys[j], zs[j], 0);
+            var dv: f64v4 = f64v4_sub(vi, vj);
+            var sq: f64v4 = f64v4_mul(dv, dv);
+            var s0: f64 = f64v4_lane0(sq);
+            var s1: f64 = f64v4_lane1(sq);
+            var s2: f64 = f64v4_lane2(sq);
+            var r2: f64 = s0 + s1 + s2;
+            if (r2 < h2) {
+                var d: f64 = h2 - r2;
+                var w: f64 = d * d * d;
+                rho = rho + ms[j] * w;
+            }
+        }
+        rs[i] = rho;
+    }
+    return 0;
+}
+
+# FNV-1a over the densities of form (a) (the records) or of the column.
+fn digest_aos(): i64 {
+    var base: *PvParticle = as_particles(g_aos);
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < N; i = i + 1) {
+        var p: *PvParticle = base + i;
+        var mb[8];
+        store64(&mb, p.density);
+        h = (h ^ load64(&mb)) * 0x100000001b3;
+    }
+    return h;
+}
+
+fn digest_col(): i64 {
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < N; i = i + 1) { h = (h ^ load64(g_rho + i * 8)) * 0x100000001b3; }
+    return h;
+}
+
+fn clear_col() {
+    for (var i = 0; i < N; i = i + 1) { store64(g_rho + i * 8, 0); }
+    return 0;
+}
+
+fn show_digest(name: cstring, d) {
+    print(name, strlen(name));
+    print(" digest 0x", 10);
+    fmt_hex(d);
+    println("");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    fl_init();
+    setup();
+    var passes = 50;
+    var pairs = load64(g_off + N * 8);
+    print("candidate pairs per pass: ", 26);
+    fmt_int(pairs);
+    println("");
+
+    pass_aos();
+    var da = digest_aos();
+    show_digest("(a) aos", da);
+    pass_soa();
+    show_digest("(b) soa", digest_col());
+    pass_struct();
+    show_digest("(c) struct values", digest_aos());
+    clear_col();
+    pass_simd();
+    show_digest("(d) f64v4 pair", digest_col());
+
+    var b1 = bench_new("(a) aos, f64 locals: one density pass");
+    bench_batch_start(b1);
+    for (var k = 0; k < passes; k = k + 1) { pass_aos(); }
+    bench_batch_stop(b1, passes);
+    bench_report(b1);
+    var b2 = bench_new("(b) soa, f64 locals: one density pass");
+    bench_batch_start(b2);
+    for (var k = 0; k < passes; k = k + 1) { pass_soa(); }
+    bench_batch_stop(b2, passes);
+    bench_report(b2);
+    var b3 = bench_new("(c) aos, struct values: one density pass");
+    bench_batch_start(b3);
+    for (var k = 0; k < passes; k = k + 1) { pass_struct(); }
+    bench_batch_stop(b3, passes);
+    bench_report(b3);
+    var b4 = bench_new("(d) soa, f64v4 pair difference: one density pass");
+    bench_batch_start(b4);
+    for (var k = 0; k < passes; k = k + 1) { pass_simd(); }
+    bench_batch_stop(b4, passes);
+    bench_report(b4);
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);

@@ -1,0 +1,66 @@
+# Probe 3 (port plan §4 step 9.3): the SPH cell key on native f32, against Rust on 10⁶ positions.
+#
+# Reads the records p3_keys.rs writes (position bits, h bits, Rust's key), recomputes each key as
+# floor(f32(p) · (1 / f32(h))) as i32 with f32_from, f32 `/` and `*`, f32_to, f64_floor and a
+# saturating convert, and counts the mismatches.
+#
+#   rustc -O --edition 2024 -o build/p3_keys scripts/probes/p3_keys.rs && ./build/p3_keys build/p3_keys.bin
+#   cyrius build scripts/probes/p3_keys.cyr build/p3_keys_cyr && ./build/p3_keys_cyr
+
+# A saturating f64 → i32, as Rust's `as i32` (NaN → 0). The port's helper is `_pv_as_i32` (M1).
+fn sat_i32(x: f64): i64 {
+    if (x != x) { return 0; }
+    if (x >= 2147483647.0) { return 2147483647; }
+    if (x <= -2147483648.0) { return 0 - 2147483648; }
+    return f64_to(x);
+}
+
+fn sph_key(p: f64, h: f64): i64 {
+    var h32: f32 = f32_from(h);
+    var one32: f32 = f32_from(1.0);
+    var inv: f32 = one32 / h32;
+    var p32: f32 = f32_from(p);
+    var prod: f32 = p32 * inv;
+    var w: f64 = f32_to(prod);
+    var fl: f64 = f64_floor(w);
+    return sat_i32(fl);
+}
+
+fn main(): i64 {
+    alloc_init();
+    var lenw[8];
+    var buf = file_read_whole("build/p3_keys.bin", &lenw);
+    if (buf == 0) { println("p3: cannot read build/p3_keys.bin (run p3_keys.rs first)"); return 1; }
+    var n = load64(&lenw) / 24;
+    var bad = 0;
+    var shown = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var at = buf + k * 24;
+        var p: f64 = load64(at);
+        var h: f64 = load64(at + 8);
+        var want = load64(at + 16);
+        var got = sph_key(p, h);
+        if (got != want) {
+            bad = bad + 1;
+            if (shown < 5) {
+                print("  MISMATCH case ", 15);
+                fmt_int(k);
+                print(": rust ", 7);
+                fmt_int(want);
+                print(", cyrius ", 9);
+                fmt_int(got);
+                println("");
+                shown = shown + 1;
+            }
+        }
+    }
+    fmt_int(n);
+    print(" keys compared, ", 16);
+    fmt_int(bad);
+    println(" mismatches");
+    if (bad != 0) { return 1; }
+    return 0;
+}
+
+var rc = main();
+sys_exit_group(rc);

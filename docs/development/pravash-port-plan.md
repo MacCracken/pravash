@@ -12,7 +12,7 @@
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
 > ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–8 are done:
+> published to crates.io. M0 steps 0–9 are done:
 > - the frozen oracle;
 > - the scaffold and its repairs;
 > - ADRs 0001–0003;
@@ -21,9 +21,10 @@
 > - the golden-value generator;
 > - `src/constants.cyr`;
 > - the parity harness;
-> - the cross-target baselines.
+> - the cross-target baselines;
+> - the eight probes.
 >
-> Next is step 9, the probes.
+> Next is step 10, the upstream requests and the conversion ledger.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -481,7 +482,26 @@ function, so nothing leaves parity entirely.
    - the math sweep through every Cyrius counterpart against glibc, on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu);
    - K set by the port-parity rule;
    - the corrected oracle (`*.cr.tsv`) for the correctly rounded primitives.
-9. **Probes.** Each one is a small program, answered with numbers before M1 writes any code. The programs go in
+9. ✅ **Probes. Done 2026-11-11** ([`port-parity.md`](port-parity.md) §4; `scripts/probes/`). The answers:
+   1. **Memory.** hisab's hash rebuild leaks 4.1 MB per 1,000-particle step; `num_dst` 10–20 KB per call;
+      ganita's 3×3 `mat_inv` 248 B; `hvec3_add` 24 B. The autodiff tape takes 0 B once reset. Freelist and the step
+      arena are flat. L3, L4, L6 and L7 are needed.
+   2. **Layout.** All four forms give the same bits. AoS with `f64` locals is 1.83 ms a pass; SoA 1.1×; struct
+      values 2.5×; `f64v4` 3.5×. Particles are `PvParticle` stride records, and hot loops use `f64` locals.
+   3. **f32 keys.** 10⁶ of 10⁶ match Rust on x86_64 ELF, PE and aarch64.
+   4. **Neighbour order.** It is (cell offset, insertion): every dumped list equals a no-hash-map build. At
+      |x| ≈ 10⁶, 89% of the probe points land in another cell: the defect D3 fixes.
+   5. **Sort ties.** Rust's ipnsort differs from the stable order at 75–94% of positions on tie-heavy inputs,
+      and not at all on sorted ones. ADR 0002 #3's stable (key, index) order applies, and L9 is definite.
+   6. **Parallel.** The oracle's serial and parallel builds give the same digests on 14 scenarios. A Cyrius
+      persistent pool gives the serial bits at T = 1–8 and allocates nothing, at 2× for T = 2 and 3–3.9× for T = 8.
+   7. **Bundle.** Dead-code elimination takes a full-hisab consumer from 3.06 MB to 677 KB. One `[lib]`, no
+      profiles.
+   8. **Libraries vs 1.4.0.** hisab's DST differs from 1.4.0's: up to 67,000 ulp on its FFT path, so L6
+      transcribes 1.4.0's. ganita's `mat_inv` gives the oracle's bits on all 300 matrices, so L7 is memory only. The
+      autodiff tape is within 3 ulp, so it stays on hisab as class D.
+
+   As planned, each one is a small program, answered with numbers before M1 writes any code. The programs go in
    `scripts/probes/` and the results in `port-parity.md`.
    1. **Memory model.** Solver-owned storage (freelist or a solver arena) plus a per-step scratch arena, with hisab
       off the step path. Gate: 10⁴ steps of a 10⁴-particle SPH dam break, and 10⁴ steps of a 128² `FluidGrid` on
@@ -645,10 +665,10 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 |---|---|---|
 | glam `DVec3` arithmetic | `hvec3_*`, which allocate on every operation | stand-in `src/vec3.cyr` on f64 locals (probe 2), ledger L3 |
 | glam `Vec3` (f32) and `SpatialHash` (f32 cells, a `HashMap` of cells) | `spatial_hash_*` (f64 cells; allocates on insert and query) | stand-in neighbour grid on native `f32` keys (D3): sorted arrays, no per-step allocation, ledger L4 |
-| `num::dst`, `num::idst` | `num_dst`, `num_idst` | use them if probe 8 shows the same bits and no per-step leak; otherwise a transcribed stand-in, ledger L6 |
+| `num::dst`, `num::idst` | `num_dst`, `num_idst`: another algorithm, 10–20 KB per call (port-parity §4.8) | a transcribed stand-in of 1.4.0's direct DST, ledger L6 |
 | `num::conjugate_gradient` (matrix-free linear CG, operator as a closure) | **none** in hisab or ganita | stand-in transcribed from 1.4.0 (ADR 0003), with the operator as a Cyrius closure, ledger L5 |
-| `num::matrix_inverse` (n×n by LU with partial pivoting, called on a 3×3) | ganita `mat_inv` (LU with partial pivoting); hisab `m3_inverse_checked`, which decides singularity exactly (class D in impetus) | ganita `mat_inv` if probe 8 shows the same bits and the per-call allocation stays off the step path; otherwise a transcribed stand-in, ledger L7 |
-| `autodiff::{Tape, Var, reverse_gradient}` | `ad_tape_*` | use it (not per-step), with the user's function as a closure; probe 8 checks the bits |
+| `num::matrix_inverse` (n×n by LU with partial pivoting, called on a 3×3) | ganita `mat_inv`: **the oracle's bits on all 300 probe matrices**, but 248 B per call | an allocation-free copy of ganita's algorithm, ledger L7, until `mat_inv_into` |
+| `autodiff::{Tape, Var, reverse_gradient}` | `ad_tape_*`: 0 B per evaluation once reset; within 3 ulp of 1.4.0's (a different reverse-pass order) | use it, with the user's function as a closure; its rows are class D (library-backed), set at probe 8 |
 
 ### 7.3 Types and idioms
 
@@ -726,10 +746,10 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
 | L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
 | L5 | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | **hisab P1 (new)**: an operator as a closure, a relative tolerance, the iteration count returned | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
-| L6 | *conditional (probe 8)*: `src/grid_solve.cyr` DST and IDST | `num_dst` / `num_idst` differ from 1.4.0's bits, leak per step, or are the direct O(N²) form | **hisab**: bit parity with 1.4.0, no per-call allocation, a fast DST (the roadmap flags the cost) | `num_dst`, `num_idst` | the DST pressure rows |
-| L7 | *conditional (probe 8)*: the MLS 3×3 inverse in `src/sph_fns.cyr` | ganita `mat_inv` differs from 1.4.0's bits, or allocates per call | **ganita**: an allocation-free `mat_inv_into` (caller output) with hisab 1.4.0's pivoting | ganita `mat_inv` | the MLS gradient-correction rows |
+| L6 | `src/grid_solve.cyr`: 1.4.0's direct DST and IDST, transcribed, on the correctly rounded `sin` (L1) | `num_dst` / `num_idst` are another algorithm (up to 67,000 ulp from 1.4.0's on the FFT path) and allocate 10–20 KB per call (port-parity §4.1, §4.8) | **hisab**: an allocation-free DST into a caller's buffer; the direct form as an option, or a fast one the DST rows can be re-bounded for | `num_dst`, `num_idst` | the DST pressure rows |
+| L7 | `src/sph_fns.cyr`: the MLS 3×3 inverse, an allocation-free copy of ganita's `mat_inv` algorithm (the same bits as the oracle's on all 300 probe matrices) | ganita `mat_inv` allocates 248 B per call, one per particle per step (port-parity §4.1, §4.8) | **ganita**: an allocation-free `mat_inv_into` (caller output) | ganita `mat_inv_into` | the MLS gradient-correction rows |
 | L8 | the step-path rule itself: solver-owned storage and a step arena, hisab kept off the step | cyrius S1, hisab H9 | as L3 | hisab back on the step path: L3, L4 and L6 convert together | every step row, plus the soak test |
-| L9 | *conditional (probe 5)*: a stable merge sort in `src/sph_fns.cyr` | `vec_sort_by` is introsort (unstable) | **stdlib**: a stable sort (impetus asked for one too) | the stdlib's stable sort | the z-order rows (class A) |
+| L9 | a stable merge sort on (key, input index) in `src/sph_fns.cyr` (ADR 0002 #3; port-parity §4.5) | `vec_sort_by` is introsort (unstable) | **stdlib**: a stable sort (impetus asked for one too) | the stdlib's stable sort | the z-order rows (class A) |
 | L10 | `src/json.cyr`: hand codecs for `DVec3` fields (`[x, y, z]`) and the data-carrying enums | `#derive` has no array form for a vector struct and no externally tagged data variants | **cyrius stdlib**: `#derive` support for those shapes (impetus listed them, unfiled), with pravash's types as the cases | `#derive(Serialize)` / `#derive(Deserialize)` | the JSON table (class A) |
 | L11 | *conditional (M7)*: a Chrome-trace writer in `src/logging.cyr` | sakshi may have no Chrome-trace exporter | **sakshi** (stdlib): an exporter | sakshi | the logging test |
 | L12 | *conditional (M1 benchmarks)*: an 8-byte-chunk record copy for particles | `memcpy` copies a byte at a time | **cyrius**: the open S5 / `2026-11-02` memcpy issue; pravash adds its particle-record numbers | stdlib `memcpy` | none (it moves bytes); the benchmark rows |
@@ -755,7 +775,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. Gated: **21,852 ok, 0 failed, 1,790 measured (powf), 9,632 pending (M1 helpers)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | — | D1–D6 decided 2026-11-11. Steps 0–7 done (oracle, scaffold, ADRs, `cyrius.cyml`, semantics probe, generator, constants, harness). Step 8 done (digests identical on 3 targets; K = 2 for the primitives, 0 for cbrt). Next: step 9, the probes |
+| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. Gated: 21,852 ok, 0 failed, 1,790 measured (powf), 9,632 pending (M1 helpers), identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 3 probe benches (layout, pool, the memory probe) | D1–D6 decided 2026-11-11. Steps 0–8 done. Step 9 done: eight probes (port-parity §4); L6, L7 and L9 definite; single bundle; persistent pool; autodiff on hisab (class D). Next: step 10, the upstream requests and the ledger |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |
