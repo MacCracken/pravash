@@ -1,0 +1,691 @@
+# syscalls_x86_64_linux.cyr — Linux x86_64 syscall wrappers
+# Usage: include "lib/syscalls.cyr" (selector picks this peer
+#        when CYRIUS_ARCH_X86 is defined; do NOT include this
+#        file directly — go through the selector so cross-arch
+#        builds work).
+#
+# Companion peer: lib/syscalls_aarch64_linux.cyr (v5.4.11+).
+# Layout-affecting constants (e.g. struct stat offsets) are
+# arch-dispatched; offsets in this file are the x86_64
+# `arch/x86/include/uapi/asm/stat.h` values.
+#
+# Cyrius re-implementation of agnosys syscall bindings.
+# Constants are enums so they fold to compile-time literals: no data slot and no load, and a
+# syscall number spelled with one is a LITERAL to the compiler's per-target syscall routing (a
+# `var` number is not — parse/expr/callee.cyr's non-literal-number warning). CHANGELOG [6.6.11]
+
+# ================================================================
+# Syscall numbers (x86_64)
+# ================================================================
+enum SysNr {
+    SYS_READ = 0;
+    SYS_WRITE = 1;
+    SYS_OPEN = 2;
+    SYS_CLOSE = 3;
+    SYS_STAT = 4;
+    SYS_FSTAT = 5;
+    SYS_POLL = 7;           # 6.7.14: fd_wait_ready's number, named (the native-region warning)
+    SYS_LSEEK = 8;
+    SYS_MMAP = 9;
+    # v6.6.4: was a raw 73 in lib/io.cyr, and a raw NATIVE 32 on its aarch64 arm that the
+    # raw-literal diagnostic flagged on every aarch64 build of anything including io.cyr.
+    SYS_FLOCK = 73;
+    SYS_BRK = 12;
+    SYS_RT_SIGPROCMASK = 14;
+    SYS_IOCTL = 16;
+    SYS_ACCESS = 21;
+    SYS_PIPE = 22;
+    SYS_DUP = 32;
+    SYS_DUP2 = 33;
+    SYS_PAUSE = 34;
+    SYS_GETPID = 39;
+    SYS_FORK = 57;
+    SYS_EXECVE = 59;
+    SYS_EXIT = 60;
+    SYS_WAIT4 = 61;
+    SYS_KILL = 62;
+    SYS_UNAME = 63;
+    SYS_SYSINFO = 99;
+    SYS_FCNTL = 72;
+    SYS_FSYNC = 74;
+    SYS_FDATASYNC = 75;
+    SYS_GETCWD = 79;
+    SYS_CHDIR = 80;
+    SYS_MKDIR = 83;
+    SYS_RMDIR = 84;
+    SYS_UNLINK = 87;
+    SYS_SYMLINK = 88;
+    SYS_READLINK = 89;
+    SYS_CHMOD = 90;
+    SYS_FCHMOD = 91;
+    SYS_GETUID = 102;
+    SYS_GETGID = 104;
+    SYS_SETUID = 105;
+    SYS_SETGID = 106;
+    SYS_GETEUID = 107;
+    SYS_GETEGID = 108;
+    SYS_GETPPID = 110;
+    SYS_SETSID = 112;
+    SYS_SETGROUPS = 116;
+    SYS_SETRESUID = 117;
+    SYS_SETRESGID = 119;
+    SYS_PRCTL = 157;
+    SYS_SYNC = 162;
+    SYS_MOUNT = 165;
+    SYS_UMOUNT2 = 166;
+    SYS_REBOOT = 169;
+    SYS_EPOLL_WAIT = 232;
+    SYS_EPOLL_CTL = 233;
+    SYS_WAITID = 247;
+    SYS_TIMERFD_CREATE = 283;
+    SYS_TIMERFD_SETTIME = 286;
+    SYS_SIGNALFD4 = 289;
+    SYS_EPOLL_CREATE1 = 291;
+    SYS_CLONE = 56;
+    SYS_MUNMAP = 11;
+    SYS_FUTEX = 202;
+    SYS_GETTID = 186;
+    SYS_SET_TID_ADDRESS = 218;
+    SYS_EXIT_GROUP = 231;
+    # v5.7.35 (agnosys-surfaced — drm/luks/security)
+    SYS_GETDENTS64 = 217;
+    # v5.11.0 (kavach-surfaced — sandbox post-fork hardening)
+    SYS_SECCOMP = 317;
+    SYS_GETRANDOM = 318;
+    SYS_EXECVEAT = 322;
+    SYS_PIDFD_OPEN = 434;         # pidfd_open(pid, flags) → fd readable on child exit (Linux 5.3+)
+    SYS_LANDLOCK_CREATE_RULESET = 444;
+    SYS_LANDLOCK_ADD_RULE = 445;
+    SYS_LANDLOCK_RESTRICT_SELF = 446;
+    # v5.11.18 (kybernet 1.1.5-surfaced — sd_notify dgram + supervisor IPC).
+    # See aarch64 peer + CHANGELOG [5.11.18].
+    SYS_SOCKET = 41;
+    SYS_SOCKETPAIR = 53;
+    SYS_SETSOCKOPT = 54;
+    SYS_CONNECT = 42;
+    SYS_RECVFROM = 45;
+    SYS_RECVMSG = 47;
+    SYS_BIND = 49;
+    SYS_LISTEN = 50;
+    # v6.4.64: the socket band's last gap. Consumers had no wrapper, so sandhi 1.9.0
+    # hardcoded a raw `syscall(52, ...)` — which is correct HERE (x86 52 IS getpeername)
+    # but silently became fchmod on aarch64. Native x86 numbers; no translation needed.
+    SYS_GETSOCKNAME = 51;
+    SYS_GETPEERNAME = 52;
+    SYS_ACCEPT4 = 288;
+    # v6.6.5 — the SEND side of the socket band, the truncate pair, memfd and the two
+    # scheduler primitives. Every one of these was NAMELESS in both Linux peers, so a
+    # consumer had no choice but to hardcode the x86 number — and an unnamed number is
+    # exactly what the ELF-aarch64 raw-literal diagnostic cannot see (its table is derived
+    # from names DECLARED IN BOTH peers). Measured under qemu-aarch64 before the fix:
+    # raw 319 was ENOSYS, raw 77 ran **tee**, raw 46 ran **ftruncate**, raw 44 ran fstatfs,
+    # raw 35 ran unlinkat(0,NULL,0). CHANGELOG [6.6.5]
+    SYS_SENDTO = 44;
+    SYS_SENDMSG = 46;
+    SYS_TRUNCATE = 76;
+    SYS_FTRUNCATE = 77;
+    SYS_MEMFD_CREATE = 319;
+    SYS_NANOSLEEP = 35;
+    SYS_SCHED_YIELD = 24;
+    # v6.6.6 — the statfs pair, nameless in BOTH Linux peers until now. That is why yukti
+    # hardcoded the numbers, and on aarch64 its native 43 was reissued as **accept** by the
+    # ESYSXLAT compat row (measured under qemu-aarch64: errno 14 from every
+    # `filesystem_usage` call on ARM since v6.2.10). Naming it here is half the fix; the
+    # aarch64 peer borrows THESE numbers and two new ESYSXLAT rows renumber them.
+    # CHANGELOG [6.6.6]
+    SYS_STATFS = 137;
+    SYS_FSTATFS = 138;
+    # v6.6.8 — namespaces, root, capabilities, cross-process memory and mknodat, nameless in
+    # BOTH Linux peers until now. kavach, takumi, shakti, mirshi and vani each hardcoded a
+    # number, and on aarch64 every one of those numbers ran a different call (161 sethostname,
+    # 272 kcmp, 155 getpgid, 125/126 sched_get_priority_max/min — qemu-aarch64 -strace). The
+    # aarch64 peer borrows THESE numbers and ESYSXLAT renumbers them. CHANGELOG [6.6.8]
+    SYS_UNSHARE = 272;
+    SYS_CHROOT = 161;
+    SYS_PIVOT_ROOT = 155;
+    SYS_CAPGET = 125;
+    SYS_CAPSET = 126;
+    SYS_PROCESS_VM_READV = 310;
+    SYS_PROCESS_VM_WRITEV = 311;
+    SYS_MKNODAT = 259;
+    # 6.6.12 — the xattr family, fchown, statx and getrlimit: NO NAME in either Linux peer until
+    # now, so consumers wrote numbers (kriya's aarch64 arm returned -ENOSYS by hand for the four
+    # xattr calls it needed). The aarch64 peer spells these through the private alias band —
+    # see its comment — and lib/syscalls_linux_common.cyr carries the wrappers. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 188;
+    SYS_LSETXATTR = 189;
+    SYS_FSETXATTR = 190;
+    SYS_GETXATTR = 191;
+    SYS_LGETXATTR = 192;
+    SYS_FGETXATTR = 193;
+    SYS_LISTXATTR = 194;
+    SYS_LLISTXATTR = 195;
+    SYS_FLISTXATTR = 196;
+    SYS_REMOVEXATTR = 197;
+    SYS_LREMOVEXATTR = 198;
+    SYS_FREMOVEXATTR = 199;
+    SYS_FCHOWN = 93;
+    SYS_STATX = 332;
+    SYS_GETRLIMIT = 97;
+    # v6.6.5 — peer asymmetries closed. The aarch64 peer declared all four; this one used
+    # raw literals below, so the correspondence table had no row and raw 294 on aarch64
+    # (kexec_file_load) went undiagnosed.
+    SYS_DUP3 = 292;
+    SYS_INOTIFY_INIT1 = 294;
+    SYS_INOTIFY_ADD_WATCH = 254;
+    SYS_INOTIFY_RM_WATCH = 255;
+    # v6.6.5 — the aarch64 peer has declared SYS_FACCESSAT = 269 (the x86 number, which
+    # ESYSXLAT renumbers 269→48) since v6.2.x, and this peer's silence forced a named
+    # exception into tests/gates/platform/aarch64_syscall_shadow.sh's ALLOW list: the
+    # gate's "is the declared value the x86 number for this call?" discriminator had no
+    # x86 declaration to compare against. Declaring it here retires that exception.
+    SYS_FACCESSAT = 269;
+    # 6.7.9 — ppoll, which this peer never named: the aarch64 peer has spelled it 1073 (the
+    # private alias ESYSXLAT renumbers to native 73) since v6.5.36, and yukti carried a local
+    # `SYS_PPOLL = 271` for the one raw call no wrapper covered. sys_ppoll
+    # (lib/syscalls_linux_common.cyr) issues it. CHANGELOG [6.7.9]
+    SYS_PPOLL = 271;
+    # v6.1.3 — bare-name fs syscalls + POSIX *at() family (kriya M2 surfaced).
+    SYS_LSTAT = 6;
+    SYS_RENAME = 82;
+    SYS_LINK = 86;
+    SYS_OPENAT = 257;
+    SYS_MKDIRAT = 258;
+    SYS_FCHOWNAT = 260;
+    SYS_NEWFSTATAT = 262;
+    SYS_UNLINKAT = 263;
+    SYS_RENAMEAT = 264;
+    SYS_LINKAT = 265;
+    SYS_FCHMODAT = 268;
+    SYS_UTIMENSAT = 280;
+}
+
+# ================================================================
+# Seccomp architecture tag (v6.6.8)
+# ================================================================
+# AUDIT_ARCH_* for the ABI this peer compiles for (x86_64: EM_X86_64 | __AUDIT_ARCH_64BIT |
+# __AUDIT_ARCH_LE). Every seccomp filter must
+# check `seccomp_data.arch` against it FIRST, or a syscall number from another ABI
+# (x32, i386 via int 0x80) slips past a number-based allow-list. kavach hand-wrote it
+# (security_seccomp_native_arch); the peer knows the value, so it names it.
+# CHANGELOG [6.6.8]
+enum AuditArch {
+    AUDIT_ARCH_NATIVE = 0xC000003E;
+}
+
+# ================================================================
+# Clone flags (for thread creation)
+# ================================================================
+enum CloneFlag {
+    CLONE_VM = 256;
+    CLONE_FS = 512;
+    CLONE_FILES = 1024;
+    CLONE_SIGHAND = 2048;
+    CLONE_THREAD = 65536;
+    CLONE_SYSVSEM = 262144;
+    CLONE_SETTLS = 524288;
+    CLONE_PARENT_SETTID = 1048576;
+    CLONE_CHILD_CLEARTID = 2097152;
+}
+
+# ================================================================
+# mmap constants
+# ================================================================
+enum MmapConst {
+    PROT_READ = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC = 4;
+    MAP_PRIVATE = 2;
+    MAP_ANONYMOUS = 32;
+    MAP_STACK = 131072;
+}
+
+# ================================================================
+# Futex operations
+# ================================================================
+enum FutexOp {
+    FUTEX_WAIT = 0;
+    FUTEX_WAKE = 1;
+    FUTEX_PRIVATE_FLAG = 128;
+}
+
+# ================================================================
+# Open flags
+# ================================================================
+enum OpenFlag {
+    O_RDONLY = 0;
+    O_WRONLY = 1;
+    O_RDWR = 2;
+    O_CREAT = 64;
+    O_EXCL = 128;
+    O_TRUNC = 512;
+    O_APPEND = 1024;
+    O_NONBLOCK = 2048;
+    O_CLOEXEC = 524288;
+    # v6.6.4: the four flags whose VALUES differ between x86_64 and arm64. These are the
+    # asm-generic/fcntl.h values (x86_64 and riscv use the generic set); arm64 overrides
+    # them in arch/arm64/include/uapi/asm/fcntl.h with a different permutation. The stdlib
+    # defined none of them, so consumers hardcoded the x86_64 numbers —
+    # patra's `O_NOFOLLOW = 131072` arrived on aarch64 as O_LARGEFILE and a symlinked WAL
+    # path was followed and its target truncated; its `O_DIRECTORY = 65536` arrived as
+    # O_DIRECT and the directory fsync got EINVAL. Spell the symbol; each peer owns its value.
+    O_DIRECT = 16384;       # 040000
+    O_LARGEFILE = 32768;    # 0100000
+    O_DIRECTORY = 65536;    # 0200000
+    O_NOFOLLOW = 131072;    # 0400000
+}
+
+# ================================================================
+# Signals
+# ================================================================
+enum Signal {
+    SIGHUP = 1;
+    SIGINT = 2;
+    SIGQUIT = 3;
+    SIGKILL = 9;
+    SIGUSR1 = 10;
+    SIGUSR2 = 12;
+    SIGTERM = 15;
+    SIGCHLD = 17;
+    SIGCONT = 18;
+    SIGSTOP = 19;
+    SIGPWR = 30;
+}
+
+enum SigAction {
+    SIG_BLOCK = 0;
+    SIG_UNBLOCK = 1;
+    SIG_SETMASK = 2;
+}
+
+# ================================================================
+# Mount flags
+# ================================================================
+enum MsFlag {
+    MS_RDONLY = 1;
+    MS_NOSUID = 2;
+    MS_NODEV = 4;
+    MS_NOEXEC = 8;
+    MS_REMOUNT = 32;
+    MS_BIND = 4096;
+    MS_MOVE = 8192;
+}
+
+# ================================================================
+# Epoll constants
+# ================================================================
+enum EpollConst {
+    EPOLL_CLOEXEC = 524288;
+    EPOLL_CTL_ADD = 1;
+    EPOLL_CTL_DEL = 2;
+    EPOLL_CTL_MOD = 3;
+    EPOLLIN = 1;
+    EPOLLOUT = 4;
+    EPOLLERR = 8;
+    EPOLLHUP = 16;
+}
+
+# ================================================================
+# Timer, wait, signalfd, reboot, errno
+# ================================================================
+enum TimerConst {
+    CLOCK_MONOTONIC = 1;
+    TFD_NONBLOCK = 2048;
+    TFD_CLOEXEC = 524288;
+}
+
+enum WaitFlag {
+    WNOHANG = 1;
+    WUNTRACED = 2;
+}
+
+enum SfdFlag {
+    SFD_NONBLOCK = 2048;
+    SFD_CLOEXEC = 524288;
+}
+
+enum RebootCmd {
+    RB_POWER_OFF = 0x4321FEDC;
+    RB_AUTOBOOT = 0x01234567;
+    RB_HALT_SYSTEM = 0xCDEF0123;
+}
+
+enum Errno {
+    EPERM = 1;
+    ENOENT = 2;
+    ESRCH = 3;
+    EINTR = 4;
+    EIO = 5;
+    ENXIO = 6;
+    EAGAIN = 11;
+    EACCES = 13;
+    EBUSY = 16;
+    EEXIST = 17;
+    ENOTDIR = 20;
+    EISDIR = 21;
+    EINVAL = 22;
+    ENFILE = 23;
+    EMFILE = 24;
+    ENOSPC = 28;
+    ECHILD = 10;
+}
+
+# Standard fds
+enum StdFd {
+    STDIN_FD = 0;
+    STDOUT_FD = 1;
+    STDERR_FD = 2;
+}
+
+# Reboot magic
+var LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD;
+var LINUX_REBOOT_MAGIC2 = 672274793;
+
+# ================================================================
+# struct stat layout — x86_64 layout
+# (arch/x86/include/uapi/asm/stat.h, 144 bytes)
+# ================================================================
+# st_dev    @ 0   (8 bytes)
+# st_ino    @ 8   (8 bytes)
+# st_nlink  @ 16  (8 bytes)   <-- 8-byte field on x86_64; 4-byte on aarch64 generic
+# st_mode   @ 24  (4 bytes)
+# st_uid    @ 28  (4 bytes)
+# st_gid    @ 32  (4 bytes)
+# (pad)     @ 36  (4 bytes)
+# st_rdev   @ 40
+# st_size   @ 48  (8 bytes)
+# ...
+# Total = 144 bytes.
+# Companion peer (aarch64) uses different offsets — consumers
+# must use the Stat enum to stay arch-clean. See v5.4.11 chunk-A
+# audit findings.
+enum Stat {
+    STAT_MODE = 24;
+    STAT_NLINK = 16;
+    STAT_UID = 28;
+    STAT_GID = 32;
+    STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
+    STAT_BUFSZ = 144;
+}
+
+# ================================================================
+# Syscall wrappers
+# ================================================================
+# Body-identical wrappers shared with the aarch64 peer live in
+# lib/syscalls_linux_common.cyr (~46 wrappers extracted v5.11.20).
+# This peer keeps only x86_64-specific wrappers below.
+
+include "lib/syscalls_linux_common.cyr"
+
+# File operations — sys_open uses x86_64's bare SYS_OPEN; aarch64
+# routes through openat(AT_FDCWD).
+#io
+fn sys_open(path, flags, mode): i64 {
+    return syscall(SYS_OPEN, path, flags, mode);
+}
+
+# v5.8.6: phylax #2 backfill — sys_stat / sys_fstat to match the
+# aarch64 wrapper surface (lib/syscalls_aarch64_linux.cyr:346-353).
+# Pre-v5.8.6, x86_64's stdlib defined the SYS_STAT (4) / SYS_FSTAT
+# (5) enum slots but exposed no wrapper fns; consumers calling
+# sys_stat(path, buf) portably (relying on aarch64's wrapper to
+# dispatch through the at-family) hit `undefined function 'sys_stat'`
+# warnings on x86 builds. Phylax + agnosys's src/fuse.cyr both
+# carried local backfills; v5.8.6 lets them drop those.
+#
+# x86_64 has direct stat/fstat syscalls (the aarch64 wrapper goes
+# through newfstatat with AT_FDCWD because aarch64 dropped the
+# direct stat in favor of the at-family). Both arches' wrappers
+# now have the same (path, buf) / (fd, buf) signatures — consumer
+# code is portable.
+fn sys_stat(path, buf): i64 {
+    return syscall(SYS_STAT, path, buf);
+}
+
+# Duplicate fd oldfd to newfd.
+fn sys_dup2(oldfd, newfd): i64 {
+    return syscall(SYS_DUP2, oldfd, newfd);
+}
+
+# Create a directory at path with given mode.
+fn sys_mkdir(path, mode): i64 {
+    return syscall(SYS_MKDIR, path, mode);
+}
+
+# Remove an empty directory.
+fn sys_rmdir(path): i64 {
+    return syscall(SYS_RMDIR, path);
+}
+
+# Delete a file.
+# cx (this peer is the .cyx guest's table): cxvm translates unlink's path and serves it through
+# the host's own wrapper since 6.7.15. It answered -ENOSYS here from 6.7.12, when cxvm passed the
+# path to the host untranslated (-EFAULT, the file left), and so file_write_atomic's failure
+# cleanup left its temp on cx. CHANGELOG [6.7.12] [6.7.15]
+fn sys_unlink(path): i64 {
+    return syscall(SYS_UNLINK, path);
+}
+
+# v6.2.14: flush a file's data + metadata to stable storage (the durability half
+# of the atomic write-tmp + fsync + rename pattern). Returns 0 / -errno. The bare
+# wrapper hides the per-arch number (74 x86_64 / 82 aarch64) — calling syscall(74)
+# directly on aarch64 hits sched_yield (which returns 0 → a silently-fake fsync).
+# See proposal 2026-05-20-syscalls-fsync-stdlib.md.
+fn sys_fsync(fd): i64 {
+    return syscall(SYS_FSYNC, fd);
+}
+
+# v6.2.14: flush file DATA only (not metadata) — slightly less I/O; for append-only
+# logs that don't need mtime/atime durability.
+fn sys_fdatasync(fd): i64 {
+    return syscall(SYS_FDATASYNC, fd);
+}
+
+# Change a file's owner/group, relative to `dirfd`. The ONE wrapped primitive of
+# the chown family: with AT_FDCWD + AT_SYMLINK_NOFOLLOW it gives lchown semantics,
+# with AT_FDCWD + 0 it gives chown, and with a real dirfd it gives the *at form —
+# so wrapping the legacy trio separately buys nothing. Returns 0, or -errno.
+#
+# NOT AVAILABLE ON aarch64 (Linux or macOS-arm64), by construction rather than
+# oversight: aarch64's native fchownat is 54, which the backend's setsockopt shim
+# (`54 -> 208`, src/backend/aarch64/emit.cyr:840) unconditionally rewrites, and that
+# shim is load-bearing for 51 ecosystem repos incl. consumer-authored source. The
+# usual house fallback (use the x86 number, 260) collides with aarch64's own
+# SYS_WAIT4 = 260. See the disproven-steps banner on roadmap.md's W1 item 1 — the
+# aarch64 arm needs a sentinel-number decision and stubs to -ENOSYS until then.
+# CHANGELOG [6.5.7]
+fn sys_fchownat(dirfd, path, uid, gid, flags): i64 {
+    return syscall(SYS_FCHOWNAT, dirfd, path, uid, gid, flags);
+}
+
+# Create a symbolic link at `linkpath` pointing to `target`.
+# Returns 0 on success, negative errno on failure.
+fn sys_symlink(target, linkpath): i64 {
+    return syscall(SYS_SYMLINK, target, linkpath);
+}
+
+# v6.1.3 — bare-name fs peers (x86_64 has the direct syscalls; the
+# aarch64 peer routes these through the at-family). Hard-link, stat
+# that does NOT follow symlinks, and rename.
+fn sys_link(oldpath, newpath): i64 {
+    return syscall(SYS_LINK, oldpath, newpath);
+}
+# lstat(path, buf) — stat that does NOT follow a trailing symlink.
+fn sys_lstat(path, buf): i64 {
+    return syscall(SYS_LSTAT, path, buf);
+}
+# rename(oldpath, newpath) — single-filesystem rename/move.
+fn sys_rename(oldpath, newpath): i64 {
+    return syscall(SYS_RENAME, oldpath, newpath);
+}
+
+# Read the target of a symbolic link into `buf` (cap `bufsize`).
+# Returns the number of bytes placed in buf (no null terminator),
+# or negative errno on failure. Buf is NOT null-terminated by the
+# kernel — caller must store0 if used as a cstring.
+fn sys_readlink(path, buf, bufsize): i64 {
+    return syscall(SYS_READLINK, path, buf, bufsize);
+}
+
+# Change file permissions.
+fn sys_chmod(path, mode): i64 {
+    return syscall(SYS_CHMOD, path, mode);
+}
+
+# Check file access permissions.
+fn sys_access(path, mode): i64 {
+    return syscall(SYS_ACCESS, path, mode);
+}
+
+# Process operations
+fn sys_fork(): i64 {
+    return syscall(SYS_FORK);
+}
+
+# pipe: create pipe, fds[0]=read end, fds[1]=write end
+# cx: -ENOSYS, and `fds` is left as it was. cxvm passes the fd-pair buffer to the host
+# untranslated (a guest offset: -EFAULT). CHANGELOG [6.7.12]
+fn sys_pipe(fds): i64 {
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 38;
+    #endif
+    return syscall(SYS_PIPE, fds);
+}
+
+# Wait for a signal.
+fn sys_pause(): i64 {
+    return syscall(SYS_PAUSE);
+}
+
+# sys_setsid / sys_waitpid / WIFEXITED / WEXITSTATUS / WIFSIGNALED /
+# WTERMSIG / sys_getuid / sys_getgid / sys_geteuid / sys_getegid /
+# sys_setuid / sys_setgid / sys_setgroups / sys_setresuid /
+# sys_setresgid all moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# sys_prctl / sys_seccomp / sys_execveat / sys_mount / sys_umount2 /
+# sys_sync / sys_reboot moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# Signal operations
+fn sigset_new(): i64 {
+    var set = alloc(8);
+    if (set == 0) { return 0; }
+    store64(set, 0);
+    return set;
+}
+
+# sigset_add syscall wrapper.
+fn sigset_add(set, signum): i64 {
+    var mask = load64(set);
+    mask = mask | (1 << (signum - 1));
+    store64(set, mask);
+    return 0;
+}
+
+# sigset_has syscall wrapper.
+fn sigset_has(set, signum): i64 {
+    var mask = load64(set);
+    if ((mask & (1 << (signum - 1))) != 0) { return 1; }
+    return 0;
+}
+
+# sys_sigprocmask / sys_signalfd / sys_epoll_create moved to
+# lib/syscalls_linux_common.cyr at v5.11.20.
+
+# epoll_event: { u32 events, u64 data } = 12 bytes. A new one, filled by epoll_event_set (16
+# bytes allocated). Returns the event, or 0 when the allocation fails.
+fn epoll_event_new(events, data): i64 {
+    var ev = alloc(16);
+    if (ev == 0) { return 0; }
+    return epoll_event_set(ev, events, data);
+}
+
+# The size of one epoll_event on x86_64 Linux — the array stride sys_epoll_wait writes at. The
+# struct is EPOLL_PACKED here, { u32 events, u64 data @4 }: 12 bytes (16 on aarch64, where it is
+# not packed). CHANGELOG [6.7.12]
+const EPOLL_EVENT_SIZE = 12;
+
+# The events mask of the epoll_event at `ev` (one element of a sys_epoll_wait array, or an
+# epoll_event_new result).
+fn epoll_event_events(ev): i64 { return load32(ev); }
+
+# The u64 data of the epoll_event at `ev` — at offset 4 on x86_64 (the packed layout
+# epoll_event_new writes). Step through a sys_epoll_wait array by EPOLL_EVENT_SIZE.
+fn epoll_event_data(ev): i64 { return load64(ev + 4); }
+
+# Fill the epoll_event at `ev`, a buffer the caller owns (a stack `var ev[16]`, at least
+# EPOLL_EVENT_SIZE bytes): `events` at 0 and `data` at offset 4 (x86_64's packed layout).
+# Returns ev, for sys_epoll_ctl. The allocation-free twin of epoll_event_new. CHANGELOG [6.7.14]
+fn epoll_event_set(ev, events, data): i64 {
+    store32(ev, events);
+    store64(ev + 4, data);
+    return ev;
+}
+
+# sys_epoll_ctl moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# Wait for epoll events.
+fn sys_epoll_wait(epfd, events, maxevents, timeout): i64 {
+    return syscall(SYS_EPOLL_WAIT, epfd, events, maxevents, timeout);
+}
+
+# sys_timerfd_create moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# itimerspec: { interval: {sec, nsec}, value: {sec, nsec} } = 32 bytes
+fn timerspec_new(interval_sec, initial_sec): i64 {
+    var ts = alloc(32);
+    if (ts == 0) { return 0; }
+    store64(ts, interval_sec);
+    store64(ts + 8, 0);
+    store64(ts + 16, initial_sec);
+    store64(ts + 24, 0);
+    return ts;
+}
+
+# sys_timerfd_settime moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# timerfd_drain syscall wrapper.
+fn timerfd_drain(fd): i64 {
+    var buf[8];
+    var n = sys_read(fd, &buf, 8);
+    if (n == 8) { return load64(&buf); }
+    return 0;
+}
+
+# Utility
+fn is_err(ret): i64 {
+    if (ret < 0) { return 1; }
+    return 0;
+}
+
+# err_code syscall wrapper.
+fn err_code(ret): i64 {
+    return 0 - ret;
+}
+
+# Inotify — file system event monitoring
+enum InotifyEvent {
+    IN_MODIFY = 2;
+    IN_CREATE = 256;
+    IN_DELETE = 512;
+    IN_MOVED_FROM = 64;
+    IN_MOVED_TO = 128;
+    IN_CLOSE_WRITE = 8;
+}
+
+# Create an inotify instance (v6.6.5: the three raw literals here are SYS_* names now —
+# the numbers are declared above, so the correspondence table gains their rows and a
+# consumer writing raw 294 on aarch64 is told it means kexec_file_load there).
+fn sys_inotify_init(): i64 { return syscall(SYS_INOTIFY_INIT1, 0); }
+# Add a watch on a path for inotify events
+fn sys_inotify_add_watch(fd, path, mask): i64 { return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask); }
+# Remove an inotify watch
+fn sys_inotify_rm_watch(fd, wd): i64 { return syscall(SYS_INOTIFY_RM_WATCH, fd, wd); }
+
+# sys_getdents64 / sys_getrandom / sys_landlock_create_ruleset /
+# sys_landlock_add_rule / sys_landlock_restrict_self / sys_socket /
+# sys_connect / sys_recvfrom / sys_recvmsg / sys_bind moved to
+# lib/syscalls_linux_common.cyr at v5.11.20.
+
+# sys_listen / sys_accept4 also moved to syscalls_linux_common.cyr at v5.11.20.

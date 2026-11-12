@@ -1,0 +1,134 @@
+# mmap.cyr — memory-mapped I/O via direct syscalls
+# Usage: include "lib/mmap.cyr"
+# Includes nothing: it issues SYS_MMAP / SYS_MUNMAP as raw syscall() numbers, so it compiles
+# alone on every target. Its PROT_* / MAP_* values agree with the syscall peers' MmapConst in
+# EITHER include order (v6.5.15 — see below); dynlib, fdlopen and thread include this file
+# themselves, so the caller no longer controls the order and must not need to.
+#
+# Wraps SYS_MMAP (9) and SYS_MUNMAP (11) for:
+# - Dynamic library loading (dynlib.cyr)
+# - Zero-copy file access
+# - Shared memory with drivers/GPU
+
+# cyr_mmap(addr, length, prot, flags, fd, offset) → mapped address or -1
+# prot: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+# flags: MAP_PRIVATE=2, MAP_SHARED=1, MAP_ANONYMOUS=32, MAP_FIXED=16
+# Prefixed cyr_ to avoid symbol clashes when linking .o files with libc.
+# v6.2.43: agnos has no host mmap — it's static-only and its heap is the
+# kernel's #27 allocator (alloc_agnos.cyr), not mmap. The raw Linux syscall
+# numbers 9/11/10 mis-dispatch to mkdir/mount/mprotect-class calls on agnos, so
+# guard them: fail clearly (cyr_mmap → -1; callers' `< 0` paths return 0) rather
+# than silently invoke the wrong kernel call. Defensive — no agnos consumer
+# reaches these (issue 2026-06-23-agnos-portability-sweep-residuals, part 2).
+# cx fails the same way: cxvm forwarded the guest's mmap to the HOST kernel, which mapped it and
+# handed back a HOST address no guest load or store can reach (cxvm traps the first one), so
+# mmap_anon returned a non-zero pointer its caller's null check passed. Now -1, so mmap_anon
+# answers 0 — the same refusal lib/thread.cyr's cx arm makes for its stacks. CHANGELOG [6.7.12]
+fn cyr_mmap(addr, length, prot, flags, fd, offset): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 1;
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 1;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_CX
+    return syscall(9, addr, length, prot, flags, fd, offset);
+    #endif
+    #endif
+}
+
+# cyr_munmap(addr, length) → 0 on success
+fn cyr_munmap(addr, length): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(11, addr, length);
+    #endif
+}
+
+# cyr_mprotect(addr, length, prot) → 0 on success
+# PE: -38 (-ENOSYS) returned directly — no PE route takes syscall 10 (Windows spells it
+# VirtualProtect). The raw call returned the same -38 but drew the compiler's unrouted-syscall
+# warning on every PE build that included this file (lib/freelist.cyr and lib/thread.cyr pull it
+# in), called or not. CHANGELOG [6.7.9]
+fn cyr_mprotect(addr, length, prot): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 38;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return syscall(10, addr, length, prot);
+    #endif
+    #endif
+}
+
+# Constants
+enum MmapProt {
+    PROT_NONE  = 0;
+    PROT_READ  = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC  = 4;
+}
+
+# v6.5.11: MAP_ANONYMOUS is the ONE flag whose value differs by platform —
+# Linux/agnos 32, Darwin 0x1000 — and this enum used to declare 32 UNGUARDED.
+# Because consumers include syscalls.cyr first and this file second, the 32 SHADOWED
+# the correct Darwin value from lib/syscalls_macos.cyr:152, so on macOS every
+# `MAP_PRIVATE | MAP_ANONYMOUS` became 0x22: a FILE mapping with fd = -1, i.e. EBADF.
+# `mmap_anon()` therefore returned 0 on macOS for EVERY caller — lib/dynlib.cyr:728/:764,
+# lib/fdlopen.cyr:467, lib/freelist.cyr:86 — not just the threading path the issue named.
+# Measured on real ecb (macOS-arm64): flag resolved to 32 and mmap_anon(4096) gave no
+# usable pointer, while the same probe on Linux returned a working one.
+#
+# ⚠ Deleting the declaration is NOT the fix, and neither is guarding it out. On macOS
+# **arm64** `lib/syscalls.cyr:69` deliberately includes `syscalls_aarch64_linux.cyr` — NOT
+# `syscalls_macos.cyr`, which is the x86-only arm — so the 32 arrives from
+# `syscalls_aarch64_linux.cyr:243` regardless of what this file omits. And agnos declares
+# no MAP_* at all, so this enum is its only source. Duplicates are last-wins, so the value
+# in whichever file comes SECOND decides it — which is why both must be right: this enum
+# declares the per-platform value, and since v6.5.15 so does every syscall peer's MmapConst
+# (syscalls_aarch64_linux.cyr, syscalls_macos.cyr, syscalls_x86_64_linux.cyr). Both include
+# orders therefore agree (CHANGELOG [6.6.9]: pinned by tests/tcyr/crossos/mmap_anon_flag.tcyr).
+#
+# ⚠ ESYSXLAT renumbers SYSCALLS, never flag VALUES — so a Linux flag whose Darwin value
+# differs is simply wrong on macOS and no translation layer will catch it. MAP_ANONYMOUS
+# is one instance of a wider class (EAGAIN 11 vs 35, the STAT_* struct offsets, several
+# signal numbers) — see the macOS-arm64 constant-divergence issue.
+enum MmapFlags {
+    MAP_SHARED    = 1;
+    MAP_PRIVATE   = 2;
+    MAP_FIXED     = 16;
+    #ifdef CYRIUS_TARGET_MACOS
+    MAP_ANONYMOUS = 0x1000;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    MAP_ANONYMOUS = 32;
+    #endif
+}
+
+# Convenience: map a file read-only
+# Returns mapped address or 0 on failure
+fn mmap_file_ro(fd, length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}
+
+# Convenience: map a file read-write (private copy)
+fn mmap_file_rw(fd, length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}
+
+# Convenience: anonymous mapping (like malloc but page-aligned)
+fn mmap_anon(length): i64 {
+    var addr = cyr_mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0);
+    if (addr < 0) { return 0; }
+    return addr;
+}

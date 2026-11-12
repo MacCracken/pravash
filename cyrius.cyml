@@ -1,0 +1,46 @@
+[package]
+name = "pravash"
+version = "${file:VERSION}"
+description = "pravash — fluid dynamics: SPH, Euler/Navier-Stokes grids, shallow water, buoyancy, vortices, VOF, phase field, FLIP/APIC coupling, MPM"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/pravash"
+language = "cyrius"
+cyrius = "6.7.18"
+
+[build]
+entry = "src/main.cyr"
+output = "build/pravash"
+# Dead-code elimination: a consumer that uses one solver doesn't carry the others (port plan §3.3 #5).
+dce = true
+
+# stdlib leaves, vendored into lib/ by `cyrius deps` and prepended to every compile (port plan §1.1, M0 step 3).
+#   math     — f64_sin / f64_cos and the _polyfill transcendentals (cross-target determinism)
+#   ganita   — ganita_f64_hypot / pow / cbrt, mat_inv (ganita 1.2.15 in the 6.7.18 bundle)
+#   tagged / result — the value-form Option and Result
+#   freelist — fl_alloc / fl_free: solver-owned storage that is returned, not leaked
+#   fnptr    — closures and callbacks (the CG operator, autodiff_gradient)
+#   atomic / thread — the worker pool for the runtime thread count (ADR 0002 #4)
+#   bayan    — #derive(Serialize) / #derive(Deserialize) JSON (ADR 0002 #6)
+# hisab's own bundle needs math, alloc, vec, ganita, result, str and fmt (hisab dist/hisab.deps).
+# sakshi (tracing → sakshi spans) arrives through hisab's own dependency in test compiles; it moves here
+# when the first library module logs, or with hisab's move to production scope.
+[deps]
+stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
+    "tagged", "result", "freelist", "fnptr", "atomic", "thread", "bayan"]
+
+# hisab 3.4.1, pinned by tag. `scope = "test"`: no library module calls hisab yet. Its returned values
+# allocate unscoped while cyrius S1 / hisab H9 are open, so the step path uses stand-ins (ADR 0003), and a
+# production-scope dependency would reach every consumer's compile (impetus measured 3.68 MB against
+# 1.70 MB for an empty program). It moves to production scope with the first library call (the autodiff
+# tape, M7, or num_dst if probe 8 says so). No `path =` override: it would bypass the commit pin.
+[deps.hisab]
+git = "https://github.com/MacCracken/hisab.git"
+tag = "3.4.1"
+modules = ["dist/hisab.cyr"]
+scope = "test"
+
+# Test / bench / fuzz compiles only.
+[test]
+stdlib = ["assert", "bench"]
+
+# No [lib] until M1: `modules = []` is invalid. The list will be the concatenation order (port plan §4 step 3).

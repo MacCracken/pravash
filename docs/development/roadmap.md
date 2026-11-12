@@ -24,7 +24,14 @@
     pressure-solver hooks and the MLS inverse;
   - `tests/oracle.rs`: 14 tests, mutation-checked, run with and without `parallel`;
   - `Cargo.lock` tracked, glibc 2.44 recorded.
-- [ ] M0 step 0.5: commit, then tag 1.3.0. The tag publishes 1.3.0 to crates.io (D1)
+- [x] M0 step 0.5: committed `a88bc4e`, then tagged 1.3.0 and published to crates.io (D1), 2026-11-11
+- [x] M0 steps 1–3, done 2026-11-11:
+  - the `cyrius port` scaffold, with the frozen crate in `rust-old/`;
+  - the repairs (CLAUDE.md, CI, `state.md`, CONTRIBUTING, SECURITY, the README banner);
+  - ADRs 0001–0003;
+  - `cyrius.cyml`, with every Cyrius gate green.
+- [x] M0 step 4: the semantics probe (port-parity §1)
+- [ ] M0 steps 5–10: the golden generator, constants, the parity harness, the baselines, the probes, and filing the upstream requests
 
 ### 1.3.0
 

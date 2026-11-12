@@ -1,0 +1,16 @@
+# pravash — Cyrius port
+# Ported from 14768 lines of Rust
+
+# Stdlib auto-included via cyrius.cyml
+
+# Entry point of the scaffold build. pravash is a library: the modules arrive with M1 (port plan §6).
+fn main() {
+    alloc_init();
+    println("pravash ready");
+    return 0;
+}
+
+var r = main();
+# sys_exit_group, not syscall(SYS_EXIT, ...): SYS_EXIT ends only the calling
+# thread, so the bare syscall hangs once this program spawns its first worker.
+sys_exit_group(r);

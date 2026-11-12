@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Changed
+- **The Cyrius port begins** (port plan M0 steps 1–3; ADRs 0001–0003). `cyrius port` moved the Rust 1.3.0 crate,
+  with its `oracle` hooks and `Cargo.lock`, into `rust-old/` as the frozen parity oracle (commit `a88bc4e`); it
+  still passes there. The repairs:
+  - the Cyrius manifest: `cyrius.cyml` reads `VERSION`, `[build] dce`, the stdlib leaves, hisab 3.4.1 test-scoped;
+  - CI: the Cyrius workflow runs build, test, `test --bounds`, `deps --locked` and `audit`, plus a job that keeps
+    the frozen oracle green with and without `parallel`;
+  - docs: CLAUDE.md merged for Cyrius; `state.md`; ADR 0001 (port with a Rust oracle), 0002 (API differences)
+    and 0003 (local stand-ins for library gaps); CONTRIBUTING and SECURITY for Cyrius; a port banner in the README;
+  - archived in `rust-old/`: the Rust workflows, scripts, architecture overview and 1.2 → 1.3 migration guide.
+
+  The library itself is still the Rust 1.3.0 crate: no Cyrius module exists yet.
+
+### Added
+- **Semantics probe** (port plan M0 step 4): `scripts/probes/p0_semantics.cyr`, its Rust twin `p0_semantics.rs`
+  and `p0_compare.py` compare the bits of the Cyrius counterpart of every f64 / f32 operation pravash uses
+  (`docs/development/port-parity.md` §1).
+  - **Bit-identical:** the f32 SPH cell keys (including saturation and NaN), floor / ceil / sqrt / abs, ln,
+    sin / cos, hypot, cbrt, `to_radians` and `powi`.
+  - **Need helpers:** `f64_min` / `f64_max` (asymmetric NaN), and `f64_to`, which doesn't saturate as Rust's
+    `as i32` / `as u32` / `as usize` do.
+  - **Correctly rounded stand-ins needed:** log10 (there is none), and ganita's pow and atan2 and the exp
+    polyfill (1 ulp off).
+
 ## [1.3.0] - 2026-11-09
 
 Toolchain/dependency refresh plus a full correctness audit of every module.

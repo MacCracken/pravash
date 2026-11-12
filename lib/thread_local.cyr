@@ -1,0 +1,630 @@
+# thread_local.cyr — per-thread slot storage (Thread-Local Storage)
+# Usage: include "lib/thread_local.cyr"
+# Includes its own definers (6.6.9): syscalls.cyr, alloc.cyr, atomic.cyr.
+#
+# Each thread gets its own 4KB block addressed via the CPU's
+# thread-pointer register: `%fs` on x86_64, `TPIDR_EL0` on aarch64.
+# The block is installed via `arch_prctl(ARCH_SET_FS, tls)` (x86)
+# or `msr TPIDR_EL0, x0` (aarch64) by `thread_local_init`, and by
+# `CLONE_SETTLS` in `_thread_spawn` for worker threads so each
+# thread automatically inherits a fresh block on creation.
+#
+# Slot API (runtime, no new compiler syntax):
+#   thread_local_init()             → 1 on success, 0 on failure
+#   thread_local_get(slot)          → i64 at slot
+#   thread_local_set(slot, val)     → void
+#
+# Slot range: 0 .. _TLOCAL_MAX_SLOTS-1 (128 slots x 8B). No bounds
+# check in the hot path — caller is trusted.
+#
+# === SLOT NAMESPACE + ALLOCATOR (v6.3.25 registry; v6.4.65 allocator) ===
+# A SHARED integer slot space addressed by thread_local_get/set. Two libs
+# linked into one program MUST NOT write the same slot or one silently
+# clobbers the other's per-thread state. That was the v6.3.25 bug: sigil's
+# crypto bank collided with patra's SQL-parse scratch (both at slot 0 then)
+# -> a patra query corrupted sigil's crypto lane index -> TLS
+# RECORD_LAYER_FAILURE in any server linking both (SecureYeoman/yeo-cy-test),
+# hand-patched by moving sigil to slot 8.
+#
+# v6.4.65 removes the hardcoding entirely: libraries call thread_local_alloc()
+# (below) ONCE at init and store the returned index in their own global. The
+# namespace is now split:
+#   0-15    FROZEN: app / legacy hardcoded slots. Apps that pick a fixed slot
+#           (yeo-cy-test: TLS_AUDIT=14, TLS_DB=15) live here and are never
+#           handed out by the allocator.
+#   16..    ALLOCATOR-MANAGED: thread_local_alloc() hands these out
+#           monotonically. patra (old 0-4) + sigil (old 8) migrated at v6.4.65.
+# Because allocated lib slots start at 16, they can NEVER alias the 0-15 range,
+# so a partially-migrated program (new lib + old app) stays collision-free.
+#
+# The macOS/agnos/foreign fallback arrays below hold _TLOCAL_MAX_SLOTS slots each (a bare
+# top-level `var x[N]` is N*8 bytes = N i64 slots since v6.4.10), and the Windows per-thread
+# block is _TLOCAL_MAX_SLOTS * 8 bytes: every one is sized by the const (6.7.6).
+#
+# (Historical note: sandhi's _SANDHI_RPC_POLICY_SLOT=16 was once flagged here
+# as a latent OOB slot -- it is NOT a thread-local slot at all, but a 16-byte
+# policy-record stride never passed to thread_local_get/set. Corrected v6.4.65.)
+#
+# NOT named tls.cyr to avoid collision with lib/tls.cyr (libssl TLS
+# protocol client; retired by the v5.9.x pure-cyrius TLS arc).
+#
+# >>> include "lib/syscalls.cyr"
+# >>> include "lib/alloc.cyr"
+# >>> include "lib/thread_local.cyr"
+#
+# ABI / call-order constraint (v5.5.30):
+# `fdlopen_init_full` (v5.5.28+) enters ld.so which clobbers `%fs` on
+# x86_64 during its own TLS setup. Programs that use both MUST call
+# `thread_local_init` AFTER any `fdlopen_init_full` completes (or
+# re-invoke `thread_local_init` after foreign-dlopen returns). On
+# aarch64 the two are disjoint (fdlopen's x86 pattern doesn't
+# translate), so ordering is free.
+
+var TLOCAL_BLOCK_SIZE = 4096;
+# v6.4.65: 16 -> 128. Slots 0-15 are the frozen app/legacy range; the
+# allocator (thread_local_alloc) hands out 16-127. The Linux %fs block is
+# TLOCAL_BLOCK_SIZE (512 slots) so it already covers this; the macOS/agnos/
+# foreign arrays are 128 slots; the Windows per-thread block sizes to this.
+# 6.7.6: the const sizes every slot array and block; the public var keeps the API.
+# 6.7.9: and the const bounds every loop and allocation too. The var TELLS a caller the slot
+# count; writing it changes nothing here. Until 6.7.9 `thread_local_alloc` and the serial / macOS
+# thread peers read the var, so a program that raised it (as the allocator's own comment advised)
+# was handed slots past the const-sized arrays on macOS / agnos / foreign mode / Windows, and agnos's
+# `thread_create` copied past its stack snapshot. CHANGELOG [6.7.9]
+const _TLOCAL_MAX_SLOTS = 128;
+# Read-only mirror of `_TLOCAL_MAX_SLOTS`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
+var TLOCAL_MAX_SLOTS = _TLOCAL_MAX_SLOTS;
+
+# macOS thread-local slots. macOS owns the thread-pointer register: on arm64 the
+# kernel overwrites any userspace TPIDR_EL0 install on the FIRST preemption —
+# proven on ecb (Apple Silicon), where a pure-compute loop with zero syscalls
+# reset TPIDR_EL0 from a valid installed block (0x1xxxxxxxx) to a small Darwin
+# thread value (~0x2010) — and x86 Darwin has no arch_prctl. So the Linux
+# `msr TPIDR_EL0` / arch_prctl(158) path below cannot be used on Darwin
+# (CHANGELOG [6.0.84]). Instead `_tlocal_macos` holds the MAIN thread's slots,
+# and each real thread gets its own block through `_tlocal_base()`: a
+# TPIDRRO_EL0-keyed registry on arm64 (v6.5.44), the gs base on x86 (6.6.19).
+# v6.5.44: the arm64-macOS per-thread TLS registry below CASes registry keys, so this module
+# needs the atomics directly rather than free-riding on whatever included it (self-sufficient
+# modules — a lib file references nothing it does not include).
+include "lib/atomic.cyr"
+# 6.6.9: the slot blocks come from alloc (and alloc_init on first use); neither the allocator nor
+# the syscall peer was included. CHANGELOG [6.6.9]
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+
+# Write the refusal `m` (NUL-terminated) to stderr; the caller then exits 70. The one body the
+# three refusals below (an unregistered thread, a foreign-TLS stranger, no TlsAlloc index) each
+# open-coded with their own strlen loop.
+fn _tlocal_say(m): i64 {
+    var n = 0;
+    while (load8(m + n) != 0) { n += 1; }
+    sys_write(2, m, n);
+    return 0;
+}
+
+#ifdef CYRIUS_TARGET_MACOS
+var _tlocal_macos[_TLOCAL_MAX_SLOTS];     # i64 slots (top-level var[N] = N*8 bytes), zero-init .bss
+
+# ⛔ v6.5.44 — THE OLD PREMISE EXPIRED, AND THE EXPIRY IS THE WHOLE POINT. This file justified a
+# process-global slot array with "cyrius threads don't run on macOS (thread.cyr is clone-only,
+# no Darwin bsdthread path), so the crypto-scratch bank is single-threaded and a process-global
+# slot store is race-free." Band J phase 2 makes arm64-macOS threads REAL, so that premise is
+# false there and a single shared array would hand every worker the SAME slots — sigil's crypto
+# bank, patra's SQL scratch, and everything else `thread_local_alloc` hands out since v6.4.65.
+# That is not a performance problem; it is the v6.3.x data-corruption class, on purpose.
+#
+# So arm64-macOS gets per-thread blocks, keyed on TPIDRRO_EL0 — the thread-unique register the
+# Darwin kernel sets when it starts a thread (measured distinct per thread on real ecb; read via
+# a 4-byte inline-asm tail, `mrs x0, tpidrro_el0` = 0xD53BD060, assembler-verified — NOT the
+# 0xD53BD040 that a hand-derivation produces, which is tpidr_el0).
+# x86-macOS (6.6.19) has real threads too and keys its blocks on the gs base instead — see its
+# arm below.
+#
+# ⛔ 6.7.18 — THE REGISTRY GROWS, AND NO THREAD IS EVER HANDED ANOTHER THREAD'S SLOTS. It was a
+# fixed 64 entries that each new thread claimed for itself at entry. A thread past the 64th LIVE
+# one found it full, ran on anyway, and every slot access it made fell through to the main
+# thread's array: it shared every library's per-thread state (sigil's crypto lane among them, an
+# alias path of CYRIUS-2026-0040) with main and with every other overflow thread. sandhi's
+# pooled server starts 128 workers by default. Now thread_create (lib/thread_macos.cyr) claims the
+# entry BEFORE the thread exists. When every entry is held, it links one more 64-entry chunk. If
+# that chunk cannot be allocated, the thread is refused (thread_create returns 0). The thread
+# stores its own key at entry. The first thread_create records its caller as the main thread, so
+# a lookup that matches neither main nor an entry comes from a thread that no thread_create
+# started. That access is refused by name rather than handed main's slots. CHANGELOG [6.7.18]
+#
+# ⚠ `_tls_main == 0` is the fast path and it matters: a program before its first thread_create
+# has one thread, and pays ONE load on every thread_local_get/set. Main later pays one compare.
+# It replaced a live-thread count (`_tls_live == 0`) that thread_create raised and each exiting
+# thread lowered with plain read-modify-writes. A lost increment let it read 0 while workers ran,
+# and they were handed main's slots (tests/tcyr/crossos/thread_local_churn_keeps_slots.tcyr).
+#ifdef CYRIUS_ARCH_AARCH64
+const _TLS_REG_MAX = 64;          # entries per registry chunk
+# Read-only mirror of `_TLS_REG_MAX`: lib/ reads the const; a write changes nothing (D16). CHANGELOG [6.7.12]
+var TLS_REG_MAX = _TLS_REG_MAX;   # tells; the scans below are bounded by the const (6.7.9)
+# A chunk is one run of words: the keys at [0, N), each key's slot block at [N, 2N), and the
+# next chunk's address at 2N (0 = the last chunk). Chunks are linked and never unlinked.
+const _TLS_REG_WORDS = _TLS_REG_MAX * 2 + 1;
+const _TLS_REG_BLKS = _TLS_REG_MAX * 8;      # byte offset of the blocks within a chunk
+const _TLS_REG_NEXT = _TLS_REG_MAX * 16;     # byte offset of the next-chunk word
+var _tls_reg[_TLS_REG_WORDS];     # the first chunk, in .bss
+# A key is the owner's TPIDRRO_EL0, 0 = free, or this value: claimed by thread_create for a
+# thread that has not stored its key yet. A TSD address is never 1.
+const _TLS_KEY_HELD = 1;
+var _tls_main = 0;                # the main thread's key, recorded by the first thread_create
+
+# Thread identity. The asm block is the fn's TAIL deliberately: cyrius's aarch64 epilogue is
+# `ldp x29,x30,[sp],#16` (+ `add sp`) + `ret`, none of which touch x0, so the value the `mrs`
+# leaves in x0 IS the return value. Verified end to end on real ecb.
+fn _thr_self(): i64 {
+    asm { 0x60; 0xD0; 0x3B; 0xD5; }    # mrs x0, tpidrro_el0
+}
+
+# The chunk after `c`. When there is none, a zeroed chunk is linked first. Returns 0 when that
+# allocation fails. Two creators can link at once: the CAS keeps one chunk, and the loser's
+# chunk is dropped (1 KiB; the bump heap has no free).
+fn _tls_grow(c): i64 {
+    var nx = load64(c + _TLS_REG_NEXT);
+    if (nx != 0) { return nx; }
+    var fresh = alloc(_TLS_REG_WORDS * 8);
+    if (fresh == 0) { return 0; }
+    var i = 0;
+    while (i < _TLS_REG_WORDS) {
+        store64(fresh + i * 8, 0);
+        i += 1;
+    }
+    atomic_fence();                                    # zeroed before it is reachable
+    if (atomic_cas(c + _TLS_REG_NEXT, 0, fresh) == 1) { return fresh; }
+    return load64(c + _TLS_REG_NEXT);
+}
+
+# Creator side (thread_create, before the thread exists): claim a free entry for the thread and
+# point it at `blk`. Returns the entry's address (its key word). Returns 0 only when every entry
+# is held and no chunk can be added. pthread_create publishes the block store to the new thread.
+fn _tls_claim(blk): i64 {
+    var c = &_tls_reg;
+    while (c != 0) {
+        var i = 0;
+        while (i < _TLS_REG_MAX) {
+            var k = c + i * 8;
+            if (load64(k) == 0) {
+                if (atomic_cas(k, 0, _TLS_KEY_HELD) == 1) {
+                    store64(k + _TLS_REG_BLKS, blk);
+                    return k;
+                }
+            }
+            i += 1;
+        }
+        c = _tls_grow(c);
+    }
+    return 0;
+}
+
+# The new thread, first thing at entry: its key into the entry thread_create claimed for it.
+fn _tls_bind(ent): i64 {
+    atomic_store(ent, _thr_self());
+    return 0;
+}
+
+# Release an entry: at the thread's exit, or by thread_create when pthread_create fails.
+fn _tls_unbind(ent): i64 {
+    atomic_fence();                                    # the slot stores are done before reuse
+    atomic_store(ent, 0);
+    return 0;
+}
+
+# A thread that no thread_create started asked for its slots. It has none, and handing it
+# another thread's (main's, as until 6.7.18) is the corruption the registry exists to prevent.
+fn _tls_refuse(): i64 {
+    _tlocal_say("thread_local: refused: a thread not started by thread_create has no slots of its own\n");
+    sys_exit(70);                                      # Darwin exit(2) ends the process
+    return 0;
+}
+
+# The calling thread's slot base.
+fn _tlocal_base(): i64 {
+    if (_tls_main == 0) { return &_tlocal_macos; }     # fast path: no thread_create yet, one thread
+    var me = _thr_self();
+    if (me == _tls_main) { return &_tlocal_macos; }
+    var c = &_tls_reg;
+    while (c != 0) {
+        var i = 0;
+        while (i < _TLS_REG_MAX) {
+            if (load64(c + i * 8) == me) { return load64(c + _TLS_REG_BLKS + i * 8); }
+            i += 1;
+        }
+        c = load64(c + _TLS_REG_NEXT);
+    }
+    return _tls_refuse();
+}
+#endif
+#ifndef CYRIUS_ARCH_AARCH64
+# x86-macOS (6.6.19): REAL threads (lib/thread_macos.cyr, raw bsdthread), so per-thread slots,
+# addressed through the gs base the way Linux addresses them through %fs. Each thread's gs base
+# points at a header whose word 0 is that thread's slot base (user mode cannot read a segment
+# base back, so the header stores it). The gs base is installed with machdep call 3,
+# thread_fast_set_cthread_self64: the kernel keeps it as thread state and restores it on every
+# switch, so — UNLIKE arm64's TPIDR_EL0 above — it survives preemption (measured on ach: main
+# plus 4 threads, 300M `gs:[0]` reads each, 0 mismatches) and is inherited across fork.
+# The main thread's header points at `_tlocal_macos`, so its slots stay where they were; it is
+# installed by the first thread_create. A program that never creates a thread (cycc included)
+# never touches gs: `_tls_gs` stays 0 and the base is the plain array.
+var _tls_gs = 0;              # 1 once the main thread's gs base is installed
+var _tlocal_macos_hdr = 0;    # the main thread's header; word 0 is set at run time (_tls_gs_main)
+
+# Point the calling thread's gs base at `hdr`. machdep call 3 (class 3 << 24 | 3 = 0x3000003) is a
+# Mach machine-dependent trap, not a BSD syscall, so it is inline asm rather than a routed
+# number. Returns 15 (USER_CTHREAD) on success, -errno if the kernel reports one with CF set.
+# `clc` first: a machdep return need not touch rflags, so a stale CF must not read as an error.
+fn _tls_gs_install(hdr): i64 {
+    var ret = 0;
+    asm {
+        0x48; 0x8B; 0x7D; 0xF8;        # mov rdi, [rbp-8]    ; hdr
+        0xB8; 0x03; 0x00; 0x00; 0x03;  # mov eax, 0x3000003  ; machdep 3
+        0xF8;                          # clc
+        0x0F; 0x05;                    # syscall
+        0x73; 0x03;                    # jnc +3
+        0x48; 0xF7; 0xD8;              # neg rax             ; CF: rax = errno -> -errno
+        0x48; 0x89; 0x45; 0xF0;        # mov [rbp-16], rax   ; ret = rax
+    }
+    return ret;
+}
+
+# The calling thread's header word 0, i.e. its slot base.
+fn _tls_gs_word0(): i64 {
+    var ret = 0;
+    asm {
+        0x31; 0xFF;                    # xor edi, edi
+        0x65; 0x48; 0x8B; 0x07;        # mov rax, gs:[rdi]
+        0x48; 0x89; 0x45; 0xF8;        # mov [rbp-8], rax    ; ret = rax
+    }
+    return ret;
+}
+
+# Install the main thread's header, once. Called by thread_create before it starts the first
+# thread, so every later reader of `_tls_gs` runs after it. 0, or the install's -errno.
+fn _tls_gs_main(): i64 {
+    if (_tls_gs == 1) { return 0; }
+    store64(&_tlocal_macos_hdr, &_tlocal_macos);
+    var r = _tls_gs_install(&_tlocal_macos_hdr);
+    if (r < 0) { return r; }
+    _tls_gs = 1;
+    return 0;
+}
+
+# The calling thread's slot base.
+fn _tlocal_base(): i64 {
+    if (_tls_gs == 0) { return &_tlocal_macos; }
+    return _tls_gs_word0();
+}
+#endif
+#endif
+
+# v6.2.3: AGNOS is single-threaded (thread_agnos.cyr runs bodies inline; no
+# %fs/TPIDR thread-pointer install at ring 3 in the frozen ABI). Like the
+# macOS path, a process-global slot array is race-free — there is only one
+# thread. Mirrors sigil's crypto-bank contract (slot 0, fresh slot reads 0).
+#ifdef CYRIUS_TARGET_AGNOS
+var _tlocal_agnos[_TLOCAL_MAX_SLOTS];     # i64 slots (top-level var[N] = N*8 bytes), zero-init
+#endif
+
+# Foreign-host coexistence (v6.3.26). When cyrius code runs INSIDE a
+# glibc-hosted process — mabda's wgpu C-launcher (ADR-004): C `main` gets
+# full libc init, then calls into cyrius — glibc owns the thread-pointer
+# register (`%fs` on x86, TPIDR_EL0 on aarch64). Its TCB holds the thread
+# self-pointer at offset 0 and the **stack-protector canary at %fs:0x28**.
+# The default Linux path below would (a) `arch_prctl(ARCH_SET_FS)` a fresh
+# cyrius block over glibc's %fs and (b) write cyrius slots into %fs:[0..0x78],
+# BOTH of which corrupt glibc's TCB → every stack-protected C callee (all of
+# wgpu-native) faults or aborts on its canary. That is the real mechanism
+# behind the folklore "fncall6 into extern-C wgpu is unreliable" — it was
+# never an fncall ABI bug (arg-passing + 16B alignment are correct), it was
+# %fs being clobbered.
+#
+# Fix: a glibc-hosted consumer calls `thread_local_use_foreign_tls()` once at
+# startup. cyrius then leaves %fs untouched and keeps its thread-local slots
+# in a process-global fallback array (identical to the macOS/agnos path).
+#
+# EXPLICIT, not auto-detected: a native worker thread installed via
+# CLONE_SETTLS (lib/thread.cyr) also has a NON-ZERO %fs, so a "fs != 0 =>
+# foreign" heuristic would misclassify native workers and collapse their
+# per-thread lanes into one shared array (the v6.3.25 crypto-bank collision
+# class). The host knows it is glibc-hosted; it declares so.
+#
+# ⛔ 6.7.18 — THE ARRAY IS THE DECLARING THREAD'S, AND NO OTHER THREAD GETS IT. Through 6.7.17
+# foreign mode handed the one array to EVERY thread. A host pthread, or a cyrius thread_create
+# worker, then shared every library's per-thread slots (sigil's crypto lane among them) with the
+# declaring thread and with each other. It was documented as single-threaded, but nothing
+# enforced it. Now the thread that declares foreign mode owns the array. Any other thread's slot
+# access is refused by name (exit 70), never handed someone else's slots. Ownership is checked by
+# thread id, one gettid per access in this mode. The thread pointer cannot be the key: it is the
+# host's, and fdlopen_init_full / dynlib_bootstrap_tls move it under the owner. A fork child's
+# first thread is the child's only thread at the fork, so it takes the array over. CHANGELOG [6.7.18]
+var _tlocal_foreign = 0;    # set by thread_local_use_foreign_tls()
+var _tlocal_fallback[_TLOCAL_MAX_SLOTS];  # i64 slots (top-level var[N] = N*8 bytes), foreign mode only
+var _tlocal_foreign_tid = 0;  # the thread that owns the array (Linux)
+var _tlocal_foreign_pid = 0;  # and its process, so a fork child can be told apart
+
+# Declare that cyrius is running inside a foreign (glibc) host that owns the
+# thread-pointer register. Idempotent. Must be called before any
+# thread_local_init / _get / _set (the C-launcher calls it at startup), on the thread that
+# will use the slots: the first call's thread owns them, and a later call changes nothing.
+fn thread_local_use_foreign_tls(): i64 {
+    if (_tlocal_foreign == 1) { return 0; }
+    #ifdef CYRIUS_TARGET_LINUX
+    _tlocal_foreign_tid = syscall(SYS_GETTID);
+    _tlocal_foreign_pid = syscall(SYS_GETPID);
+    #endif
+    _tlocal_foreign = 1;
+    return 0;
+}
+
+# Foreign mode: the slot array, for the thread that owns it. Any other thread is refused.
+fn _tlocal_foreign_base(): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var t = syscall(SYS_GETTID);
+    if (t != _tlocal_foreign_tid) {
+        var p = syscall(SYS_GETPID);
+        if (p == _tlocal_foreign_pid || t != p) {
+            _tlocal_say("thread_local: refused: in foreign-TLS mode the slots are the declaring thread's alone\n");
+            sys_exit_group(70);
+        }
+        _tlocal_foreign_tid = t;    # a fork child's first thread: the owner's copy is its own now
+        _tlocal_foreign_pid = p;
+    }
+    #endif
+    return &_tlocal_fallback;
+}
+
+# === PROCESS-GLOBAL SLOT ALLOCATOR (v6.4.65) ===
+# The real fix for the hardcoded-slot collision class (see the SLOT NAMESPACE
+# note above + docs/development/issues/2026-07-01-thread-local-slot-namespace...).
+# A library wanting per-thread state calls thread_local_alloc() ONCE at init
+# and stores the returned index in its OWN global, instead of hardcoding a
+# literal. Slots are handed out monotonically starting at 16, so allocated lib
+# slots (16.._TLOCAL_MAX_SLOTS-1) can NEVER alias the frozen 0-15 app/legacy
+# range -- a partially-migrated program stays collision-free.
+#
+# NOT atomic: like the Windows TlsAlloc index, the contract (shared with
+# thread_local_init) is that allocation happens on the MAIN thread at startup,
+# before workers spawn -- so a plain read-then-bump is race-free. Target-
+# agnostic (a pure process-global integer counter); works identically on the
+# %fs/TPIDR, macOS/agnos, foreign, and Windows backends below.
+var _tlocal_next_slot = 16;    # first allocator-managed slot; 0-15 are frozen
+# Hand out the next free thread-local slot (monotonic, always >= 16), or -1 if
+# the namespace is exhausted. Call once at init; store the result in your own global.
+fn thread_local_alloc(): i64 {
+    var s = _tlocal_next_slot;
+    # Exhausted: every allocator slot (16.._TLOCAL_MAX_SLOTS-1) is out. The const sizes every slot
+    # store, so more slots means raising _TLOCAL_MAX_SLOTS here; writing the public var does not.
+    if (s >= _TLOCAL_MAX_SLOTS) { return 0 - 1; }
+    _tlocal_next_slot = s + 1;
+    return s;
+}
+
+#ifndef CYRIUS_TARGET_WIN
+# Install `tls` as the current thread's thread-pointer register base.
+# x86_64: syscall(158, ARCH_SET_FS=0x1002, tls)
+# aarch64: msr TPIDR_EL0, tls
+# Returns 0 on success, non-zero on failure (x86 only; aarch64 never
+# fails at EL0).
+# v6.6.8: never called on macOS (thread_local_init returns before it; the slots live in a
+# process-global array there), but the x86 arm still COMPILED there, and Darwin has no
+# arch_prctl — every x86-macOS build that included this file warned "syscall 158 not routed".
+# Declined with -ENOSYS rather than guarded to nothing, so a future caller gets an error and
+# not a fall-off-the-end 0 that reads as success. CHANGELOG [6.6.8]
+fn _tlocal_install(tls): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #endif
+    # cx: no thread-pointer register, and thread_local_init never gets here (see there). Declined
+    # like macOS rather than left with no arm at all, which returned whatever sat in the return
+    # register (cx_tcyr_runs.sh's empty-body axis; reachable once 6.6.9 made this file compile
+    # alone for cx). CHANGELOG [6.6.9]
+    #ifdef CYRIUS_TARGET_CX
+    return 0 - 38;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(158, 0x1002, tls);
+    #endif
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame layout: [x29-8] = tls (first param)
+        0xA0; 0x83; 0x5F; 0xF8;    # ldur x0, [x29, #-8]
+        0x40; 0xD0; 0x1B; 0xD5;    # msr  TPIDR_EL0, x0
+    }
+    return 0;
+    #endif
+}
+
+# Allocate + install a fresh per-thread TLS block. Call once per
+# thread. Worker threads spawned via `thread_create` get a block
+# installed automatically by CLONE_SETTLS, so they do NOT need to
+# call this. Returns 1 on success, 0 on failure.
+fn thread_local_init(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 1;     # process-global _tlocal_macos is zero-init .bss; nothing to install
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    return 1;     # cx is a single-threaded VM: the process-global fallback IS its TLS (6.6.9)
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 1;     # process-global _tlocal_agnos is zero-init; nothing to install
+    #endif
+    # Foreign host (glibc) owns %fs — do NOT arch_prctl-clobber it; the
+    # fallback array is zero-init and ready. See thread_local_use_foreign_tls.
+    if (_tlocal_foreign == 1) { return 1; }
+    alloc_init();
+    var tls = alloc(TLOCAL_BLOCK_SIZE);
+    if (tls == 0) { return 0; }
+    var i = 0;
+    while (i < TLOCAL_BLOCK_SIZE) {
+        store8(tls + i, 0);
+        i += 1;
+    }
+    var rc = _tlocal_install(tls);
+    if (rc != 0) { return 0; }
+    return 1;
+}
+
+# Read the i64 value at `slot`. Returns 0 on fresh slots.
+fn thread_local_get(slot): i64 {
+    var ret = 0;
+    #ifdef CYRIUS_TARGET_MACOS
+    return load64(_tlocal_base() + slot * 8);
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    return load64(&_tlocal_agnos + slot * 8);
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    return load64(&_tlocal_fallback + slot * 8);   # single-threaded VM (6.6.9)
+    #endif
+    # Foreign host: %fs belongs to glibc — read from the declaring thread's array (6.7.18).
+    if (_tlocal_foreign == 1) { return load64(_tlocal_foreign_base() + slot * 8); }
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        # Frame: [rbp-8]=slot, [rbp-16]=ret
+        0x48; 0x8B; 0x7D; 0xF8;        # mov rdi, [rbp-8]    ; slot
+        0x48; 0xC1; 0xE7; 0x03;        # shl rdi, 3          ; slot*8
+        0x64; 0x48; 0x8B; 0x07;        # mov rax, fs:[rdi]   ; load
+        0x48; 0x89; 0x45; 0xF0;        # mov [rbp-16], rax   ; ret = rax
+    }
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame: [x29-8]=slot, [x29-16]=ret
+        0xA0; 0x83; 0x5F; 0xF8;        # ldur x0, [x29, #-8]      ; slot
+        0x41; 0xD0; 0x3B; 0xD5;        # mrs  x1, TPIDR_EL0       ; base
+        0x22; 0x78; 0x60; 0xF8;        # ldr  x2, [x1, x0, lsl #3]; load slot*8
+        0xA2; 0x03; 0x1F; 0xF8;        # stur x2, [x29, #-16]     ; ret = x2
+    }
+    #endif
+    return ret;
+}
+
+# Write `val` into `slot`.
+fn thread_local_set(slot, val): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    store64(_tlocal_base() + slot * 8, val);
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    store64(&_tlocal_agnos + slot * 8, val);
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_CX
+    store64(&_tlocal_fallback + slot * 8, val);    # single-threaded VM (6.6.9)
+    return 0;
+    #endif
+    # Foreign host: %fs belongs to glibc — write to the declaring thread's array (6.7.18).
+    if (_tlocal_foreign == 1) { store64(_tlocal_foreign_base() + slot * 8, val); return 0; }
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        # Frame: [rbp-8]=slot, [rbp-16]=val
+        0x48; 0x8B; 0x7D; 0xF8;        # mov rdi, [rbp-8]    ; slot
+        0x48; 0x8B; 0x45; 0xF0;        # mov rax, [rbp-16]   ; val
+        0x48; 0xC1; 0xE7; 0x03;        # shl rdi, 3          ; slot*8
+        0x64; 0x48; 0x89; 0x07;        # mov fs:[rdi], rax   ; store
+    }
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame: [x29-8]=slot, [x29-16]=val
+        0xA0; 0x83; 0x5F; 0xF8;        # ldur x0, [x29, #-8]       ; slot
+        0xA2; 0x03; 0x5F; 0xF8;        # ldur x2, [x29, #-16]      ; val
+        0x41; 0xD0; 0x3B; 0xD5;        # mrs  x1, TPIDR_EL0        ; base
+        0x22; 0x78; 0x20; 0xF8;        # str  x2, [x1, x0, lsl #3] ; store slot*8
+    }
+    #endif
+    return 0;
+}
+#endif
+
+#ifdef CYRIUS_TARGET_WIN
+# Windows (PE/x86_64) thread-local storage — REAL per-thread storage (v6.0.61).
+#
+# The Linux/macOS body above installs a per-thread block via the CPU
+# thread-pointer register (`%fs` / `TPIDR_EL0`). Windows has neither
+# arch_prctl(158) nor a settable fs base at ring 3 (the TEB lives at gs,
+# managed by the OS), so that path SIGILLs. Instead we use the Win32 TLS
+# API (the v6.0.61 0xF00C-0xF00E reroutes — see backend/x86/emit.cyr):
+# TlsAlloc() reserves ONE process-global TEB slot index; each thread stores
+# its own pointer to a fresh 1024-byte (128 × i64) block at that index via
+# TlsSetValue / reads it via TlsGetValue. So the logical slots become
+# real per-thread storage — concurrent workers no longer collide.
+#
+# Supersedes the v6.0.53 serial process-global array. In lockstep with real
+# threads (lib/thread_win.cyr) per docs/development/issues/archived/
+# 2026-06-03-windows-threading-stdlib-gap.md.
+#
+# Satisfies sigil's crypto-bank contract: a fresh slot reads 0, init
+# idempotent (sigil src/crypto_scratch.cyr). As of v6.4.65 sigil's slot is
+# handed out by thread_local_alloc() rather than hardcoded.
+#
+# ⛔ 6.7.18 — ONE THREAD ALLOCATES THE INDEX. It was `if (idx == -1) idx = TlsAlloc();`, unguarded,
+# under the contract that main calls thread_local_init() before spawning (Linux never needed
+# that: each worker gets its block at clone). Threads whose first access overlapped each
+# allocated an index and stored it, last store winning. A thread that had written its slot under
+# a losing index then found no block under the winning one, got a fresh zeroed one, and read 0:
+# its write was gone (the old note here called that "self-heals"). Measured under wine: 271 of
+# 320 writes lost (tests/tcyr/crossos/thread_local_first_access_concurrent.tcyr). Now a CAS elects
+# one allocator and the others wait for its index. A failed TlsAlloc is refused by name, not
+# stored. CHANGELOG [6.7.18]
+
+var _tlocal_win_idx = 0 - 1;   # TlsAlloc'd index; -1 = unallocated, -2 = being allocated
+
+# The process-wide TLS index, allocated exactly once.
+fn _tlocal_win_index(): i64 {
+    var idx = atomic_load(&_tlocal_win_idx);
+    if (idx >= 0) { return idx; }
+    if (atomic_cas(&_tlocal_win_idx, 0 - 1, 0 - 2) == 1) {
+        idx = syscall(61452) & 0xFFFFFFFF;           # TlsAlloc → a DWORD index (the upper half is not part of it)
+        if (idx == 0xFFFFFFFF) {                     # TLS_OUT_OF_INDEXES
+            _tlocal_say("thread_local: refused: TlsAlloc has no index left for the thread-local slots\n");
+            sys_exit(70);
+        }
+        atomic_fence();
+        atomic_store(&_tlocal_win_idx, idx);
+        return idx;
+    }
+    while (atomic_load(&_tlocal_win_idx) < 0) { }    # another thread's TlsAlloc is in flight
+    return atomic_load(&_tlocal_win_idx);
+}
+
+# Resolve (lazily allocating) THIS thread's _TLOCAL_MAX_SLOTS-slot block:
+# the process-global TLS index, then this thread's own zeroed block at it.
+fn _tlocal_win_block(): i64 {
+    var idx = _tlocal_win_index();
+    var blk = syscall(61453, idx);                   # TlsGetValue(idx)
+    if (blk == 0) {
+        alloc_init();
+        const NB = _TLOCAL_MAX_SLOTS * 8;           # the block's bytes
+        blk = alloc(NB);
+        if (blk == 0) { return 0; }
+        var i = 0;
+        while (i < NB) { store8(blk + i, 0); i += 1; }
+        syscall(61454, idx, blk);                    # TlsSetValue(idx, blk)
+    }
+    return blk;
+}
+
+# Install this thread's TLS block (and, first call, the process-global TLS
+# index). Idempotent. Returns 1 on success.
+fn thread_local_init(): i64 {
+    _tlocal_win_block();
+    return 1;
+}
+
+# Read the i64 at `slot` (0 on a fresh slot).
+fn thread_local_get(slot): i64 {
+    return load64(_tlocal_win_block() + slot * 8);
+}
+
+# Write `val` into `slot`.
+fn thread_local_set(slot, val): i64 {
+    store64(_tlocal_win_block() + slot * 8, val);
+    return 0;
+}
+#endif

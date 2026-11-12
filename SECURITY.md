@@ -1,5 +1,13 @@
 # Security Policy
 
+## Supported Versions
+
+| Version | Language | Status |
+|---|---|---|
+| 2.0.x | Cyrius | In development (the port; see `docs/development/pravash-port-plan.md`) |
+| 1.3.x | Rust | Supported. The final Rust line, frozen in `rust-old/` as the port's oracle. Security fixes ship as 1.3.x |
+| < 1.3 | Rust | Not supported |
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in pravash, please report it
@@ -23,8 +31,9 @@ responsibly through **GitHub Security Advisories**:
 
 ## Scope
 
-This policy covers the `pravash` crate and its published API. Vulnerabilities
-in dependencies should be reported to the respective upstream projects (and
+This policy covers the `pravash` Rust crate and its published API, and the Cyrius library as it is ported.
+The Rust crate's hidden `oracle` feature is port tooling, not public API. Vulnerabilities in dependencies
+(hisab, the Cyrius stdlib, or the Rust crates) should be reported to the respective upstream projects (and
 flagged here if they affect pravash users).
 
 ## Disclosure

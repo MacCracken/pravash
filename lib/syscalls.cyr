@@ -1,0 +1,268 @@
+# syscalls.cyr — Linux syscall wrappers (arch-dispatched)
+# Usage: include "lib/syscalls.cyr"
+#
+# This file is the public include point for Linux syscalls. It
+# delegates to the per-arch peer based on the compile-time arch
+# macro that cycc sets via PP_PREDEFINE in main.cyr / main_aarch64.cyr.
+# Consumers see a single file; the right syscall numbers, struct
+# layouts, and at-family wrappers come along automatically.
+#
+# Per-arch peers (do NOT include them directly — go through here):
+#   lib/syscalls_x86_64_linux.cyr   — x86_64 syscall numbers,
+#                                     bare stat(2)/open(2)/etc.,
+#                                     `arch/x86/include/uapi/asm/stat.h`
+#                                     struct layout (st_mode @ 24).
+#   lib/syscalls_aarch64_linux.cyr  — aarch64 generic-table numbers,
+#                                     at-family wrappers
+#                                     (openat / newfstatat / mkdirat /
+#                                     unlinkat / pipe2 / clone(SIGCHLD)),
+#                                     `include/uapi/asm-generic/stat.h`
+#                                     struct layout (st_mode @ 16).
+#
+# Splitting from the v5.4.10 monolith fixes the yukti aarch64
+# regression filed 2026-04-19 (yukti/docs/development/issues/
+# 2026-04-19-aarch64-syscall-portability.md): cross-built aarch64
+# binaries were inheriting x86_64 syscall numbers verbatim, so
+# `syscall(SYS_STAT, ...)` invoked `pivot_root` on aarch64 instead
+# of `stat`. Per-arch peers eliminate the silent number drift.
+#
+# `#ifplat` directive available (v5.4.19) but call sites stay on
+# `#ifdef` until codegen regression diagnosed; new consumers may use.
+#
+# cycc / cycc_aarch64 predefine CYRIUS_TARGET_LINUX; cycc_win predefines
+# CYRIUS_TARGET_WIN. Mutually exclusive per compile; no #else needed.
+# See CHANGELOG [5.4.11], [5.4.19], [5.5.0].
+#ifdef CYRIUS_TARGET_WIN
+include "lib/syscalls_windows.cyr"
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+#ifdef CYRIUS_ARCH_X86
+include "lib/syscalls_x86_64_linux.cyr"
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+include "lib/syscalls_aarch64_linux.cyr"
+#endif
+#endif
+# macOS (Mach-O). x86_64 uses the BSD-numbered syscalls_macos.cyr.
+# arm64 uses the Linux aarch64 numbers for now (tools build but their
+# file I/O does not yet work on macOS — see below). Mirrors the
+# CYRIUS_TARGET_MACOS dispatch in lib/alloc.cyr.
+#
+# KNOWN-INCOMPLETE (v6.0.33): full macOS tool/wrapper support is a
+# separate backend task. The macho-arm ESYSXLAT (src/backend/aarch64/
+# emit.cyr) translates ONLY the 9-syscall whitelist (0,1,2,3,9,10,11,
+# 60,228) from x86_64-Linux numbers to BSD. To make the tools work:
+#   (a) the stdlib here must feed x86_64-Linux numbers (read=0/open=2/
+#       …), not aarch64 (read=63/openat=56) — but switching to
+#       syscalls_x86_64_linux.cyr collides (duplicate `enum`); and
+#   (b) ESYSXLAT's whitelist must grow to cover the syscalls the tools
+#       use (stat/lseek/fork/execve/dup2/pipe → BSD equivalents +
+#       reroutes for the non-trivial ones).
+# Tracked as the macОS tool-surface follow-up. `cycc` itself is
+# UNAFFECTED — it uses its own x86-numbered `enum Sys`
+# (src/main_aarch64_macho.cyr) and self-hosts byte-identical (v6.0.33).
+#ifdef CYRIUS_TARGET_MACOS
+#ifdef CYRIUS_ARCH_X86
+include "lib/syscalls_macos.cyr"
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+include "lib/syscalls_aarch64_linux.cyr"
+#endif
+#endif
+# AGNOS ring-3 userspace (x86_64). Agnos syscall numbers + AO_* open flags
+# + the a4=r10 4-arg convention. Selected when cycc predefines
+# CYRIUS_TARGET_AGNOS (a CYRIUS_TARGET_AGNOS=1 build). Standalone peer —
+# see its header + agnos/docs/development/agnos-userland-abi.md.
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/syscalls_x86_64_agnos.cyr"
+#endif
+
+# cyrius-x bytecode (v6.6.6). The .cyx guest ABI is x86_64-LINUX-numbered:
+# cxvm serves each guest call it lists through the host's own stdlib wrapper
+# (6.7.15) and translates the pointer args, so the x86_64 peer is the correct
+# table here.
+# ⚠ The served set — authority: programs/cxvm.cyr's op-0x70 dispatch — is read(0) /
+# write(1) / open(2) with pointer translation, getrandom(318) and clock_gettime(228) served
+# through the HOST's stdlib (6.6.8), brk(12) in guest space (6.7.14), and a short list of
+# scalar-only calls (close, lseek, exit, getpid, kill, fork, fcntl …) served through the
+# HOST's own wrappers running the call the guest names on every host, -38 where the host has
+# no route (6.7.15), as are the path calls mkdir / rmdir / unlink / rename / symlink /
+# readlink / stat, their paths and buffers translated (6.7.15), and getdents64 / mknodat /
+# wait4 likewise and poll as poll(NULL, 0, ms), a sleep (6.7.16). Every other number answers
+# -ENOSYS (-38) without reaching the host (6.7.14, D55), so a wrapper outside that set
+# compiles on cx and answers -38. docs/platform-status.md states the whole guest contract.
+# 6.7.12: sys_pipe / sys_fstat refuse with -ENOSYS on cx (sys_unlink too until 6.7.15) and
+# lib/mmap.cyr's cyr_mmap with -1, rather than hand the host a guest offset. Before this arm
+# the cx driver matched no target at all, so `sys_exit` (and every other
+# wrapper) was undefined and `lib/assert.cyr` could not compile for cx.
+#ifdef CYRIUS_TARGET_CX
+include "lib/syscalls_x86_64_linux.cyr"
+#endif
+
+# ── signal_ignore (v6.4.51) ──
+# Set a signal's disposition to SIG_IGN (ignore). Primary use: SIGPIPE — so a
+# write to a pipe whose reader has gone returns EPIPE instead of TERMINATING the
+# process. lib/net.cyr's socket writers no longer need it: since 6.6.16 they go
+# through _fd_write_nosigpipe below and never raise SIGPIPE (until then every
+# `sock_send` was a flagless `sys_write`, one reset peer away from an
+# unauthenticated kill). A raw write(2) to a socket, or any write to a pipe,
+# still does. See issue 2026-07-11-sandhi-signal-ignore-stdlib-gap.md.
+# Portable: Linux rt_sigaction (x86 #13 / aarch64 #134), macOS BSD sigaction
+# (the Mach-O ESYSXLAT renumbers 13/134 → BSD 46), Windows/agnos no-op (no
+# SIGPIPE there). The 32-byte {sa_handler=SIG_IGN, 0,0,0} struct is valid for
+# BOTH the Linux rt_sigaction and BSD sigaction ABIs (macOS reads sa_handler
+# from the first 8 bytes; Linux's trailing sigsetsize arg is ignored on BSD).
+# Returns the syscall result (0 on success).
+enum Signal { SIGINT = 2; SIGQUIT = 3; SIGKILL = 9; SIGPIPE = 13; SIGTERM = 15; }
+# ONE definition; exactly one target branch survives the preprocessor per compile
+# (Win/agnos have no SIGPIPE → no-op; Linux uses the 4-arg rt_sigaction incl.
+# sigsetsize=8; macOS uses the 3-arg BSD sigaction, the Mach-O ESYSXLAT renumbering
+# 13/134 → 46). Kept as a single fn so the #ifdef-blind static checker doesn't read
+# it as a duplicate definition.
+fn signal_ignore(signum): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var act[32];
+    var ap = &act;
+    var i = 0;
+    while (i < 32) { store8(ap + i, 0); i += 1; }
+    store64(ap, 1);   # sa_handler = SIG_IGN (1)
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(13, signum, ap, 0, 8);    # rt_sigaction(sig, act, oldact=0, sigsetsize=8)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(134, signum, ap, 0, 8);   # rt_sigaction (aarch64 #134)
+    #endif
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    var mact[32];
+    var mp = &mact;
+    var mi = 0;
+    while (mi < 32) { store8(mp + mi, 0); mi += 1; }
+    store64(mp, 1);   # sa_handler = SIG_IGN (1)
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(13, signum, mp, 0);       # ESYSXLAT 13  → BSD sigaction 46 (3-arg)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(134, signum, mp, 0);      # ESYSXLAT 134 → BSD sigaction 46 (3-arg)
+    #endif
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0;   # Windows has no SIGPIPE
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # agnos ring-3: no signal delivery yet
+    #endif
+    # cx bytecode: cxvm delivers no signals. v6.6.6 — without this arm EVERY
+    # branch of this fn is preprocessed away on cx and the body returns
+    # whatever happens to be in the return register.
+    #ifdef CYRIUS_TARGET_CX
+    return 0;
+    #endif
+}
+
+# Set a signal's disposition back to SIG_DFL — the counterpart to signal_ignore.
+#
+# WHY THIS IS NOT OPTIONAL ALONGSIDE signal_ignore: SIG_IGN is INHERITED across
+# execve (a handler is reset, an ignore is not). So a process that ignores a
+# signal and then fork+execve's a child gives that child a disposition its own
+# code never chose, permanently, with no way to undo it. Call this in the child
+# between fork and execve — which is exactly what std::process::Command does for
+# SIGPIPE.
+#
+# The shape is signal_ignore's, one word different: sa_handler = 0 (SIG_DFL)
+# rather than 1 (SIG_IGN). Everything argued in that comment about the 32-byte
+# struct and the per-target routing applies unchanged.
+# Filed by agnosai (sandbox tools inherited an unwanted SIGPIPE ignore, so a
+# tool running `cmd | head` saw EPIPE where it would otherwise die on the
+# signal — silent divergence between inside and outside the sandbox).
+# CHANGELOG [6.5.7]
+fn signal_default(signum): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var act[32];
+    var ap = &act;
+    var i = 0;
+    while (i < 32) { store8(ap + i, 0); i += 1; }
+    store64(ap, 0);   # sa_handler = SIG_DFL (0)
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(13, signum, ap, 0, 8);    # rt_sigaction(sig, act, oldact=0, sigsetsize=8)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(134, signum, ap, 0, 8);   # rt_sigaction (aarch64 #134)
+    #endif
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    var mact[32];
+    var mp = &mact;
+    var mi = 0;
+    while (mi < 32) { store8(mp + mi, 0); mi += 1; }
+    store64(mp, 0);   # sa_handler = SIG_DFL (0)
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(13, signum, mp, 0);       # ESYSXLAT 13  → BSD sigaction 46 (3-arg)
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(134, signum, mp, 0);      # ESYSXLAT 134 → BSD sigaction 46 (3-arg)
+    #endif
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0;   # Windows has no SIGPIPE
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;   # agnos ring-3: no signal delivery yet
+    #endif
+    # cx bytecode: cxvm delivers no signals. v6.6.6 — without this arm EVERY
+    # branch of this fn is preprocessed away on cx and the body returns
+    # whatever happens to be in the return register.
+    #ifdef CYRIUS_TARGET_CX
+    return 0;
+    #endif
+}
+
+# Write up to `n` bytes to `fd` WITHOUT raising SIGPIPE when `fd` is a socket whose peer has gone:
+# the count, or -errno (-EPIPE / -ECONNRESET for a reset peer). Private: the one leaf under every
+# plain-socket writer (lib/net.cyr's _net_os_send, lib/async.cyr's and lib/async_macos.cyr's send
+# and relay writers), so they cannot drift apart.
+#
+# ⛔ WHY: a flagless write(2) to a peer that has reset the connection raises SIGPIPE, whose
+# default disposition TERMINATES the process — so any peer could kill a lib/net.cyr client or
+# server it was talking to, remotely and unauthenticated (CYRIUS-2026-0025; CYRIUS-2026-0021 was the same class on
+# the TLS transport, lib/tls_native_conn.cyr).
+#   Linux: send(MSG_NOSIGNAL 0x4000) — sendto with no destination IS write(2) on a connected
+#     socket, with the same O_NONBLOCK and SO_SNDTIMEO behaviour. ENOTSOCK (88: a pipe, a file,
+#     a tty) falls through to write(2), which keeps its own semantics there, SIGPIPE included.
+#   macOS: SO_NOSIGPIPE (SOL_SOCKET 0xFFFF, 0x1022), set on EVERY call — sockets made by a raw
+#     sys_socket (sandhi's IPv6 paths) never pass through tcp_socket, so a set-at-creation design
+#     would leave them bare. xnu answers EINVAL only for a socket already shut down both ways, which
+#     is what an RST leaves: that is answered EPIPE, the errno the write would have given, with
+#     nothing written (failing closed, like _tn_nosigpipe). ENOTSOCK (38) writes; any other
+#     failure is returned. (Darwin does define MSG_NOSIGNAL, back to 13.7.8 at least; it is not
+#     relied on.)
+#   Every other target (PE, EFI, agnos, cx): write(2) as before — no SIGPIPE there.
+# ⚠ A seccomp filter that allows write but not sendto now kills a plain-socket writer on Linux.
+# CHANGELOG [6.6.16]
+fn _fd_write_nosigpipe(fd, buf, n): i64 {
+    #ifdef CYRIUS_TARGET_LINUX
+    var s = sys_sendto(fd, buf, n, 0x4000, 0, 0);    # MSG_NOSIGNAL: EPIPE, never SIGPIPE
+    if (s != 0 - 88) { return s; }                   # anything but ENOTSOCK is the answer
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    var one[8];
+    store64(&one, 1);
+    var r = sys_setsockopt(fd, 0xFFFF, 0x1022, &one, 4);    # SOL_SOCKET, SO_NOSIGPIPE
+    if (r == 0 - 22) { return 0 - 32; }              # EINVAL: shut down both ways -> EPIPE, unwritten
+    if (r < 0) {
+        if (r != 0 - 38) { return r; }               # ENOTSOCK is the only failure that is not one
+    }
+    #endif
+    return sys_write(fd, buf, n);
+}
+
+# ── alloc.cyr, LAST ──
+# The Linux and agnos peers' sigset / epoll / timer helpers call `alloc()`, so a bare
+# `include "lib/syscalls.cyr"` compiled with `warning: undefined function 'alloc'` — a ud2
+# stub at the first sigset_new — on every target that has those helpers (on cx, which emits
+# every fn, it was a hard error, and only the cx arm carried this include). It sits at the
+# END, after the peers, so a program that includes syscalls.cyr and then alloc.cyr lays out
+# exactly as before; include-once makes the later include free, and on agnos, where alloc.cyr
+# includes this file, the cycle is broken by include-once marking a file before it is read.
+# CHANGELOG [6.6.9]
+include "lib/alloc.cyr"

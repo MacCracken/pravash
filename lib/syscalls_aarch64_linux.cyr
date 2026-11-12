@@ -1,0 +1,1090 @@
+# syscalls_aarch64_linux.cyr — Linux aarch64 syscall wrappers
+# Usage: include "lib/syscalls.cyr" (selector picks this peer
+#        when CYRIUS_ARCH_AARCH64 is defined; do NOT include this
+#        file directly — go through the selector so cross-arch
+#        builds work).
+#
+# Companion peer: lib/syscalls_x86_64_linux.cyr.
+#
+# Numbers: Linux generic syscall table from
+# include/uapi/asm-generic/unistd.h. Wholly different from
+# x86_64's table — `SYS_OPEN = 56` here is `io_setup` on x86_64,
+# `SYS_STAT = 4` on x86_64 is `pivot_root` on aarch64. The split
+# fixes the yukti regression filed 2026-04-19 (yukti
+# `test_query_permissions_dev_null` SIGSEGV'd because cross-built
+# aarch64 binaries inherited x86_64 numbers verbatim from the
+# pre-v5.4.11 monolithic lib/syscalls.cyr).
+#
+# At-family wrappers: aarch64 has no bare `open`, `stat`, `fstat`,
+# `mkdir`, `rmdir`, `unlink`, `chmod`, `access`, `pipe`, `fork`,
+# `dup2`, `epoll_create`, `epoll_wait`, `poll`, `pause` syscalls.
+# Wrappers below route to the at-family equivalents (`openat`,
+# `newfstatat`, `mkdirat`, `unlinkat`, `fchmodat`, `faccessat`,
+# `pipe2`, `clone(SIGCHLD)`, `dup3`, `epoll_create1`,
+# `epoll_pwait`, `ppoll`) using `AT_FDCWD = -100` for the
+# directory-fd argument so behavior matches the x86_64 wrappers.
+#
+# Most cross-arch-stable Linux constants (CLONE_*, PROT_*, MAP_*,
+# FUTEX_*, O_*, signals, mount flags, errno, …) are duplicated
+# from the x86_64 peer in this file. Drift risk is low (kernel
+# UAPI headers anchor these values across all Linux arches);
+# extraction to a shared `lib/syscalls_linux_constants.cyr` is a
+# v5.4.13 closeout cleanup candidate if duplication becomes
+# painful.
+
+# ================================================================
+# Syscall numbers (aarch64 — from include/uapi/asm-generic/unistd.h)
+# ================================================================
+enum SysNr {
+    # File I/O
+    SYS_READ = 63;
+    SYS_WRITE = 64;
+    SYS_CLOSE = 57;
+    SYS_LSEEK = 62;
+    SYS_DUP = 23;
+    SYS_DUP3 = 24;
+    SYS_FCNTL = 25;
+    SYS_IOCTL = 29;
+
+    # v6.2.14: EMIT the x86 numbers (74/75) — the backend ESYSXLAT renumbers them to
+    # the aarch64 fsync(82)/fdatasync(83). Using the aarch64-native 82/83 directly
+    # is WRONG: 82 is x86 *rename*, which ESYSXLAT remaps 82→38 (renameat) → syscall(82)
+    # ⚠ v6.6.5: this line read "82→128" for four minors. 128 is the DARWIN renameat number
+    # (the _TARGET_MACHO arm's 82→128 row); the ELF-aarch64 row is 82→38. Same slip in
+    # src/backend/aarch64/emit.cyr's own fsync comment, corrected in the same patch.
+    # would call rename(fd,…) and return -EFAULT, not fsync. See feedback on the
+    # aarch64 ESYSXLAT collision class + emit.cyr's 74→82/75→83 entries.
+    SYS_FSYNC = 74;
+    SYS_FDATASYNC = 75;
+    # v6.6.4: flock — the x86 number, renumbered 73→32 by ESYSXLAT (the same intended-x86-
+    # number pattern as fsync/fdatasync above). lib/io.cyr used to spell the native 32 under
+    # an #ifdef, which the v6.5.51 raw-literal diagnostic flagged on EVERY aarch64 build that
+    # includes io.cyr ("raw syscall 32 is x86_64 dup") — a false positive on correct code.
+    SYS_FLOCK = 73;
+    # At-family (aarch64 has no bare open/stat/mkdir/etc.)
+    SYS_OPENAT = 56;        # → sys_open  (AT_FDCWD)
+    # v6.1.3: newfstatat uses the X86 number 262 (not the aarch64-native 79),
+    # renumbered 262→79 by ESYSXLAT. The aarch64-native 79 COLLIDES with
+    # ESYSXLAT's x86 getcwd(79→17) entry (cbt issues raw x86 getcwd(79)), so a
+    # stdlib `syscall(79,...)` was wrongly remapped to getcwd → -EFAULT. This
+    # was a SILENT sys_stat break on native aarch64 since v6.0.41. x86 newfstatat
+    # (262) and aarch64 newfstatat (79) have identical arg layouts, so the
+    # ESYSXLAT 262→79 entry is a pure renumber. See CHANGELOG [6.1.3].
+    SYS_NEWFSTATAT = 262;   # x86 newfstatat → ESYSXLAT 262→79 (collision-free)
+    SYS_FSTAT = 80;         # bare fstat exists; takes fd
+    SYS_MKDIRAT = 34;       # → sys_mkdir (AT_FDCWD)
+    # v6.6.5: MOVED 35 → 263 (the x86 number, renumbered 263→35 by ESYSXLAT) — the same
+    # intended-x86-number pattern as SYS_NEWFSTATAT/SYS_FACCESSAT above, and for the same
+    # reason one level down: the aarch64-native 35 is now claimed by the x86-compat row
+    # `nanosleep 35→101`. Leaving it at 35 would make every sys_unlink/sys_rmdir SLEEP.
+    # ⚠ The 263→35 row MUST sit after the 35→101 row in the chain; the reverse order makes
+    # unlinkat re-caught as nanosleep. tests/gates/platform/esysxlat_row_order.sh pins it.
+    # CHANGELOG [6.6.5]
+    SYS_UNLINKAT = 263;     # x86 unlinkat → ESYSXLAT 263→35. → sys_rmdir (AT_REMOVEDIR) and sys_unlink
+    SYS_SYMLINKAT = 36;     # → sys_symlink (AT_FDCWD)
+    SYS_READLINKAT = 78;    # → sys_readlink (AT_FDCWD)
+    SYS_FCHMODAT = 53;      # → sys_chmod (AT_FDCWD)
+    # faccessat uses the X86 number 269 (not aarch64-native 48), renumbered
+    # 269→48 by ESYSXLAT — the aarch64-native 48 COLLIDES with ESYSXLAT's
+    # x86 shutdown(48→210) entry (lib/net.cyr issues raw x86 shutdown(48),
+    # added v6.2.10). A stdlib syscall(48) meant as faccessat was wrongly
+    # remapped to setsockopt(210) → -EBADF, so EVERY sys_access() check on
+    # native aarch64 returned -9. Same collision class as newfstatat(262→79)
+    # / utimensat(280→88) above. x86 faccessat(269) and aarch64 faccessat(48)
+    # share the (dirfd,path,mode) arg layout, so the 269→48 entry is a pure
+    # renumber. See feedback_aarch64_esysxlat_syscall_number_collision.
+    SYS_FACCESSAT = 269;    # x86 faccessat → ESYSXLAT 269→48 (collision-free)
+    # v6.1.3 — at-family peers missing until now (kriya M2). linkat(37) +
+    # renameat(38) are aarch64-native (no ESYSXLAT collision → pass through).
+    SYS_LINKAT = 37;        # → sys_link (AT_FDCWD, flags=0)
+    SYS_RENAMEAT = 38;      # → sys_rename (AT_FDCWD)
+    # utimensat uses the X86 number 280 (not aarch64-native 88), renumbered
+    # 280→88 by ESYSXLAT — the aarch64-native 88 COLLIDES with ESYSXLAT's
+    # x86 symlink(88→36) entry. Same class as newfstatat above.
+    SYS_UTIMENSAT = 280;    # x86 utimensat → ESYSXLAT 280→88 (collision-free)
+    # ── v6.5.7: THE PRIVATE ALIAS BAND (1000 + native aarch64 number).
+    # Every collision above was resolved the documented way — pick the OTHER
+    # architecture's number and add a pure-renumber ESYSXLAT entry. fchownat is the
+    # first case where BOTH candidates are already owned:
+    #   - native 54 is consumed by the x86-compat socket shim (setsockopt 54→208),
+    #     which is load-bearing for 51 ecosystem repos that emit raw `syscall(54,…)`;
+    #   - the x86 number 260 is this peer's own SYS_WAIT4 (:102), which is aarch64-
+    #     native and MUST pass through untranslated.
+    # So there is no real number left to borrow, and the answer is to stop borrowing:
+    # source numbers ≥1000 are cyrius-private aliases that no OS will ever mint
+    # (Linux is in the 400s and grows ~5/yr; Darwin numbers are routed separately),
+    # and each one is renumbered to its true target by ESYSXLAT. The convention is
+    # 1000 + the native aarch64 number so the alias reads as its own documentation.
+    # Requires an ESYSXLAT arm on BOTH aarch64 branches — Linux (→54) and macho
+    # (→Darwin 468) — plus a `_macho_arm_routes` row, because macOS-arm64 resolves
+    # THIS peer. Adding an alias without all three is a stale-x16 garbage call.
+    # ⚠ The Linux arm MUST sit at the END of the chain: it produces x8=54, and the
+    # setsockopt entry earlier in that chain compares against 54 and would re-catch
+    # it — the same ordering trap already documented on flock/poll and epoll_wait.
+    SYS_FCHOWNAT = 1054;    # private alias → ESYSXLAT 1054→54 (a64) / →468 (Darwin)
+    SYS_PIPE2 = 59;         # → sys_pipe (flags=0)
+    # v6.5.36 — PRIVATE ALIAS. 73 is aarch64's NATIVE ppoll, but ESYSXLAT's x86-compat
+    # row rewrites 73 (x86 flock) → 32, so a native 73 was *matched as an x86 number* and
+    # sys_pause() issued flock(2). Both candidates are owned — 73 is eaten by the shim and
+    # the x86 ppoll number (271) is not a usable escape — so this takes the >=1000 band.
+    # → sys_ppoll (6.7.9; the x86 peer's SYS_PPOLL is 271) and sys_pause (NULL fds, NULL timeout).
+    SYS_PPOLL = 1073;       # private alias → ESYSXLAT 1073→73 (a64)
+    # 6.7.14 — the x86 poll NUMBER, by name (guide rule 2): ESYSXLAT 7 → ppoll 73 converts the int
+    # ms to a timespec (aarch64 has no poll; native 7 is fsetxattr), Darwin routes 7 → BSD poll
+    # 230. lib/syscalls_linux_common.cyr's fd_wait_ready and the macOS sleeps issue it from inside
+    # lib/syscalls.cyr's aarch64 region, where a raw 7 is warned as a native number (D61).
+    SYS_POLL = 7;           # x86 poll → ESYSXLAT 7→73 (ppoll, ms → timespec)
+
+    # Directory + cwd
+    SYS_GETCWD = 17;
+    # ⚠ NOT the native 49 — see the private-alias comment above SYS_FCHOWNAT. aarch64's
+    # chdir IS 49, but ESYSXLAT's x86-compat shim rewrites source-49 to 200 (bind), so a
+    # native-numbered `syscall(49, path)` ran bind(path, …) and returned -EBADF. The x86
+    # number (80) is no escape either: this peer's own SYS_FSTAT is 80. Second occupant of
+    # the alias band. **Found by running `vr01_syscall_wrappers.tcyr` on aarch64** — the
+    # constant read correctly, compiled on every target, and was wrong only after the
+    # backend rewrote it. CHANGELOG [6.5.7]
+    SYS_CHDIR = 1049;       # private alias → ESYSXLAT 1049→49 (a64) / →12 (Darwin)
+    # v6.5.16: sysctl + gettimeofday — the two Darwin-ONLY occupants of the band.
+    # Both back lib/sys.cyr's macOS sys_uname/sys_sysinfo (Darwin has neither
+    # uname(2) nor sysinfo(2); the data comes from sysctl, and uptime needs a
+    # wall-clock "now" to subtract kern.boottime from).
+    # ⚠ These two DEVIATE from the band's "1000 + native aarch64 number" spelling,
+    # deliberately: Linux has no live sysctl (x86 _sysctl 156 is removed, aarch64
+    # never had one), so there is no native number to build on. They are spelled
+    # 1000 + the DARWIN BSD number instead, which is the only self-documenting
+    # choice available — do not read 202/116 as aarch64-Linux numbers.
+    # Consequence: unlike FCHOWNAT/CHDIR these get NO aarch64-Linux ESYSXLAT arm
+    # (there is nothing to renumber to), so the "Linux arm must sit LAST" ordering
+    # rule above has no arm to apply to here. That is safe ONLY because every call
+    # site sits inside `#ifdef CYRIUS_TARGET_MACOS` and cyrius's #ifdef is a real
+    # preprocessor (src/frontend/lex/pp/pass.cyr) — the lines are REMOVED before parse
+    # on Linux, so an untranslated `svc x8=1202` can never be emitted for
+    # aarch64-Linux. Calling either outside that guard breaks the invariant.
+    # Still requires the macho ESYSXLAT row + the `_macho_arm_routes` row, because
+    # macOS-arm64 resolves THIS peer. CHANGELOG [6.5.16]
+    SYS_GETTIMEOFDAY = 1116;  # private alias → ESYSXLAT →116 (Darwin); no Linux arm
+    SYS_SYSCTL = 1202;        # private alias → ESYSXLAT →202 (Darwin); no Linux arm
+
+    # Process control
+    SYS_CLONE = 220;        # → sys_fork (clone(SIGCHLD,...)); also thread spawning
+    SYS_EXECVE = 221;
+    SYS_EXIT = 93;
+    SYS_EXIT_GROUP = 94;
+    SYS_WAIT4 = 260;
+    SYS_KILL = 129;
+    SYS_GETPID = 172;
+    SYS_GETPPID = 173;
+    SYS_GETTID = 178;
+    SYS_SETSID = 157;
+    SYS_SET_TID_ADDRESS = 96;
+
+    # Identity
+    SYS_GETUID = 174;
+    SYS_GETGID = 176;
+    SYS_GETEUID = 175;
+    SYS_GETEGID = 177;
+    SYS_SETUID = 146;
+    SYS_SETGID = 144;
+    SYS_SETGROUPS = 159;
+    SYS_SETRESUID = 147;
+    SYS_SETRESGID = 149;
+
+    # Memory
+    SYS_BRK = 214;
+    SYS_MMAP = 222;
+    SYS_MUNMAP = 215;
+
+    # Mount + sync + reboot
+    SYS_MOUNT = 40;
+    SYS_UMOUNT2 = 1039;         # v6.5.37: private alias — native 39 is eaten by x86 getpid(39)->172
+    SYS_SYNC = 81;
+    SYS_REBOOT = 142;
+    SYS_UNAME = 160;
+    SYS_SYSINFO = 179;
+
+    # Signals + sync primitives
+    SYS_RT_SIGPROCMASK = 135;
+    SYS_FUTEX = 98;
+    # v6.5.36 — PRIVATE ALIAS, same collision as SYS_PPOLL above: ESYSXLAT rewrites
+    # 74 (x86 fsync) → 82, so a native 74 made sys_signalfd() issue fsync(2).
+    SYS_SIGNALFD4 = 1074;   # private alias → ESYSXLAT 1074→74 (a64)
+
+    # Epoll
+    SYS_EPOLL_CREATE1 = 20;
+    SYS_EPOLL_CTL = 21;
+    SYS_EPOLL_PWAIT = 1022; # v6.5.37: private alias — native 22 is eaten by x86 pipe(22)->59
+    # 6.7.14 — the x86 epoll_wait NUMBER, by name (guide rule 2), for sys_epoll_wait below: a raw
+    # 232 inside lib/syscalls.cyr's aarch64 region is warned as a native number (D61).
+    SYS_EPOLL_WAIT = 232;   # x86 epoll_wait → ESYSXLAT 232→22 (epoll_pwait, NULL sigmask)
+
+    # Timers + waitid
+    SYS_TIMERFD_CREATE = 85;
+    SYS_TIMERFD_SETTIME = 86;
+    SYS_WAITID = 95;
+
+    # Inotify
+    SYS_INOTIFY_INIT1 = 26;
+    SYS_INOTIFY_ADD_WATCH = 27;
+    SYS_INOTIFY_RM_WATCH = 28;
+
+    # v5.7.35 (agnosys-surfaced — drm/luks/security)
+    SYS_GETDENTS64 = 61;
+    SYS_GETRANDOM = 278;
+    # v5.11.0 (kavach-surfaced — sandbox post-fork hardening)
+    SYS_FCHMOD = 52;
+    SYS_PRCTL = 167;
+    SYS_SECCOMP = 277;
+    SYS_EXECVEAT = 281;
+    SYS_PIDFD_OPEN = 434;         # pidfd_open(pid, flags) → fd readable on child exit (Linux 5.3+)
+    SYS_LANDLOCK_CREATE_RULESET = 444;
+    SYS_LANDLOCK_ADD_RULE = 445;
+    SYS_LANDLOCK_RESTRICT_SELF = 446;
+    # v5.11.18 (kybernet 1.1.5-surfaced — sd_notify dgram + supervisor IPC).
+    # Wrappers exist to prevent silent aarch64 syscall-number misroute when
+    # consumers hardcode x86_64 numbers. See CHANGELOG [5.11.18].
+    SYS_SOCKET = 198;
+    SYS_SOCKETPAIR = 199;
+    SYS_SETSOCKOPT = 208;
+    SYS_BIND = 200;
+    SYS_LISTEN = 201;
+    # v6.4.64: NATIVE aarch64 numbers — deliberately NOT the x86 51/52. x86-52 collides
+    # with this peer's own SYS_FCHMOD = 52, and an ESYSXLAT entry for it would remap
+    # fchmod to getpeername (CI caught exactly that: sandbox_syscalls RED on pi). Native
+    # numbers pass through untranslated on aarch64-Linux; the macho backend dual-maps
+    # 204/205 → BSD 32/31 for macOS-arm64, same shape as socket 198→97.
+    SYS_GETSOCKNAME = 204;
+    SYS_GETPEERNAME = 205;
+    SYS_CONNECT = 203;
+    SYS_RECVFROM = 207;
+    SYS_RECVMSG = 212;
+    SYS_ACCEPT4 = 242;
+    # ── v6.6.5: the send side, the truncate pair, memfd and the two scheduler primitives.
+    # NATIVE aarch64 numbers where the number is free as an ESYSXLAT source; none of
+    # 206/211/279/101/124 is a row source or a row product, so they pass through untouched.
+    SYS_SENDTO = 206;
+    SYS_SENDMSG = 211;
+    SYS_MEMFD_CREATE = 279;
+    SYS_NANOSLEEP = 101;
+    SYS_SCHED_YIELD = 124;
+    # ⚠ truncate/ftruncate take the X86 numbers, NOT the native 45/46 — the documented
+    # borrow-the-other-arch's-number pattern (SYS_NEWFSTATAT, SYS_FACCESSAT, SYS_FSYNC).
+    # Native 45 and 46 are both consumed by the new x86-compat rows (recvfrom 45→207 and
+    # sendmsg 46→211), which is precisely the shadow class aarch64_syscall_shadow.sh
+    # exists for: a compat row matches a NUMBER and cannot tell a native one from the x86
+    # one it is chasing. Routed 76→45 / 77→46. CHANGELOG [6.6.5]
+    SYS_TRUNCATE = 76;      # x86 truncate  → ESYSXLAT 76→45
+    SYS_FTRUNCATE = 77;     # x86 ftruncate → ESYSXLAT 77→46
+    # ⚠ v6.6.6 — statfs/fstatfs take the X86 numbers too, NOT the native 43/44, and for
+    # exactly the reason above one level down: native 43 is consumed by the x86-compat
+    # accept row (43→202) and native 44 by sendto (44→206). A native-numbered
+    # `syscall(43, path, buf)` therefore ran **accept** — traced under qemu-aarch64 as
+    # `accept(…) = -1 errno=14`, which is what yukti's `filesystem_usage` has been
+    # reporting on every ARM host since v6.2.10 (yukti <= 2.3.11 declared 43; fixed at the
+    # source in yukti 2.3.12, which spells sys_statfs, and folded at 6.6.7 with 2.3.13 —
+    # CHANGELOG [6.6.7]).
+    # Routed 137→43 / 138→44, appended below the accept/sendto rows they produce into.
+    # x86_64 and aarch64 share the 120-byte struct statfs and the (path|fd, buf) layout,
+    # so both rows are pure renumbers. CHANGELOG [6.6.6]
+    SYS_STATFS = 137;       # x86 statfs  → ESYSXLAT 137→43
+    SYS_FSTATFS = 138;      # x86 fstatfs → ESYSXLAT 138→44
+    # ⚠ v6.6.8 — the X86 numbers again, for the same two reasons. Native chroot (51) and
+    # pivot_root (41) are x86-compat row SOURCES (getsockname 51→204, socket 41→198), so a
+    # native-numbered call never reached the kernel as itself; and native unshare (97),
+    # capget/capset (90/91) and process_vm_* (270/271) are free today only because no row has
+    # claimed them yet — the fragility rule 3 warns about. mknodat's native 33 is the x86
+    # dup2 row source (33→dup3). Routed 272→97, 161→51, 155→41, 125→90, 126→91, 310→270,
+    # 311→271, 259→33, appended below the rows they produce into. On arm64-macOS the shared
+    # wrappers decline (Darwin has none of these), so the numbers are never emitted there.
+    # CHANGELOG [6.6.8]
+    SYS_UNSHARE = 272;              # x86 unshare           → ESYSXLAT 272→97
+    SYS_CHROOT = 161;               # x86 chroot            → ESYSXLAT 161→51
+    SYS_PIVOT_ROOT = 155;           # x86 pivot_root        → ESYSXLAT 155→41
+    SYS_CAPGET = 125;               # x86 capget            → ESYSXLAT 125→90
+    SYS_CAPSET = 126;               # x86 capset            → ESYSXLAT 126→91
+    SYS_PROCESS_VM_READV = 310;     # x86 process_vm_readv  → ESYSXLAT 310→270
+    SYS_PROCESS_VM_WRITEV = 311;    # x86 process_vm_writev → ESYSXLAT 311→271
+    SYS_MKNODAT = 259;              # x86 mknodat           → ESYSXLAT 259→33
+    # ⚠ 6.6.12 — the xattr family, fchown and statx take the PRIVATE ALIAS BAND (see the
+    # comment above SYS_FCHOWNAT), NOT their native numbers and NOT the x86 ones. Native
+    # 5/6/7/9/10/11/12/16 and 55 are x86-compat row SOURCES (fstat, lstat, poll, mmap,
+    # mprotect, munmap, brk, ioctl, getsockopt), so `syscall(9, …)` meant as lgetxattr ran
+    # mmap; the x86 numbers 188..199 are no escape either (191..197 are native aarch64 calls,
+    # 198/199 this peer's own SYS_SOCKET/SYS_SOCKETPAIR). 8/13/14/15/291 are free as sources,
+    # but a native declaration below 1000 would drop the raw-x86-literal warning for lseek (8)
+    # and epoll_create1 (291) — programs/gen_syscall_xlat.cyr's is_native_a64 reads THIS enum.
+    # Renumbered at the tail of ESYSXLAT's ELF arm; on arm64-macOS the xattr/statx wrappers
+    # decline (lib/syscalls_linux_common.cyr) and fchown's 1055 routes to Darwin 123.
+    # getrlimit is the NATIVE 163: neither a row source nor a row product. CHANGELOG [6.6.12]
+    SYS_SETXATTR = 1005;            # private alias → ESYSXLAT 1005→5
+    SYS_LSETXATTR = 1006;           # private alias → ESYSXLAT 1006→6
+    SYS_FSETXATTR = 1007;           # private alias → ESYSXLAT 1007→7
+    SYS_GETXATTR = 1008;            # private alias → ESYSXLAT 1008→8
+    SYS_LGETXATTR = 1009;           # private alias → ESYSXLAT 1009→9
+    SYS_FGETXATTR = 1010;           # private alias → ESYSXLAT 1010→10
+    SYS_LISTXATTR = 1011;           # private alias → ESYSXLAT 1011→11
+    SYS_LLISTXATTR = 1012;          # private alias → ESYSXLAT 1012→12
+    SYS_FLISTXATTR = 1013;          # private alias → ESYSXLAT 1013→13
+    SYS_REMOVEXATTR = 1014;         # private alias → ESYSXLAT 1014→14
+    SYS_LREMOVEXATTR = 1015;        # private alias → ESYSXLAT 1015→15
+    SYS_FREMOVEXATTR = 1016;        # private alias → ESYSXLAT 1016→16
+    SYS_FCHOWN = 1055;              # private alias → ESYSXLAT 1055→55 (a64) / →123 (Darwin)
+    SYS_STATX = 1291;               # private alias → ESYSXLAT 1291→291
+    SYS_GETRLIMIT = 163;            # native (→194 on Darwin)
+}
+
+# AT_FDCWD / AT_EMPTY_PATH / AT_REMOVEDIR (+ AT_SYMLINK_* / UTIME_*) are
+# defined once in lib/syscalls_linux_common.cyr (included below) as of
+# v6.1.3 — they were aarch64-peer-only before. The at-family wrappers
+# below pass AT_FDCWD so consumer-facing semantics match the x86_64
+# `sys_open(path, flags, mode)` etc. calling convention.
+
+# ================================================================
+# Seccomp architecture tag (v6.6.8)
+# ================================================================
+# AUDIT_ARCH_* for the ABI this peer compiles for (aarch64: EM_AARCH64 | __AUDIT_ARCH_64BIT |
+# __AUDIT_ARCH_LE; arm64-macOS shares this peer, where seccomp itself declines). Every seccomp
+# filter must
+# check `seccomp_data.arch` against it FIRST, or a syscall number from another ABI
+# (x32, i386 via int 0x80) slips past a number-based allow-list. kavach hand-wrote it
+# (security_seccomp_native_arch); the peer knows the value, so it names it.
+# CHANGELOG [6.6.8]
+enum AuditArch {
+    AUDIT_ARCH_NATIVE = 0xC00000B7;
+}
+
+# ================================================================
+# Clone flags (cross-arch identical — same as x86_64 peer)
+# ================================================================
+enum CloneFlag {
+    CLONE_VM = 256;
+    CLONE_FS = 512;
+    CLONE_FILES = 1024;
+    CLONE_SIGHAND = 2048;
+    CLONE_THREAD = 65536;
+    CLONE_SYSVSEM = 262144;
+    CLONE_SETTLS = 524288;
+    CLONE_PARENT_SETTID = 1048576;
+    CLONE_CHILD_CLEARTID = 2097152;
+}
+
+# ================================================================
+# mmap constants (cross-arch identical)
+# ================================================================
+# v6.5.15: MAP_ANONYMOUS and MAP_STACK are VALUES, not syscall numbers, so
+# ESYSXLAT never corrects them (see the Signal block below). MAP_ANONYMOUS was
+# fixed for macOS at v6.5.11 in lib/mmap.cyr, which SHADOWS this enum because
+# consumers include syscalls.cyr first and mmap.cyr second — but that only
+# helps a consumer that includes mmap.cyr. Declaring the right value HERE too
+# means both orders are correct, and the two agree rather than race.
+# Darwin has no MAP_STACK at all; 0 is inert, which is what a nonexistent flag
+# should contribute to a bitwise OR. Linux's 131072 on Darwin is a live bit in
+# a field Darwin reads differently.
+#ifdef CYRIUS_TARGET_MACOS
+enum MmapConst {
+    PROT_READ = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC = 4;
+    MAP_PRIVATE = 2;
+    MAP_ANONYMOUS = 0x1000;
+    MAP_STACK = 0;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+enum MmapConst {
+    PROT_READ = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC = 4;
+    MAP_PRIVATE = 2;
+    MAP_ANONYMOUS = 32;
+    MAP_STACK = 131072;
+}
+#endif
+
+# ================================================================
+# Futex operations (cross-arch identical)
+# ================================================================
+enum FutexOp {
+    FUTEX_WAIT = 0;
+    FUTEX_WAKE = 1;
+    FUTEX_PRIVATE_FLAG = 128;
+}
+
+# ================================================================
+# Open flags. ⚠ NOT cross-arch identical (this header said so until v6.6.4): the
+# generic set in include/uapi/asm-generic/fcntl.h IS what x86_64 uses; arm64 is the
+# arch that OVERRIDES four of them in arch/arm64/include/uapi/asm/fcntl.h
+# (O_DIRECTORY / O_NOFOLLOW / O_DIRECT / O_LARGEFILE — see below). riscv takes the
+# generic (x86_64) values.
+# ================================================================
+# O_* flag VALUES differ between Linux and macOS/BSD (the access-mode low
+# bits 0/1/2 match, but CREAT/EXCL/TRUNC/APPEND/etc. don't). This file is
+# included for BOTH Linux-aarch64 AND macho-arm (lib/syscalls.cyr dispatch
+# + ESYSXLAT translating the call numbers), so the constants must match the
+# RUNTIME OS. Without this, a macho tool/wrapper opening O_CREAT|O_TRUNC
+# passes Linux bits to BSD open → wrong flags → file not created (v6.0.34
+# "cyrius build … FAIL", cyrfmt --write). See CHANGELOG.
+#ifdef CYRIUS_TARGET_MACOS
+enum OpenFlag {
+    O_RDONLY = 0;
+    O_WRONLY = 1;
+    O_RDWR = 2;
+    O_CREAT = 0x200;
+    O_EXCL = 0x800;
+    O_TRUNC = 0x400;
+    O_APPEND = 0x8;
+    O_NONBLOCK = 0x4;
+    O_CLOEXEC = 0x1000000;
+    O_NOFOLLOW = 0x100;      # v6.6.4 (Darwin sys/fcntl.h)
+    O_DIRECTORY = 0x100000;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+enum OpenFlag {
+    O_RDONLY = 0;
+    O_WRONLY = 1;
+    O_RDWR = 2;
+    O_CREAT = 64;
+    O_EXCL = 128;
+    O_TRUNC = 512;
+    O_APPEND = 1024;
+    O_NONBLOCK = 2048;
+    O_CLOEXEC = 524288;
+    # v6.6.4: the arm64-SPECIFIC values (arch/arm64/include/uapi/asm/fcntl.h) — NOT the
+    # asm-generic ones, which are x86_64's (and riscv's). The pairs SWAP: x86 O_DIRECTORY
+    # (0x10000) is arm64 O_DIRECT, x86 O_NOFOLLOW (0x20000) is arm64 O_LARGEFILE — which is
+    # how a consumer's hardcoded x86 O_NOFOLLOW followed a symlink here.
+    O_DIRECTORY = 16384;    # 040000
+    O_NOFOLLOW = 32768;     # 0100000
+    O_DIRECT = 65536;       # 0200000
+    O_LARGEFILE = 131072;   # 0400000
+}
+#endif
+
+# ================================================================
+# Signals — cross-ARCH identical (asm-generic/signal.h) but NOT cross-OS.
+#
+# ⚠ v6.5.15: this file is the constant peer for BOTH aarch64-Linux AND
+# macOS-arm64 (`lib/syscalls.cyr:64-71`), and `ESYSXLAT` renumbers SYSCALL
+# NUMBERS ONLY — it never touches VALUES. A signal number is a VALUE, so an
+# unsplit Linux number is simply wrong on Darwin and nothing downstream can
+# notice. Measured on real ecb at v6.5.11: five of these were wrong.
+#
+# ⭐ WRONG HERE DOES NOT MEAN "FAILS" — IT MEANS "SIGNALS THE WRONG THING".
+# Linux SIGCHLD=17 is Darwin's SIGSTOP, so a process waiting on child-exit was
+# watching for a stop. That is why this survived: there is no error to see.
+# Split per-OS, mirroring the `Stat` precedent lower in this file.
+# See issues/archived/2026-08-07-macos-arm64-inherits-linux-signal-and-errno-constants.md.
+# ================================================================
+#ifdef CYRIUS_TARGET_MACOS
+enum Signal {
+    SIGHUP = 1;
+    SIGINT = 2;
+    SIGQUIT = 3;
+    SIGKILL = 9;
+    SIGUSR1 = 30;
+    SIGUSR2 = 31;
+    SIGTERM = 15;
+    SIGCHLD = 20;
+    SIGCONT = 19;
+    SIGSTOP = 17;
+    # Darwin has NO SIGPWR. The x86-macOS peer declares it 30, which is
+    # Darwin's SIGUSR1 — so `kill(pid, SIGPWR)` there silently delivers
+    # SIGUSR1. 0 is the inert choice (`kill(pid, 0)` is the liveness probe,
+    # not a delivery), matching the MAP_STACK = 0 precedent for a flag that
+    # does not exist on this OS. Fail-inert beats fail-wrong.
+    SIGPWR = 0;
+}
+
+enum SigAction {
+    SIG_BLOCK = 1;
+    SIG_UNBLOCK = 2;
+    SIG_SETMASK = 3;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+enum Signal {
+    SIGHUP = 1;
+    SIGINT = 2;
+    SIGQUIT = 3;
+    SIGKILL = 9;
+    SIGUSR1 = 10;
+    SIGUSR2 = 12;
+    SIGTERM = 15;
+    SIGCHLD = 17;
+    SIGCONT = 18;
+    SIGSTOP = 19;
+    SIGPWR = 30;
+}
+
+enum SigAction {
+    SIG_BLOCK = 0;
+    SIG_UNBLOCK = 1;
+    SIG_SETMASK = 2;
+}
+#endif
+
+# ================================================================
+# Mount flags (cross-arch identical)
+# ================================================================
+enum MsFlag {
+    MS_RDONLY = 1;
+    MS_NOSUID = 2;
+    MS_NODEV = 4;
+    MS_NOEXEC = 8;
+    MS_REMOUNT = 32;
+    MS_BIND = 4096;
+    MS_MOVE = 8192;
+}
+
+# ================================================================
+# Epoll constants (cross-arch identical)
+# ================================================================
+enum EpollConst {
+    EPOLL_CLOEXEC = 524288;
+    EPOLL_CTL_ADD = 1;
+    EPOLL_CTL_DEL = 2;
+    EPOLL_CTL_MOD = 3;
+    EPOLLIN = 1;
+    EPOLLOUT = 4;
+    EPOLLERR = 8;
+    EPOLLHUP = 16;
+}
+
+# ================================================================
+# Timer, wait, signalfd, reboot, errno (cross-arch identical)
+# ================================================================
+enum TimerConst {
+    CLOCK_MONOTONIC = 1;
+    TFD_NONBLOCK = 2048;
+    TFD_CLOEXEC = 524288;
+}
+
+enum WaitFlag {
+    WNOHANG = 1;
+    WUNTRACED = 2;
+}
+
+enum SfdFlag {
+    SFD_NONBLOCK = 2048;
+    SFD_CLOEXEC = 524288;
+}
+
+enum RebootCmd {
+    RB_POWER_OFF = 0x4321FEDC;
+    RB_AUTOBOOT = 0x01234567;
+    RB_HALT_SYSTEM = 0xCDEF0123;
+}
+
+# v6.5.15: EAGAIN is the ONLY errno in this list whose value differs on Darwin
+# (35, vs Linux 11 — Darwin's 11 is EDEADLK). Split out ALONE rather than
+# duplicating the whole enum per-OS: the other 16 are identical on both, and a
+# duplicated block is how one arm silently drifts from the other (the exact
+# shape of the Darwin `AT_*` and macOS `Stat` half-fixes). One divergent value,
+# one guarded declaration.
+#ifdef CYRIUS_TARGET_MACOS
+enum ErrnoOs { EAGAIN = 35; }
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+enum ErrnoOs { EAGAIN = 11; }
+#endif
+
+enum Errno {
+    EPERM = 1;
+    ENOENT = 2;
+    ESRCH = 3;
+    EINTR = 4;
+    EIO = 5;
+    ENXIO = 6;
+    EACCES = 13;
+    EBUSY = 16;
+    EEXIST = 17;
+    ENOTDIR = 20;
+    EISDIR = 21;
+    EINVAL = 22;
+    ENFILE = 23;
+    EMFILE = 24;
+    ENOSPC = 28;
+    ECHILD = 10;
+}
+
+# Standard fds
+enum StdFd {
+    STDIN_FD = 0;
+    STDOUT_FD = 1;
+    STDERR_FD = 2;
+}
+
+# Reboot magic
+var LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD;
+var LINUX_REBOOT_MAGIC2 = 672274793;
+
+# ================================================================
+# struct stat layout — aarch64 generic-stat layout
+# (include/uapi/asm-generic/stat.h)
+# ================================================================
+# st_dev    @ 0   (8 bytes)
+# st_ino    @ 8   (8 bytes)
+# st_mode   @ 16  (4 bytes)   <-- offset differs from x86's 144-byte layout (@24)
+# st_nlink  @ 20  (4 bytes)
+# st_uid    @ 24  (4 bytes)   <-- x86 layout: @28
+# st_gid    @ 28  (4 bytes)   <-- x86 layout: @32
+# st_rdev   @ 32
+# (pad)     @ 40
+# st_size   @ 48  (8 bytes)   <-- coincidentally @48 on both arches
+# ...
+# Total = 128 bytes; we use STAT_BUFSZ = 144 (= max of both arches)
+# so consumer alloc/var sites stay arch-clean.
+#
+# This file is included for BOTH aarch64-Linux AND macho-arm (arm64-macOS); the
+# ESYSXLAT macho branch renumbers newfstatat(262)→Darwin fstatat64(470), which
+# fills a Darwin `struct stat64` whose field offsets differ from the Linux
+# generic-stat layout. So the Stat enum is per-OS (mirrors the OpenFlag split
+# above). Darwin arm64 offsets EMPIRICALLY verified on ecb (v6.1.20):
+# st_mode@4, st_size@96, st_mtimespec@48 (sec) / @56 (nsec). Note these differ
+# from x86-macOS's legacy-stat layout in syscalls_macos.cyr (st_size@72) — the
+# arm64 fstatat64 struct is the modern stat64 with birthtimespec.
+# See issues/archived/2026-06-08-macho-arm-at-family-darwin-syscall-mappings.md.
+#ifdef CYRIUS_TARGET_MACOS
+enum Stat {
+    STAT_MODE = 4;
+    STAT_NLINK = 6;
+    STAT_UID = 16;
+    STAT_GID = 20;
+    STAT_SIZE = 96;
+    STAT_MTIME = 48;
+    STAT_MTIME_NSEC = 56;
+    STAT_BUFSZ = 144;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
+enum Stat {
+    STAT_MODE = 16;
+    STAT_NLINK = 20;
+    STAT_UID = 24;
+    STAT_GID = 28;
+    STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
+    STAT_BUFSZ = 144;
+}
+#endif
+
+# ================================================================
+# Syscall wrappers
+# ================================================================
+
+# Body-identical wrappers shared with the x86_64 peer live in
+# lib/syscalls_linux_common.cyr (~46 wrappers extracted v5.11.20).
+# This peer keeps only aarch64-specific at-family wrappers below.
+
+include "lib/syscalls_linux_common.cyr"
+
+# File operations — all routed through at-family equivalents.
+
+# Open a file. Translates to openat(AT_FDCWD, path, flags, mode).
+fn sys_open(path, flags, mode): i64 {
+    return syscall(SYS_OPENAT, AT_FDCWD, path, flags, mode);
+}
+
+# stat(2) equivalent — newfstatat(AT_FDCWD, path, buf, 0).
+# Buffer must be STAT_BUFSZ (= 144) bytes; aarch64 only writes
+# 128 of them but consumers shouldn't have to know that.
+fn sys_stat(path, buf): i64 {
+    return syscall(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0);
+}
+
+# Duplicate fd oldfd to newfd. Translates to dup3(oldfd, newfd, 0) on Linux.
+# The self-dup is the one case dup3 is not dup2: dup3(fd, fd, 0) refuses with -EINVAL by design,
+# where dup2(fd, fd) answers fd when it is open and -EBADF when it is not — x86_64 Linux's and
+# macOS's answer. So `oldfd == newfd` asks fcntl(F_GETFD) whether the fd is open instead, as
+# musl's dup2 does where there is no dup2 syscall (glibc asks F_GETFL; both fail only with
+# EBADF). CHANGELOG [6.7.15]
+# ⚠ On arm64-macOS it issues the x86 dup2 number 33 (ESYSXLAT routes 33 → BSD dup2 90):
+# Darwin has no dup3, and the Mach-O arm deliberately has no 24 row — the one it had
+# (24 → 90) silently dropped dup3's flags, so dup3(…, O_CLOEXEC) left FD_CLOEXEC clear.
+# CHANGELOG [6.6.12]
+fn sys_dup2(oldfd, newfd): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(33, oldfd, newfd);
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    if (oldfd == newfd) {
+        if (sys_fcntl(oldfd, 1, 0) < 0) { return 0 - 9; }   # F_GETFD; EBADF: not open
+        return oldfd;
+    }
+    return syscall(SYS_DUP3, oldfd, newfd, 0);
+    #endif
+}
+
+# Create a directory at path with given mode.
+# Translates to mkdirat(AT_FDCWD, path, mode).
+fn sys_mkdir(path, mode): i64 {
+    return syscall(SYS_MKDIRAT, AT_FDCWD, path, mode);
+}
+
+# Remove an empty directory.
+# Translates to unlinkat(AT_FDCWD, path, AT_REMOVEDIR).
+fn sys_rmdir(path): i64 {
+    return syscall(SYS_UNLINKAT, AT_FDCWD, path, AT_REMOVEDIR);
+}
+
+# Delete a file.
+# Translates to unlinkat(AT_FDCWD, path, 0).
+fn sys_unlink(path): i64 {
+    return syscall(SYS_UNLINKAT, AT_FDCWD, path, 0);
+}
+
+# v6.2.14: flush a file's data + metadata to stable storage. Returns 0 / -errno.
+# aarch64 fsync is 82 (74 on x86_64); the bare wrapper hides the gap — a raw
+# syscall(74) here would hit sched_yield (returns 0 → a silently-fake fsync).
+# See proposal 2026-05-20-syscalls-fsync-stdlib.md.
+fn sys_fsync(fd): i64 {
+    return syscall(SYS_FSYNC, fd);
+}
+
+# v6.2.14: flush file DATA only (not metadata). aarch64 fdatasync is 83.
+fn sys_fdatasync(fd): i64 {
+    return syscall(SYS_FDATASYNC, fd);
+}
+
+# Change owner/group of `path` relative to `dirfd`. With AT_FDCWD +
+# AT_SYMLINK_NOFOLLOW this is lchown; uid/gid of -1 leaves that field unchanged.
+#
+# Issues the PRIVATE ALIAS 1054, not the native 54 — 54 is owned by the x86-compat
+# setsockopt shim and 260 (the x86 number, the usual escape) is this peer's native
+# SYS_WAIT4. See the SYS_FCHOWNAT comment in the enum above for why the alias band
+# exists and what has to move in lockstep. CHANGELOG [6.5.7]
+fn sys_fchownat(dirfd, path, uid, gid, flags): i64 {
+    return syscall(SYS_FCHOWNAT, dirfd, path, uid, gid, flags);
+}
+
+# Create a symbolic link at `linkpath` pointing to `target`.
+# Translates to symlinkat(target, AT_FDCWD, linkpath).
+# Returns 0 on success, negative errno on failure.
+fn sys_symlink(target, linkpath): i64 {
+    return syscall(SYS_SYMLINKAT, target, AT_FDCWD, linkpath);
+}
+
+# v6.1.3 — bare-name fs peers routed through the at-family (aarch64
+# dropped the bare link/lstat/rename syscalls). sys_link uses flags=0
+# to match POSIX link(2)'s no-follow default; sys_lstat sets
+# AT_SYMLINK_NOFOLLOW so it does NOT follow a trailing symlink.
+fn sys_link(oldpath, newpath): i64 {
+    return sys_linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+}
+# lstat(path, buf) — stat that does NOT follow a trailing symlink (via fstatat).
+fn sys_lstat(path, buf): i64 {
+    return sys_fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
+}
+# rename(oldpath, newpath) — single-filesystem rename/move (via renameat).
+fn sys_rename(oldpath, newpath): i64 {
+    return sys_renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
+}
+
+# Read the target of a symbolic link into `buf` (cap `bufsize`).
+# Translates to readlinkat(AT_FDCWD, path, buf, bufsize).
+# Returns the number of bytes placed in buf (no null terminator),
+# or negative errno on failure. Buf is NOT null-terminated by the
+# kernel — caller must store0 if used as a cstring.
+fn sys_readlink(path, buf, bufsize): i64 {
+    return syscall(SYS_READLINKAT, AT_FDCWD, path, buf, bufsize);
+}
+
+# Change file permissions.
+# Translates to fchmodat(AT_FDCWD, path, mode, 0).
+fn sys_chmod(path, mode): i64 {
+    return syscall(SYS_FCHMODAT, AT_FDCWD, path, mode, 0);
+}
+
+# Check file access permissions.
+# Translates to faccessat(AT_FDCWD, path, mode, 0).
+# v6.5.15: the flags word used to be OMITTED. Linux's faccessat syscall really is
+# 3-arg (faccessat2/439 is the 4-arg one), so the register was simply ignored there
+# — but Darwin's faccessat IS 4-arg and VALIDATES flags, so the stale value left in
+# x3 by the previous call made every macOS-arm64 sys_access return -22 EINVAL
+# (measured on ecb: flags=0 → 0; flags=1/420/0xDEADBEEF → -22). Passing an explicit
+# 0 is inert on Linux and required on Darwin — the same shape sys_chmod above has
+# always used for fchmodat. Surfaced once ESYSXLAT actually routed 269→466.
+fn sys_access(path, mode): i64 {
+    return syscall(SYS_FACCESSAT, AT_FDCWD, path, mode, 0);
+}
+
+# Process operations.
+
+# fork(2) equivalent — clone(SIGCHLD, NULL, NULL, NULL, NULL).
+# `SIGCHLD` (=17) tells the kernel to send SIGCHLD to the parent
+# on child exit. No CLONE_* bits set, so child gets its own VM,
+# files, signal handlers, etc. — POSIX-fork semantics. Verified:
+# the proposal originally suggested `CLONE_CHILD|SIGCHLD`, but
+# `CLONE_CHILD` isn't a real Linux clone flag.
+# arm64 macOS (6.6.13): libSystem `fork()` through the Mach-O __got (1701 is the
+# compiler's "__got-bound libSystem routine" sub-band, not a syscall number). The
+# clone row translates to Darwin's RAW fork, which skips libSystem's child-side
+# handling, and the child's first thread_create (pthread_create) then died of
+# SIGSEGV. Same returns either way: 0 child, pid parent, -errno on failure.
+# CHANGELOG [6.6.13]
+fn sys_fork(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return syscall(1701);
+    #else
+    return syscall(SYS_CLONE, SIGCHLD, 0, 0, 0, 0);
+    #endif
+}
+
+# pipe: create pipe, fds[0]=read end, fds[1]=write end.
+# Translates to pipe2(fds, 0).
+fn sys_pipe(fds): i64 {
+    return syscall(SYS_PIPE2, fds, 0);
+}
+
+# Wait for a signal.
+# aarch64 has no bare `pause` syscall; emulate via ppoll with NULL
+# fds and NULL timeout — equivalent to pause(2) semantics
+# (block until a signal handler interrupts it).
+# v6.6.8 — arm64-macOS (which resolves THIS peer) declines with -ENOSYS, the x86-macOS peer's
+# answer since 6.6.5: Darwin has no pause(2) and ppoll is unrouted there (SYS_PPOLL's note in
+# macho_route_parity.sh says why a bare poll renumber would be wrong). Before ESYSXLAT's
+# chain-head default this issued a stale x16; after it, a SIGSYS. CHANGELOG [6.6.8]
+fn sys_pause(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #else
+    return syscall(SYS_PPOLL, 0, 0, 0, 0, 0);
+    #endif
+}
+
+# sys_setsid / sys_waitpid / WIFEXITED / WEXITSTATUS / WIFSIGNALED /
+# WTERMSIG / sys_getuid / sys_getgid / sys_geteuid / sys_getegid /
+# sys_setuid / sys_setgid / sys_setgroups / sys_setresuid /
+# sys_setresgid / sys_prctl / sys_seccomp / sys_execveat / sys_mount /
+# sys_umount2 / sys_sync moved to lib/syscalls_linux_common.cyr at
+# v5.11.20.
+
+# sys_reboot also in lib/syscalls_linux_common.cyr at v5.11.20.
+
+# Signal operations
+fn sigset_new(): i64 {
+    var set = alloc(8);
+    if (set == 0) { return 0; }
+    store64(set, 0);
+    return set;
+}
+
+# sigset_add syscall wrapper.
+fn sigset_add(set, signum): i64 {
+    var mask = load64(set);
+    mask = mask | (1 << (signum - 1));
+    store64(set, mask);
+    return 0;
+}
+
+# sigset_has syscall wrapper.
+fn sigset_has(set, signum): i64 {
+    var mask = load64(set);
+    if ((mask & (1 << (signum - 1))) != 0) { return 1; }
+    return 0;
+}
+
+# sys_sigprocmask / sys_signalfd / sys_epoll_create moved to
+# lib/syscalls_linux_common.cyr at v5.11.20.
+
+# epoll_event: { u32 events, u64 data } = 16 bytes on aarch64. Unlike x86_64 (which
+# has EPOLL_PACKED → data @4), aarch64 leaves the struct unpacked, so the u64 aligns
+# to offset 8. Filled by epoll_event_set, which lib/async.cyr's registrations call too. (v6.4.42)
+# Returns the event, or 0 when the allocation fails.
+fn epoll_event_new(events, data): i64 {
+    var ev = alloc(16);
+    if (ev == 0) { return 0; }
+    return epoll_event_set(ev, events, data);
+}
+
+# The size of one epoll_event on aarch64 — the array stride sys_epoll_wait writes at. The struct
+# is not packed here, so the u64 data aligns to offset 8: 16 bytes (12 on x86_64, which packs
+# it). Reading a returned array at x86_64's 12 / +4 read the wrong bytes. CHANGELOG [6.7.12]
+const EPOLL_EVENT_SIZE = 16;
+
+# The events mask of the epoll_event at `ev` (one element of a sys_epoll_wait array, or an
+# epoll_event_new result).
+fn epoll_event_events(ev): i64 { return load32(ev); }
+
+# The u64 data of the epoll_event at `ev` — at offset 8 on aarch64 (the unpacked layout
+# epoll_event_new writes). Step through a sys_epoll_wait array by EPOLL_EVENT_SIZE.
+fn epoll_event_data(ev): i64 { return load64(ev + 8); }
+
+# Fill the epoll_event at `ev`, a buffer the caller owns (a stack `var ev[16]`, at least
+# EPOLL_EVENT_SIZE bytes): `events` at 0 and `data` at offset 8 (aarch64's unpacked layout).
+# Returns ev, for sys_epoll_ctl. The allocation-free twin of epoll_event_new. CHANGELOG [6.7.14]
+fn epoll_event_set(ev, events, data): i64 {
+    store32(ev, events);
+    store64(ev + 8, data);
+    return ev;
+}
+
+# sys_epoll_ctl moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# Wait for epoll events. aarch64 has only epoll_pwait (#22) — but 22 is x86 `pipe`,
+# which ESYSXLAT rewrites to pipe2(x0, 0). Issuing raw 22 here therefore ran
+# pipe2(epfd, 0) → -EFAULT, so the epoll reactor NEVER worked on aarch64 (the async
+# gates only run on x86; caught on real pi hardware). Issue the x86 epoll_wait number
+# (232, SYS_EPOLL_WAIT — named since 6.7.14: a raw literal in lib/syscalls.cyr's aarch64
+# region is warned as a native number, D61) instead; ESYSXLAT arg-extends it to
+# epoll_pwait(...,NULL sigmask,0). The x86 sibling issues 232 natively, so the wrapper surface
+# matches. See CHANGELOG [6.4.42].
+# v6.6.8: -ENOSYS on arm64-macOS — Darwin has no epoll (kqueue is a different API, see
+# sys_kqueue below), and the raw 232 reached Darwin unrouted. It was invisible to both route
+# gates: macho_route_parity reads only `syscall(SYS_*` names and raw_syscall_literals_routed
+# excludes the peers by name. CHANGELOG [6.6.8]
+fn sys_epoll_wait(epfd, events, maxevents, timeout): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #else
+    return syscall(SYS_EPOLL_WAIT, epfd, events, maxevents, timeout);
+    #endif
+}
+
+# sys_timerfd_create moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# itimerspec: { interval: {sec, nsec}, value: {sec, nsec} } = 32 bytes
+fn timerspec_new(interval_sec, initial_sec): i64 {
+    var ts = alloc(32);
+    if (ts == 0) { return 0; }
+    store64(ts, interval_sec);
+    store64(ts + 8, 0);
+    store64(ts + 16, initial_sec);
+    store64(ts + 24, 0);
+    return ts;
+}
+
+# sys_timerfd_settime moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# timerfd_drain syscall wrapper.
+fn timerfd_drain(fd): i64 {
+    var buf[8];
+    var n = sys_read(fd, &buf, 8);
+    if (n == 8) { return load64(&buf); }
+    return 0;
+}
+
+# Utility
+fn is_err(ret): i64 {
+    if (ret < 0) { return 1; }
+    return 0;
+}
+
+# err_code syscall wrapper.
+fn err_code(ret): i64 {
+    return 0 - ret;
+}
+
+# Inotify — file system event monitoring (cross-arch identical
+# event flag values; only the syscall numbers differ from x86_64).
+enum InotifyEvent {
+    IN_MODIFY = 2;
+    IN_CREATE = 256;
+    IN_DELETE = 512;
+    IN_MOVED_FROM = 64;
+    IN_MOVED_TO = 128;
+    IN_CLOSE_WRITE = 8;
+}
+
+# v6.6.8: all three decline with -ENOSYS on arm64-macOS, which resolves this peer — Darwin
+# has no inotify (file events are kqueue/FSEvents), so 26/27/28 reached it unrouted, a stale
+# x16 before ESYSXLAT's chain-head default and a SIGSYS after it. CHANGELOG [6.6.8]
+# One definition each with the arms INSIDE, not two definitions under #ifdef/#else — the
+# #ifdef-blind static tools would read the pair as a duplicate (signal_ignore's note).
+# Initialise an inotify instance and return its fd.
+fn sys_inotify_init(): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #else
+    return syscall(SYS_INOTIFY_INIT1, 0);
+    #endif
+}
+# Add a watch on a path for inotify events
+fn sys_inotify_add_watch(fd, path, mask): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #else
+    return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask);
+    #endif
+}
+# Remove an inotify watch
+fn sys_inotify_rm_watch(fd, wd): i64 {
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 78;
+    #else
+    return syscall(SYS_INOTIFY_RM_WATCH, fd, wd);
+    #endif
+}
+
+# v5.7.35 (drm/luks/security) + v5.11.18 (kybernet socket family) —
+# sys_getdents64 / sys_getrandom / sys_landlock_create_ruleset /
+# sys_landlock_add_rule / sys_landlock_restrict_self / sys_socket /
+# sys_bind / sys_listen / sys_connect / sys_recvfrom / sys_accept4 /
+# sys_recvmsg moved to lib/syscalls_linux_common.cyr at v5.11.20.
+
+# v6.5.27 — kqueue/kevent for arm64-macOS ONLY.
+# ⚠ THIS FILE IS SHARED: lib/syscalls.cyr selects it for aarch64-LINUX *and* for
+# arm64-macOS (see syscalls.cyr:68-70 — macOS+AARCH64 resolves HERE, not to
+# syscalls_macos.cyr, which is x86-macOS only). That surprise is exactly why the first
+# kqueue pass built on Intel-Mac and failed on ecb with `undefined function sys_kqueue`.
+# Guarded so real aarch64-Linux, which has epoll and no kqueue, is untouched.
+# Private-alias band 1000+native: 1362→BSD 362 kqueue, 1363→BSD 363 kevent, renumbered by
+# the aarch64 macho translator (_macho_arm_routes + the ESYSXLAT rows added at v6.5.27).
+#ifdef CYRIUS_TARGET_MACOS
+# Create a Darwin kernel queue. Returns the kqueue fd, or < 0.
+fn sys_kqueue(): i64 {
+    return syscall(1362);
+}
+# Register changes and/or collect events on a kqueue. Returns the event count, or < 0.
+fn sys_kevent(kq, changelist, nchanges, eventlist, nevents, timeout): i64 {
+    return syscall(1363, kq, changelist, nchanges, eventlist, nevents, timeout);
+}
+#endif
+
+# ── v6.5.43 (band J phase 1) — Darwin CONCURRENCY primitives, arm64-macOS ONLY.
+#
+# macOS has neither clone nor futex. Real threading is `bsdthread_*` and blocking is
+# `__ulock_*`; none of the five was routed on either Mach-O backend before this release, which
+# is why `lib/thread_macos.cyr` runs bodies INLINE and `lib/sync_macos.cyr` is a bare
+# `atomic_cas` spinlock with no kernel wait.
+#
+# ⚠ SAME SHARED-FILE TRAP as kqueue above: `lib/syscalls.cyr` selects THIS file for
+# aarch64-LINUX *and* arm64-macOS, so every one is `#ifdef CYRIUS_TARGET_MACOS`-guarded and
+# real aarch64-Linux — which has futex and clone — is untouched.
+#
+# ⚠ ARITIES ARE FROM DARWIN'S `syscalls.master`, and phase 2 is what CONFIRMS them by
+# execution. `bsdthread_register` takes 6 args in older SDKs and 7 in newer ones (a trailing
+# `tsd_offset`); the 6-arg form is used here because cyrius `syscall()` carries at most 6 and
+# the 7th is optional in practice. If phase 2 finds otherwise on real ecb, this is the line to
+# change — recorded so that is a one-line correction rather than a re-investigation.
+#
+# ⛔ THESE DO NOT MAKE A THREAD ON THEIR OWN. `bsdthread_register` must run before
+# `bsdthread_create`, and the created thread enters the REGISTERED TRAMPOLINE with a
+# Darwin-specific register layout — not the user fn. That is phase 2 (`.44`).
+#ifdef CYRIUS_TARGET_MACOS
+# Register the thread-start and workqueue trampolines. MUST be called once, before any
+# bsdthread_create. Returns 0 on success.
+fn sys_bsdthread_register(threadstart, wqthread, flags, stack_addr_hint, targetconc, dq_offset): i64 {
+    return syscall(1366, threadstart, wqthread, flags, stack_addr_hint, targetconc, dq_offset);
+}
+# Create a thread that begins in the REGISTERED trampoline (not `func`). Returns the new
+# thread's port/pointer, or < 0.
+fn sys_bsdthread_create(func, func_arg, stack_addr, pthread, flags): i64 {
+    return syscall(1360, func, func_arg, stack_addr, pthread, flags);
+}
+# Terminate the calling thread and free its stack. Does not return on success.
+fn sys_bsdthread_terminate(stackaddr, freesize, port, sem): i64 {
+    return syscall(1361, stackaddr, freesize, port, sem);
+}
+# Block until *addr changes from `value`. `operation` selects the ulock class
+# (UL_COMPARE_AND_WAIT = 1). `timeout` is microseconds; 0 means wait forever.
+fn sys_ulock_wait(operation, addr, value, timeout_us): i64 {
+    return syscall(1515, operation, addr, value, timeout_us);
+}
+# Wake a thread blocked in __ulock_wait on `addr`. ULF_WAKE_ALL = 0x100 in `operation`.
+fn sys_ulock_wake(operation, addr, wake_value): i64 {
+    return syscall(1516, operation, addr, wake_value);
+}
+#endif

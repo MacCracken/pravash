@@ -1,0 +1,167 @@
+# alloc_windows.cyr — VirtualAlloc-backed bump allocator for
+# Cyrius PE targets (Windows x86_64).
+# Usage: include via lib/alloc.cyr's selector (do NOT include
+#        this file directly — go through lib/alloc.cyr).
+#
+# Shipped v5.5.0. Linux's lib/alloc.cyr uses brk (syscall 12)
+# which has no native Windows equivalent (Windows heaps are
+# HeapAlloc / VirtualAlloc — region-oriented, not the one
+# monotonically-growing brk region). Rather than teach cyrius's
+# PE reroute to fake brk via repeated VirtualAlloc commits, we
+# ship a Windows-shaped allocator with the same public surface
+# (alloc_init / alloc / alloc_reset / ALLOC_MAX).
+#
+# DESIGN: one big reservation at alloc_init (16 MB default),
+# bump inside it. Matches lib/alloc.cyr's existing "no individual
+# free" contract — programs that outgrow 16 MB should use
+# `lib/freelist.cyr` or spawn a fresh arena. The reservation
+# size can be tuned per program via environment (future work;
+# not wired yet).
+
+var _heap_base = 0;
+var _heap_ptr = 0;
+var _heap_end = 0;
+
+# Windows heap reservation size. 16 MB — matches the historical
+# Linux heap ceiling most cyrius-compiled programs use. Grow
+# discipline: if a downstream program needs more, open a GitHub
+# issue; don't silently bump (bigger initial commit = slower
+# startup + more RSS).
+var _WIN_HEAP_SIZE = 0x1000000;
+
+# Initialize the heap via mmap (syscall 9), which the PE backend
+# routes to VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE,
+# PAGE_READWRITE) — the SAME reroute the main compiler heap uses.
+#
+# v6.0.39 FIX: this used `syscall(12)` (brk), assuming a
+# "PE-reroutes-brk-to-VirtualAlloc" that was NEVER implemented — the
+# PE syscall dispatch (parse/expr/factor.cyr) has cases for 0/1/2/3/8/9/60/228
+# but NOT 12, so `syscall(12)` fell through to a raw SYSCALL instruction,
+# illegal on Windows → STATUS_ACCESS_VIOLATION. cycc's own `vec_new()`
+# at startup hit it on the first `alloc()` and crashed before reading a
+# single byte of source — which is why no program ever compiled on
+# Windows. It shipped since v5.5.0 because CI only ran EMITTED programs,
+# never compiled one THROUGH cycc on real Windows. mmap is rerouted and
+# works on both hosts (Linux: real mmap; Windows: VirtualAlloc). No grow
+# on Windows: `alloc()` returns 0 on overflow rather than corrupting.
+# See CHANGELOG [6.0.39].
+fn alloc_init() {
+    # Idempotent (v6.1.23): re-call is a no-op once the heap is up — pre-fix every
+    # recall VirtualAlloc'd a fresh 16 MB reservation, abandoning the live one.
+    # Free via alloc_reset(). See issue 2026-06-09-chunked-alloc-init-not-idempotent.
+    if (_heap_base != 0) { return _heap_base; }
+    # mmap(addr=0, len=_WIN_HEAP_SIZE, prot=RW(3), MAP_PRIVATE|ANON(0x22),
+    # fd=-1, off=0). PE EMMAP_PE ignores prot/flags/fd/off and always
+    # COMMIT|RESERVE + PAGE_READWRITE.
+    # ⚠ CHECKED, and into a LOCAL first (6.6.7). VirtualAlloc returns 0 on failure; this
+    # adopted it unchecked, so `_heap_base` stayed 0 and EVERY later alloc() re-ran this
+    # init and silently returned 0 (or a small bogus pointer) while the Linux and macOS
+    # peers abort loudly. Now it aborts like them. CHANGELOG [6.6.7]
+    var base = syscall(9, 0, _WIN_HEAP_SIZE, 3, 0x22, 0 - 1, 0);
+    if (base <= 0) {
+        syscall(1, 2, "alloc_init: mmap failed\n", 24);
+        syscall(60, 1);
+    }
+    _heap_base = base;
+    _heap_end = base + _WIN_HEAP_SIZE;
+    _heap_ptr = base;
+    return base;
+}
+
+# Maximum single allocation (256 MB — same as Linux peer, will
+# fail at runtime if >16 MB is requested from a single allocation
+# since the reservation is 16 MB).
+var ALLOC_MAX = 0x80000000;   # 2 GiB (v6.4.51: was 256 MiB; output_buf now allocs 1 GiB off-heap)
+
+# Allocate size bytes, 8-byte aligned. Returns 0 on overflow /
+# out-of-region.
+fn alloc(size) {
+    # Pure validation OUTSIDE the v6.0.64 alloc lock (no shared state).
+    if (size <= 0) { return 0; }
+    if (size > ALLOC_MAX) { return 0; }
+    #ifdef CYRIUS_POISON
+    var pz_req = size;       # 6.6.18: redzone room, after the checks on the REQUEST
+    size = size + _POISON_HDR + _POISON_RZ + _POISON_RZ;
+    #endif
+    size = (size + 7) & (0 - 8);
+    # --- critical section (shared bump pointer) ---
+    _alloc_lock_acquire();
+    # v5.8.37 — lazy-init the heap if alloc_init() was never called
+    # (now race-safe). See lib/alloc.cyr header for the migration note.
+    if (_heap_base == 0) { alloc_init(); }
+    #ifdef CYRIUS_POISON
+    # 6.6.18 review: the reserve-fit decision alloc_used() reports must be the NON-poison one.
+    # The redzones fill the reserve sooner, so a request that fits without poison can take the
+    # `big` path here; the shadow counter advances by the rounded request exactly when the
+    # non-poison request would have fit the reserve, whichever path the poisoned block takes.
+    var pz_cnt = _poison_shadow_take(pz_req, _heap_end - _heap_base);
+    #endif
+    var ptr = _heap_ptr;
+    var new_ptr = ptr + size;
+    # Overflow check: wrapped pointer = arithmetic overflow.
+    if (new_ptr < ptr) { _alloc_lock_release(); return 0; }
+    # v6.4.52 — large-object path. A request that won't fit the fixed
+    # _WIN_HEAP_SIZE bump reservation gets its OWN dedicated VirtualAlloc,
+    # returned directly (bump pointer untouched). Same reroute the reservation
+    # uses: syscall(9, 0, size, RW=3, PRIV|ANON=0x22, -1, 0) -> EMMAP_PE ->
+    # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE). NOTE:
+    # EMMAP_PE always eager-commits (no MEM_RESERVE-only variant in the backend),
+    # so a 1 GiB request charges 1 GiB against the commit limit up front (RAM
+    # still lazy/demand-zero); this succeeds on a normal dev box (cass's own
+    # ~116 MiB heap commits up front every release) — a MEM_RESERVE-only path
+    # would need a codegen change (future). VirtualAlloc returns 0 on failure,
+    # which is exactly alloc()'s overflow contract. No individual free (same as
+    # the bump region; reclaimed at process exit). Mirrors lib/alloc.cyr's
+    # fresh-chunk-per-large-request. See issue
+    # 2026-07-11-macos-windows-large-single-allocation-path.md.
+    if (new_ptr > _heap_end) {
+        var big = syscall(9, 0, size, 3, 0x22, 0 - 1, 0);
+        #ifdef CYRIUS_POISON
+        if (big <= 0) { _poison_shadow_undo(pz_req, pz_cnt); }
+        #endif
+        _alloc_lock_release();
+        if (big <= 0) { return 0; }
+        #ifdef CYRIUS_POISON
+        return _poison_arm_alloc(big, pz_req, pz_cnt);
+        #endif
+        return big;
+    }
+    _heap_ptr = new_ptr;
+    _alloc_lock_release();
+    #ifdef CYRIUS_POISON
+    return _poison_arm_alloc(ptr, pz_req, pz_cnt);   # armed + published outside the lock
+    #endif
+    return ptr;
+}
+
+# Reset the bump pointer back to base. All previously-allocated
+# memory is invalidated (same contract as Linux peer). Locked so a
+# concurrent alloc() can't observe a half-updated bump pointer.
+fn alloc_reset() {
+    #ifdef CYRIUS_POISON
+    poison_forget_all();     # 6.6.18: every listed block dies here, and its address is re-issued
+    #endif
+    _alloc_lock_acquire();
+    # Scrub the reclaimed span before rewinding so a later alloc() can't read
+    # the prior occupant's bytes (memory-reuse info-leak, CVE-2026-34988 class;
+    # v6.4.1). One fixed VirtualAlloc reservation here, so [_heap_base,
+    # _heap_ptr) is the exact written extent. _alloc_zero is the un-gated helper
+    # in lib/alloc.cyr.
+    var span = _heap_ptr - _heap_base;
+    if (span > 0) { _alloc_zero(_heap_base, span); }
+    _heap_ptr = _heap_base;
+    #ifdef CYRIUS_POISON
+    _poison_shadow = 0;
+    _poison_hidden = 0;
+    #endif
+    _alloc_lock_release();
+    return 0;
+}
+
+# Bytes used from the heap.
+fn alloc_used() {
+    #ifdef CYRIUS_POISON
+    return _poison_shadow - _poison_hidden;
+    #endif
+    return _heap_ptr - _heap_base;
+}

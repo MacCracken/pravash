@@ -3,59 +3,64 @@
 Thank you for considering a contribution! This document covers the development
 workflow, coding standards, and review process.
 
+pravash is being ported from Rust to Cyrius. The plan of record is
+[`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md). The Rust 1.3.0 crate in
+`rust-old/` is the frozen parity oracle: don't change it.
+
 ## Development Setup
 
-```bash
+```sh
 # Clone the repository
 git clone https://github.com/MacCracken/pravash.git
 cd pravash
 
-# Ensure you have the correct toolchain (see rust-toolchain.toml)
-rustup show
+# The Cyrius toolchain version is pinned in cyrius.cyml ([package].cyrius)
+cyrius --version
 
-# Run the full local CI suite
-make check
+# Resolve dependencies (vendors lib/), build, test
+cyrius deps
+cyrius build src/main.cyr build/pravash
+cyrius test
+
+# The Rust oracle (read-only; needs cargo)
+cargo test --manifest-path rust-old/Cargo.toml --all-features
 ```
 
 ## Pull Request Process
 
 1. **Fork and branch** — create a feature branch from `main`.
-2. **Keep commits focused** — one logical change per commit.
-3. **Write tests** — new features require tests; bug fixes require a regression
-   test.
-4. **Run CI locally** before pushing:
-   ```bash
-   make check        # fmt + clippy + test + audit
-   ```
+2. **Keep commits focused** — one logical change per commit; one module at a time during the port.
+3. **Write tests** — a ported function needs its golden parity rows and its ported Rust tests; a bug fix needs
+   a regression test.
+4. **Run the cleanliness check** before pushing (CLAUDE.md lists it): `cyrius fmt --check`, `cyrius lint`,
+   `cyrius vet`, `cyrius build`, `cyrius test` (warning-free), `cyrius test --bounds`, `cyrius bench`,
+   `cyrius deps --locked`, `cyrius audit`.
 5. **Open a PR** against `main` with a clear description of the change.
 6. **Address review feedback** — maintainers may request changes before merging.
 
 ## Code Style
 
-- Follow `rustfmt` defaults (enforced by CI).
-- Zero clippy warnings (`cargo clippy --all-features --all-targets -- -D warnings`).
-- Public API items must have doc comments.
-- Use `#[inline]` on small, hot-path functions.
-- Use `#[non_exhaustive]` on public enums and extensible structs.
-- Physics functions must document units in their doc comments.
+- `cyrius fmt` formatting and a clean `cyrius lint` (enforced by CI).
+- `cyrius test` and `cyrius build` print no float type warnings. Each warning is a bug.
+- Public functions have doc comments, and physics functions document their units.
+- `#must_use` on pure functions, `#inline` on hot paths, append-only enum values.
+- No aborts in `src/`: no `+?`, `-?`, `*?`, `assert_fatal`, `panic` or `result_unwrap`.
+- Names: `Pv<Name>` structs, `PV_` globals, `_pv_` private helpers.
+- A stand-in for a missing library routine carries an `UPSTREAM(Ln)` note and a ledger row (ADR 0003).
 
 ## Testing Requirements
 
-- All public API changes must include unit tests.
-- Integration tests go in `tests/`.
-- Benchmarks go in `benches/` and should be run before/after performance-sensitive
+- Every ported public function is compared against the oracle's golden values, within the parity class the
+  port plan (§5) assigns. Never widen a class to make a row pass.
+- Every Rust test is ported, folded into golden rows, or recorded with a reason.
+- Benchmarks go in `tests/*.bcyr`, beside their Rust twins, and are run before and after performance-sensitive
   changes.
-- Target: maintain or improve code coverage on every PR.
 
-```bash
-# Run tests
-cargo test --all-features
-
-# Run benchmarks
-make bench
-
-# Generate coverage report
-make coverage
+```sh
+cyrius test            # unit, parity and reference tests
+cyrius test --bounds   # the same, bounds-checked
+cyrius bench           # benchmarks
+cyrius fuzz            # fuzz targets
 ```
 
 ## Commit Messages
@@ -63,7 +68,7 @@ make coverage
 Use clear, imperative-mood commit messages:
 
 ```
-add Manning's bed friction to shallow water solver
+port shallow water's HLL fluxes (M2 part 1)
 
 fix NaN handling in FluidConfig validation
 ```

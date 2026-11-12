@@ -2,6 +2,12 @@
 
 > **Pravash** (Sanskrit: प्रवास — journey, flow) — fluid dynamics simulation for AGNOS
 
+> **Being ported to Cyrius.** This README describes the Rust crate, **1.3.0**, which is the published library
+> and the frozen parity oracle in [`rust-old/`](rust-old/). The Cyrius library will ship as **2.0.0**, carrying
+> every module and feature. The plan of record is [`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md),
+> and its progress is in [`docs/development/state.md`](docs/development/state.md). The README is rewritten for
+> Cyrius at the port's last milestone (M8).
+
 [![CI](https://github.com/MacCracken/pravash/actions/workflows/ci.yml/badge.svg)](https://github.com/MacCracken/pravash/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/pravash.svg)](https://crates.io/crates/pravash)

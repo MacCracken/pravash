@@ -1,0 +1,3 @@
+# cyrius.lock records the exact bytes of every lib/ file, so git must not convert their line
+# endings on checkout (core.autocrlf): `cyrius deps --verify` and `--locked` fail on a CRLF copy.
+lib/** -text

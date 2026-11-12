@@ -11,9 +11,15 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. M0 steps 0.1–0.4 are
-> done: the Rust `oracle` hooks and their proof, the tracked lockfile, and glibc recorded. Next is step 0.5,
-> the commit and the 1.3.0 tag. Nothing has moved to `rust-old/` yet.
+> ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
+> published to crates.io. M0 steps 0–4 are done:
+> - the frozen oracle;
+> - the scaffold and its repairs;
+> - ADRs 0001–0003;
+> - `cyrius.cyml`;
+> - the semantics probe.
+>
+> Next is step 5, the golden-value generator.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -282,12 +288,25 @@ function, so nothing leaves parity entirely.
       a corpus from another glibc.
    5. ⏳ **Commit, then tag 1.3.0** (D1). The tag runs `release.yml`, which publishes 1.3.0 to crates.io. Nothing
       in `src/` changes after this point.
-1. **Scaffold.** Run `cargo clean` first (`target/` is 3.3 GB). Then run `cyrius port --dry-run .`, then `cyrius port .`.
+1. ✅ **Scaffold. Done 2026-11-11.** Run `cargo clean` first (`target/` was 4.1 GB by then). Then run `cyrius port --dry-run .`, then `cyrius port .`.
+   The result matched the expectation below. `rust-old/` stays tracked, because the scaffold appends `/rust-old/target/`
+   (not `/rust-old/` as it reports). The frozen crate still passes there: 351 unit, 33 integration and 14 oracle tests.
+   The scaffold overwrote CLAUDE.md, the roadmap and both workflows, wrote `version = "0.1.0"`, and left `bench` out of
+   `[test] stdlib`: the open clobber issue's items 1–3, confirmed again on 6.7.18.
    - Expect these to move into `rust-old/`: `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`, `benches/`, `examples/`,
      `Makefile`, `deny.toml`, `codecov.yml`, `rust-toolchain.toml`. `--dry-run` doesn't list them by name.
    - Expect these to be written: `src/main.cyr`, `cyrius.cyml`, `tests/pravash.{tcyr,bcyr,fcyr}`,
      `docs/{adr,architecture,guides,examples}/` and `docs/development/state.md`.
-2. **Repair what the scaffold overwrites.** The clobber issue is still open on 6.7.18; impetus's §4 step 2 is the checklist.
+2. ✅ **Repair what the scaffold overwrites. Done 2026-11-11.**
+   - CLAUDE.md merged, with the principles translated against §1.1 and the §0.1 rules.
+   - The roadmap restored from git, and `state.md` rewritten.
+   - The Cyrius CI gained `test --bounds`, `deps --locked`, `audit` and a frozen-oracle job. The Rust workflows are in `rust-old/.github/workflows/`.
+   - The Rust scripts, `docs/architecture/overview.md` and `docs/development/migration.md` are in `rust-old/`, and so is `rust-old/README.md` (the manifest names it).
+   - ADRs 0001–0003 are written.
+   - The six scaffold stubs are documented.
+   - CONTRIBUTING and SECURITY are rewritten. The README gets a port banner now; its full rewrite is M8's, as in impetus.
+
+   The clobber issue is still open on 6.7.18; impetus's §4 step 2 is the checklist.
    - **CLAUDE.md**: merge `git show HEAD:CLAUDE.md` with the scaffold's Cyrius rules, keeping the identity, the
      process and the DO NOT list, including "NEVER use `gh`". Translate the principles against §1.1:
      - `#[non_exhaustive]` → append-only enum values;
@@ -319,7 +338,11 @@ function, so nothing leaves parity entirely.
        transcriptions, the ganita substitutes and `crmath` (D2).
    - **Checks**: `cyrius.cyml` reads `version = "${file:VERSION}"`, and `bench` is in `[test] stdlib`. Document the
      scaffold's stub functions so `cyrius audit` passes. Rewrite CONTRIBUTING, SECURITY and the README for Cyrius.
-3. **`cyrius.cyml`.** There is no `[lib]` until M1, because `modules = []` is invalid. Confirm the keys with `cyrius help manifest`.
+3. ✅ **`cyrius.cyml`. Done 2026-11-11.** It is written as below, with one change: hisab is `scope = "test"` until a library
+   module calls it. As a production dependency it would reach every consumer's compile (impetus ADR 0007, second amendment).
+   `cyrius deps` locked 52 files, plus 2 commit pins (hisab 3.4.1 `d6703c5`, and sakshi 2.5.10 through hisab). These gates pass,
+   with no warnings: `build`, `test`, `test --bounds`, `bench`, `fuzz`, `lint`, `fmt --check`, `vet`, `deps --locked`, `audit`.
+   There is no `[lib]` until M1, because `modules = []` is invalid. Confirm the keys with `cyrius help manifest`.
    ```toml
    [package]
    name = "pravash"
@@ -352,7 +375,22 @@ function, so nothing leaves parity entirely.
    Module order: error → constants → mathx → crmath → vec3 → common → json → buoyancy → vortex → bridge → par →
    shallow → grid_solve → grid → mac_grid → k_epsilon → vof → phase_field → sph_kernels → neighbor → sph_fns → sph →
    sph_pcisph → sph_dfsph → sph_multiphase → coupling → mpm → compute → logging → ai.
-4. **Toolchain and math check.** Confirm the counterpart of every Rust f64 method in §7.1 on 6.7.18. impetus
+4. ✅ **Toolchain and math check. Done 2026-11-11** ([`port-parity.md`](port-parity.md) §1, programs in `scripts/probes/`).
+   `p0_semantics.cyr` and its Rust twin `p0_semantics.rs` compare the bits of every operation, and the probe compiles
+   warning-free. Exact on every case:
+   - the f32 SPH cell key, including saturation and NaN;
+   - `floor`, `ceil`, `sqrt` and `abs`;
+   - ln, sin and cos, hypot and cbrt on the probed points;
+   - `to_radians`, and `powi` (2 and 8) as square-and-multiply.
+
+   Needs a helper (ledger L2):
+   - `f64_min` / `f64_max` return NaN for a NaN *second* operand (165 call sites);
+   - `f64_to` doesn't saturate as Rust's `as i32`, `as u32` and `as usize` do (3, 2 and 19 sites):
+     negatives, huge values and NaN differ.
+
+   Off by 1–2 ulp: there is no `log10` (ln/ln 10 is 1–2 ulp off), and ganita's `pow` and `atan2` and the exp
+   polyfill are each 1 ulp off somewhere. All of these are covered by L1.
+   Confirm the counterpart of every Rust f64 method in §7.1 on 6.7.18. impetus
    probed the following, and its results carry over:
    - `f64_min` / `f64_max` don't follow Rust's NaN rules;
    - the stdlib has no public `is_nan`, `is_finite`, `copysign`, `sin_cos`, `EPSILON`, `INFINITY` or `NAN`;
@@ -630,7 +668,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | # | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
 |---|---|---|---|---|---|
 | L1 | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2) | ganita has no correctly rounded tier | **ganita**: the open `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`; pravash joins as the third consumer and adds ln, log10 and cbrt to its list | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
-| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `copysign`, `sin_cos`, typed `EPSILON` / `INFINITY` / `NAN` | the stdlib's `f64_min` / `f64_max` NaN rules and missing names | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
+| L2 | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, typed `MAX` / `INFINITY` / `NAN` / `f32::EPSILON`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize` | the stdlib's `f64_min` / `f64_max` NaN rules, missing names, and no saturating float→int convert (port-parity §1) | **stdlib math**: impetus's list (§8 of its plan). pravash files it if it is still unfiled, otherwise joins it | stdlib `f64_*` | the M0 math sweep, class A |
 | L3 | `src/vec3.cyr`: `DVec3` arithmetic on f64 locals | every `hvec3_*` result allocates | **hisab** H1 (allocation-free vector math) and H9, **cyrius** S1; pravash joins all three with probe 1 and 2 numbers | hisab's value or in-place vector forms | the class B rows of every module that uses vectors |
 | L4 | `src/neighbor.cyr`: the neighbour grid (f32 keys until the D3 switch) | `spatial_hash_*` allocates on every insert and query | **hisab P2 (new)**: a rebuild with no per-insert allocation and a query into a caller's buffer. It joins impetus's H7 and H9 | `spatial_hash_*` | neighbour lists (class A) and every SPH and coupling step row |
 | L5 | `src/grid_solve.cyr`: matrix-free linear CG, transcribed from hisab 1.4.0 | no linear CG in hisab 3.4.1 or ganita | **hisab P1 (new)**: an operator as a closure, a relative tolerance, the iteration count returned | hisab's linear CG | the CG pressure rows (iterations class A, solution class B) |
@@ -663,7 +701,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | — | — | — | D1–D6 decided 2026-11-11; step 0.1–0.4 done 2026-11-11 (gates green, `oracle` feature + `tests/oracle.rs` 14 tests, mutation-checked, lockfile tracked, glibc 2.44); next: step 0.5, the commit and the 1.3.0 tag (maintainer) (Rust oracle hooks, lockfile, tag 1.3.0); step 10 files the upstream requests and seeds the ledger |
+| M0 Initialize | ⏳ in progress | — | — | — | D1–D6 decided 2026-11-11. Step 0 done; **1.3.0 tagged on `a88bc4e` and published to crates.io**. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`; every Cyrius gate green). Step 4 done (port-parity §1: the semantics probe; L2 gains the saturating casts). Next: step 5, the golden-value generator |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

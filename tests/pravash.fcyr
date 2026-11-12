@@ -1,0 +1,18 @@
+# pravash fuzz harness
+
+# Fuzz target: takes `len` bytes at `data`. The port's targets replace this (M8).
+fn fuzz_main(data, len) {
+    if (len == 0) { return 0; }
+    return 0;
+}
+
+# Runs the fuzz target once on a fixed input.
+fn main() {
+    alloc_init();
+    fuzz_main("test", 4);
+    println("fuzz: ok");
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);
