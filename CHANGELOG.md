@@ -47,6 +47,12 @@
     9,632 pending (the M1 helpers). It is warning-free, and the same under `--bounds`.
   - **Finding:** ganita's cbrt equals the oracle's on all 1,025 rows, so cbrt needs no stand-in.
   - **Mutation-checked:** a flipped golden bit, a 1-ulp constant, and a mis-wired dispatcher each fail their row.
+- **Cross-target baselines** (port plan M0 step 8): per-function digests in `tests/parity.tcyr`. Every dispatched
+  function gives identical bits on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu); only the native x87 shadows
+  differ, by design.
+  - **Bounds:** K = 2 for sin, cos, sin_cos, atan2, exp, ln and hypot (measured max 1, hypot 2), and K = 0 for
+    cbrt. powf stays measured until its correctly rounded M1 counterpart.
+  - **Gated:** 21,852 ok, 0 failed on all three targets. Both bounds are mutation-checked.
 
 ## [1.3.0] - 2026-11-09
 

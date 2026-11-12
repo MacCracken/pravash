@@ -17,7 +17,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 
 | Milestone | Status |
 |---|---|
-| M0 Initialize | ⏳ **in progress.** Step 0 (Rust, 2026-11-11): P(-1) gates green; the hidden `oracle` feature (dumps for all eleven stateful types, the SPH neighbour lists, the four pressure-solver hooks, the MLS inverse); `tests/oracle.rs` 14 tests, mutation-checked, green with and without `parallel`; `Cargo.lock` tracked; glibc 2.44. Step 1 (2026-11-11): `cyrius port` scaffold, with the Rust crate in `rust-old/`, which still passes there (351 unit, 33 integration, 14 oracle). Step 2: repairs done (CLAUDE.md, CI, docs, ADRs 0001–0003). Step 3: `cyrius.cyml`, with hisab 3.4.1 test-scoped; `build`, `test`, `test --bounds`, `bench`, `fuzz`, `lint`, `fmt`, `vet`, `deps --locked` and `audit` all green. Step 4: the semantics probe ([`port-parity.md`](port-parity.md) §1), with the helpers it calls for in ledger L2. Step 5: the golden-value generator (`scripts/oracle/`): constants 29 + math 33,239 rows, deterministic, reproduced by the parallel build, all recomputed by `validate.py`; the oracle's cbrt is compiler_builtins' (port-parity §3). Step 6: `src/constants.cyr` (14 public + 6 std float constants, both lists proven complete), every value compiled and compared by `probe_tables.py`. Step 7: the parity harness (`tests/parity.tcyr`): 5,149 ok, 0 failed, 18,493 measured, 9,632 pending; ganita's cbrt equals the oracle's. Steps 8–10: pending |
+| M0 Initialize | ⏳ **in progress.** Step 0 (Rust, 2026-11-11): P(-1) gates green; the hidden `oracle` feature (dumps for all eleven stateful types, the SPH neighbour lists, the four pressure-solver hooks, the MLS inverse); `tests/oracle.rs` 14 tests, mutation-checked, green with and without `parallel`; `Cargo.lock` tracked; glibc 2.44. Step 1 (2026-11-11): `cyrius port` scaffold, with the Rust crate in `rust-old/`, which still passes there (351 unit, 33 integration, 14 oracle). Step 2: repairs done (CLAUDE.md, CI, docs, ADRs 0001–0003). Step 3: `cyrius.cyml`, with hisab 3.4.1 test-scoped; `build`, `test`, `test --bounds`, `bench`, `fuzz`, `lint`, `fmt`, `vet`, `deps --locked` and `audit` all green. Step 4: the semantics probe ([`port-parity.md`](port-parity.md) §1), with the helpers it calls for in ledger L2. Step 5: the golden-value generator (`scripts/oracle/`): constants 29 + math 33,239 rows, deterministic, reproduced by the parallel build, all recomputed by `validate.py`; the oracle's cbrt is compiler_builtins' (port-parity §3). Step 6: `src/constants.cyr` (14 public + 6 std float constants, both lists proven complete), every value compiled and compared by `probe_tables.py`. Step 7: the parity harness (`tests/parity.tcyr`): 5,149 ok, 0 failed, 18,493 measured, 9,632 pending; ganita's cbrt equals the oracle's. Step 8: the cross-target baselines: digests identical on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt; gated **21,852 ok, 0 failed** (port-parity §2.2). Steps 9–10: pending |
 | M1–M8 | not started |
 
 ## Toolchain
@@ -37,7 +37,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
-- **Cyrius**: `tests/parity.tcyr` replays the corpus: 2 modules, 0 failing; 5,149 ok, 0 failed, 18,493 measured (class C, bounds at step 8), 9,632 pending (M1 helpers); plus the scaffold's `tests/pravash.{tcyr,bcyr,fcyr}` stubs.
+- **Cyrius**: `tests/parity.tcyr` replays the corpus: 2 modules, 0 failing; 21,852 ok, 0 failed, 1,790 measured (powf, until M1), 9,632 pending (M1 helpers), with identical bits on x86_64 ELF, x86_64 PE and aarch64; plus the scaffold's `tests/pravash.{tcyr,bcyr,fcyr}` stubs.
 - **Golden corpus** (`tests/golden/`): constants 35, math 33,239 rows; `validate.py` 0 failures; `probe_tables.py` 35 of 35.
 
 ## Upstream requests and stand-ins
@@ -63,4 +63,4 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M0 steps 8–10 (port plan §4): the parity harness, the baselines, the probes, and filing the upstream requests.
+M0 steps 9–10 (port plan §4): the parity harness, the baselines, the probes, and filing the upstream requests.

@@ -12,7 +12,7 @@
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
 > ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–7 are done:
+> published to crates.io. M0 steps 0–8 are done:
 > - the frozen oracle;
 > - the scaffold and its repairs;
 > - ADRs 0001–0003;
@@ -20,9 +20,10 @@
 > - the semantics probe;
 > - the golden-value generator;
 > - `src/constants.cyr`;
-> - the parity harness.
+> - the parity harness;
+> - the cross-target baselines.
 >
-> Next is step 8, the cross-target baselines.
+> Next is step 9, the probes.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -464,7 +465,19 @@ function, so nothing leaves parity entirely.
    - a state loader and a step comparator per solver, with per-field classes;
    - a JSON comparator (decode the oracle's document, compare bits, re-encode, decode again);
    - the divergence table, which names each ADR 0002 row and reports it by name.
-8. **Baseline measurements**, recorded in `docs/development/port-parity.md`:
+8. ✅ **Baseline measurements. Done 2026-11-11** ([`port-parity.md`](port-parity.md) §2.2).
+   - **Cross-target:** the replay runs warning-free on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu). Every
+     dispatched function's digest is **identical on all three**. The native x87 shadows differ on aarch64, and
+     their aarch64 digests equal the polyfills', which confirms the polyfill choice.
+   - **Bounds:** K = 2 for sin, cos, sin_cos, atan2, exp, ln and hypot (measured max 1, hypot 2); K = 0 for cbrt
+     (correctly rounded on both sides). powf stays measured until its M1 counterpart, the correctly rounded pow:
+     its only outlier is ganita's open `pow(-1, huge)` defect.
+   - **Gated result:** 0 failing; 21,852 ok, 1,790 measured, 9,632 pending, on all three targets. Both bounds are
+     mutation-checked at their edges.
+   - **Moved to M1:** the corrected oracle (`*.cr.tsv`, MPFR) comes with the correctly rounded stand-ins (L1),
+     which it gates at K = 0, as impetus's ADR 0011.
+
+   As planned, recorded in `docs/development/port-parity.md`:
    - the math sweep through every Cyrius counterpart against glibc, on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu);
    - K set by the port-parity rule;
    - the corrected oracle (`*.cr.tsv`) for the correctly rounded primitives.
@@ -742,7 +755,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. First replay: 5,149 ok, 0 failed, 18,493 measured, 9,632 pending (M1 helpers) | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published. Steps 1–3 done (scaffold, repairs, ADRs, `cyrius.cyml`). Step 4 done (semantics probe). Step 5 done (`scripts/oracle/`). Step 6 done (`src/constants.cyr`). Step 7 done (`tests/parity.tcyr`; ganita's cbrt is exact). Next: step 8, the cross-target baselines |
+| M0 Initialize | ⏳ in progress | constants 35 + math 33,239. Gated: **21,852 ok, 0 failed, 1,790 measured (powf), 9,632 pending (M1 helpers)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | — | D1–D6 decided 2026-11-11. Steps 0–7 done (oracle, scaffold, ADRs, `cyrius.cyml`, semantics probe, generator, constants, harness). Step 8 done (digests identical on 3 targets; K = 2 for the primitives, 0 for cbrt). Next: step 9, the probes |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

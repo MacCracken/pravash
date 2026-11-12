@@ -34,7 +34,8 @@
 - [x] M0 step 5: the golden-value generator (`scripts/oracle/`: constants 29 + math 33,239 rows, validated)
 - [x] M0 step 6: `src/constants.cyr` (public + std float constants, compiled and compared by `probe_tables.py`)
 - [x] M0 step 7: the parity harness (`tests/parity.tcyr`: 5,149 ok, 0 failed; the rest measured or pending)
-- [ ] M0 steps 8–10: the parity harness, the baselines, the probes, and filing the upstream requests
+- [x] M0 step 8: the cross-target baselines (identical bits on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt)
+- [ ] M0 steps 9–10: the parity harness, the baselines, the probes, and filing the upstream requests
 
 ### 1.3.0
 

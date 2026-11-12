@@ -36,6 +36,57 @@ fn _par_error_name(code): i64 {
     return "Unknown";
 }
 
+# ── cross-target digests (M0 step 8) ────────────────────────────────────────────────
+# A 64-bit FNV-1a fold of every output word the port returns for a function, in row order. Run on
+# x86_64 ELF, x86_64 PE and aarch64: equal digests mean bit-identical results on every row, which is
+# what ADR 0002 #7 promises for pravash-owned arithmetic. Histograms alone can't show that.
+# Slots 0–8 are the dispatched class-C functions, 9 the class-A/B math rows together, 10 the
+# constants, 11–13 the native shadows (which differ on aarch64 by design: there the builtins are
+# the polyfills).
+var _PAR_DG_N = 14;
+var _par_dg[112];
+
+fn _par_dg_init() {
+    for (var k = 0; k < _PAR_DG_N; k = k + 1) { store64(&_par_dg + k * 8, 0xcbf29ce484222325); }
+    return 0;
+}
+
+# The digest slot of a math function's dispatched outputs.
+#must_use
+fn _par_dg_slot(fp, fl): i64 {
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 0; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { return 1; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 3; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 4; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { return 5; }
+    if (_par_eq(fp, fl, "f64::ln") == 1) { return 6; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { return 7; }
+    if (_par_eq(fp, fl, "f64::cbrt") == 1) { return 8; }
+    return 9;
+}
+
+# Folds the got list into digest `slot`.
+fn _par_dg_fold(slot) {
+    var at = &_par_dg + slot * 8;
+    var h = load64(at);
+    for (var k = 0; k < _par_got_n; k = k + 1) {
+        h = (h ^ load64(_par_got_v + k * 8)) * 0x100000001b3;
+    }
+    store64(at, h);
+    return 0;
+}
+
+# Prints digest `slot` under `name`.
+fn _par_dg_print(slot, name) {
+    print("  digest ", 9);
+    _par_print_pad(name, strlen(name), 34);
+    print(" 0x", 3);
+    fmt_hex(load64(&_par_dg + slot * 8));
+    println("");
+    return 0;
+}
+
 # ── candidates ──────────────────────────────────────────────────────────────────────
 # ganita_f64_atan2 (lib/ganita.cyr, 1.2.15) with `_f64_atan_polyfill` in place of the `f64_atan`
 # builtin, which is x87 on x86_64 and the polyfill on aarch64: the same bits on every target
@@ -130,13 +181,20 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
 # - the sin polyfill, which the builtin is on every target;
 # - the stdlib min / max, to show where their NaN semantics differ from Rust's.
 fn _par_shadows(mp, ml, fp, fl, cls) {
+    # The port's own outputs first (a pending row has none), before a shadow replaces them.
+    if (_par_eq(mp, ml, "constants") == 1) {
+        if (_par_got_n > 0) { _par_dg_fold(10); }
+        return 0;
+    }
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
+    if (_par_got_n > 0) { _par_dg_fold(_par_dg_slot(fp, fl)); }
     var x: f64 = _par_in(0);
     if (_par_eq(fp, fl, "f64::exp") == 1) {
         _par_got_n = 0;
         var r: f64 = f64_exp(x);
         _par_got_f(r);
         _par_shadow_record("f64::exp ~ f64_exp (native)", cls);
+        _par_dg_fold(11);
         return 0;
     }
     if (_par_eq(fp, fl, "f64::ln") == 1) {
@@ -144,6 +202,7 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
         var r: f64 = f64_ln(x);
         _par_got_f(r);
         _par_shadow_record("f64::ln ~ f64_ln (native)", cls);
+        _par_dg_fold(12);
         return 0;
     }
     if (_par_eq(fp, fl, "f64::sin") == 1) {
@@ -160,6 +219,7 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
         var r: f64 = ganita_f64_atan2(x, y);
         _par_got_f(r);
         _par_shadow_record("f64::atan2 ~ ganita_f64_atan2", cls);
+        _par_dg_fold(13);
         return 0;
     }
     if (_par_eq(fp, fl, "f64::max") == 1) {
@@ -180,10 +240,30 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 }
 
 # The class-C bound for a function, in ulps; -1 while none is set (the rows are measured). Bounds
-# are set in M0 step 8 (docs/development/port-parity.md) per target, BEFORE the function's first
-# gated comparison, and never raised to make a row pass.
+# are set before a function's first gated comparison (M0 step 8, docs/development/port-parity.md
+# §2.2) and never raised to make a row pass. They hold on x86_64 ELF, x86_64 PE and aarch64, which
+# give the same bits for every dispatched function (the digests).
+# - The primitives get K = 2: glibc and each Cyrius counterpart (the polyfills, ganita) are within
+#   about 1 ulp of the correctly rounded value, so two implementations can differ by up to 2
+#   (impetus's rule). Measured 2026-11-11: max 1 ulp, and hypot 2 on 2 rows.
+# - cbrt gets K = 0: the oracle's (compiler_builtins) and ganita's are both correctly rounded, and
+#   equal on every row (port-parity §3).
+# - powf stays measured until M1: its counterpart then is the correctly rounded pow (ledger L1, K = 0
+#   against the corrected oracle). Today's, ganita's, is within 1 ulp on every row but one, ganita's
+#   open pow(-1, |y| > 2^64) defect (ganita issue 2026-11-08). No ADR accepts a counterpart that is
+#   being replaced.
+# - log10 is pending (L1). pravash's own class-C functions get K_F = 2·S·c + 2 at their milestones
+#   (port-parity, the rule).
 #must_use
 fn _par_c_bound(fp, fl): i64 {
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::ln") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::cbrt") == 1) { return 0; }
     return 0 - 1;
 }
 
@@ -200,9 +280,23 @@ fn _par_accepted_quiet(adr): i64 {
     return 0;
 }
 
-# Module-specific summary lines after a module's report. None yet (step 8 adds the cross-target
-# digests).
+# After each module: its cross-target digests.
 fn _par_module_done(mp, ml) {
+    if (_par_eq(mp, ml, "constants") == 1) { _par_dg_print(10, "const"); return 0; }
+    if (_par_eq(mp, ml, "math") != 1) { return 0; }
+    _par_dg_print(0, "f64::sin_cos");
+    _par_dg_print(1, "f64::sin");
+    _par_dg_print(2, "f64::cos");
+    _par_dg_print(3, "f64::atan2");
+    _par_dg_print(4, "f64::hypot");
+    _par_dg_print(5, "f64::exp");
+    _par_dg_print(6, "f64::ln");
+    _par_dg_print(7, "f64::powf");
+    _par_dg_print(8, "f64::cbrt");
+    _par_dg_print(9, "class A/B math rows");
+    _par_dg_print(11, "exp ~ f64_exp (native)");
+    _par_dg_print(12, "ln ~ f64_ln (native)");
+    _par_dg_print(13, "atan2 ~ ganita_f64_atan2");
     return 0;
 }
 
@@ -212,5 +306,6 @@ fn _par_skip(mp, ml): i64 {
     return 0;
 }
 
+_par_dg_init();
 var exit_code = _par_main();
 sys_exit_group(exit_code);

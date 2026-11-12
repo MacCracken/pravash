@@ -88,9 +88,62 @@ rounded stand-ins (L1) are for. The harness was mutation-checked three ways, and
 row's note: one bit of a golden sqrt row, a 1-ulp change to one generated constant, and floor dispatched as ceil
 (813 rows fail).
 
-### 2.2 Cross-target baselines (M0 step 8)
+### 2.2 Cross-target baselines and the class-C bounds (M0 step 8, 2026-11-11)
 
-Pending: the same replay on x86_64 PE (wine) and aarch64 (qemu), per-function digests, and the class-C bounds.
+**Method.** The same replay runs three ways: `cyrius test tests/parity.tcyr` (x86_64 Linux ELF), with `--win`
+(x86_64 PE, under wine), and with `--aarch64` (aarch64 Linux, under qemu). Each run is warning-free. Beside the
+histograms, the harness prints a **digest** per function: a 64-bit FNV-1a fold of every output word the port
+returns, in row order. Equal digests mean bit-identical results on every row, which histograms alone can't show.
+
+**Result: every dispatched function gives the same bits on all three targets.**
+
+| Digest | x86_64 ELF | x86_64 PE | aarch64 |
+|---|---|---|---|
+| `const` (35 rows) | `0x30ce491fbf8f5944` | same | same |
+| `f64::sin_cos` | `0xad45b202a22e6a31` | same | same |
+| `f64::sin` | `0x67180dc38fb16041` | same | same |
+| `f64::cos` | `0x4212f8b5d2dcd2c9` | same | same |
+| `f64::atan2` (ganita's on `_f64_atan_polyfill`) | `0x3e384187e8288aed` | same | same |
+| `f64::hypot` (`ganita_f64_hypot`) | `0xdf1c2d8737693d0c` | same | same |
+| `f64::exp` (`_f64_exp_polyfill`) | `0x4f0e5046d7cc0f41` | same | same |
+| `f64::ln` (`_f64_ln_polyfill`) | `0xd4604f4385941ec0` | same | same |
+| `f64::powf` (`ganita_f64_pow`) | `0xfbb4a8cf2186ac9c` | same | same |
+| `f64::cbrt` (`ganita_f64_cbrt`) | `0x40ee50fb449fea82` | same | same |
+| class A/B math rows | `0x85c8c0329e69c66f` | same | same |
+| shadow: native `f64_exp` | `0xd2acc77fe0ddf658` | same | `0x4f0e5046d7cc0f41` |
+| shadow: native `f64_ln` | `0x507bc977672036b1` | same | `0xd4604f4385941ec0` |
+| shadow: ganita's own atan2 (native `f64_atan`) | `0x779a1ed33f36f54` | same | `0x3e384187e8288aed` |
+
+The shadows differ on aarch64 by design. On x86_64 the native `f64_exp`, `f64_ln` and `f64_atan` are x87; on
+aarch64 they are the polyfills, so there each shadow digest equals the dispatched polyfill form's x86_64 digest.
+That cross-match independently confirms the choice: the polyfill forms are the cross-target ones. The
+per-function histograms are identical on all three targets for every dispatched function. PE matches ELF in every
+line, shadows included, as wine runs the same x87 code.
+
+**The class-C bounds**, set here before each function's first gated comparison (`_par_c_bound` in
+`tests/parity.tcyr`):
+
+| Function | K (ulp) | Why | Measured max (all 3 targets) |
+|---|---|---|---|
+| sin, cos, sin_cos, atan2, exp, ln, hypot | **2** | impetus's rule for primitives: glibc and each Cyrius counterpart are within about 1 ulp of the correctly rounded value, so two implementations can differ by 2 | 1; hypot 2 (2 rows) |
+| cbrt | **0** | both the oracle's (compiler_builtins) and ganita's are correctly rounded, so they must agree exactly | 0 |
+| powf | — (measured until M1) | the M1 counterpart is the correctly rounded pow (L1, K = 0 against the corrected oracle). Today's, ganita's, is within 1 ulp on 1,789 rows. The one other row is ganita's open `pow(-1, \|y\| > 2^64)` defect (ganita issue 2026-11-08): +∞ against 1. No ADR accepts a counterpart that is being replaced | 1, plus that row |
+| log10 | — (pending) | no counterpart until the correctly rounded log10 (L1) | — |
+
+pravash's own class-C functions get K_F = 2·S·c + 2 at their milestones (tanmatra's port-parity rule). If K_F
+exceeds 64, the primitive is made exact or an ADR is written.
+
+**Gated result, identical on x86_64 ELF, x86_64 PE and aarch64: 2 modules, 0 failing | rows: 21,852 ok, 0 failed,
+1,790 measured, 9,632 pending, 0 accepted.**
+
+**The bounds are mutation-checked:**
+- cbrt shifted by 1 ulp fails 1,023 of 1,025 rows (the two left are NaN rows, which match any NaN);
+- sin shifted by 3 ulp fails 2,845 of 2,876 rows (the 31 left were 1 ulp below, so they land at 2, within K).
+
+**What M1 changes.** The correctly rounded stand-ins (L1) replace the polyfills and ganita's pow, atan2 and hypot.
+They are compared exactly (K = 0) against a corrected oracle, which is glibc's rows re-rounded where glibc
+misrounds (`*.cr.tsv`, with MPFR references, as impetus's ADR 0011). Those rows are reported as accepted under the
+accuracy policy. The K = 2 bounds above gate M0's interim counterparts only.
 
 ## 3. Oracle provenance findings (M0 step 5, 2026-11-11)
 
