@@ -1,0 +1,3 @@
+# pravash golden corpus: one module per line; tests/parity.tcyr replays each
+constants
+math

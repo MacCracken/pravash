@@ -57,3 +57,27 @@ These are the language as documented, met for the first time here; none is a def
 - Array initializer lists are module-scope constants, and they don't take `cstring` elements.
 - An `f32` value goes through `f32_from` / `f32_to`, and f32 arithmetic needs both operands `f32` (§1.1's key
   probe).
+
+## 2. Corpus baselines (M0 step 8)
+
+Pending: the math sweep through every Cyrius counterpart, on x86_64 ELF, x86_64 PE and aarch64.
+
+## 3. Oracle provenance findings (M0 step 5, 2026-11-11)
+
+What the golden generator (`scripts/oracle/`) found about where the oracle's bits come from. These findings are
+about the oracle, not the port.
+
+- **cbrt is not glibc's.** rustc 1.99.1 resolves `f64::cbrt` to `compiler_builtins::math::libm_math::cbrt`, linked
+  into the binary. `nm` shows `cbrt` defined there, and not among the symbols imported from glibc: `sin`, `cos`,
+  `sincos`, `atan2`, `hypot`, `exp`, `log`, `log10`, `pow`. glibc's own `cbrt` differs: `cbrt(27)` is
+  3.0000000000000004 there, and 3 exactly in the oracle. `validate.py` first caught this as 491 mismatches against
+  glibc. It now proves all **1,025** `cbrt` rows **correctly rounded**, with exact rationals: the cube of the
+  midpoint to each neighbour of the recorded value brackets the input. So the `cbrt` rows are platform-free, and
+  ganita's `cbrt`, which matched on the §1 probe points, is the candidate exact counterpart; step 8 measures it on
+  the whole sweep.
+- **`sin_cos` is glibc's `sincos`.** LLVM lowers `x.sin_cos()` to glibc's `sincos`. On all 2,876 probed angles it
+  gives the same bits as separate `sin` and `cos` calls (`validate.py` checks each pair against ctypes `sin` and
+  `cos`), so the port can treat `sin_cos` as the pair.
+- **Thread count changes no row.** The generator's `parallel` build (rayon on in the oracle) reproduces the serial
+  corpus byte for byte; it is check-only. No row in the M0 modules runs through a parallel loop yet; the step rows
+  from M2 on do.

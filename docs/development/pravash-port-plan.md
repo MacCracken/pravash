@@ -12,14 +12,15 @@
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
 > ⏳ **Status: M0 in progress** (2026-11-11). §0.2 records the maintainer's decisions. 1.3.0 is tagged on `a88bc4e` and
-> published to crates.io. M0 steps 0–4 are done:
+> published to crates.io. M0 steps 0–5 are done:
 > - the frozen oracle;
 > - the scaffold and its repairs;
 > - ADRs 0001–0003;
 > - `cyrius.cyml`;
-> - the semantics probe.
+> - the semantics probe;
+> - the golden-value generator (`constants` and `math`).
 >
-> Next is step 5, the golden-value generator.
+> Next is step 6, `src/constants.cyr`.
 
 | Thing | Value | Source |
 |---|---|---|
@@ -401,7 +402,21 @@ function, so nothing leaves parity entirely.
    - `f64::MAX` (`cfl_dt`'s value when there is no flow);
    - saturating `as i32` from an f32 floor;
    - `saturating_sub` on `usize`.
-5. **Golden-value generator** (`scripts/oracle/`), copied from impetus's crate:
+5. ✅ **Golden-value generator. Done 2026-11-11** (`scripts/oracle/`: `README.md`, `validate.py`).
+   - **Output:** `constants.tsv` 29 rows (proven complete against `rust-old/src`) and `math.tsv` 33,239 rows. The
+     math rows cover every std f64 method pravash calls, plus the saturating casts, `as f32`, and the SPH cell key
+     through the oracle hook.
+   - **Determinism:** two runs and the `parallel` build's `--check` give the same bytes. The `parallel` build
+     refuses to write.
+   - **Independent check:** `validate.py` recomputes all 33,268 rows: class A/B in Python, glibc's class C through
+     ctypes, and `cbrt` proven correctly rounded.
+   - **Tamper checks:** a one-bit change fails both `validate.py` and `--check`, and a header naming another glibc
+     is refused by name.
+   - **Finding** (port-parity §3): the oracle's `cbrt` is compiler_builtins', not glibc's, and correctly rounded.
+   - **Not yet:** the JSON table and the step-row format arrive with the first types and solvers (M1, M2), as
+     impetus added its modules.
+
+   As built, copied from impetus's crate:
    - TSV format 1 with f64 values as bit patterns, deterministic output, a `--check` mode, and the glibc header;
    - `validate.py` recomputes the class A/B rows in Python;
    - two builds: `--features full,oracle` without `parallel`, and the same with `parallel`, whose rows must match the
@@ -701,7 +716,7 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ⏳ in progress | — | — | — | D1–D6 decided 2026-11-11. Step 0 done; **1.3.0 tagged on `a88bc4e` and published to crates.io**. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`; every Cyrius gate green). Step 4 done (port-parity §1: the semantics probe; L2 gains the saturating casts). Next: step 5, the golden-value generator |
+| M0 Initialize | ⏳ in progress | constants 29 + math 33,239 (validated, deterministic, parallel-checked) | — | — | D1–D6 decided 2026-11-11. Step 0 done; 1.3.0 tagged on `a88bc4e` and published to crates.io. Steps 1–3 done (scaffold, repairs, ADRs 0001–0003, `cyrius.cyml`). Step 4 done (the semantics probe, port-parity §1). Step 5 done (`scripts/oracle/`, port-parity §3: the oracle's cbrt is compiler_builtins'). Next: step 6, `src/constants.cyr` |
 | M1 Foundation | — | — | — | — | |
 | M2 Shallow water | — | — | — | — | |
 | M3 Grid | — | — | — | — | |

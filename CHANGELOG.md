@@ -25,6 +25,14 @@
     `as i32` / `as u32` / `as usize` do.
   - **Correctly rounded stand-ins needed:** log10 (there is none), and ganita's pow and atan2 and the exp
     polyfill (1 ulp off).
+- **Golden-value generator** (port plan M0 step 5): `scripts/oracle/`, adapted from impetus's. It drives the frozen
+  oracle and writes `tests/golden/`: `constants.tsv` (29 rows) and `math.tsv` (33,239 rows).
+  - **Format and determinism:** TSV format 1, every float as its bits. Two runs give the same bytes, and the
+    `parallel` build reproduces the corpus but may only `--check` it.
+  - **`--check`:** refuses a corpus recorded on another glibc.
+  - **`validate.py`:** recomputes every row without the oracle. Class A/B in Python; glibc's class C through
+    ctypes; `cbrt` proven correctly rounded.
+  - **Finding:** the oracle's `cbrt` is compiler_builtins', not glibc's (port-parity §3).
 
 ## [1.3.0] - 2026-11-09
 

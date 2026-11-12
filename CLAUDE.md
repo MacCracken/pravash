@@ -43,7 +43,13 @@ cyrius test                                    # run tests/*.tcyr (parity + refe
 cyrius bench                                   # run tests/*.bcyr
 cargo test --manifest-path rust-old/Cargo.toml --all-features                     # the Rust oracle, read-only
 cargo test --manifest-path rust-old/Cargo.toml --features oracle,coupling --test oracle   # oracle hooks without parallel
+cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check        # golden corpus up to date
+cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # ... and thread-count free
+python3 -I -B scripts/oracle/validate.py .                                               # independent check of the corpus
 ```
+
+The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI (the
+runner's glibc differs): `--check` refuses another platform by name.
 
 ## Development Process
 

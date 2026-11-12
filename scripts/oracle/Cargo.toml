@@ -1,0 +1,35 @@
+[package]
+name = "pravash-oracle"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-only"
+publish = false
+description = "Drives the frozen Rust pravash 1.3.0 in rust-old/ to write the Cyrius port's golden corpus"
+
+# The oracle is used by path and never built or edited in place (CLAUDE.md: do not modify
+# rust-old/). Cargo.lock was seeded from rust-old/Cargo.lock, so every shared dependency (hisab
+# 1.4.0 and the glam 0.29.3 it links, above all) resolves to the version the oracle was tested with.
+# `oracle` is the hidden state-dump feature (port plan §4 step 0). Every solver feature is on;
+# `logging` is not (it only adds the tracing-subscriber init), and `parallel` is this crate's own
+# feature below.
+[dependencies]
+pravash = { path = "../../rust-old", default-features = false, features = [
+    "oracle", "sph", "grid", "shallow", "buoyancy", "vortex", "coupling", "compute", "ai",
+] }
+
+# The generator runs twice (port plan §4 step 5): the serial build writes the corpus, and the
+# `parallel` build may only `--check` it, so every row must come out the same with rayon on
+# (ADR 0002 #4, probe 6):
+#   cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml [-- --check]
+#   cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check
+[features]
+parallel = ["pravash/parallel"]
+
+[[bin]]
+name = "oracle"
+path = "src/main.rs"
+
+[profile.release]
+# Correctness, not speed: keep overflow checks so a bad grid index fails loudly.
+overflow-checks = true
