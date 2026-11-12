@@ -13,6 +13,7 @@ cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml          
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check             # verify; exit 1 on any difference
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # rayon on: must match
 python3 -I -B scripts/oracle/validate.py .                                                    # independent re-check
+python3 -I -B scripts/oracle/validate.py . --write                                            # regenerate the corrected oracle and the cr tables
 python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
 ```
 
@@ -72,15 +73,41 @@ fn <TAB> class <TAB> inputs <TAB> outputs <TAB> note
   rows arrive with the solvers.
 - **The note** is a human rendering of the same call, for review only; the harness ignores it.
 
+## The corrected oracle (ADR 0004)
+
+`tests/golden/<module>.cr.tsv` holds the rows whose outputs change when every exp, ln, log10, sin, cos, hypot,
+pow and atan2 result in the oracle's operations is correctly rounded. It is impetus's format (its ADR 0011), written
+by `validate.py --write` from MPFR (`mpfr_ref.py`, libmpfr.so.6 through ctypes). It has five header lines, then:
+
+```text
+fn <TAB> inputs <TAB> corrected outputs <TAB> note
+```
+
+- **The key:** fn and inputs are the golden row's fields, byte for byte. The harness compares that row against
+  the corrected outputs, and a pass is *accepted (ADR 4)*.
+- **The note:** the oracle's own outputs, then each call glibc misrounded:
+  `<fn>(<args>) glibc f:… correctly rounded f:…`.
+- **A module with no such row** has no `.cr.tsv`, and `modules.txt` never lists one.
+
+The same `--write` writes the tables of the correctly rounded primitives:
+- `src/crmath_data.cyr`, by `crtables.py`, a copy of impetus's: π and ln 2 come from exact integer series, and are
+  checked against MPFR to 2,048 bits;
+- `src/crlog_data.cyr`, by `lntables.py`, the ln part of kimiya's `mathx_tables.py`: MPFR values, with the error
+  analysis's properties asserted.
+
 ## validate.py
 
-Standard library only. It never runs the Rust oracle:
+Standard library plus MPFR (for the corrected oracle and the tables), through ctypes. It never runs the Rust
+oracle:
 - it parses every file (header, row count, five fields, classes, tokens) and checks that `modules.txt` lists
   exactly the files present;
 - it checks `constants.tsv` against the literals in `rust-old/src`;
 - it recomputes every class-A/B `math` row in Python, in Rust's operation order;
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
-- it proves every `cbrt` row correctly rounded, with exact rationals.
+- it proves every `cbrt` row correctly rounded, with exact rationals;
+- it recomputes the corrected oracle and the two table files, and fails if any differs from what is committed;
+- it checks crmath's π and ln 2 against MPFR, every table's head against MPFR's correctly rounded value, and the ln
+  tables' ln 2 and 1/ln 10 against integer series MPFR doesn't share.
 
 A tampered row fails it, and fails `--check`; a header naming another glibc is refused by `--check` with the reason.
 

@@ -1,10 +1,12 @@
 # parity_core.cyr — the golden-corpus replay machinery.
 #
-# Copied unchanged from impetus's tests/parity_core.cyr (its M0 version), itself kimiya's and
-# tanmatra's (same format, same outcomes). An error code is named through the harness's
-# `_par_error_name` hook, so the harness needs no src/error.cyr before M1. tests/parity.tcyr
-# includes the src modules it needs, then this file, and defines:
-# - `_par_error_name(code)`: the Rust variant name of a `PV_ERR_*` code, as a C string;
+# Copied from impetus's tests/parity_core.cyr (its version with the corrected oracle, impetus ADR 0011), itself
+# kimiya's (kimiya ADR 0006) and tanmatra's (same format, same outcomes). The changes from impetus's: the
+# corrected oracle is pravash's ADR 0004, and the error names are `PV_ERR_*`. As in impetus's, an error code is
+# named through the harness's `_par_error_name` hook, kimiya's transitional rule is off (_PAR_CR_TRANSITIONAL),
+# and a row may carry 8,192 tokens per list. tests/parity.tcyr includes the src modules it needs, then this
+# file, and defines:
+# - `_par_error_name(code)`: the Rust variant name of an `PV_ERR_*` code, as a C string;
 # - `_par_dispatch(mp, ml, fp, fl)`: fill the got list for one row (1 handled, 0 pending, -1 unusable);
 # - `_par_c_bound(fp, fl)`: a class-C function's ulp bound, or -1;
 # - `_par_accepted(fp, fl, ip, il)`: the ADR accepting a divergent row, or 0;
@@ -16,12 +18,19 @@
 #   against another Cyrius candidate, each recorded with `_par_shadow_record`.
 # It runs `_par_main()`, whose result is the exit code. Format and comparison rules:
 # scripts/oracle/README.md.
+#
+# The corrected oracle (ADR 0004): before a module is replayed, tests/golden/<module>.cr.tsv is loaded when it
+# exists. A golden row with a correction (matched by its exact fn and inputs text) is compared against the corrected
+# outputs, under its class and bound: a pass is *accepted (ADR 4)*, anything else fails, including the oracle's
+# own misrounded outputs (kimiya's transitional rule, _PAR_CR_TRANSITIONAL, is off). A correction that matches no
+# golden row fails its module.
 
 # ── tokens ──────────────────────────────────────────────────────────────────────────
 # Three token lists of up to _PAR_MAX tokens: the row's inputs, its wanted outputs, and what the port returned.
 # Each slot is a kind byte ('f' 'i' 'e' 's' 'n' 'E' 'v'), a value word (f64 bits, an
 # integer, or a pointer to text) and a text length.
-var _PAR_MAX = 1024;
+# impetus raised kimiya's 1,024 (its broadphase rows carry 1,000 boxes, 4,001 input tokens); pravash keeps it.
+var _PAR_MAX = 8192;
 var _par_in_k = 0;
 var _par_in_v = 0;
 var _par_in_l = 0;
@@ -34,6 +43,16 @@ var _par_got_k = 0;
 var _par_got_v = 0;
 var _par_got_l = 0;
 var _par_got_n = 0;
+# A second wanted-output list. On a row with an ADR 0004 correction the two are swapped: _par_want_* holds the
+# corrected outputs (the reference) and _par_alt_* the oracle's own.
+# kimiya's transitional rule (its M3c-1): a corrected row the port fails, but whose oracle outputs it
+# matches, is measured rather than failed. Off in pravash (as in impetus), whose primitives are correctly
+# rounded from the start: matching glibc's misrounding is a failure (ADR 0004).
+var _PAR_CR_TRANSITIONAL = 0;
+var _par_alt_k = 0;
+var _par_alt_v = 0;
+var _par_alt_l = 0;
+var _par_alt_n = 0;
 
 # 1 if text [p, p + len) equals the C string `s`.
 #must_use
@@ -277,6 +296,11 @@ var _par_fn_meas = 0;
 var _par_fn_pend = 0;
 var _par_fn_acc = 0;
 var _par_fn_diff = 0;  # shadow slots only: rows where the candidate differs
+var _par_fn_adr6 = 0;  # rows accepted under ADR 4 (a pass against the corrected outputs)
+var _par_fn_glibc = 0; # measured rows that match only the oracle's misrounded outputs (the transitional rule, off)
+var _par_fn_cr = 0;    # rows with an ADR 0004 correction
+var _par_fn_cr0 = 0;   # ... whose port outputs are bit-identical to the corrected outputs
+var _par_fn_crg = 0;   # ... whose port outputs are bit-identical to the oracle's
 var _par_fn_h = 0;     # 6 buckets per fn
 var _par_fn_max = 0;
 var _par_fn_n = 0;
@@ -301,6 +325,11 @@ fn _par_fn_slot(fp, fl, cls): i64 {
     store64(_par_fn_pend + at, 0);
     store64(_par_fn_acc + at, 0);
     store64(_par_fn_diff + at, 0);
+    store64(_par_fn_adr6 + at, 0);
+    store64(_par_fn_glibc + at, 0);
+    store64(_par_fn_cr + at, 0);
+    store64(_par_fn_cr0 + at, 0);
+    store64(_par_fn_crg + at, 0);
     store64(_par_fn_max + at, 0);
     var b = 0;
     while (b < 6) { store64(_par_fn_h + (_par_fn_n * 6 + b) * 8, 0); b = b + 1; }
@@ -313,8 +342,11 @@ fn _par_bump(base, slot) {
     store64(base + slot * 8, load64(base + slot * 8) + 1);
 }
 
-# Records one float comparison's ulp distance in the slot's histogram and maximum.
+# Records one float comparison's ulp distance in the slot's histogram and maximum, unless _par_hist_on is 0
+# (the extra comparisons of a corrected row: the histogram is the distance from each row's reference).
+var _par_hist_on = 1;
 fn _par_hist(slot, d) {
+    if (_par_hist_on == 0) { return 0; }
     var b = 5;
     if (d == 0) { b = 0; }
     elif (d == 1) { b = 1; }
@@ -326,6 +358,40 @@ fn _par_hist(slot, d) {
 }
 
 # ── row comparison ──────────────────────────────────────────────────────────────────
+# The index of the first output whose kind or value differs between got and want (bitwise; the
+# shorter count when one list is a prefix of the other), for a failure report.
+#must_use
+fn _par_first_diff(): i64 {
+    var n = _par_got_n;
+    if (_par_want_n < n) { n = _par_want_n; }
+    for (var k = 0; k < n; k = k + 1) {
+        var at = k * 8;
+        if (load64(_par_want_k + at) != load64(_par_got_k + at)) { return k; }
+        if (load64(_par_want_v + at) != load64(_par_got_v + at)) {
+            if (load64(_par_want_k + at) == 102 || load64(_par_want_k + at) == 105 || load64(_par_want_k + at) == 118) {
+                return k;
+            }
+        }
+    }
+    return n;
+}
+
+# Prints where a failing row first differs: the output index, both counts, and the pair there.
+fn _par_print_first_diff() {
+    var k = _par_first_diff();
+    eprint("    first difference at output ", 31);
+    efmt_int(k);
+    eprint(" (got ", 6);
+    efmt_int(_par_got_n);
+    eprint(" outputs, want ", 15);
+    efmt_int(_par_want_n);
+    eprint(")\n", 2);
+    if (k < _par_got_n && k < _par_want_n) {
+        ulp_print_pair(load64(_par_got_v + k * 8), load64(_par_want_v + k * 8));
+    }
+    return 0;
+}
+
 # Compares the got list with the wanted outputs under class `cls` ('A' 'B' 'C' 'D').
 # Returns 1 ok, 0 failed, 2 measured (class C with no bound yet). Sets _par_outlier when a
 # float is more than 16 ulp off, or a NaN / infinity disagrees.
@@ -424,10 +490,14 @@ fn _par_report_fns() {
         if (f > 0) { print(", ", 2); fmt_int(f); print(" FAILED", 7); }
         var m = load64(_par_fn_meas + at);
         if (m > 0) { print(", ", 2); fmt_int(m); print(" measured", 9); }
+        var gm = load64(_par_fn_glibc + at);
+        if (gm > 0) { print(" (", 2); fmt_int(gm); print(" match glibc's misrounding)", 27); }
         var p = load64(_par_fn_pend + at);
         if (p > 0) { print(", ", 2); fmt_int(p); print(" pending", 8); }
         var acc = load64(_par_fn_acc + at);
         if (acc > 0) { print(", ", 2); fmt_int(acc); print(" accepted", 9); }
+        var a6 = load64(_par_fn_adr6 + at);
+        if (a6 > 0) { print(" (ADR 4: ", 9); fmt_int(a6); print(")", 1); }
         var dif = load64(_par_fn_diff + at);
         if (dif > 0) { print(", ", 2); fmt_int(dif); print(" differ (shadow)", 16); }
         var hb = k * 6;
@@ -450,9 +520,156 @@ fn _par_report_fns() {
             var mx = load64(_par_fn_max + at);
             if (mx < 0x7FFFFFFFFFFFFFFF) { print(" max:", 5); fmt_int(mx); }
         }
+        var crn = load64(_par_fn_cr + at);
+        if (crn > 0) {
+            print("  | ADR 4 rows: ", 16);
+            fmt_int(crn);
+            print(", port = corrected ", 19);
+            fmt_int(load64(_par_fn_cr0 + at));
+            print(", = glibc's ", 12);
+            fmt_int(load64(_par_fn_crg + at));
+        }
         println("");
         k = k + 1;
     }
+}
+
+# ── the corrected oracle (ADR 0004) ─────────────────────────────────────────────────
+# tests/golden/<module>.cr.tsv (scripts/oracle/validate.py --write; format: scripts/oracle/README.md):
+# fn <TAB> inputs <TAB> corrected outputs <TAB> note, one row per golden row whose outputs change when every primitive
+# result is correctly rounded. The fn and inputs fields are the golden row's, byte for byte: the key. The table holds
+# 8 words per row (fn, fn length, inputs, inputs length, outputs, outputs length, used, unused) and points into the
+# file's buffer, which is kept. A hash index (open addressing, linear probing, a power of two at least twice the row
+# count, so a probe always ends) holds row + 1, 0 for an empty slot.
+var _par_cr_n = 0;
+var _par_cr_t = 0;
+var _par_cr_idx = 0;
+var _par_cr_mask = 0;
+var _par_cr_file[128];
+
+# FNV-1a over the key: fn, a TAB, inputs. (The offset basis is FNV's with the top bit cleared, which only changes
+# where keys land.)
+#must_use
+fn _par_cr_hash(fp, fl, ip, il): i64 {
+    var h = 0x4BF29CE484222325;
+    var k = 0;
+    while (k < fl) { h = (h ^ load8(fp + k)) * 1099511628211; k = k + 1; }
+    h = (h ^ 9) * 1099511628211;
+    k = 0;
+    while (k < il) { h = (h ^ load8(ip + k)) * 1099511628211; k = k + 1; }
+    return h;
+}
+
+# 1 if correction row r has the key (fn, inputs).
+#must_use
+fn _par_cr_key_is(r, fp, fl, ip, il): i64 {
+    var at = _par_cr_t + r * 64;
+    if (load64(at + 8) != fl || load64(at + 24) != il) { return 0; }
+    if (memeq(load64(at), fp, fl) != 1) { return 0; }
+    return memeq(load64(at + 16), ip, il);
+}
+
+# Loads tests/golden/<module>.cr.tsv into the table. Returns its row count (0 when the module has no file), or -1
+# when the file exists but can't be read or holds a malformed row.
+fn _par_cr_load(mp, ml): i64 {
+    _par_cr_n = 0;
+    var pre = "tests/golden/";
+    var pl = strlen(pre);
+    if (pl + ml + 8 > 127) { return 0 - 1; }
+    memcpy(&_par_cr_file, pre, pl);
+    memcpy(&_par_cr_file + pl, mp, ml);
+    memcpy(&_par_cr_file + pl + ml, ".cr.tsv", 7);
+    store8(&_par_cr_file + pl + ml + 7, 0);
+    var lenw[8];
+    var buf = file_read_whole(&_par_cr_file, &lenw);
+    var len = load64(&lenw);
+    if (buf == 0) {
+        if (len == 0 - 2) { return 0; }   # ENOENT: no row of this module needs a correction
+        return 0 - 1;
+    }
+    var rows = 0;
+    var line = 0;
+    while (line < len) {
+        var eol = _par_find(buf, line, len, 10);
+        if (eol > line && load8(buf + line) != 35) { rows = rows + 1; }
+        line = eol + 1;
+    }
+    var cap = 16;
+    while (cap < rows * 2) { cap = cap * 2; }
+    _par_cr_t = _par_words(rows * 8 + 8);
+    _par_cr_idx = _par_words(cap);
+    if (_par_cr_t == 0 || _par_cr_idx == 0) { return 0 - 1; }
+    _par_cr_mask = cap - 1;
+    var s = 0;
+    while (s < cap) { store64(_par_cr_idx + s * 8, 0); s = s + 1; }
+    line = 0;
+    while (line < len) {
+        var eol = _par_find(buf, line, len, 10);
+        if (eol > line && load8(buf + line) != 35) {
+            var t1 = _par_find(buf, line, eol, 9);
+            var t2 = _par_find(buf, t1 + 1, eol, 9);
+            var t3 = _par_find(buf, t2 + 1, eol, 9);
+            if (t3 >= eol || t1 == line || t2 == t1 + 1 || t3 == t2 + 1) { return 0 - 1; }
+            var at = _par_cr_t + _par_cr_n * 64;
+            store64(at, buf + line);
+            store64(at + 8, t1 - line);
+            store64(at + 16, buf + t1 + 1);
+            store64(at + 24, t2 - t1 - 1);
+            store64(at + 32, buf + t2 + 1);
+            store64(at + 40, t3 - t2 - 1);
+            store64(at + 48, 0);
+            store64(at + 56, 0);
+            var h = _par_cr_hash(buf + line, t1 - line, buf + t1 + 1, t2 - t1 - 1) & _par_cr_mask;
+            while (load64(_par_cr_idx + h * 8) != 0) { h = (h + 1) & _par_cr_mask; }
+            _par_cr_n = _par_cr_n + 1;
+            store64(_par_cr_idx + h * 8, _par_cr_n);
+        }
+        line = eol + 1;
+    }
+    return _par_cr_n;
+}
+
+# The first unused correction for the golden row (fn, inputs), now marked used, or -1. Rows with one key are found
+# in file order (a probe meets them in insertion order).
+fn _par_cr_find(fp, fl, ip, il): i64 {
+    if (_par_cr_n == 0) { return 0 - 1; }
+    var h = _par_cr_hash(fp, fl, ip, il) & _par_cr_mask;
+    var e = load64(_par_cr_idx + h * 8);
+    while (e != 0) {
+        var r = e - 1;
+        if (load64(_par_cr_t + r * 64 + 48) == 0 && _par_cr_key_is(r, fp, fl, ip, il) == 1) {
+            store64(_par_cr_t + r * 64 + 48, 1);
+            return r;
+        }
+        h = (h + 1) & _par_cr_mask;
+        e = load64(_par_cr_idx + h * 8);
+    }
+    return 0 - 1;
+}
+
+# Swaps the wanted-output list with the alternate one (on a corrected row: the corrected and the oracle's outputs).
+fn _par_swap_want() {
+    var k = _par_want_k;
+    var v = _par_want_v;
+    var l = _par_want_l;
+    var n = _par_want_n;
+    _par_want_k = _par_alt_k;
+    _par_want_v = _par_alt_v;
+    _par_want_l = _par_alt_l;
+    _par_want_n = _par_alt_n;
+    _par_alt_k = k;
+    _par_alt_v = v;
+    _par_alt_l = l;
+    _par_alt_n = n;
+    return 0;
+}
+
+# 1 if the got list is bit-identical to the wanted list (class A's rule; the histogram is left alone).
+fn _par_identical(slot, fp, fl): i64 {
+    _par_hist_on = 0;
+    var r = _par_compare(slot, 65, fp, fl);
+    _par_hist_on = 1;
+    return r;
 }
 
 # ── driver ──────────────────────────────────────────────────────────────────────────
@@ -461,6 +678,8 @@ var _par_rows_fail = 0;
 var _par_rows_meas = 0;
 var _par_rows_pend = 0;
 var _par_rows_acc = 0;
+var _par_rows_adr6 = 0;    # of _par_rows_acc: accepted under ADR 4 (a pass against the corrected outputs)
+var _par_rows_glibc = 0;   # of _par_rows_meas: glibc-matching corrected rows (the transitional rule, off)
 
 # The index of the next byte `c` in [p + at, p + end), or `end`.
 #must_use
@@ -487,12 +706,26 @@ fn _par_module(mp, ml): i64 {
     print("=== parity: ", 12);
     print(mp, ml);
     if (buf == 0) { println(" — cannot read the golden file"); return 1; }
+    var crn = _par_cr_load(mp, ml);
+    if (crn < 0) {
+        print(" — cannot read ", 17);
+        print(&_par_cr_file, strlen(&_par_cr_file));
+        println(", or it holds a malformed row");
+        return 1;
+    }
     println(" ===");
 
     _par_fn_n = 0;
     var fails_shown = 0;
     var outliers_shown = 0;
     var mod_fail = 0;
+    # The module's corrected rows by outcome (ADR 0004).
+    var cr_acc6 = 0;
+    var cr_glibc = 0;
+    var cr_meas = 0;
+    var cr_other = 0;
+    var cr_pend = 0;
+    var cr_fail = 0;
     var line = 0;
     while (line < len) {
         var eol = _par_find(buf, line, len, 10);
@@ -513,20 +746,64 @@ fn _par_module(mp, ml): i64 {
                 _par_want_n = _par_tokens(buf + t3 + 1, t4 - t3 - 1, _par_want_k, _par_want_v, _par_want_l);
                 if (_par_in_n < 0 || _par_want_n < 0) { bad = 1; }
             }
+            # ADR 0004: a row with a correction is compared against the corrected outputs; the oracle's own move to
+            # the alternate list.
+            var cr = 0 - 1;
+            var crbad = 0;
+            if (bad == 0) {
+                cr = _par_cr_find(fp, fl, buf + t2 + 1, t3 - t2 - 1);
+                if (cr >= 0) {
+                    _par_swap_want();
+                    var cat = _par_cr_t + cr * 64;
+                    var cop = load64(cat + 32);
+                    var col = load64(cat + 40);
+                    _par_want_n = _par_tokens(cop, col, _par_want_k, _par_want_v, _par_want_l);
+                    if (_par_want_n < 0) { bad = 1; crbad = 1; }
+                }
+            }
             var slot = _par_fn_slot(fp, fl, cls);
             if (slot < 0) { println("  too many functions in one module"); return 1; }
             _par_bump(_par_fn_rows, slot);
             var outcome = 0;
+            var handled = 0;
             if (bad == 0) {
-                var h = _par_dispatch(mp, ml, fp, fl);
-                if (h == 0) { outcome = 3; }
-                elif (h == 1) { outcome = _par_compare(slot, cls, fp, fl); }
+                handled = _par_dispatch(mp, ml, fp, fl);
+                if (handled == 0) { outcome = 3; }
+                elif (handled == 1) { outcome = _par_compare(slot, cls, fp, fl); }
+            }
+            # A corrected row: is the port bit-identical to the corrected outputs, to the oracle's? And, under the
+            # transitional rule, when it fails against the corrected outputs: does it match the oracle's misrounded
+            # outputs under the same class and bound? Then it still uses a glibc-like primitive, and is measured.
+            var glibc = 0;
+            if (cr >= 0 && handled == 1) {
+                var outl = _par_outlier;
+                _par_bump(_par_fn_cr, slot);
+                if (_par_identical(slot, fp, fl) == 1) { _par_bump(_par_fn_cr0, slot); }
+                _par_swap_want();
+                if (_par_identical(slot, fp, fl) == 1) { _par_bump(_par_fn_crg, slot); }
+                if (outcome == 0 && _PAR_CR_TRANSITIONAL == 1) {
+                    _par_hist_on = 0;
+                    var r2 = _par_compare(slot, cls, fp, fl);
+                    _par_hist_on = 1;
+                    if (r2 == 1 || r2 == 2) { glibc = 1; }
+                }
+                _par_swap_want();
+                _par_outlier = outl;
             }
             # The ADR accepting this row, asked only of a row that failed its comparison.
             var adr = 0;
-            if (bad == 0 && outcome == 0) { adr = _par_accepted(fp, fl, buf + t2 + 1, t3 - t2 - 1); }
-            if (outcome == 1) { _par_bump(_par_fn_ok, slot); _par_rows_ok = _par_rows_ok + 1; }
+            if (bad == 0 && outcome == 0 && glibc == 0) { adr = _par_accepted(fp, fl, buf + t2 + 1, t3 - t2 - 1); }
+            if (outcome == 1 && cr >= 0) {
+                # ADR 4: the port matches the corrected oracle where the oracle's libm misrounded.
+                _par_bump(_par_fn_acc, slot);
+                _par_bump(_par_fn_adr6, slot);
+                _par_rows_acc = _par_rows_acc + 1;
+                _par_rows_adr6 = _par_rows_adr6 + 1;
+                cr_acc6 = cr_acc6 + 1;
+            }
+            elif (outcome == 1) { _par_bump(_par_fn_ok, slot); _par_rows_ok = _par_rows_ok + 1; }
             elif (outcome == 2) {
+                if (cr >= 0) { cr_meas = cr_meas + 1; }
                 _par_bump(_par_fn_meas, slot);
                 _par_rows_meas = _par_rows_meas + 1;
                 if (_par_outlier == 1 && outliers_shown < 10) {
@@ -537,12 +814,25 @@ fn _par_module(mp, ml): i64 {
                     outliers_shown = outliers_shown + 1;
                 }
             }
-            elif (outcome == 3) { _par_bump(_par_fn_pend, slot); _par_rows_pend = _par_rows_pend + 1; }
+            elif (outcome == 3) {
+                if (cr >= 0) { cr_pend = cr_pend + 1; }
+                _par_bump(_par_fn_pend, slot);
+                _par_rows_pend = _par_rows_pend + 1;
+            }
+            elif (glibc == 1) {
+                _par_bump(_par_fn_meas, slot);
+                _par_bump(_par_fn_glibc, slot);
+                _par_rows_meas = _par_rows_meas + 1;
+                _par_rows_glibc = _par_rows_glibc + 1;
+                cr_glibc = cr_glibc + 1;
+            }
             elif (adr > 0 && _par_accepted_quiet(adr) == 1) {
+                if (cr >= 0) { cr_other = cr_other + 1; }
                 _par_bump(_par_fn_acc, slot);
                 _par_rows_acc = _par_rows_acc + 1;
             }
             elif (adr > 0) {
+                if (cr >= 0) { cr_other = cr_other + 1; }
                 _par_bump(_par_fn_acc, slot);
                 _par_rows_acc = _par_rows_acc + 1;
                 print("  accepted (ADR ", 16);
@@ -553,21 +843,24 @@ fn _par_module(mp, ml): i64 {
                 ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
             }
             else {
+                if (cr >= 0) { cr_fail = cr_fail + 1; }
                 _par_bump(_par_fn_fail, slot);
                 _par_rows_fail = _par_rows_fail + 1;
                 mod_fail = 1;
                 if (fails_shown < 10) {
                     eprint("  FAIL: ", 8);
-                    if (bad == 1) {
+                    if (cr >= 0) { eprint("(against the ADR 4 corrected outputs) ", 38); }
+                    if (crbad == 1) {
+                        eprint("malformed correction for the row: ", 34);
+                        eprint(buf + line, eol - line);
+                    } elif (bad == 1) {
                         eprint("malformed row: ", 15);
                         eprint(buf + line, eol - line);
                     } else {
                         eprint(buf + t4 + 1, eol - t4 - 1);
                     }
                     eprint("\n", 1);
-                    if (bad == 0 && _par_got_n > 0) {
-                        ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
-                    }
+                    if (bad == 0 && _par_got_n > 0) { _par_print_first_diff(); }
                     fails_shown = fails_shown + 1;
                 }
             }
@@ -575,7 +868,48 @@ fn _par_module(mp, ml): i64 {
         }
         line = eol + 1;
     }
+    # A correction that no golden row took is stale: its key matches no row (or one row twice).
+    var unmatched = 0;
+    var k = 0;
+    while (k < _par_cr_n) {
+        var at = _par_cr_t + k * 64;
+        if (load64(at + 48) == 0) {
+            unmatched = unmatched + 1;
+            _par_rows_fail = _par_rows_fail + 1;
+            mod_fail = 1;
+            if (fails_shown < 10) {
+                eprint("  FAIL: a correction matches no golden row: ", 44);
+                eprint(load64(at), load64(at + 8));
+                eprint(" ", 1);
+                eprint(load64(at + 16), load64(at + 24));
+                eprint("\n", 1);
+                fails_shown = fails_shown + 1;
+            }
+        }
+        k = k + 1;
+    }
     _par_report_fns();
+    if (crn > 0) {
+        print("  ADR 0004 corrected oracle, ", 29);
+        print(&_par_cr_file, strlen(&_par_cr_file));
+        print(": ", 2);
+        fmt_int(crn);
+        print(" rows: ", 7);
+        fmt_int(cr_acc6);
+        print(" accepted (ADR 4), ", 19);
+        fmt_int(cr_glibc);
+        print(" glibc-matching (measured), ", 28);
+        fmt_int(cr_meas);
+        print(" measured (no bound), ", 22);
+        fmt_int(cr_other);
+        print(" accepted (another ADR), ", 25);
+        fmt_int(cr_pend);
+        print(" pending, ", 10);
+        fmt_int(cr_fail);
+        print(" FAILED, ", 9);
+        fmt_int(unmatched);
+        println(" matching no golden row");
+    }
     _par_module_done(mp, ml);
     return mod_fail;
 }
@@ -611,6 +945,14 @@ fn _par_alloc(): i64 {
     _par_fn_pend = _par_words(_PAR_FN_MAX);
     _par_fn_acc = _par_words(_PAR_FN_MAX);
     _par_fn_diff = _par_words(_PAR_FN_MAX);
+    _par_fn_adr6 = _par_words(_PAR_FN_MAX);
+    _par_fn_glibc = _par_words(_PAR_FN_MAX);
+    _par_fn_cr = _par_words(_PAR_FN_MAX);
+    _par_fn_cr0 = _par_words(_PAR_FN_MAX);
+    _par_fn_crg = _par_words(_PAR_FN_MAX);
+    _par_alt_k = _par_words(_PAR_MAX);
+    _par_alt_v = _par_words(_PAR_MAX);
+    _par_alt_l = _par_words(_PAR_MAX);
     _par_fn_h = _par_words(_PAR_FN_MAX * 6);
     _par_fn_max = _par_words(_PAR_FN_MAX);
     if (_par_in_k == 0 || _par_in_v == 0 || _par_in_l == 0) { return 1; }
@@ -619,6 +961,9 @@ fn _par_alloc(): i64 {
     if (_par_fn_p == 0 || _par_fn_l == 0 || _par_fn_cls == 0 || _par_fn_rows == 0) { return 1; }
     if (_par_fn_ok == 0 || _par_fn_fail == 0 || _par_fn_meas == 0 || _par_fn_pend == 0) { return 1; }
     if (_par_fn_acc == 0 || _par_fn_diff == 0 || _par_fn_h == 0 || _par_fn_max == 0) { return 1; }
+    if (_par_fn_adr6 == 0 || _par_fn_glibc == 0 || _par_fn_cr == 0) { return 1; }
+    if (_par_fn_cr0 == 0 || _par_fn_crg == 0) { return 1; }
+    if (_par_alt_k == 0 || _par_alt_v == 0 || _par_alt_l == 0) { return 1; }
     return 0;
 }
 
@@ -661,6 +1006,10 @@ fn _par_main(): i64 {
     fmt_int(_par_rows_pend);
     print(" pending, ", 10);
     fmt_int(_par_rows_acc);
-    println(" accepted ===");
+    print(" accepted (ADR 4: ", 18);
+    fmt_int(_par_rows_adr6);
+    print("), ", 3);
+    fmt_int(_par_rows_glibc);
+    println(" glibc-matching (measured) ===");
     return failing;
 }

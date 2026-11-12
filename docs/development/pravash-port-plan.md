@@ -11,9 +11,13 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M1 in progress** (2026-11-11). M0 is complete (§4). M1 part 1 is done: `src/mathx.cyr`, the first
-> `[lib]` and the bundle; 28,223 rows gated, identical on three targets. Next is part 2, the correctly rounded
-> primitives (`src/crmath.cyr`, the MPFR-corrected oracle, ADR 0004).
+> ⏳ **Status: M1 in progress** (2026-11-11). M0 is complete (§4). M1 parts 1 and 2 are done:
+> - `src/mathx.cyr`, the first `[lib]` and the bundle;
+> - the correctly rounded primitives (`src/crmath.cyr`, `src/crlog.cyr`), gated at 0 ulp against the MPFR-corrected
+>   oracle (ADR 0004).
+>
+> Every math row but the M4 cell key is gated: 30,771 ok and 43 accepted (ADR 4), identical on three targets. Next is
+> part 3 (error, vec3, common).
 
 | Thing | Value | Source |
 |---|---|---|
@@ -179,7 +183,7 @@ functions, so six things change.
 |---|---|---|---|---|---|---|
 | M1 | `error.rs` | 26 | — | 6 | `src/error.cyr` | — |
 | M1 | *(public and private constants, presets)* | — | — | — | `src/constants.cyr` (generated) | — |
-| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr` (L2), `src/crmath.cyr` (D2, L1) | ganita where it is already exact; stand-ins otherwise |
+| M1 | *(std f64 methods)* | — | — | — | `src/mathx.cyr` (L2), `src/crmath.cyr` and `src/crlog.cyr` (D2, L1) | ganita where it is already exact; stand-ins otherwise |
 | M1 | `common.rs` | 611 | 35 | 49 | `src/vec3.cyr` (the `DVec3` operations pravash uses), `src/common.cyr`, codecs in `src/json.cyr` | none on the step path: a pravash-owned glam transcription, as impetus's `math3.cyr` |
 | M1 | `buoyancy.rs` | 105 | 5 | 16 | `src/buoyancy.cyr` | — |
 | M1 | `vortex.rs` | 47 | 5 | 12 | `src/vortex.cyr` | — |
@@ -366,7 +370,7 @@ function, so nothing leaves parity entirely.
    [lib]
    modules = ["src/error.cyr", ...]
    ```
-   Module order: error → constants → mathx → crmath → vec3 → common → json → buoyancy → vortex → bridge → par →
+   Module order: error → constants → crmath → crlog → mathx → vec3 → common → json → buoyancy → vortex → bridge → par →
    shallow → grid_solve → grid → mac_grid → k_epsilon → vof → phase_field → sph_kernels → neighbor → sph_fns → sph →
    sph_pcisph → sph_dfsph → sph_multiphase → coupling → mpm → compute → logging → ai.
 4. ✅ **Toolchain and math check. Done 2026-11-11** ([`port-parity.md`](port-parity.md) §1, programs in `scripts/probes/`).
@@ -465,7 +469,8 @@ function, so nothing leaves parity entirely.
    - **Gated result:** 0 failing; 21,852 ok, 1,790 measured, 9,632 pending, on all three targets. Both bounds are
      mutation-checked at their edges.
    - **Moved to M1:** the corrected oracle (`*.cr.tsv`, MPFR) comes with the correctly rounded stand-ins (L1),
-     which it gates at K = 0, as impetus's ADR 0011.
+     which it gates at K = 0, as impetus's ADR 0011. Done in M1 part 2 (ADR 0004, port-parity §6): every bound
+     above is now K = 0, powf and log10 included.
 
    As planned, recorded in `docs/development/port-parity.md`:
    - the math sweep through every Cyrius counterpart against glibc, on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu);
@@ -650,7 +655,7 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 | `sqrt` (46), `abs` (34), `floor` (21), `ceil` (3) | builtins | exact on every target |
 | `max` (128), `min` (37), `clamp` (22) | `_pv_max`, `_pv_min` and `_pv_clamp` with Rust's NaN-ignoring semantics (as impetus's `mathx.cyr`) | exact |
 | `is_finite` (101), `is_nan` (3) | `x - x == 0`; `x != x` | exact |
-| `exp` (5), `ln` (8), `log10` (1), `powf` (6), `sin` (2), `cos` (4), `sin_cos` (2), `atan2` (2), `hypot` (3) | correctly rounded: `src/crmath.cyr` (D2, ledger L1) until ganita ships its tier | class C, exact against the corrected oracle |
+| `exp` (5), `ln` (8), `log10` (1), `powf` (6), `sin` (2), `cos` (4), `sin_cos` (2), `atan2` (2), `hypot` (3) | correctly rounded: `src/crmath.cyr` and `src/crlog.cyr` (D2, ledger L1, ADR 0004) until ganita ships its tier; `cbrt` is ganita's, already exact | class C, exact against the corrected oracle |
 | `cbrt` (2, Manning friction) | `ganita_f64_cbrt`; its comments describe an exact rounding decision, which step 8 measures | class C |
 | `powi` (6) | explicit products in LLVM's square-and-multiply order (as tanmatra) | class B |
 | `to_radians` (1) | `x * (PI / 180.0)` in Rust's order | class B |
@@ -687,7 +692,7 @@ These are every std f64 method in `src/` outside tests, as of 1.3.0.
 | `Option<T>` | the value-form `Option` for one word, otherwise an out-pointer plus 1/0 |
 | `impl Fn` parameters | closures, called through `fncallN` / `callptr` |
 | serde derives | `#derive(Serialize)` / `#derive(Deserialize)`, plus hand codecs in `src/json.cyr` for `DVec3` (`[x, y, z]`) and the data-carrying enums |
-| rayon `par_iter` / `par_chunks_mut` | `src/par.cyr`: a persistent worker pool on `thread_create` and `chan_*`, splitting index ranges, each index writing its own slot; a runtime thread count (D6) |
+| rayon `par_iter` / `par_chunks_mut` | `src/par.cyr`: a persistent worker pool on `thread_create` and `chan_*`, splitting index ranges, each index writing its own slot; a runtime thread count (D6). The pool calls `_pv_cr_load()` before it starts workers: crmath's tables load lazily behind a plain flag (ADR 0004, port-parity §6) |
 | `sort_unstable_by_key` | per probe 5 |
 | `tracing::trace_span!`, `warn!` | sakshi spans and events behind a level |
 | `String` config fields | `Str` |
@@ -750,7 +755,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 
 | # | Status | pravash stand-in | Gap | Upstream request | Converts to | Parity rows to re-run |
 |---|---|---|---|---|---|---|
-| L1 | open | `src/crmath.cyr`: correctly rounded exp, ln, log10, pow, sin, cos, sin_cos, hypot, atan2 (D2), vendored from impetus's crmath and kimiya's ln / log10. Not cbrt: ganita's already equals the oracle's on every row (port-parity §2.1, §3) | ganita has no correctly rounded tier, and no log10 at all | `ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md` (pravash joined as the third consumer, adding ln and log10) | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
+| L1 | open | `src/crmath.cyr` (exp, pow, sin, cos, sin_cos, hypot, atan2: impetus's crmath) and `src/crlog.cyr` (ln, log10: kimiya's), with their generated tables `src/crmath_data.cyr` and `src/crlog_data.cyr`: the correctly rounded primitives (D2, ADR 0004). Not cbrt: ganita's already equals the oracle's on every row (port-parity §2.1, §3) | ganita has no correctly rounded tier, and no log10 at all | `ganita:docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md` (pravash joined as the third consumer, adding ln and log10) | ganita's correctly rounded functions | every class C row, which must stay 0 ulp against the corrected oracle |
 | L2 | open | `src/mathx.cyr`: Rust-semantics min / max / clamp, `is_nan`, `is_finite`, `sin_cos`, and the saturating casts `_pv_as_i32` / `_pv_as_u32` / `_pv_as_usize`. The typed std float constants are generated into `src/constants.cyr` | `f64_min` / `f64_max` ignore a NaN only as the first operand; no public predicates, typed constants or saturating converts (port-parity §1) | `cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md` | the stdlib's `f64_*` | the M0 math sweep, class A |
 | L3 | open | `src/vec3.cyr`: `DVec3` arithmetic on `f64` locals | every `hvec3_*` result allocates, 24 B (port-parity §4.1) | `hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md`; `cyrius:docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md` (pravash's numbers added to both) | hisab's vector forms, once a call's allocation can be scoped | the class B rows of every module that uses vectors |
 | L4 | open | `src/neighbor.cyr`: the neighbour grid on sorted arrays (f32 keys until the D3 switch) | `spatial_hash_query_cell` allocates a vec per query: 4.1 MB per 1,000-particle step (port-parity §4.1) | `hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md` | `spatial_hash_*` with a non-allocating query | neighbour lists (class A) and every SPH and coupling step row |
@@ -793,14 +798,15 @@ A stand-in is never a reason to hold the 2.0 release, and an upstream release is
   - nine upstream requests filed, four open issues extended, and the ledger seeded and checked in CI.
 
   Next: M1 |
-| M1 Foundation | ⏳ in progress | part 1: math 28,223 ok, 0 failed, 1,790 measured, 3,261 pending | — | — | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
+| M1 Foundation | ⏳ in progress | math: 30,771 ok, 43 accepted (ADR 4), 0 failed, 0 measured, 2,460 pending (the M4 cell key) | `tests/crmath.tcyr` (85 checks) | `math/*`: 10 primitives against Rust's glibc | **Part 1 done 2026-11-11** (port-parity §5): `src/mathx.cyr`, the Rust-semantics helpers (`UPSTREAM(L2)`); the first `[lib]` (constants, mathx), `dist/pravash.cyr` and `tests/lib.cyr`; 6,371 rows newly gated, all bit-exact, identical on three targets.
 
-**Part 2, next:** the correctly rounded primitives (`UPSTREAM(L1)`):
-- `src/crmath.cyr`: impetus's crmath (exp, sin, cos, sin_cos, hypot, pow, atan2) and kimiya's ln / log10 (19 functions, ~555 lines);
-- `src/crmath_data.cyr`, generated by a copy of impetus's `crtables.py` on the system MPFR (4.2.2, self-checks ok);
-- the corrected oracle (`tests/golden/math.cr.tsv`, MPFR);
-- ADR 0004 (correct rounding is the accuracy target);
-- the class C rows gated at K = 0 against it, powf included.
+**Part 2 done 2026-11-11** (port-parity §6, ADR 0004): the correctly rounded primitives (`UPSTREAM(L1)`):
+- `src/crmath.cyr` (impetus's crmath: exp, sin, cos, sin_cos, hypot, pow, atan2) and `src/crlog.cyr` (kimiya's ln, log10);
+- their tables, generated: `crtables.py` (impetus's) and `lntables.py` (kimiya's), checked against MPFR 4.2.2 and integer series;
+- the corrected oracle `tests/golden/math.cr.tsv`: the 43 rows glibc 2.44 misrounds;
+- `src/mathx.cyr`'s wrappers;
+- K = 0 for every class C math function, powf and log10 included: all 43 corrected rows accepted, identical on three targets;
+- `tests/crmath.tcyr` and the first benchmark record (`docs/benchmarks-rust-v-cyrius.md`).
 
 **Then:** part 3 (error, vec3, common, with surface parity from here on) and part 4 (buoyancy, vortex, bridge, the M1 JSON) |
 | M2 Shallow water | — | — | — | — | |

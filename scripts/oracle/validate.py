@@ -18,16 +18,46 @@ the Rust oracle, so it catches a generator that records the wrong thing:
 - `f64::cbrt` is not glibc's (rustc links compiler_builtins' own into the binary, port-parity §3),
   so each recorded value is proven correctly rounded instead, with exact rational arithmetic.
 
-Exit status 1 on any failure. Adapted from impetus's validate.py (M0 version).
+The correctly rounded math (ADR 0004) adds three generated outputs, which `--write` writes and a plain
+run checks are current:
+- `src/crmath_data.cyr`, the tables of src/crmath.cyr (scripts/oracle/crtables.py), whose π and ln 2
+  and every table's head are checked against MPFR;
+- `src/crlog_data.cyr`, the tables of src/crlog.cyr (scripts/oracle/lntables.py, which asserts the
+  properties the ln error analysis relies on);
+- the corrected oracle, `tests/golden/<module>.cr.tsv`: each row whose outputs change when every
+  exp, ln, log10, sin, cos, hypot, pow and atan2 result is correctly rounded, with the oracle's
+  outputs and each misrounded call in its note.
+MPFR (libmpfr.so.6, 4.x) is the one system library this needs besides libm, through ctypes
+(scripts/oracle/mpfr_ref.py).
+
+Exit status 1 on any failure. Adapted from impetus's validate.py.
 """
 
 import ctypes
 import ctypes.util
+import importlib.util
+from fractions import Fraction
 import math
 import re
 import struct
 import sys
 from pathlib import Path
+
+WRITE = "--write" in sys.argv[2:]
+sys.dont_write_bytecode = True   # the modules loaded below leave no __pycache__ in the repo
+
+
+def _load(name):
+    """A module beside this script, by path: `-I` keeps the script's directory off sys.path."""
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MPFR = _load("mpfr_ref")
+CRTABLES = _load("crtables")
+LNTABLES = _load("lntables")
 
 FAILS = []
 
@@ -264,7 +294,6 @@ def cbrt_correctly_rounded(x, y):
     The oracle's `f64::cbrt` is not glibc's: rustc links compiler_builtins' own `cbrt` into the
     binary (port-parity §3), so this can't be a ctypes call. It is checked against the definition
     instead: |x| must lie between the cubes of the midpoints to y's neighbours."""
-    from fractions import Fraction
 
     if math.isnan(x):
         return math.isnan(y)
@@ -371,10 +400,166 @@ def check_math(rows):
     return counts
 
 
+# ── the correctly rounded math (ADR 0004) ─────────────────────────────────────────────────────
+# The corrected oracle: the oracle's own operations with every exp, ln, log10, sin, cos, hypot, pow and
+# atan2 result correctly rounded (MPFR). Where glibc rounded every call correctly the row is unchanged
+# and nothing is written; where it didn't, tests/golden/<module>.cr.tsv carries the corrected outputs.
+# cbrt is not here: the oracle's (compiler_builtins') is already correctly rounded, checked above.
+
+CR_UNARY = {"f64::exp": "exp", "f64::ln": "log", "f64::log10": "log10", "f64::sin": "sin",
+            "f64::cos": "cos"}
+CR_BINARY = {"f64::hypot": "hypot", "f64::powf": "pow", "f64::atan2": "atan2"}
+
+
+def corrections(module, rows):
+    """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
+    when every transcendental result is correctly rounded."""
+    out = []
+    for fn, cls, ins, outs, where in rows:
+        log = []
+        if module != "math":
+            continue
+        if fn in CR_BINARY:
+            nm = CR_BINARY[fn]
+            x, y = tok_f(ins[0]), tok_f(ins[1])
+            want = [MPFR.cr2(nm, x, y)]
+            calls = [(f"{nm}(f:{bits(x):016x}, f:{bits(y):016x})", tok_f(outs[0]), want[0])]
+        elif fn in CR_UNARY:
+            nm = CR_UNARY[fn]
+            x = tok_f(ins[0])
+            want = [MPFR.cr(nm, x)]
+            calls = [(f"{nm}(f:{bits(x):016x})", tok_f(outs[0]), want[0])]
+        elif fn == "f64::sin_cos":
+            x = tok_f(ins[0])
+            want = [MPFR.cr("sin", x), MPFR.cr("cos", x)]
+            calls = [(f"sin(f:{bits(x):016x})", tok_f(outs[0]), want[0]),
+                     (f"cos(f:{bits(x):016x})", tok_f(outs[1]), want[1])]
+        else:
+            continue
+        for call, glibc, cr in calls:
+            if not same(glibc, cr):
+                log.append(f"{call} glibc f:{bits(glibc):016x} correctly rounded f:{bits(cr):016x}")
+        got = [tok_f(t) for t in outs]
+        if len(got) == len(want) and all(same(a, b) for a, b in zip(got, want)):
+            continue
+        new = " ".join(f"f:{bits(w):016x}" for w in want)
+        out.append((fn, " ".join(ins), new, "oracle " + " ".join(outs) + "; " + "; ".join(log)))
+    return out
+
+
+def cr_text(module, golden_header, rows):
+    """The text of tests/golden/<module>.cr.tsv, or None when no row needs a correction."""
+    fixes = corrections(module, rows)
+    if not fixes:
+        return None
+    oracle = next(l for l in golden_header if l.startswith("# oracle:"))
+    oracle = oracle.replace(" Generated by scripts/oracle; do not edit.", "")
+    head = [
+        f"# pravash corrected oracle (ADR 0004), format 1: {module}",
+        f"{oracle} Correctly rounded: MPFR {MPFR.VERSION}. Generated by scripts/oracle/validate.py; do not edit.",
+        "# regenerate: python3 -I scripts/oracle/validate.py . --write",
+        "# columns: fn<TAB>inputs<TAB>outputs<TAB>note (fn, inputs: the golden row's, byte for byte; outputs: "
+        "the oracle's operations with every exp, ln, log10, sin, cos, hypot, pow and atan2 result correctly "
+        "rounded; note: the oracle's outputs, then each call glibc misrounded)",
+        f"# rows: {len(fixes)}",
+    ]
+    return "\n".join(head + ["\t".join(f) for f in fixes]) + "\n"
+
+
+def check_corrections(root, module, path_tsv, rows):
+    """tests/golden/<module>.cr.tsv is current (written with --write)."""
+    header = path_tsv.read_text().splitlines()[:5]
+    text = cr_text(module, header, rows)
+    path = path_tsv.with_name(f"{module}.cr.tsv")
+    rel = f"tests/golden/{module}.cr.tsv"
+    if WRITE:
+        if text is None:
+            if path.exists():
+                path.unlink()
+                print(f"removed {rel}")
+        else:
+            path.write_text(text)
+            print(f"wrote {rel} ({text.count(chr(10)) - 5} rows)")
+        return
+    if text is None:
+        if path.exists():
+            fail(f"{rel}: no row needs a correction, but the file exists (regenerate with --write)")
+        return
+    if not path.exists() or path.read_text() != text:
+        fail(f"{rel}: differs from the corrected oracle (regenerate with --write)")
+        return
+    print(f"{module}.cr.tsv: current, {text.count(chr(10)) - 5} corrected rows")
+
+
+def _write_or_check(root, rel, text):
+    path = root / rel
+    if WRITE:
+        path.write_text(text)
+        print(f"wrote {rel} ({len(text.splitlines())} lines)")
+        return False
+    if not path.exists() or path.read_text() != text:
+        fail(f"{rel} is not its generator's output (regenerate with --write)")
+        return False
+    return True
+
+
+def _atanh_inv(n, prec):
+    """atanh(1/n) to `prec` fraction bits (Σ 1/((2k + 1)·n^(2k + 1)), each term truncated), as a Fraction."""
+    one = 1 << (prec + 64)
+    x = one // n
+    total = x
+    k = 1
+    while x:
+        x //= n * n
+        total += x // (2 * k + 1)
+        k += 1
+    return Fraction(total >> 64, 1 << prec)
+
+
+def check_tables(root):
+    """src/crmath_data.cyr and src/crlog_data.cyr are their generators' renderings, and crmath's π and ln 2
+    and every table's head are MPFR's."""
+    n = CRTABLES.PREC
+    for name, fn in (("pi", CRTABLES.pi_bits), ("log2", CRTABLES.ln2_bits)):
+        if fn(n) != MPFR.const_bits(name, n):
+            fail(f"crtables: {name} to {n} bits differs from MPFR's")
+    t = CRTABLES.tables()
+    for j, (hi, lo) in enumerate(t["exp2"]):
+        if hi != MPFR.bits(MPFR.cr("exp2", j / 64)):
+            fail(f"crtables: 2^({j}/64) hi is not MPFR's correctly rounded value")
+    for i, (sh, sl, ch, cl) in enumerate(t["sincos"]):
+        if sh != MPFR.bits(MPFR.cr("sin", i / 64)) or ch != MPFR.bits(MPFR.cr("cos", i / 64)):
+            fail(f"crtables: sin or cos of {i}/64 hi is not MPFR's correctly rounded value")
+    for i, (hi, lo) in enumerate(t["atan"]):
+        if hi != MPFR.bits(MPFR.cr("atan", i / 64)):
+            fail(f"crtables: atan({i}/64) hi is not MPFR's correctly rounded value")
+    for name, want in (("PI_HI", MPFR.atan2(0.0, -1.0)), ("PIO2_HI", MPFR.atan2(1.0, 0.0)),
+                       ("PIO4", MPFR.atan2(1.0, 1.0)), ("PI3O4", MPFR.atan2(1.0, -1.0))):
+        if t[name] != MPFR.bits(want):
+            fail(f"crtables: {name} is not MPFR's correctly rounded value")
+    for j, (c, lh, lm, ll) in enumerate(LNTABLES.ln_table()):
+        if j != 256 and LNTABLES.bits(lh) != MPFR.bits(-MPFR.cr("log", c)):
+            fail(f"lntables: −ln c_{j} hi is not MPFR's correctly rounded value")
+    # ln 2 and 1/ln 10 to 2^-150 relative, against integer series (ln 10 = 3·ln 2 + 2·atanh(1/9)): MPFR's
+    # constants, as the ln tables use them, checked by arithmetic MPFR doesn't share.
+    k = LNTABLES.ln_consts()
+    ln2 = Fraction(CRTABLES.ln2_bits(), 1 << CRTABLES.PREC)
+    ln10 = 3 * ln2 + 2 * _atanh_inv(9, CRTABLES.PREC)
+    for name, parts, exact in (("ln 2", ("LN2H", "LN2M", "LN2L"), ln2), ("1/ln 10", ("IVH", "IVM", "IVL"), 1 / ln10)):
+        approx = sum((Fraction(k[p]) for p in parts), Fraction(0))
+        if abs(approx - exact) > exact / (1 << 150):
+            fail(f"lntables: {name} as {' + '.join(parts)} is off by more than 2^-150 relative")
+    ok = _write_or_check(root, "src/crmath_data.cyr", CRTABLES.render())
+    ok = _write_or_check(root, "src/crlog_data.cyr", LNTABLES.render()) and ok
+    if ok:
+        print(f"crmath_data, crlog_data: current; π and ln 2 to {n} bits, and every table's head, equal "
+              f"MPFR {MPFR.VERSION}'s")
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests" / "golden"
-    files = sorted(p for p in golden.glob("*.tsv"))
+    files = sorted(p for p in golden.glob("*.tsv") if not p.name.endswith(".cr.tsv"))
     listed = [l for l in (golden / "modules.txt").read_text().split("\n") if l and not l.startswith("#")]
     if sorted(listed) != sorted(p.stem for p in files):
         fail(f"modules.txt lists {listed}, the files are {[p.stem for p in files]}")
@@ -389,8 +574,13 @@ def main():
             counts = check_math(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"math: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "math", path, rows)
         else:
             print(f"{path.stem}: {len(rows)} rows parsed (no recomputation yet)")
+    for path in sorted(golden.glob("*.cr.tsv")):
+        if not (golden / path.name.replace(".cr.tsv", ".tsv")).exists():
+            fail(f"{path.name}: no golden module of that name")
+    check_tables(root)
     for msg in FAILS[:40]:
         print("FAIL", msg)
     if len(FAILS) > 40:

@@ -8,7 +8,10 @@
 # - to_radians and the literal-exponent powi are Rust's exact operation order;
 # - the casts saturate as Rust's `as` does (f64_to is the i64 conversion: no saturation to i32 / u32, and a
 #   negative stays negative).
-# The correctly rounded transcendentals arrive in M1a part 2 (src/crmath.cyr, ledger L1).
+# The transcendentals are correctly rounded (ADR 0004): exp, sin, cos, sin_cos, hypot, powf and atan2 on
+# src/crmath.cyr, ln and log10 on src/crlog.cyr (both ledger L1, with their own UPSTREAM notes), cbrt on ganita's,
+# which already is. Every class C row of tests/golden/math.tsv is 0 ulp from the corrected oracle
+# (tests/golden/math.cr.tsv).
 #
 # UPSTREAM(L2): cyrius:docs/development/issues/2026-11-11-f64-min-max-drop-nan-only-as-first-operand.md
 #   replace each helper with the stdlib's minNum / maxNum, predicates and saturating converts once they ship;
@@ -122,4 +125,80 @@ fn _pv_as_usize(x: f64): i64 {
         return f64_to(hi) | 0x8000000000000000;
     }
     return f64_to(x);
+}
+
+# e^x, correctly rounded (src/crmath.cyr). Stands for `f64::exp`.
+#must_use
+fn _pv_exp(x: f64): f64 {
+    var r: f64 = _pv_cr_exp(x);
+    return r;
+}
+
+# ln x, correctly rounded (src/crlog.cyr). Stands for `f64::ln`.
+#must_use
+fn _pv_ln(x: f64): f64 {
+    var r: f64 = _pv_cr_ln(x);
+    return r;
+}
+
+# log₁₀ x, correctly rounded (src/crlog.cyr); log10(10^k) = k exactly for k = 0 … 22. Stands for `f64::log10`.
+#must_use
+fn _pv_log10(x: f64): f64 {
+    var r: f64 = _pv_cr_log10(x);
+    return r;
+}
+
+# x^y, correctly rounded (src/crmath.cyr), C99 Annex F's specials. Stands for `f64::powf`.
+#must_use
+fn _pv_powf(x: f64, y: f64): f64 {
+    var r: f64 = _pv_cr_pow(x, y);
+    return r;
+}
+
+# ∛x, correctly rounded: ganita's, which equals the oracle's compiler_builtins cbrt on every row
+# (port-parity §3). Stands for `f64::cbrt`.
+#must_use
+fn _pv_cbrt(x: f64): f64 {
+    var r: f64 = ganita_f64_cbrt(x);
+    return r;
+}
+
+# √(x² + y²), correctly rounded (src/crmath.cyr), without overflow or underflow in the squares. Stands for
+# `f64::hypot`.
+#must_use
+fn _pv_hypot(x: f64, y: f64): f64 {
+    var r: f64 = _pv_cr_hypot(x, y);
+    return r;
+}
+
+# (sin x, cos x), each correctly rounded (src/crmath.cyr). Stands for `f64::sin_cos`, which is Rust's
+# (x.sin(), x.cos()). Read as `var s, c = _pv_sin_cos(x);` and bind each to an f64 local.
+#must_use
+fn _pv_sin_cos(x: f64) {
+    var s, c = _pv_cr_sin_cos(x);
+    var sv: f64 = s;
+    var cv: f64 = c;
+    return (sv, cv);
+}
+
+# sin x, correctly rounded (src/crmath.cyr). Stands for `f64::sin`.
+#must_use
+fn _pv_sin(x: f64): f64 {
+    var r: f64 = _pv_cr_sin(x);
+    return r;
+}
+
+# cos x, correctly rounded (src/crmath.cyr). Stands for `f64::cos`.
+#must_use
+fn _pv_cos(x: f64): f64 {
+    var r: f64 = _pv_cr_cos(x);
+    return r;
+}
+
+# The angle of (x, y) in [−π, π], correctly rounded (src/crmath.cyr), C99 Annex F's specials and signs of zero
+# included. Stands for `y.atan2(x)`.
+#must_use
+fn _pv_atan2(y: f64, x: f64): f64 {
+    var r: f64 = _pv_cr_atan2(y, x);
+    return r;
 }

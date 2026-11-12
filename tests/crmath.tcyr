@@ -1,0 +1,538 @@
+# crmath.tcyr — Cyrius-only tests of the correctly rounded primitives (ADR 0004): src/crmath.cyr's exp, sin,
+# cos, hypot, pow and atan2 (impetus's, its ADR 0011) and src/crlog.cyr's ln and log10 (kimiya's, its ADR 0006).
+#
+# Against the oracle, the golden math rows gate them at 0 ulp (tests/parity.tcyr, with the corrected oracle where
+# glibc misrounds). These check what the corpus can't say directly: the IEEE special cases, the exact cases, the
+# known hard-to-round arguments, that the fast and slow paths agree wherever both run, and that the fast phases
+# decide ordinary arguments (phase 2 costs about 25×, the slow path about 250×). Adapted from impetus's
+# tests/crmath.tcyr (the crmath groups, renamed) and kimiya's tests/mathx.tcyr (the ln and log10 groups).
+
+include "tests/lib.cyr"
+
+# 1 when a and b have the same bits.
+fn same(a: f64, b: f64): i64 {
+    if (_pv_cr_word(a) == _pv_cr_word(b)) { return 1; }
+    return 0;
+}
+
+# The xorshift state.
+var _seed = 88172645463325252;
+# A seeded xorshift64 step.
+fn next_word(): i64 {
+    var x = _seed;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    _seed = x;
+    return x;
+}
+
+# A uniform double in [lo, hi).
+fn uniform(lo: f64, hi: f64): f64 {
+    var u = (next_word() >> 11) & 9007199254740991;
+    var uf: f64 = f64_from(u);
+    var t: f64 = uf * 0.00000000000000011102230246251565404236316680908203125;
+    var r: f64 = lo + (hi - lo) * t;
+    return r;
+}
+
+# ── ln and log10 (src/crlog.cyr; kimiya's tests/mathx.tcyr) ────────────────────────────────────────
+
+# ln (fid 0) or log10 (fid 1); acc = 1 for the accurate path alone.
+fn crl(fid, acc, x: f64): f64 {
+    if (acc == 0) {
+        if (fid == 0) { var a: f64 = _pv_cr_ln(x); return a; }
+        var b: f64 = _pv_cr_log10(x);
+        return b;
+    }
+    if (fid == 0) { var c: f64 = _pv_cr_ln_acc(x); return c; }
+    var d: f64 = _pv_cr_log10_acc(x);
+    return d;
+}
+
+# The fast path alone: (its result, 1), or (0, 0) when its rounding test fails.
+fn crlf(fid, x: f64) {
+    if (fid == 0) {
+        var a, oa = _pv_cr_ln_fast(x);
+        var av: f64 = a;
+        return (av, oa);
+    }
+    var b, ob = _pv_cr_log10_fast(x);
+    var bv: f64 = b;
+    return (bv, ob);
+}
+
+# Checks f(arg) = want by the full function and by the accurate path alone, for `n` (fid, argument bits,
+# expected bits) triples at `t`; NaN matches any NaN. Returns the number of mismatches.
+fn crl_table(t, n): i64 {
+    var bad = 0;
+    for (var k = 0; k < n; k = k + 1) {
+        var fid = load64(t + 24 * k);
+        var x: f64 = _pv_cr_from_word(load64(t + 24 * k + 8));
+        var want = load64(t + 24 * k + 16);
+        for (var acc = 0; acc < 2; acc = acc + 1) {
+            var y: f64 = crl(fid, acc, x);
+            var w = _pv_cr_word(y);
+            var nan_ok = 0;
+            if (y != y && (want & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { nan_ok = 1; }
+            if (w != want && nan_ok == 0) { bad = bad + 1; }
+        }
+    }
+    return bad;
+}
+
+# (fid, argument, expected) for the special values: kimiya's, the ln and log10 rows (MPFR's values).
+var _T_LN_SPECIAL: i64[48] = {
+    0, 0x3FF0000000000000, 0x0000000000000000,     # ln(1) = +0
+    0, 0x0000000000000000, 0xFFF0000000000000,     # ln(+0) = -inf
+    0, 0x8000000000000000, 0xFFF0000000000000,     # ln(-0) = -inf
+    0, 0x7FF0000000000000, 0x7FF0000000000000,     # ln(+inf) = +inf
+    0, 0xBFF0000000000000, 0x7FF8000000000000,     # ln(-1) = NaN
+    0, 0xFFF0000000000000, 0x7FF8000000000000,     # ln(-inf) = NaN
+    0, 0x7FF8000000000000, 0x7FF8000000000000,     # ln(NaN) = NaN
+    0, 0x0000000000000001, 0xC0874385446D71C3,     # ln(5e-324) = -744.44007192138126
+    0, 0x7FEFFFFFFFFFFFFF, 0x40862E42FEFA39EF,     # ln(DBL_MAX) = 709.782712893384
+    1, 0x3FF0000000000000, 0x0000000000000000,     # log10(1) = +0
+    1, 0x0000000000000000, 0xFFF0000000000000,     # log10(+0) = -inf
+    1, 0x7FF0000000000000, 0x7FF0000000000000,     # log10(+inf) = +inf
+    1, 0xC024000000000000, 0x7FF8000000000000,     # log10(-10) = NaN
+    1, 0x7FF8000000000000, 0x7FF8000000000000,     # log10(NaN) = NaN
+    1, 0x0000000000000001, 0xC07434E6420F4374,     # log10(5e-324) = -323.3062153431158
+    1, 0x8000000000000000, 0xFFF0000000000000      # log10(-0) = -inf
+};
+
+# Hard-to-round arguments (kimiya's): Lefèvre and Muller's 2003 database (Table 5: ln) and arguments found with
+# the fast path's rounding test failing. The first five are the database's; the two marked "midpoint" and the last
+# are the three the fast path sends to the accurate path.
+var _T_LN_HARD: i64[42] = {
+    0, 0x202EA71D85CEE020, 0xC0760296A66B4300,     # ln, [2^-1074, 1): 1 1^60
+    0, 0x27F9476E304CD7C7, 0xC0709B60CAF47B36,     # ln: 1 0^60, just above a midpoint
+    0, 0x31726E9C4D327960, 0xC064156584BCD084,     # ln: 0 0^60
+    0, 0x3DC613955DC802F8, 0xC037F02F9BAF6035,     # ln: 0 1^60, just below a midpoint
+    0, 0x6A562A88613629B6, 0x407D6479EBA7C971,     # ln, (1, 2^1024]: 0 0^64
+    1, 0x27F9476E304CD7C7, 0xC05CD96672F7F3CC,     # log10 at ln's hard arguments
+    1, 0x3DC613955DC802F8, 0xC024CADFEC694FF2,
+    0, 0x2A8DAA7804BAA0AD, 0xC06DA439F276FBDB,     # ln(1.0347821840303089e-103)
+    0, 0x09B65E76E1E024A0, 0xC082CA8887D25E07,     # ln(7.103794337389895e-262)
+    1, 0x71E24C2852C3CB5B, 0x406E129980991459,     # log10(3.812747790751892e+240)
+    0, 0x0000000000000003, 0xC0873ABB4F301B42,     # ln(1.5e-323)
+    1, 0x3FEFFFFFFFFFFFFF, 0xBC8BCB7B1526E50F,     # log10(1 - 2^-53)
+    0, 0x3FF0000000000001, 0x3CAFFFFFFFFFFFFF,     # ln(1 + 2^-52)
+    0, 0x3FEFE9360A3A6228, 0xBF66D216F8365EE9      # ln(0.9972181510702898): the fast test fails (1 in 14.4M)
+};
+
+fn test_ln_log10() {
+    test_group("ln_log10_specials");
+    assert_eq(crl_table(&_T_LN_SPECIAL, 16), 0, "ln and log10 specials, by the full function and the accurate path");
+
+    test_group("log10_exact");
+    # log10(10^k) = k for k = 0 … 22, the only exact cases (10^k is a double only there).
+    var p: f64 = 1.0;
+    var bad = 0;
+    for (var k = 0; k <= 22; k = k + 1) {
+        var kf: f64 = f64_from(k);
+        var l: f64 = _pv_cr_log10(p);
+        var la: f64 = _pv_cr_log10_acc(p);
+        if (_pv_cr_word(l) != _pv_cr_word(kf) || _pv_cr_word(la) != _pv_cr_word(kf)) { bad = bad + 1; }
+        p = p * 10.0;
+    }
+    assert_eq(bad, 0, "log10(10^k) = k for k = 0 … 22, by both paths");
+
+    test_group("ln_hard_cases");
+    assert_eq(crl_table(&_T_LN_HARD, 14), 0, "hard-to-round arguments, by the full function and the accurate path");
+    var sent = 0;
+    var agree = 1;
+    for (var k = 0; k < 14; k = k + 1) {
+        var fid = load64(&_T_LN_HARD + 24 * k);
+        var x: f64 = _pv_cr_from_word(load64(&_T_LN_HARD + 24 * k + 8));
+        var y: f64 = crl(fid, 0, x);
+        var yf, ok = crlf(fid, x);
+        var yfv: f64 = yf;
+        if (ok == 0) { sent = sent + 1; }
+        if (ok == 1 && same(yfv, y) == 0) { agree = 0; }
+    }
+    assert_eq(agree, 1, "where the fast path answers, its result is the function's");
+    assert_eq(sent, 3, "the fast path's test fails on the 3 hard arguments it should");
+
+    test_group("ln_fast_and_acc_agree");
+    # The accurate path alone gives the full function's bits on seeded arguments over every positive finite
+    # double (the fast path answers almost all of them, so this checks the two against each other).
+    var s = 0x2545F4914F6CDD1D;
+    var dis = 0;
+    var fast_fail = 0;
+    for (var fid = 0; fid < 2; fid = fid + 1) {
+        for (var k = 0; k < 1500; k = k + 1) {
+            s = s ^ (s << 13);
+            s = s ^ (s >> 7);
+            s = s ^ (s << 17);
+            var b = ((s >> 1) % 0x7FE0000000000000) + 1;
+            var x: f64 = _pv_cr_from_word(b);
+            var y: f64 = crl(fid, 0, x);
+            var z: f64 = crl(fid, 1, x);
+            if (same(y, z) == 0) { dis = dis + 1; }
+            var yf, ok = crlf(fid, x);
+            if (ok == 0) { fast_fail = fast_fail + 1; }
+        }
+    }
+    assert_eq(dis, 0, "fast and accurate paths agree on 3,000 seeded arguments");
+    assert_eq(fast_fail < 3, 1, "the fast path decides almost all of them (it fails about once in 14 million)");
+    return 0;
+}
+
+# Runs the crmath tests.
+fn main() {
+    alloc_init();
+    var zero: f64 = 0.0;
+    var nan: f64 = zero / zero;
+    var inf: f64 = 1.0 / zero;
+    var ninf: f64 = -inf;
+    var nzero: f64 = -zero;
+
+    test_group("exp_specials");
+    var e: f64 = _pv_cr_exp(nan);
+    assert(e != e, "exp(NaN) is NaN");
+    e = _pv_cr_exp(inf);
+    assert(same(e, inf) == 1, "exp(+inf) = +inf");
+    e = _pv_cr_exp(ninf);
+    assert(same(e, zero) == 1, "exp(-inf) = +0");
+    e = _pv_cr_exp(zero);
+    assert(e == 1.0, "exp(0) = 1");
+    e = _pv_cr_exp(nzero);
+    assert(e == 1.0, "exp(-0) = 1");
+    e = _pv_cr_exp(710.0);
+    assert(same(e, inf) == 1, "exp(710) overflows");
+    e = _pv_cr_exp(709.0);
+    assert(e < inf, "exp(709) is finite");
+    e = _pv_cr_exp(-746.0);
+    assert(same(e, zero) == 1, "exp(-746) underflows to +0");
+    e = _pv_cr_exp(-745.1332191019411);
+    assert(_pv_cr_word(e) == 1, "exp(-745.1332191019411) is the smallest subnormal");
+    e = _pv_cr_exp(-740.0);
+    var w = _pv_cr_word(e);
+    assert(w > 0 && w < 4503599627370496, "exp(-740) is subnormal");
+    e = _pv_cr_exp(1.0);
+    assert(_pv_cr_word(e) == 4613303445314885481, "exp(1) = e rounded (0x4005BF0A8B145769)");
+
+    test_group("sin_cos_specials");
+    var s, c = _pv_cr_sin_cos(nan);
+    var sv: f64 = s;
+    var cv: f64 = c;
+    assert(sv != sv && cv != cv, "NaN gives NaN");
+    var s2, c2 = _pv_cr_sin_cos(inf);
+    sv = s2;
+    cv = c2;
+    assert(sv != sv && cv != cv, "+inf gives NaN");
+    var s3, c3 = _pv_cr_sin_cos(nzero);
+    sv = s3;
+    cv = c3;
+    assert(same(sv, nzero) == 1 && cv == 1.0, "sin(-0) = -0, cos(-0) = 1");
+    var tiny: f64 = _pv_cr_from_word(1);
+    var s4, c4 = _pv_cr_sin_cos(tiny);
+    sv = s4;
+    cv = c4;
+    assert(same(sv, tiny) == 1 && cv == 1.0, "sin of the smallest subnormal is itself");
+    var pi: f64 = 3.141592653589793;
+    sv = _pv_cr_sin(pi);
+    assert(_pv_cr_word(sv) == 4368955796522032135, "sin(fl(pi)) = 1.2246467991473532e-16 (0x3CA1A62633145C07)");
+    cv = _pv_cr_cos(pi);
+    assert(cv == -1.0, "cos(fl(pi)) = -1");
+    var big: f64 = _pv_cr_pow2(1023);
+    sv = _pv_cr_sin(big);
+    var asv: f64 = f64_abs(sv);
+    assert(asv <= 1.0, "sin(2^1023) is in [-1, 1]");
+    var sn: f64 = _pv_cr_sin(-big);
+    assert(same(sn, -sv) == 1, "sin is odd at 2^1023");
+    var cp: f64 = _pv_cr_cos(big);
+    var cn: f64 = _pv_cr_cos(-big);
+    assert(same(cp, cn) == 1, "cos is even at 2^1023");
+
+    test_group("fast_and_slow_agree");
+    # Every argument where the fast path runs: its answer is the slow path's.
+    var bad = 0;
+    for (var i = 0; i < 300; i = i + 1) {
+        var x: f64 = uniform(-700.0, 700.0);
+        var a: f64 = _pv_cr_exp(x);
+        var b: f64 = _pv_cr_exp_slow(x);
+        if (same(a, b) == 0) { bad = bad + 1; }
+        var y: f64 = uniform(-1000.0, 1000.0);
+        var sa: f64 = _pv_cr_sin(y);
+        var sb: f64 = _pv_cr_sin_cos_slow(y, 1);
+        var ca: f64 = _pv_cr_cos(y);
+        var cb: f64 = _pv_cr_sin_cos_slow(y, 0);
+        if (same(sa, sb) == 0 || same(ca, cb) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "fast = slow on 300 exp and 300 sin/cos arguments");
+
+    test_group("fast_path_decides");
+    var before = _pv_cr_slow_calls;
+    var before2 = _pv_cr_phase2_calls;
+    for (var i = 0; i < 2000; i = i + 1) {
+        var x2: f64 = uniform(-700.0, 700.0);
+        var r1: f64 = _pv_cr_exp(x2);
+        var y2: f64 = uniform(-100000.0, 100000.0);
+        var r2, r3 = _pv_cr_sin_cos(y2);
+        var r4: f64 = r2;
+        var keep = _pv_cr_word(r1) + _pv_cr_word(r4);
+        if (keep == 1) { bad = bad + 1; }
+    }
+    var slow = _pv_cr_slow_calls - before;
+    assert(slow < 10, "at most a handful of 6,000 ordinary results need the slow path");
+    var p2 = _pv_cr_phase2_calls - before2;
+    assert(p2 < 60, "phase 1 decides over 99% of them (its bound 2^-62 fails about 0.3% of the time)");
+
+    test_group("reduction_extremes");
+    # The double closest to a multiple of π/2 (6381956970095103·2^797): |cos| or |sin| is about 4.7e-19.
+    var m: f64 = 6381956970095103.0;
+    var hard: f64 = m * _pv_cr_pow2(797);
+    var hs, hc = _pv_cr_sin_cos(hard);
+    var hsv: f64 = hs;
+    var hcv: f64 = hc;
+    var ahs: f64 = f64_abs(hsv);
+    var ahc: f64 = f64_abs(hcv);
+    var small: f64 = ahs;
+    if (ahc < ahs) { small = ahc; }
+    assert(small > 0.0000000000000000001 && small < 0.000000000000000001, "the small one is ~4.7e-19");
+    test_group("hypot");
+    var hz: f64 = 0.0;
+    var hinf: f64 = 1.0 / hz;
+    var hnan: f64 = hz / hz;
+    var dmax: f64 = _pv_cr_from_word(9218868437227405311);
+    var r5: f64 = _pv_cr_hypot(-3.0, 4.0);
+    assert_eq(r5 == 5.0, 1, "(-3, 4) is exactly 5");
+    var r7: f64 = _pv_cr_hypot(0.0, -7.0);
+    assert_eq(r7 == 7.0, 1, "(0, -7) is 7");
+    var rz: f64 = _pv_cr_hypot(-hz, -hz);
+    assert_eq(_pv_cr_word(rz), 0, "(-0, -0) is +0");
+    var ri: f64 = _pv_cr_hypot(hinf, hnan);
+    var ri2: f64 = _pv_cr_hypot(hnan, -hinf);
+    assert_eq(ri == hinf && ri2 == hinf, 1, "an infinity wins over a NaN");
+    var rn: f64 = _pv_cr_hypot(hnan, 1.0);
+    assert_eq(rn != rn, 1, "NaN otherwise");
+    var ro: f64 = _pv_cr_hypot(dmax, dmax);
+    var rm: f64 = _pv_cr_hypot(dmax, 1.0);
+    assert_eq(ro == hinf, 1, "(DBL_MAX, DBL_MAX) overflows");
+    assert_eq(same(rm, dmax), 1, "(DBL_MAX, 1) is DBL_MAX");
+    var hs3: f64 = _pv_cr_from_word(3);
+    var hs4: f64 = _pv_cr_from_word(4);
+    var hs1: f64 = _pv_cr_from_word(1);
+    var hrs: f64 = _pv_cr_hypot(hs3, hs4);
+    var hrs2: f64 = _pv_cr_hypot(hs1, hs1);
+    var hrs3: f64 = _pv_cr_hypot(hs1, hs3);
+    assert_eq(_pv_cr_word(hrs), 5, "subnormal 3-4-5 is exact");
+    assert_eq(_pv_cr_word(hrs2), 1, "√2 · 2^-1074 rounds to 2^-1074");
+    assert_eq(_pv_cr_word(hrs3), 3, "√10 · 2^-1074 rounds to 3 · 2^-1074");
+    var rg: f64 = _pv_cr_hypot(-0.6500409241819365, -0.43523229591675383);
+    assert_eq(same(rg, 0.7822917323609363), 1, "where glibc misrounds: MPFR's value");
+    var hbefore = _pv_cr_hypot_slow_calls;
+    var rt: f64 = _pv_cr_hypot(4503599513168213.0, 7800463565973516.0);
+    assert_eq(same(rt, 9007199366012124.0), 1, "an exact midpoint (hypotenuse 9007199366012125) rounds to even");
+    assert_eq(_pv_cr_hypot_slow_calls > hbefore, 1, "the tie is decided by the slow path");
+    var sym = 1;
+    for (var hk = 0; hk < 2000; hk = hk + 1) {
+        var hx: f64 = uniform(-50.0, 50.0);
+        var hy: f64 = uniform(-50.0, 50.0);
+        var p1: f64 = _pv_cr_hypot(hx, hy);
+        var p2: f64 = _pv_cr_hypot(hy, -hx);
+        if (same(p1, p2) == 0) { sym = 0; }
+    }
+    assert_eq(sym, 1, "symmetric in order and sign");
+
+    test_group("pow_specials");
+    var pz: f64 = 0.0;
+    var pinf: f64 = 1.0 / pz;
+    var pnan: f64 = pz / pz;
+    var pnz: f64 = _pv_cr_from_word(0 - 9223372036854775807 - 1);
+    var pninf: f64 = -pinf;
+    var q1: f64 = _pv_cr_pow(pnan, 0.0);
+    var q2: f64 = _pv_cr_pow(1.0, pnan);
+    var q3: f64 = _pv_cr_pow(pnan, 1.0);
+    var q4: f64 = _pv_cr_pow(2.0, pnan);
+    assert_eq(q1 == 1.0 && q2 == 1.0, 1, "x^0 and 1^y are 1, even with a NaN");
+    assert_eq(q3 != q3 && q4 != q4, 1, "NaN otherwise");
+    var q5: f64 = _pv_cr_pow(-1.0, pinf);
+    var q6: f64 = _pv_cr_pow(0.5, pinf);
+    var q7: f64 = _pv_cr_pow(0.5, pninf);
+    var q8: f64 = _pv_cr_pow(2.0, pninf);
+    assert_eq(q5 == 1.0 && q6 == 0.0 && q7 == pinf && q8 == 0.0, 1, "the limits at y = ±∞");
+    var q9: f64 = _pv_cr_pow(pnz, -3.0);
+    var q10: f64 = _pv_cr_pow(pnz, -2.0);
+    var q11: f64 = _pv_cr_pow(pnz, 3.0);
+    var q12: f64 = _pv_cr_pow(pnz, 2.5);
+    assert_eq(q9 == pninf && q10 == pinf, 1, "(-0)^-3 = -∞, (-0)^-2 = +∞");
+    assert_eq(_pv_cr_word(q11) == _pv_cr_word(pnz) && _pv_cr_word(q12) == 0, 1, "(-0)^3 = -0, (-0)^2.5 = +0");
+    var q13: f64 = _pv_cr_pow(pninf, 3.0);
+    var q14: f64 = _pv_cr_pow(pninf, -3.0);
+    var q15: f64 = _pv_cr_pow(pninf, 2.0);
+    var q16: f64 = _pv_cr_pow(pinf, -0.5);
+    assert_eq(q13 == pninf && _pv_cr_word(q14) == _pv_cr_word(pnz), 1, "(-∞)^3 = -∞, (-∞)^-3 = -0");
+    assert_eq(q15 == pinf && _pv_cr_word(q16) == 0, 1, "(-∞)^2 = +∞, (+∞)^-0.5 = +0");
+    var q17: f64 = _pv_cr_pow(-8.0, 0.5);
+    var q18: f64 = _pv_cr_pow(-2.0, 3.0);
+    var q19: f64 = _pv_cr_pow(-2.0, -3.0);
+    var dmx: f64 = _pv_cr_from_word(9218868437227405311);
+    var q20: f64 = _pv_cr_pow(-1.0, dmx);
+    assert_eq(q17 != q17, 1, "a negative base with a non-integer exponent is NaN");
+    assert_eq(q18 == 0.0 - 8.0 && q19 == 0.0 - 0.125, 1, "a negative base takes the parity's sign");
+    assert_eq(q20 == 1.0, 1, "(-1)^DBL_MAX = 1 (ganita's pow gives +∞: its issue 2026-11-08)");
+
+    test_group("pow_exact_and_ties");
+    var t1: f64 = _pv_cr_pow(25.0, 11.5);
+    assert_eq(_pv_cr_word(t1), 4847330063900822262, "25^11.5 = 5^23, a 54-bit tie, rounds to even");
+    var tb1: f64 = _pv_cr_pow2(0 - 215);
+    var tx1: f64 = 3.0 * tb1;
+    var t2: f64 = _pv_cr_pow(tx1, 5.0);
+    var tb2: f64 = _pv_cr_pow2(0 - 430);
+    var tx2: f64 = 9.0 * tb2;
+    var t3: f64 = _pv_cr_pow(tx2, 2.5);
+    assert_eq(_pv_cr_word(t2) == 122 && _pv_cr_word(t3) == 122, 1, "subnormal ties (glibc 2.44: 121)");
+    var t4: f64 = _pv_cr_pow(0.5, 1075.0);
+    var t5: f64 = _pv_cr_pow(0.5, 1074.0);
+    assert_eq(_pv_cr_word(t4) == 0 && _pv_cr_word(t5) == 1, 1, "2^-1075 is a tie to 0; 2^-1074 exact");
+    var tx6: f64 = 0.9999999925494194;
+    var t6: f64 = _pv_cr_pow(tx6, 2.0);
+    assert_eq(_pv_cr_word(t6), 4607182418665799680, "(1 - 2^-27)^2 = 1 - 2^-26 + 2^-54, a tie");
+    var t7: f64 = _pv_cr_pow(2.0, 0.5);
+    var t8: f64 = _pv_cr_pow(4.0, -537.5);
+    assert_eq(_pv_cr_word(t7) == 4609047870845172685 && _pv_cr_word(t8) == 0, 1, "√2; 4^-537.5 = 2^-1075, a tie to 0");
+
+    test_group("pow_values");
+    var px1: f64 = 1.0000000000000002;
+    var v1: f64 = _pv_cr_pow(px1, 4503599627370496.0);
+    var v2: f64 = _pv_cr_pow(10.0, 308.25);
+    var v3: f64 = _pv_cr_pow(10.0, 0.0 - 323.5);
+    var v4: f64 = _pv_cr_pow(0.7, 0.0 - 1990.0);
+    var v5: f64 = _pv_cr_pow(1.5, 1750.0);
+    var v6: f64 = _pv_cr_pow(0.00001, 3.3333333333333335);
+    var ptiny: f64 = _pv_cr_from_word(1);
+    var v7: f64 = _pv_cr_pow(ptiny, 0.5);
+    assert_eq(_pv_cr_word(v1), 4613303445314885481, "(1 + 2^-52)^(2^52), next to e");
+    assert_eq(_pv_cr_word(v2), 9218771166294802899, "near overflow");
+    assert_eq(_pv_cr_word(v3) == 1 && v4 == pinf, 1, "the subnormal floor and an overflow");
+    assert_eq(_pv_cr_word(v5) == 9217098554343486296 && _pv_cr_word(v6) == 4357468780335506004, 1, "MPFR's values");
+    assert_eq(_pv_cr_word(v7), 2188749418902061056, "√(2^-1074)");
+
+    test_group("pow_fast_and_slow");
+    # The fast phase decides ordinary arguments; where both run, the slow path agrees with it.
+    var pb = _pv_cr_pow_slow_calls;
+    var p2b = _pv_cr_pow_phase2_calls;
+    var agree = 1;
+    for (var pk = 0; pk < 4000; pk = pk + 1) {
+        var lx: f64 = uniform(-9.0, 9.0);
+        var bx: f64 = _pv_cr_exp(lx);
+        var by: f64 = uniform(-20.0, 20.0);
+        var pfast: f64 = _pv_cr_pow(bx, by);
+        if (pk < 300) {
+            var pslow: f64 = _pv_cr_pow_slow(bx, by, 0);
+            if (same(pfast, pslow) == 0) { agree = 0; }
+        }
+    }
+    assert_eq(agree, 1, "fast = slow on 300 arguments");
+    assert_eq(_pv_cr_pow_slow_calls - pb < 4, 1, "the fast phases decide almost all of 4,000");
+    var p2n = _pv_cr_pow_phase2_calls - p2b;
+    assert_eq(p2n < 40, 1, "phase 1 alone decides more than 99 % of them");
+
+    test_group("atan2_specials");
+    # C99 Annex F: signed zeros, ±π, ±π/2, ±π/4 and ±3π/4.
+    var q_az: f64 = 0.0;
+    var q_anz: f64 = -0.0;
+    var q_ainf: f64 = 1.0 / q_az;
+    var q_aninf: f64 = -q_ainf;
+    var q_anan: f64 = q_az / q_az;
+    var q_pi_w = _pv_cr_word(_PV_CR_PI_HI);
+    var q_pio2_w = _pv_cr_word(_PV_CR_PIO2_HI);
+    var q_sgn = 0 - 9223372036854775807 - 1;
+    var q_s1: f64 = _pv_cr_atan2(q_az, q_az);
+    var q_s2: f64 = _pv_cr_atan2(q_anz, q_az);
+    var q_s3: f64 = _pv_cr_atan2(q_az, q_anz);
+    var q_s4: f64 = _pv_cr_atan2(q_anz, -1.0);
+    var q_s5: f64 = _pv_cr_atan2(q_anz, 1.0);
+    assert_eq(_pv_cr_word(q_s1) == 0 && _pv_cr_word(q_s2) == q_sgn, 1, "atan2(±0, +0) = ±0");
+    assert_eq(_pv_cr_word(q_s3) == q_pi_w && _pv_cr_word(q_s4) == (q_pi_w | q_sgn), 1, "atan2(±0, −0 or −1) = ±π");
+    assert_eq(_pv_cr_word(q_s5), q_sgn, "atan2(−0, 1) = −0");
+    var q_s6: f64 = _pv_cr_atan2(1.0, q_anz);
+    var q_s7: f64 = _pv_cr_atan2(-1.0, q_az);
+    var q_s8: f64 = _pv_cr_atan2(q_ainf, 5.0);
+    var q_pio2_ok = _pv_cr_word(q_s6) == q_pio2_w && _pv_cr_word(q_s7) == (q_pio2_w | q_sgn);
+    assert_eq(q_pio2_ok && _pv_cr_word(q_s8) == q_pio2_w, 1, "±π/2 for x = ±0 and an infinite y");
+    var q_s9: f64 = _pv_cr_atan2(q_ainf, q_ainf);
+    var q_s10: f64 = _pv_cr_atan2(q_aninf, q_aninf);
+    var q_pi3o4_w = _pv_cr_word(_PV_CR_PI3O4) | q_sgn;
+    assert_eq(_pv_cr_word(q_s9) == _pv_cr_word(_PV_CR_PIO4) && _pv_cr_word(q_s10) == q_pi3o4_w, 1, "π/4 and −3π/4");
+    var q_s11: f64 = _pv_cr_atan2(-3.0, q_ainf);
+    var q_s12: f64 = _pv_cr_atan2(3.0, q_aninf);
+    var q_s13: f64 = _pv_cr_atan2(q_anan, 1.0);
+    var q_s14: f64 = _pv_cr_atan2(1.0, q_anan);
+    assert_eq(_pv_cr_word(q_s11) == q_sgn && _pv_cr_word(q_s12) == q_pi_w, 1, "−0 and π for an infinite x");
+    assert_eq(q_s13 != q_s13 && q_s14 != q_s14, 1, "NaN in, NaN out");
+
+    test_group("atan2_tiny_and_ties");
+    # r < 2^-60: the IEEE quotient, except at an exact subnormal-grid midpoint, which rounds toward zero.
+    var q_u: f64 = _pv_cr_from_word(1);
+    var q_t1: f64 = _pv_cr_atan2(3.0 * q_u, 2.0);
+    var q_t2: f64 = _pv_cr_atan2(-3.0 * q_u, 2.0);
+    var q_t3: f64 = _pv_cr_atan2(5.0 * q_u, 2.0);
+    var q_t4: f64 = _pv_cr_atan2(q_u, 2.0);
+    var q_t5: f64 = _pv_cr_atan2(21.0 * q_u, 6.0);
+    assert_eq(_pv_cr_word(q_t1), 1, "1.5·2^-1074 rounds down to 2^-1074 (the quotient ties up to 2)");
+    assert_eq(_pv_cr_word(q_t2), q_sgn | 1, "and its negation");
+    assert_eq(_pv_cr_word(q_t3) == 2 && _pv_cr_word(q_t4) == 0, 1, "2.5 → 2, 0.5 → 0");
+    assert_eq(_pv_cr_word(q_t5), 3, "21·2^-1074/6 = 7·2^-1075, a tie (B = 3 divides A = 21): 3, as MPFR");
+    var q_p100: f64 = _pv_cr_pow2(0 - 100);
+    var q_t6: f64 = _pv_cr_atan2(q_p100, 3.0);
+    var q_t7: f64 = _pv_cr_atan2(q_p100, -3.0);
+    assert_eq(_pv_cr_word(q_t6) == 4149316456684016981 && _pv_cr_word(q_t7) == 4614256656552045848, 1,
+      "2^-100 against 3 and −3, MPFR's values");
+
+    test_group("atan2_values");
+    var q_w1: f64 = _pv_cr_atan2(1.0, 2.0);
+    var q_w2: f64 = _pv_cr_atan2(-7.0, -0.001);
+    var q_w3: f64 = _pv_cr_atan2(0.75, 0.7500000000000002);
+    var q_gy: f64 = _pv_cr_from_word(4589452743166928496);
+    var q_gx: f64 = _pv_cr_from_word(4602970030937506456);
+    var q_w4: f64 = _pv_cr_atan2(q_gy, q_gx);
+    assert_eq(_pv_cr_word(q_w1) == 4602023952714414927 && _pv_cr_word(q_w2) == 0 - 4613618336558729494, 1,
+      "MPFR's values");
+    assert_eq(_pv_cr_word(q_w3), 4605249457297304855, "near π/4, MPFR's value");
+    assert_eq(_pv_cr_word(q_w4), 4593613140084300459, "the math row glibc 2.44 misrounds, as MPFR");
+
+    test_group("atan2_fast_and_slow");
+    # Phase 1 decides almost every argument; where both run, the slow path (CORDIC) agrees with it.
+    var q_ab = _pv_cr_atan2_slow_calls;
+    var q_aagree = 1;
+    for (var q_ak = 0; q_ak < 4000; q_ak = q_ak + 1) {
+        var q_ay0: f64 = uniform(-4.0, 4.0);
+        var q_ax0: f64 = uniform(-4.0, 4.0);
+        var q_af: f64 = _pv_cr_atan2(q_ay0, q_ax0);
+        if (q_ak < 200) {
+            var q_aay: f64 = f64_abs(q_ay0);
+            var q_aax: f64 = f64_abs(q_ax0);
+            var q_swp = 0;
+            var q_anum: f64 = q_aay;
+            var q_aden: f64 = q_aax;
+            if (q_aay > q_aax) {
+                q_swp = 1;
+                q_anum = q_aax;
+                q_aden = q_aay;
+            }
+            var q_ae = _pv_cr_ilogb(q_aden);
+            var q_nx = 0;
+            var q_ny = 0;
+            if (q_ax0 < 0.0) { q_nx = 1; }
+            if (q_ay0 < 0.0) { q_ny = 1; }
+            var q_anum_s: f64 = _pv_cr_ldexp(q_anum, 0 - q_ae);
+            var q_aden_s: f64 = _pv_cr_ldexp(q_aden, 0 - q_ae);
+            var q_aslow: f64 = _pv_cr_atan2_slow(q_anum_s, q_aden_s, q_swp, q_nx, q_ny);
+            if (same(q_af, q_aslow) == 0) { q_aagree = 0; }
+        }
+    }
+    assert_eq(q_aagree, 1, "fast = slow on 200 arguments");
+    assert_eq(_pv_cr_atan2_slow_calls - q_ab < 200 + 20, 1, "phase 1 decides more than 99 % of 4,000");
+
+    test_ln_log10();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

@@ -39,7 +39,9 @@
 - [x] M0 step 10: upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) and the conversion ledger seeded and checked in CI
 - [x] **M0 done 2026-11-11.**
 - [x] M1 part 1: `src/mathx.cyr`, the first `[lib]` and `dist/pravash.cyr` (6,371 rows newly gated, bit-exact)
-- [ ] M1 part 2: `src/crmath.cyr` and the MPFR-corrected oracle (ADR 0004); then parts 3–4
+- [x] M1 part 2: `src/crmath.cyr`, `src/crlog.cyr` and the MPFR-corrected oracle (ADR 0004): every class C math
+  row at 0 ulp, 43 rows more accurate than the oracle
+- [ ] M1 part 3: error, vec3, common (with surface parity); then part 4: buoyancy, vortex, bridge, the M1 JSON
 
 ### 1.3.0
 

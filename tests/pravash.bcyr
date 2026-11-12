@@ -2,22 +2,161 @@
 # Stdlib auto-included via cyrius.cyml
 #
 # Pattern: bench_new -> bench_batch_start -> tight loop -> bench_batch_stop -> bench_report.
-# For sub-1us ops use batch_size >= 1000 to amortize clock_gettime overhead
-# (~240 ns per start/stop pair on x86_64 Linux). See lib/bench.cyr header for
-# the full overhead-vs-batching guidance.
+# For sub-1us ops use batch_size >= 1000 to amortize the clock read (lib/bench.cyr measures its floor
+# and subtracts it). Results: docs/benchmarks-rust-v-cyrius.md. Run pinned on the shared host:
+#   taskset -c 15 cyrius bench tests/pravash.bcyr
+
+include "tests/lib.cyr"
+
+var NS = 1000000;
+var g_sink = 0;
 
 # The benchmark loop's empty body, which measures the harness overhead.
 fn bench_noop(): i64 { return 0; }
 
-# Scaffold benchmark. The Rust benchmarks' twins replace this from M1.
+# ── the std transcendentals (M1a part 2, ADR 0004) ─────────────────────────────────────────────
+# Each function runs on 1,024 seeded arguments, cycled: the same arguments as Rust's twin
+# (scripts/probes/rust/src/bin/bench_libm.rs, which times glibc, what Rust's std calls). The xorshift64
+# draw u in [0, 1) maps to lo + (hi − lo)·u in both, so the tables are bit-identical. Beside each correctly
+# rounded function, the counterpart M1a part 1 used, which it replaced (not correctly rounded), for scale.
+var _bx = 0;   # 1,024 f64 x arguments (alloc'd in main)
+var _by = 0;   # and y arguments
+var _bs = 0;
+
+# The next xorshift64 draw, as a double in [0, 1).
+fn _bench_u(): f64 {
+    var s = _bs;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 7);
+    s = s ^ (s << 17);
+    _bs = s;
+    var m: f64 = f64_from(s >> 11);
+    var u: f64 = m * 0.00000000000000011102230246251565404236316680908203125;   # 2^-53
+    return u;
+}
+
+# Fills the 1,024 x arguments with [xlo, xhi) and the y arguments with [ylo, yhi), from the fixed seed.
+fn _bench_args(xlo: f64, xhi: f64, ylo: f64, yhi: f64) {
+    _bs = 0x9E3779B97F4A7C15;
+    for (var k = 0; k < 1024; k = k + 1) {
+        var u: f64 = _bench_u();
+        var x: f64 = xlo + (xhi - xlo) * u;
+        store64(_bx + k * 8, x);
+        var v: f64 = _bench_u();
+        var y: f64 = ylo + (yhi - ylo) * v;
+        store64(_by + k * 8, y);
+    }
+    return 0;
+}
+
+# One timed row: NS calls of unary function `id` over the x arguments.
+fn _bench_unary(name, id) {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var x: f64 = load64(_bx + (i & 1023) * 8);
+        var r: f64 = 0.0;
+        if (id == 0) { r = _pv_exp(x); }
+        elif (id == 1) { r = _f64_exp_polyfill(x); }
+        elif (id == 2) { r = _pv_ln(x); }
+        elif (id == 3) { r = _f64_ln_polyfill(x); }
+        elif (id == 4) { r = _pv_log10(x); }
+        elif (id == 5) { r = _pv_sin(x); }
+        elif (id == 6) { r = f64_sin(x); }
+        elif (id == 7) { r = _pv_cos(x); }
+        elif (id == 8) { r = _pv_cbrt(x); }
+        g_sink = g_sink ^ _pv_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# One timed row: NS calls of binary function `id` over the (x, y) arguments.
+fn _bench_binary(name, id) {
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var x: f64 = load64(_bx + (i & 1023) * 8);
+        var y: f64 = load64(_by + (i & 1023) * 8);
+        var r: f64 = 0.0;
+        if (id == 0) { r = _pv_hypot(x, y); }
+        elif (id == 1) { r = ganita_f64_hypot(x, y); }
+        elif (id == 2) { r = _pv_powf(x, y); }
+        elif (id == 3) { r = ganita_f64_pow(x, y); }
+        elif (id == 4) { r = _pv_atan2(x, y); }
+        elif (id == 5) { r = ganita_f64_atan2(x, y); }
+        g_sink = g_sink ^ _pv_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# sin_cos: both results of one argument, against the two builtins it replaced.
+fn _bench_sin_cos() {
+    var b = bench_new("math/sin_cos_cr");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var x: f64 = load64(_bx + (i & 1023) * 8);
+        var s, c = _pv_sin_cos(x);
+        g_sink = g_sink ^ s ^ c;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    var g = bench_new("math/sin_cos_builtin");
+    bench_batch_start(g);
+    for (var j = 0; j < NS; j = j + 1) {
+        var x2: f64 = load64(_bx + (j & 1023) * 8);
+        var s2: f64 = f64_sin(x2);
+        var c2: f64 = f64_cos(x2);
+        g_sink = g_sink ^ _pv_bits(s2) ^ _pv_bits(c2);
+    }
+    bench_batch_stop(g, NS);
+    bench_report(g);
+    return 0;
+}
+
+fn bench_math() {
+    # The dispatch loop alone (an if chain falling through to its end), for the rows' overhead.
+    _bench_args(-20.0, 20.0, 0.0, 1.0);
+    _bench_unary("math/dispatch_floor", 99);
+    _bench_unary("math/exp_cr", 0);
+    _bench_unary("math/exp_polyfill", 1);
+    _bench_args(0.001, 1000.0, 0.0, 1.0);
+    _bench_unary("math/ln_cr", 2);
+    _bench_unary("math/ln_polyfill", 3);
+    _bench_unary("math/log10_cr", 4);
+    _bench_args(-10.0, 10.0, 0.0, 1.0);
+    _bench_unary("math/sin_cr", 5);
+    _bench_unary("math/sin_builtin", 6);
+    _bench_unary("math/cos_cr", 7);
+    _bench_sin_cos();
+    _bench_args(-1000.0, 1000.0, 0.0, 1.0);
+    _bench_unary("math/cbrt_ganita", 8);
+    _bench_args(-100.0, 100.0, -100.0, 100.0);
+    _bench_binary("math/hypot_cr", 0);
+    _bench_binary("math/hypot_ganita", 1);
+    _bench_args(0.1, 10.0, -10.0, 10.0);
+    _bench_binary("math/powf_cr", 2);
+    _bench_binary("math/powf_ganita", 3);
+    _bench_args(-1.0, 1.0, -1.0, 1.0);
+    _bench_binary("math/atan2_cr", 4);
+    _bench_binary("math/atan2_ganita", 5);
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
+    _bx = alloc(8192);
+    _by = alloc(8192);
     var b = bench_new("noop");
     bench_batch_start(b);
     var i = 0;
-    while (i < 1000000) { bench_noop(); i = i + 1; }
-    bench_batch_stop(b, 1000000);
+    while (i < NS) { bench_noop(); i = i + 1; }
+    bench_batch_stop(b, NS);
     bench_report(b);
+    bench_math();
     return 0;
 }
 

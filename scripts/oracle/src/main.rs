@@ -16,7 +16,9 @@
 //! `--check` regenerates every output in memory and compares it byte for byte with the committed
 //! file. It exits 1 if any output differs or is missing, if a `.tsv` has no emitter, or if a file
 //! was recorded on another glibc platform (`glibc.rs`): its transcendental rows are glibc's bits,
-//! so they can only be checked where they were made.
+//! so they can only be checked where they were made. A `<module>.cr.tsv` is the corrected oracle
+//! (ADR 0004), which `validate.py --write` writes and checks: here it is stale only when its module
+//! has no emitter.
 //!
 //! Adapted from impetus's `scripts/oracle/` (same format, same rules), which took it from kimiya's
 //! and tanmatra's. Modules are added at the start of their milestone, with the golden grid from
@@ -236,9 +238,14 @@ fn run() -> Result<bool, String> {
         ok &= emit(&root, check, out)?;
     }
 
-    // A .tsv with no emitter is stale: the harness would test rows nobody regenerates.
+    // A .tsv with no emitter is stale: the harness would test rows nobody regenerates. A
+    // `<module>.cr.tsv` (the corrected oracle, ADR 0004, written by validate.py) belongs to its
+    // module's emitter.
     for name in tsv_names(&dir) {
-        if !emitted.contains(&name) {
+        let module_file = name
+            .strip_suffix(".cr.tsv")
+            .map_or_else(|| name.clone(), |m| format!("{m}.tsv"));
+        if !emitted.contains(&module_file) {
             println!("STALE    tests/golden/{name} (no emitter)");
             ok = false;
         }
