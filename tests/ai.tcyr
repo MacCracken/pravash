@@ -1,4 +1,4 @@
-# ai.tcyr — the ported Rust tests of rust-old/src/ai.rs (M7 part b): both, in Rust's order. Cyrius-only groups follow:
+# ai.tcyr — the ported tests of Rust 1.3.0's src/ai.rs (M7 part b): both, in Rust's order. Cyrius-only groups follow:
 # the layouts, ownership (the defaults own nothing; the setters copy and release; drop), the escape table's edges, a
 # byte that is no part of valid UTF-8, the alternate Debug, and the JSON text checks.
 

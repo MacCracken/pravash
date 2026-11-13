@@ -1,4 +1,4 @@
-# mpm.cyr — the material point method of rust-old/src/mpm.rs (M6 part c): per-particle deformation gradients and
+# mpm.cyr — the material point method of Rust 1.3.0's src/mpm.rs (M6 part c): per-particle deformation gradients and
 # constitutive stress (a weakly compressible fluid, a Neo-Hookean solid, Drucker–Prager sand with its plastic
 # projection), transferred on a background grid with separating walls.
 #
@@ -7,7 +7,7 @@
 # matrices (the deformation gradient, the stress) are `PvMat2`, row-major. Every formula is Rust's in its operation
 # order, on the correctly rounded primitives (src/crmath.cyr, src/crlog.cyr): the 2 × 2 SVD's hypot, atan2, sin and
 # cos, the Hencky strain's ln and exp, the friction angle's sin. So the step and stress rows are class C, equal to the
-# corrected oracle where glibc misrounds (tests/golden/mpm.cr.tsv). The grid's cell lookup is the FLIP solver's
+# correctly rounded rows where glibc misrounds (tests/golden/mpm.cr.tsv). The grid's cell lookup is the FLIP solver's
 # (`_pv_flip_axis`, the same expression). A kind outside the enum, which Rust can't hold, is refused by `validate`
 # and gives a NaN stress. Rust's `trace_span!` arrives with M7's logging. Slices are (pointer, count) (ADR 0002 #9).
 

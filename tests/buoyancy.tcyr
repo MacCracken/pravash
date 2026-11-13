@@ -1,4 +1,4 @@
-# buoyancy.tcyr — the ported Rust tests of rust-old/src/buoyancy.rs (M1 part 4).
+# buoyancy.tcyr — the ported tests of Rust 1.3.0's src/buoyancy.rs (M1 part 4).
 #
 # `is_err()` is `is_err_result`; an Ok f64 is the Result's payload word, bound to an f64 local.
 

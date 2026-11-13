@@ -1,4 +1,4 @@
-# error.tcyr — the ported Rust tests of rust-old/src/error.rs (M1 part 3).
+# error.tcyr — the ported tests of Rust 1.3.0's src/error.rs (M1 part 3).
 #
 # The Rust tests format each error with its payload (`InvalidGridResolution { nx: 0, ny: 10 }` displays
 # "0x10"). The Cyrius code carries no payload (ADR 0002 #1), so each test is re-expressed against the code: the

@@ -1,4 +1,4 @@
-# shallow.cyr — the shallow water equations on a 2D grid (port of rust-old/src/shallow.rs).
+# shallow.cyr — the shallow water equations on a 2D grid (port of Rust 1.3.0's src/shallow.rs).
 #
 # `PvShallowWater` mirrors `ShallowWater`: the grid (nx × ny cells of size dx, row-major, index y·nx + x), the
 # public fields `height` (the surface η), `vx`, `vy`, `ground` (the bed z) and `manning_n` as columns
@@ -7,7 +7,7 @@
 # `PvShallowWater_new`, release with `PvShallowWater_drop`.
 #
 # Every formula is Rust's in Rust's operation order; `cbrt` (Manning friction, sediment) is ganita's, correctly
-# rounded as the oracle's compiler_builtins cbrt is, and the damping `powf` the correctly rounded one (ADR 0004). An
+# rounded as 1.3.0's compiler_builtins cbrt is, and the damping `powf` the correctly rounded one (ADR 0004). An
 # index outside a field, where Rust panics, reads NaN or false and writes nothing (ADR 0002 #8). Rust's
 # `trace_span!`s arrive with M7's logging.
 

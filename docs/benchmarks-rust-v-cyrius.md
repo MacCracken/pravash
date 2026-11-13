@@ -1,5 +1,10 @@
 # Benchmarks — Rust 1.3.0 vs the Cyrius port
 
+> **The Rust columns are frozen at 2.0.0.** Rust left the tree after 2.0.0. `rust-old/`, the Rust generator and probes, and the tools named below that ran
+> or read Rust are at the tag 2.0.0 (commit `0f2b054`); the 1.3.0 crate is at the tag `1.3.0`. Paths under
+> `rust-old/` and `scripts/probes/rust/`, and `cargo` commands, name files and steps of that tag.
+> New Cyrius numbers compare with the Cyrius columns.
+
 Each row times one benchmark body twice:
 - **Rust:** the same work in Rust, either `rust-old/`'s criterion benches or a twin in `scripts/probes/rust/`;
 - **Cyrius:** `tests/pravash.bcyr`, run by `cyrius bench`.
@@ -422,7 +427,7 @@ tree; B: this one). The runs agree within 1%. The Rust column is part a's criter
 ## M3 part c: MacGrid, KEpsilon and the ghost fluid (2026-11-12)
 
 rust-old/benches has no bench for these types, so `scripts/probes/rust/src/bin/bench_grid_c.rs` times the same
-bodies on the frozen oracle, and `tests/pravash.bcyr`'s `bench_grid_c` is the Cyrius side. Each row is `iters` calls
+bodies on the frozen crate, and `tests/pravash.bcyr`'s `bench_grid_c` is the Cyrius side. Each row is `iters` calls
 on one state, which evolves the same way on both sides, bit for bit. Runs were pinned on core 15 and interleaved,
 three of each side. The runs agree within 1%, and the table gives medians.
 
@@ -459,7 +464,7 @@ a positive constant floor. Written out as `if (x > floor)`, instead of `_pv_max`
 ## M3 part d: VOF and the phase field (2026-11-12)
 
 rust-old/benches has no bench for `VofField` or `PhaseField`, so `scripts/probes/rust/src/bin/bench_vof_pf.rs` times
-the same bodies on the frozen oracle, and `tests/pravash.bcyr`'s `bench_m3d` is the Cyrius side. Each row is `iters`
+the same bodies on the frozen crate, and `tests/pravash.bcyr`'s `bench_m3d` is the Cyrius side. Each row is `iters`
 calls on one state, which evolves the same way on both sides. Runs were pinned on core 15 and interleaved, three of
 each side, and the table gives medians. The Rust column comes from the runs interleaved with the first Cyrius build
 (they agree within 5%). The Cyrius column is the B side of the A/B below (within 1%).
@@ -1071,7 +1076,7 @@ The "with `defer`" column is a run of 13 rows only, three rounds each.
 
 ## M8 part d: Debug text (2026-11-13)
 
-Rust's criterion suite has no Debug bench, so these are against a twin on the frozen oracle,
+Rust's criterion suite has no Debug bench, so these are against a twin on the frozen crate,
 `scripts/probes/rust/src/bin/bench_debug_d.rs` (rustc 1.99.1). Two rounds, pinned to core 15, the twin and
 `cyrius bench` interleaved. Each iteration writes into a fresh `String` or `str_builder`, as `format!` does.
 

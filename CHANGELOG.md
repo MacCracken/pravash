@@ -2,10 +2,38 @@
 
 ## [Unreleased]
 
+### Removed
+- **Rust leaves the tree** ([ADR 0001's update](docs/adr/0001-cyrius-port-of-rust-1.3.0.md)). `rust-old/` (Rust 1.3.0
+  with its dump hooks) is gone, with everything that ran or read it:
+  - the golden generator's crate;
+  - the Rust probes (`scripts/probes/rust/`, and the p0, p3 and p8 probes that read their output);
+  - the surface diff (`scripts/surface_parity.py`) and the Rust-test ledger's writer (`scripts/rust_test_ledger.py`);
+  - the benchmark recorder (`scripts/bench_record.py`) and the examples' `.out` derivation (`scripts/golden/examples.py`).
+
+  All are at the tag 2.0.0 (commit `0f2b054`), and the 1.3.0 crate is at the tag `1.3.0`. The library, its tests,
+  CI and the release used none of them.
+
+### Changed
+- **The golden corpus is frozen.** Each `tests/golden/*.tsv` header now names the tag the file was generated at, in
+  place of a cargo command. The generated sources (`src/constants.cyr`, `src/constants_private.cyr`,
+  `src/str_debug_data.cyr`, `tests/constants_rows.cyr`) say the same. No row or value changed.
+  `validate.py` checks `constants.tsv` against `src/constants.cyr` instead of the Rust literals, and still
+  recomputes every row.
+- **The word "oracle" is retired.** Rust 1.3.0 is the source of the ported functionality; the accuracy bar is
+  correct rounding (ADR 0004).
+  - `scripts/oracle/` is now `scripts/golden/`, and ADR 0001 is now `0001-cyrius-port-of-rust-1.3.0.md`.
+  - The corpus header's provenance line starts `# recorded:`.
+  - The dump-hook rows take their API names: `sph::cell_key`, `sph::invert_3x3` and
+    `FluidGrid::pressure_solve_{cg,dst,gauss_seidel,multigrid}`. The parity harness reads the new names, and every
+    row's class, inputs and outputs are unchanged.
+- **CLAUDE.md, the README, CONTRIBUTING, SECURITY and the guides** drop the Rust commands. The record documents (the
+  port plan, port parity, the benchmarks, the Rust-test ledger) are marked frozen at 2.0.0.
+
 ## [2.0.0] - 2026-11-13
 
-pravash 2.0 is the Cyrius library: the parity port of the Rust crate 1.3.0, which stays frozen in `rust-old/` as the
-oracle. It ships as one bundle, `dist/pravash.cyr`. The release record:
+pravash 2.0 is the Cyrius library: the Rust crate 1.3.0's functionality, ported, with correct rounding as the
+accuracy bar (ADR 0004). It ships as one bundle, `dist/pravash.cyr`, and nothing in it builds, tests or releases from
+Rust; the 1.3.0 source is kept in `rust-old/` for reference. The release record:
 - **Golden rows:** 68,007 in 18 modules, replayed with the same bits on x86_64 Linux, x86_64 Windows (PE) and
   aarch64. 67,276 match Rust within their class; 728 are accepted under ADR 0002 #2 (the f64 neighbour keys) and
   ADR 0004 (correct rounding where glibc misrounds); 3 wait on bayan's JSON policies. `validate.py` recomputes every
@@ -20,7 +48,7 @@ section run from the last part of the port (M8 part e) back to the first (M0), e
 Changed, Fixed and Performance.
 
 ### Breaking
-- **pravash 2.0 is a Cyrius library.** The Rust crate stays at 1.3.0, frozen in `rust-old/` as the parity oracle;
+- **pravash 2.0 is a Cyrius library.** The Rust crate's last release is 1.3.0, its source kept in `rust-old/` for reference;
   2.0 is its port, with the same physics and Rust's names. Code that used the Rust crate moves by
   [the migration guide](docs/guides/migration-2.0.md), which shows each change below with code that compiles and
   runs. [ADR 0002](docs/adr/0002-port-api-divergences.md) records each one in full; the numbers below are its rows.
@@ -66,7 +94,7 @@ Changed, Fixed and Performance.
 
 ### Changed (Cyrius)
 - **VERSION is 2.0.0.**
-- **CI and the release no longer depend on Rust or `rust-old/`.** The `rust-oracle` job, which built and tested the
+- **CI and the release no longer depend on Rust or `rust-old/`.** The CI job that built and tested the
   1.3.0 crate with cargo and gated every release through `needs: [ci]`, is removed. So are the two steps that read
   `rust-old/`'s source, surface parity and the Rust-test ledger, which stay local porting tools. CI runs the build,
   the tests (also bounds-checked), `deps --locked`, the audit, the upstream ledger, `distlib --check`, the doc
@@ -91,10 +119,10 @@ Changed, Fixed and Performance.
   - **A new golden module, `debug.tsv`**: 9,602 rows, class A, every one matching on the first replay after one fix
     (below). It holds 6,871 f64 and 2,565 f32 printings (the specials, every power of ten and of two with their
     neighbours, eight steps either side of both thresholds, seeded sweeps), 156 values of the 35 types (the scratch
-    from the oracle's dumps), and 10 states after their own steps.
+    from the dump hooks' output), and 10 states after their own steps.
   - **The after-step rows** check the port's private state: after its own shallow-water, grid (Gauss–Seidel, CG,
     multigrid, BFECC), k-ε, MAC, VOF and phase-field steps, the scratch holds Rust's bits.
-  - **`validate.py`** recomputes all 9,602 rows in Python. The after-step states come from the oracle, so for those
+  - **`validate.py`** recomputes all 9,602 rows in Python. The after-step states come from Rust 1.3.0, so for those
     rows it parses Rust's text and renders both forms again.
   - **Tests:** `debug_unknown_kinds` (a kind word outside its enum prints `Unknown`, in both forms and nested) and
     `debug_appends`, 3 more checks in `tests/common.tcyr`.
@@ -116,7 +144,7 @@ Changed, Fixed and Performance.
   Rust items and 115 Cyrius-only by 18 rules.
 
 ### Performance
-- **Debug text against Rust** (`debug_d/*`, a twin on the frozen oracle, two rounds pinned to core 15, interleaved):
+- **Debug text against Rust** (`debug_d/*`, a twin on the frozen crate, two rounds pinned to core 15, interleaved):
 
   | Row | Rust 1.3.0 | Cyrius | Cyrius / Rust |
   |---|---|---|---|
@@ -149,7 +177,7 @@ Changed, Fixed and Performance.
   The Manning-friction test now uses it.
 - **The ported examples** (`docs/examples/`): Rust's `basic_fluid`, `shallow_water` and `multiphase` as Cyrius
   programs, each with the output it must print (`.out`).
-  - **`scripts/oracle/examples.py`** derives those files from the oracle. The shallow-water output is exactly the
+  - **`scripts/golden/examples.py`** derives those files from Rust 1.3.0. The shallow-water output is exactly the
     Rust example's. For the two SPH examples, validate.py's transcription of the solver reproduces Rust's frames
     exactly on f32 neighbour keys, and gives the `.out` frames on the port's f64 keys.
   - **The divergence is ADR 0002 #2's.** At `basic_fluid`'s second step, the f32 keys move a particle at
@@ -165,7 +193,7 @@ Changed, Fixed and Performance.
   `_PvKernelCoeffs`, `_PvMgLevel` and `_PvPool`, and `PvPool_new` / `PvPool_drop` are `_pv_pool_new` /
   `_pv_pool_drop`. No public signature used them; 2.0.0 would have frozen them into the surface.
 - **The README** is rewritten for the Cyrius library. It covers what is checked against Rust, the features, the
-  dependency, Rust's Quick Start ported and run, the examples, the known limitations, and the build and oracle
+  dependency, Rust's Quick Start ported and run, the examples, the known limitations, and the build
   commands. **`docs/guides/getting-started.md`** is rewritten from the scaffold's stub as the guide to working on
   pravash.
 
@@ -219,7 +247,7 @@ Changed, Fixed and Performance.
     - `clear_api_key` and `_drop` release what the record owns.
   - **`debug(sb, alternate)`** writes Rust's `{:?}` and `{:#?}` exactly, the API key as `Some("<redacted>")`.
     `<str as Debug>`'s escapes come from a generated table, `src/str_debug_data.cyr`: 910 ranges read char by char
-    from rustc 1.99.1's core, Unicode 17.0.0 (`scripts/oracle/src/t_str_debug.rs`). Bytes that aren't UTF-8 are
+    from rustc 1.99.1's core, Unicode 17.0.0 (`scripts/golden/src/t_str_debug.rs`). Bytes that aren't UTF-8 are
     written as U+FFFD.
   - **The JSON codecs** live in `src/json.cyr`: serde_json's escaping on write, and serde's derive rules on read (a
     missing or null API key is `None`). bayan accepts two things serde_json refuses: a raw control byte inside a
@@ -257,7 +285,7 @@ Changed, Fixed and Performance.
     - serde_json's `to_string` and both Debug forms of every document that reads.
   - **`tests/golden/logging.tsv`** has 251 rows.
     - 99 filter rows: 63 `PRAVASH_LOG` values and unset, against 8 defaults.
-    - 152 trace rows over 37 traced calls. A capture subscriber on the oracle records the enters, exits and events.
+    - 152 trace rows over 37 traced calls. A capture subscriber on Rust 1.3.0 records the enters, exits and events.
   - validate.py recomputes every `ai` row and every filter row. It checks the escape table against the stdlib's
     Unicode 17.0.0 categories. For trace rows it checks the form: nesting, the declared fields and the targets.
   - The instrumentation changed no other row's bits. The whole corpus replays, thread-count runs included: 17
@@ -289,7 +317,7 @@ Changed, Fixed and Performance.
   - the SPH list functions' invalid neighbour lists.
 - **grid:** MacCormack's and BFECC's forward passes call a span-free `_pv_fg_advect_raw`, because Rust's run without
   a span.
-- **Tooling:** `scripts/oracle/probe_tables.py` now accepts one resolver notice in its probe build: the sakshi leaf
+- **Tooling:** `scripts/golden/probe_tables.py` now accepts one resolver notice in its probe build: the sakshi leaf
   warning that hisab's package causes. It matches the exact text, and every other error or warning line still
   fails the probe.
 
@@ -419,7 +447,7 @@ Changed, Fixed and Performance.
       inversions and the specials, and the solver's refusals. The step trajectories are the plan's elastic block,
       sand column and fluid column to 300 steps, a mixed column, the Rust tests' scenes, the specials and 30 seeded
       scenes.
-    - 1,319 rows match the oracle bit for bit.
+    - 1,319 rows match Rust 1.3.0 bit for bit.
     - The other 17 (3 stresses, 14 steps) are where glibc misrounds a call, mostly hypot. validate.py writes them to
       `mpm.cr.tsv` from MPFR, and the port matches every one bit for bit, *accepted (ADR 4)*. Those are exactly the
       rows the first replay failed against glibc's bits.
@@ -569,11 +597,11 @@ Changed, Fixed and Performance.
     - **Parity:** the rows the switch changes are mapped by name to two new tables, which validate.py writes from its
       own transcription of the f64 grid: `tests/golden/math.d3.tsv` (558 of the 2,460 cell-key rows) and
       `sph.d3.tsv` (all 30 list rows, 6 `step`, 1 `step_dfsph`, 1 `step_multiphase`). All 596 pass, *accepted
-      (ADR 2)*; the other rows keep the oracle's outputs.
+      (ADR 2)*; the other rows keep 1.3.0's outputs.
     - **Tests:** lattices at x = 10⁶ and 10¹², where the f32 lists drifted, still list every particle within h once.
       Keys saturated at ±∞ on each axis never list each other, and a NaN coordinate is cell 0 (no row can hold a ±∞
-      position: the oracle panics on `cx + 1`). 190 checks.
-- **The parity harness**: `tests/golden/<module>.d3.tsv` loads into the corrected-oracle table, each row tagged with its
+      position: Rust 1.3.0 panics on `cx + 1`). 190 checks.
+- **The parity harness**: `tests/golden/<module>.d3.tsv` loads into the correctly rounded table, each row tagged with its
   ADR, and reports *accepted (ADR 2)* apart from ADR 4. Thread-count replays share one helper, `_par_threads_agree`.
   validate.py writes and checks the `.d3.tsv` files (`--write`, as the `.cr.tsv` ones), and the generator's `--check`
   counts each as its module's.
@@ -635,7 +663,7 @@ Changed, Fixed and Performance.
     - All 34 rows of the first set passed on the first replay. `validate.py` transcribes DFSPH: 49,942 rows,
       0 failures.
     - No row advects a position to ±∞. Its saturated key would overflow the second build's `cx + 1`, which panics in
-      the oracle's build; the diverging rows use NaN instead.
+      1.3.0's build; the diverging rows use NaN instead.
   - **Tests:** the four DFSPH Rust tests, and `test_grid_cfl_dt` and `test_shallow_cfl_dt`, two grid and shallow-water
     tests that live in `sph.rs` and had been missed. That makes 74 of the 79; the last five are the multiphase step's.
     Part a ported 23 tests, not the 22 its record says, so the counts since then were one short (68 after M5 part b).
@@ -708,13 +736,13 @@ Changed, Fixed and Performance.
     `update_secondary_particles`, which compacts the survivors in place.
   - **The configs:** `PvViscoelasticConfig`, `PvHeatConfig`, `PvPhaseChangeConfig` (with `_water_ice`) and
     `PvCombustionConfig` (with `_default`).
-  - **The 3×3 inverse, ledger L7.** `_pv_invert_3x3` transcribes the oracle's own `matrix_inverse` (hisab 1.4.0: LU
+  - **The 3×3 inverse, ledger L7.** `_pv_invert_3x3` transcribes 1.3.0's own `matrix_inverse` (hisab 1.4.0: LU
     with an absolute 1e-12 pivot test), allocation-free.
     - ganita's `mat_inv`, the planned conversion target, differs on 12 of the 60 inverse rows: it refuses non-finite
       entries and scales its threshold. The correction is on the ganita request.
   - **Parity:** 318 new `sph.tsv` rows, 1,370 in all.
     - 315 of the first 316 passed on the first replay. The other was a contact-angle row at a cosine glibc misrounds,
-      which matches the corrected oracle (`sph.cr.tsv`, now 22 rows).
+      which matches the correctly rounded rows (`sph.cr.tsv`, now 22 rows).
     - `validate.py` transcribes part d: 49,804 rows, 0 failures.
     - The mutation tests found two gaps, exact ties no random row hits, closed by two rows that draw no random
       numbers.
@@ -750,7 +778,7 @@ Changed, Fixed and Performance.
     - 60 brute-force rows and 43 step rows (trajectories to 300 steps, a 3D box, the walls, every config error, three
       divergences);
     - 36 block rows and 30 merge rows;
-    - 29 split rows, 5 of them against the corrected oracle `sph.cr.tsv`, at child counts whose ring angles glibc
+    - 29 split rows, 5 of them against the correctly rounded rows `sph.cr.tsv`, at child counts whose ring angles glibc
       misrounds (an MPFR search).
 
     `validate.py` transcribes part c: 49,486 rows, 0 failures.
@@ -788,7 +816,7 @@ Changed, Fixed and Performance.
   - **ADR 0002 row 16:** the grid's form, the i32 probe offset (wraps, as Rust's release builds do), and
     `sort_by_zorder` returning 1 sorted or 0 unchanged.
   - **Parity:** 50 new `sph.tsv` rows, all bit-exact: 30 neighbour-list rows and 20 z-order rows. The 2,460
-    `oracle::sph_cell_key` rows of `math.tsv`, pending since M0, now pass.
+    `sph::cell_key` rows of `math.tsv`, pending since M0, now pass.
     - `validate.py` transcribes the grid and the Morton codes: 49,288 rows, 0 failures.
     - Two corpus gaps the mutation tests found are closed by four rows that draw no random numbers, so no other row
       moved. One gap was a grid kept within `f32::EPSILON` of h with points on cell edges and at 4.5e6. The other
@@ -818,12 +846,12 @@ Changed, Fixed and Performance.
   - **The non-Newtonian viscosity models,** the first data-carrying enum (ADR 0002 #15): `PvNonNewtonianViscosity`,
     `PvNonNewtonianModel` and its constructors, and `non_newtonian_viscosity_effective_viscosity`.
   - **`batch_poly6`, `batch_distance_squared`, `total_kinetic_energy` and `max_speed`.**
-  - **Private constants, generated:** `scripts/oracle/src/t_private.rs` writes `src/constants_private.cyr` from each
+  - **Private constants, generated:** `scripts/golden/src/t_private.rs` writes `src/constants_private.cyr` from each
     private `const`'s Rust literal (`_PV_SPH_MIN_DENSITY`, `_PV_GRID_MIN_SIZE`, …). It fails on any unlisted one,
     and `probe_tables.py` compiles each against its literal. The grid's hand-typed 4s became `_PV_GRID_MIN_SIZE`.
   - **Parity:** a new golden module, `sph.tsv`, 804 rows, bit-exact on the first replay.
     - It includes 471 Tait rows (12 at arguments where glibc misrounds pow or ln) and 22 viscosity-model rows.
-    - `validate.py` transcribes part a and writes the corrected oracle `sph.cr.tsv` (16 rows). The port matches
+    - `validate.py` transcribes part a and writes the correctly rounded rows `sph.cr.tsv` (16 rows). The port matches
       every one.
   - **Tests:** 22 Rust tests in `tests/sph.tcyr`. Surface parity adds `sph`, with the rest of it listed as pending
     by part.
@@ -903,7 +931,7 @@ Changed, Fixed and Performance.
   1.17–1.18× faster. Writing out the phase-field clamp made its step 1.18–1.19× faster. Both keep the rows unchanged.
 
 ### Fixed
-- **`scripts/oracle/src/m_grid_c.rs`** was not rustfmt-clean (one tuple line, after a late edit in part c).
+- **`scripts/golden/src/m_grid_c.rs`** was not rustfmt-clean (one tuple line, after a late edit in part c).
 
 ### Added (Cyrius)
 - **grid** (M3 part c): the rest of `rust-old/src/grid.rs`.
@@ -951,11 +979,11 @@ Changed, Fixed and Performance.
 ### Added (Cyrius)
 - **grid** (M3 part b): the DST and CG projections under parity, and the DST plans.
   - **Parity:** `tests/golden/grid.tsv` grows to 827 rows. Part b's rows come from their own seed, so part a's 569
-    keep their values. Every row is bit-exact against the oracle, or against the corrected oracle where glibc
+    keep their values. Every row is bit-exact against Rust 1.3.0, or against the correctly rounded rows where glibc
     misrounds one of the DST's sines or cosines:
-    - `oracle::pressure_solve_dst`: 21 rows, class C, bound 0. They cover part a's shared systems, part b's systems
+    - `FluidGrid::pressure_solve_dst`: 21 rows, class C, bound 0. They cover part a's shared systems, part b's systems
       at the transform lengths where glibc misrounds (12, 18, 25, 30, 36, 38, 60), and the edges.
-    - `oracle::pressure_solve_cg`: 49 rows, class B, at 1 to 200 iterations, including the empty system hisab
+    - `FluidGrid::pressure_solve_cg`: 49 rows, class B, at 1 to 200 iterations, including the empty system hisab
       refuses.
     - 188 more `FluidGrid::step` rows on the DST and CG projections: 300-step trajectories of still tanks; single
       steps of plumes (10 × 10, and 14 × 14 where the DST misrounds), a vortex and a jet under every scheme and
@@ -1019,7 +1047,7 @@ Changed, Fixed and Performance.
     - 188 of them are `FluidGrid::step` rows (class S, bound 0) on the periodic and multigrid projections: 300-step
       trajectories of still tanks, and single steps at frames {0, 1, 2, 10, 60, 300} of plumes, a vortex and a jet
       under every scheme and force.
-    - 70 rows run the Gauss–Seidel and multigrid oracle hooks on shared systems. The DST and CG rows come with part b.
+    - 70 rows run the Gauss–Seidel and multigrid dump hooks on shared systems. The DST and CG rows come with part b.
     - `validate.py` transcribes the grid and recomputes every row.
   - **Tests:** 44 of the 49 Rust tests of `grid.rs` (`tests/grid.tcyr`; the other 5 need part c's MacGrid and
     KEpsilon), the 5 grid integration tests, and `serde_roundtrip_all_types`.
@@ -1061,7 +1089,7 @@ Changed, Fixed and Performance.
   - **Parity:** `tests/golden/shallow.tsv`, 888 rows, all bit-exact on the first replay on three targets.
     - 142 of them are `ShallowWater::step` rows in the new **class S** (single solver steps; `_par_c_bound` gives the
       bound, 0 here).
-    - The non-chaotic scenes are 300-step trajectories, and the rest single steps from the oracle's own state at
+    - The non-chaotic scenes are 300-step trajectories, and the rest single steps from 1.3.0's own state at
       frames {0, 1, 2, 10, 60, 300}.
     - `validate.py` transcribes the whole step and reproduces every row on glibc. MPFR finds no correction: glibc's
       pow is correctly rounded on all 22 damping pairs used.
@@ -1099,7 +1127,7 @@ Changed, Fixed and Performance.
   - **Parity:** 8,275 new golden rows in `buoyancy.tsv` (1,716), `vortex.tsv` (2,293), `bridge.tsv` (3,964) and
     `json.tsv` (302).
     - Every row is recomputed by `validate.py`. The class C functions use glibc for the record and MPFR for the
-      corrected oracle, which gains `vortex.cr.tsv` (3) and `bridge.cr.tsv` (26).
+      correctly rounded rows, which gains `vortex.cr.tsv` (3) and `bridge.cr.tsv` (26).
     - All rows pass on the first replay, on three targets.
     - Three JSON documents that bayan's policies read otherwise than serde_json (S3, S4, the integer `-0`) are rows
       of their own, pending until bayan changes.
@@ -1173,14 +1201,14 @@ Changed, Fixed and Performance.
   - **The code:**
     - `src/crmath.cyr`: impetus's exp, sin, cos, sin_cos, hypot, pow and atan2;
     - `src/crlog.cyr`: kimiya's ln and log10;
-    - their tables `src/crmath_data.cyr` and `src/crlog_data.cyr`, generated by `scripts/oracle/crtables.py` and
+    - their tables `src/crmath_data.cyr` and `src/crlog_data.cyr`, generated by `scripts/golden/crtables.py` and
       `lntables.py` and checked against MPFR;
     - `src/mathx.cyr` wraps them as `_pv_exp`, `_pv_ln`, `_pv_log10`, `_pv_powf`, `_pv_sin`, `_pv_cos`,
       `_pv_sin_cos`, `_pv_hypot` and `_pv_atan2`, plus `_pv_cbrt` (ganita's, already exact).
-  - **The corrected oracle:** `tests/golden/math.cr.tsv`, the 43 math rows glibc 2.44 misrounds (21 log10,
+  - **The correctly rounded rows:** `tests/golden/math.cr.tsv`, the 43 math rows glibc 2.44 misrounds (21 log10,
     11 hypot, 3 sin, 3 sin_cos, 2 atan2, 1 each of exp, ln and powf), with MPFR's values.
-    - `scripts/oracle/validate.py --write` writes it and the two table files; a plain run checks all three.
-    - MPFR comes through `scripts/oracle/mpfr_ref.py`.
+    - `scripts/golden/validate.py --write` writes it and the two table files; a plain run checks all three.
+    - MPFR comes through `scripts/golden/mpfr_ref.py`.
   - **Parity:** K = 0 for every class C math function, powf and log10 included.
     - The replay is 30,771 ok and 43 accepted (ADR 4), with 0 failed and 0 measured, identical on x86_64 ELF,
       x86_64 PE and aarch64.
@@ -1217,12 +1245,12 @@ Changed, Fixed and Performance.
 
 ### Changed
 - **The Cyrius port begins** (port plan M0 steps 1–3; ADRs 0001–0003). `cyrius port` moved the Rust 1.3.0 crate,
-  with its `oracle` hooks and `Cargo.lock`, into `rust-old/` as the frozen parity oracle (commit `a88bc4e`); it
+  with its `oracle` hooks and `Cargo.lock`, into `rust-old/`, frozen (commit `a88bc4e`); it
   still passes there. The repairs:
   - the Cyrius manifest: `cyrius.cyml` reads `VERSION`, `[build] dce`, the stdlib leaves, hisab 3.4.1 test-scoped;
   - CI: the Cyrius workflow runs build, test, `test --bounds`, `deps --locked` and `audit`, plus a job that keeps
-    the frozen oracle green with and without `parallel`;
-  - docs: CLAUDE.md merged for Cyrius; `state.md`; ADR 0001 (port with a Rust oracle), 0002 (API differences)
+    the frozen crate green with and without `parallel`;
+  - docs: CLAUDE.md merged for Cyrius; `state.md`; ADR 0001 (the port of Rust 1.3.0's functionality), 0002 (API differences)
     and 0003 (local stand-ins for library gaps); CONTRIBUTING and SECURITY for Cyrius; a port banner in the README;
   - archived in `rust-old/`: the Rust workflows, scripts, architecture overview and 1.2 → 1.3 migration guide.
 
@@ -1238,27 +1266,27 @@ Changed, Fixed and Performance.
     `as i32` / `as u32` / `as usize` do.
   - **Correctly rounded stand-ins needed:** log10 (there is none), and ganita's pow and atan2 and the exp
     polyfill (1 ulp off).
-- **Golden-value generator** (port plan M0 step 5): `scripts/oracle/`, adapted from impetus's. It drives the frozen
-  oracle and writes `tests/golden/`: `constants.tsv` (29 rows) and `math.tsv` (33,239 rows).
+- **Golden-value generator** (port plan M0 step 5): `scripts/golden/`, adapted from impetus's. It drives the frozen
+  Rust 1.3.0 and writes `tests/golden/`: `constants.tsv` (29 rows) and `math.tsv` (33,239 rows).
   - **Format and determinism:** TSV format 1, every float as its bits. Two runs give the same bytes, and the
     `parallel` build reproduces the corpus but may only `--check` it.
   - **`--check`:** refuses a corpus recorded on another glibc.
-  - **`validate.py`:** recomputes every row without the oracle. Class A/B in Python; glibc's class C through
+  - **`validate.py`:** recomputes every row without Rust. Class A/B in Python; glibc's class C through
     ctypes; `cbrt` proven correctly rounded.
-  - **Finding:** the oracle's `cbrt` is compiler_builtins', not glibc's (port-parity §3).
-- **`src/constants.cyr`** (port plan M0 step 6), generated by `scripts/oracle` (never edited by hand). It holds
+  - **Finding:** 1.3.0's `cbrt` is compiler_builtins', not glibc's (port-parity §3).
+- **`src/constants.cyr`** (port plan M0 step 6), generated by `scripts/golden` (never edited by hand). It holds
   the 14 public constants (`PV_FLUID_MATERIAL_*`, `PV_DRAG_COEFFICIENT_*`, `PV_ADDED_MASS_COEFFICIENT_*`) and the
   6 Rust std float constants the code uses (`PV_F64_MAX`, `PV_F64_INFINITY`, `PV_F64_NEG_INFINITY`, `PV_F64_NAN`,
   `PV_F64_PI`, `PV_F32_EPSILON`).
   - **Proofs:** both lists are proven complete against `rust-old/src`, and `constants.tsv` pins all 35 values.
-  - **`scripts/oracle/probe_tables.py`:** compiles each value and confirms its bits; a 2-ulp change to one literal
+  - **`scripts/golden/probe_tables.py`:** compiles each value and confirms its bits; a 2-ulp change to one literal
     fails it.
 - **Parity harness** (port plan M0 step 7): `tests/parity.tcyr` replays `tests/golden/` against the port, with
   impetus's `tests/parity_core.cyr` and `tests/ulp.cyr`. The constants rows go through the generated
   `tests/constants_rows.cyr`.
   - **First run:** 0 failing; 5,149 ok, 0 failed, 18,493 measured (class C, ≤ 2 ulp, bounds at step 8), and
     9,632 pending (the M1 helpers). It is warning-free, and the same under `--bounds`.
-  - **Finding:** ganita's cbrt equals the oracle's on all 1,025 rows, so cbrt needs no stand-in.
+  - **Finding:** ganita's cbrt equals 1.3.0's on all 1,025 rows, so cbrt needs no stand-in.
   - **Mutation-checked:** a flipped golden bit, a 1-ulp constant, and a mis-wired dispatcher each fail their row.
 - **Cross-target baselines** (port plan M0 step 8): per-function digests in `tests/parity.tcyr`. Every dispatched
   function gives identical bits on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu); only the native x87 shadows
@@ -1277,11 +1305,11 @@ Changed, Fixed and Performance.
     defect D3 fixes.
   - **Sort ties:** Rust's ipnsort leaves a different order at 75–94% of positions on tie-heavy inputs, so the
     stable (key, index) order applies (ADR 0002 #3).
-  - **Parallel:** the Rust oracle's serial and parallel builds give the same digests on 14 scenarios. A Cyrius
+  - **Parallel:** Rust 1.3.0's serial and parallel builds give the same digests on 14 scenarios. A Cyrius
     persistent pool gives the serial bits at 1–8 threads, allocates nothing, and is 3.9× at 8 for 10⁵ particles.
   - **Bundle:** DCE takes a full-hisab consumer from 3.06 MB to 677 KB, so there is one bundle (ADR 0002 #5).
   - **Libraries vs hisab 1.4.0:** hisab 3.4.1's DST is another algorithm, so ledger L6 transcribes 1.4.0's.
-    ganita's `mat_inv` gives the oracle's bits on all 300 matrices, so L7 is needed for memory only. The
+    ganita's `mat_inv` gives 1.3.0's bits on all 300 matrices, so L7 is needed for memory only. The
     autodiff tape is within 3 ulp, so it stays on hisab as class D.
 - **Upstream requests and the conversion ledger** (port plan M0 step 10; ADR 0003). Each request was filed with
   pravash's numbers and, where the gap can be shown, a self-proving repro verified from the owning repo's root:
@@ -1376,16 +1404,16 @@ upgrading. No public signatures were removed or changed.
 - `SphSolver::neighbor_lists()` (the free neighbour-list functions were unusable without it), `SphSolver::reset_integrator()`.
 - Constructors for `#[non_exhaustive]` configs that external crates could not build: `HeatConfig::new`, `ViscoelasticConfig::new`, `PhaseChangeConfig::new` / `water_ice`, and `Default` for `SphKernelParams`/`GridKernelParams`/`ShallowKernelParams`.
 - `ShallowWater::interior_volume()` (the conserved quantity), `ParticleSoa::is_consistent`/`consistent_len`, `BodyShape::bounding_radius`/`projected_area`.
-- **oracle** (Cyrius port tooling, not public API): a hidden, non-default `oracle` feature, kept out of `full`, gives `scripts/oracle/` read-only access to state the public API doesn't expose (port plan M0 step 0). It covers:
+- **`oracle`** (Cyrius port tooling, not public API): a hidden, non-default feature, kept out of `full`, gives `scripts/golden/` read-only access to state the public API doesn't expose (port plan M0 step 0). It covers:
   - `oracle_dump()` on every stateful type: `ParticleArena`, `ArenaHandle`, `ShallowWater`, `FluidGrid`, `KEpsilon`, `MacGrid`, `VofField`, `PhaseField`, `FlipSolver`, `MpmSolver` and `SphSolver`. The `SphSolver` dump includes the f32 positions and the neighbour lists in summation order;
-  - `oracle::sph_cell_key`;
+  - `pravash::oracle::sph_cell_key`;
   - the four grid pressure solvers on a caller's system (`pressure_solve_gauss_seidel`, `_dst`, `_cg`, `_multigrid`);
-  - `oracle::invert_3x3`, which is hisab 1.4.0's `matrix_inverse` as the MLS correction calls it.
+  - `pravash::oracle::invert_3x3`, which is hisab 1.4.0's `matrix_inverse` as the MLS correction calls it.
 
   The dumps live in child modules (`src/<module>/oracle.rs`), so each audited source gains only a `mod oracle;` declaration. `tests/oracle.rs` (14 tests) runs every solver variant 300 steps plain and 300 steps dumping after each step, and requires bit-identical final states. Its harness was mutation-checked: one extra step in the dumped run fails all 10 solver checks. CI runs it with and without `parallel`. Simulation behaviour is unchanged.
 
 ### Changed (port tooling)
-- `Cargo.lock` is tracked for the Cyrius port's freeze: the oracle's bits depend on hisab 1.4.0 and glam 0.29.3. This is an exception to the library-crate rule, to be recorded in the port's ADR 0001. The oracle host's glibc is 2.44.
+- `Cargo.lock` is tracked for the Cyrius port's freeze: 1.3.0's bits depend on hisab 1.4.0 and glam 0.29.3. This is an exception to the library-crate rule, to be recorded in the port's ADR 0001. The host's glibc is 2.44.
 
 ### Security
 - `DaimonConfig`'s `Debug` redacts `api_key`.

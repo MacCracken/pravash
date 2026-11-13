@@ -9,12 +9,12 @@
 
 pravash **2.0** is a Cyrius library: the functionality of the Rust crate **1.3.0**, ported, with correct rounding as
 the accuracy bar ([ADR 0004](docs/adr/0004-correct-rounding-is-the-accuracy-target.md)). Rust on glibc misrounds
-some transcendentals; 2.0 gives the correctly rounded value, and the same bits on every target. Nothing builds,
-tests or releases from Rust: the 1.3.0 source is kept in [`rust-old/`](rust-old/) for reference only.
+some transcendentals; 2.0 gives the correctly rounded value, and the same bits on every target. The tree holds
+no Rust: the 1.3.0 crate is at the tag [`1.3.0`](https://github.com/MacCracken/pravash/tree/1.3.0).
 - **68,007 golden rows** in 18 modules, the test corpus taken from 1.3.0's behaviour and corrected wherever glibc
   misrounds, replay with the same output bits on x86_64 Linux, x86_64 Windows (PE) and aarch64. Every grid and SPH
   solver step also gives the same bits at 2, 3, 4 and 8 threads. Python recomputes every row independently
-  (`scripts/oracle/validate.py`).
+  (`scripts/golden/validate.py`).
 - **The functionality:** every public item of 1.3.0 and each of its 157 derives (the serde pair, Default, Clone,
   PartialEq, Debug) has its counterpart, and all 405 of its tests are ported or accounted for
   ([the Rust-test ledger](docs/development/rust-test-ledger.md)).
@@ -107,7 +107,7 @@ its own `[deps] stdlib`.
 ## Examples
 
 Rust's three examples, ported ([`docs/examples/`](docs/examples/)). Each prints the output in its `.out` file, which
-is derived from the oracle.
+is derived from Rust 1.3.0.
 
 | Example | What it runs |
 |---|---|
@@ -151,10 +151,9 @@ cyrius distlib                              # dist/pravash.cyr
 ```
 
 CI and the release run only the commands above, `scripts/upstream_ledger.py --check` and
-`python3 -I -B scripts/doc_examples.py .` (the docs' code blocks and the examples compile and run). The porting tools
-run locally, never in CI: the corpus generator and the Rust probes (on `rust-old/`, with `cargo +1.99.1`, the
-toolchain the corpus was recorded on), `scripts/oracle/validate.py` (the corpus recomputed in Python),
-`scripts/surface_parity.py` and `scripts/rust_test_ledger.py` (1.3.0's items and tests against the port's).
+`python3 -I -B scripts/doc_examples.py .` (the docs' code blocks and the examples compile and run).
+`scripts/golden/validate.py` recomputes the frozen golden corpus in Python. It calls the recorded glibc (2.44), so it
+runs locally.
 
 ## Documentation
 
@@ -168,8 +167,8 @@ toolchain the corpus was recorded on), `scripts/oracle/validate.py` (the corpus 
   [benchmarks against Rust](docs/benchmarks-rust-v-cyrius.md)
 - [Architecture decisions](docs/adr/)
 - [Contributing](CONTRIBUTING.md), [Security policy](SECURITY.md)
-- The Rust 1.3.0 [README](rust-old/README.md), [architecture overview](rust-old/docs/architecture/overview.md) and
-  [migration guide](rust-old/docs/development/migration.md), kept for reference
+- The Rust 1.3.0 [README](https://github.com/MacCracken/pravash/blob/1.3.0/README.md), [architecture overview](https://github.com/MacCracken/pravash/blob/1.3.0/docs/architecture/overview.md)
+  and [migration guide](https://github.com/MacCracken/pravash/blob/1.3.0/docs/development/migration.md), at the tag 1.3.0
 
 ## License
 

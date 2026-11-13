@@ -1,4 +1,4 @@
-# compute.tcyr — the ported Rust tests of rust-old/src/compute.rs (M7 part a): all 11, in Rust's order.
+# compute.tcyr — the ported tests of Rust 1.3.0's src/compute.rs (M7 part a): all 11, in Rust's order.
 #
 # Rust's `Vec<f32>` buffers are `PvF32Column`s; `particles.density_pressure[0] = 1000.0` is `set(0, 1000.0)`. The
 # file also includes src/compute_ad.cyr, which ships outside the `[lib]` bundle (hisab is test-scope here). Cyrius-only

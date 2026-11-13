@@ -26,7 +26,7 @@ the port waits on an upstream release.
   probe or benchmark numbers that show the gap. Where a request is already open, pravash joins it with its own
   numbers instead of filing a second.
 - **Stand-ins.** A stand-in is one of three kinds:
-  - a transcription of the routine the oracle used (hisab 1.4.0), which keeps bit parity;
+  - a transcription of the routine Rust 1.3.0 used (hisab 1.4.0), which keeps bit parity;
   - a copy of a sibling's code (`crmath`, from impetus and kimiya; port plan D2);
   - a pravash-owned implementation.
 - **Marking.** Each stand-in carries an `UPSTREAM(Ln)` note naming its request, the library call that replaces
@@ -36,7 +36,7 @@ the port waits on an upstream release.
   1. bump the pin;
   2. swap the call and delete the stand-in;
   3. re-run the named parity rows. They keep their class. A change of bits is either the library being more
-     accurate, which is accepted against the corrected oracle, or a defect, which is filed while the stand-in
+     accurate, which is accepted against the correctly rounded rows, or a defect, which is filed while the stand-in
      stays;
   4. close the ledger row, and add a CHANGELOG entry.
 
@@ -44,7 +44,7 @@ the port waits on an upstream release.
 
 - **Positive**
   - The port proceeds at its own pace, and each upstream project gets a consumer's concrete case and numbers.
-  - A transcription keeps the oracle's bits, so it is a stronger parity check than a substitute would be.
+  - A transcription keeps 1.3.0's bits, so it is a stronger parity check than a substitute would be.
 - **Negative**
   - pravash temporarily owns code that belongs elsewhere: the correctly rounded math, a CG, a neighbour grid,
     3D vector math.

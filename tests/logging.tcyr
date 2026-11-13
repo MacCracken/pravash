@@ -1,4 +1,4 @@
-# logging.tcyr — the ported Rust test of rust-old/src/logging.rs (M7 part b), then Cyrius-only groups: the span and
+# logging.tcyr — the ported test of Rust 1.3.0's src/logging.rs (M7 part b), then Cyrius-only groups: the span and
 # event texts through a sakshi hook, the level gates (pravash's filter, and sakshi's level before any init), a full
 # span stack, the directive parser's corners, and the Trace Event file (ledger L11): written, read back, checked and
 # removed, under build/ (the trace goes to the working directory, as Rust's does).

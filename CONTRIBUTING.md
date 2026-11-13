@@ -5,9 +5,8 @@ workflow, coding standards, and review process.
 
 pravash 2.0 is a Cyrius library, the port of the Rust crate 1.3.0. The plan of record is
 [`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md), and
-[`docs/guides/getting-started.md`](docs/guides/getting-started.md) is the guide to working on it. The Rust 1.3.0 crate
-in `rust-old/` is kept for reference: don't change it. Nothing in the build, the tests, CI or the release depends on
-it; the local porting tools run it with `cargo +1.99.1`.
+[`docs/guides/getting-started.md`](docs/guides/getting-started.md) is the guide to working on it. The tree holds no
+Rust: the 1.3.0 crate is at the tag `1.3.0`, and don't bring Rust back into the tree, CI or the release.
 
 ## Development Setup
 
@@ -23,17 +22,14 @@ cyrius --version
 cyrius deps
 cyrius build src/main.cyr build/pravash
 cyrius test
-
-# The Rust oracle (read-only; needs cargo)
-cargo test --manifest-path rust-old/Cargo.toml --all-features
 ```
 
 ## Pull Request Process
 
 1. **Fork and branch** — create a feature branch from `main`.
 2. **Keep commits focused** — one logical change per commit; one module at a time during the port.
-3. **Write tests** — a ported function needs its golden parity rows and its ported Rust tests; a bug fix needs
-   a regression test.
+3. **Write tests** — new code needs reference tests (analytic values, or MPFR) and benches; a bug fix needs a
+   regression test. The golden corpus is frozen: never patch a row.
 4. **Run the cleanliness check** before pushing (CLAUDE.md lists it): `cyrius fmt --check`, `cyrius lint`,
    `cyrius vet`, `cyrius build`, `cyrius test` (warning-free), `cyrius test --bounds`, `cyrius bench`,
    `cyrius deps --locked`, `cyrius audit`.
@@ -52,7 +48,7 @@ cargo test --manifest-path rust-old/Cargo.toml --all-features
 
 ## Testing Requirements
 
-- Every ported public function is compared against the oracle's golden values, within the parity class the
+- Every ported public function is compared against 1.3.0's golden values, within the parity class the
   port plan (§5) assigns. Never widen a class to make a row pass.
 - Every Rust test is ported, folded into golden rows, or recorded with a reason.
 - Benchmarks go in `tests/*.bcyr`, beside their Rust twins, and are run before and after performance-sensitive

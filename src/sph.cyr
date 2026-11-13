@@ -1,4 +1,4 @@
-# sph.cyr — `SphSolver` of rust-old/src/sph.rs (M5): the stateful SPH solver on part b's neighbour grid.
+# sph.cyr — `SphSolver` of Rust 1.3.0's src/sph.rs (M5): the stateful SPH solver on part b's neighbour grid.
 #
 # M5 part a: the solver's state and constructors, its WCSPH `step` (symplectic Euler or velocity Verlet, with the CSF
 # surface tension), the neighbour lists it leaves for M4 part d's functions, and `adaptive_dt`. PCISPH (part b) is in

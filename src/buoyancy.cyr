@@ -1,7 +1,7 @@
-# buoyancy.cyr — buoyancy and drag forces on a body in a fluid (port of rust-old/src/buoyancy.rs).
+# buoyancy.cyr — buoyancy and drag forces on a body in a fluid (port of Rust 1.3.0's src/buoyancy.rs).
 #
 # Each formula is Rust's in Rust's operation order (left to right, no fused operations), so the results have the
-# oracle's bits: buoyancy_force is (ρ·g)·V, drag_force ((((0.5·ρ)·v)·v)·Cd)·A. The drag coefficients are the
+# 1.3.0's bits: buoyancy_force is (ρ·g)·V, drag_force ((((0.5·ρ)·v)·v)·Cd)·A. The drag coefficients are the
 # generated constants PV_DRAG_COEFFICIENT_* (src/constants.cyr); Rust's `DragCoefficient` is a unit struct that only
 # holds them.
 

@@ -4,7 +4,7 @@
 
 ### 2.0.0 — Cyrius port (done; ready to tag)
 
-- [x] Port to Cyrius with Rust 1.3.0 as the frozen oracle in `rust-old/`: the plan of record is
+- [x] Port to Cyrius with Rust 1.3.0 as the frozen crate in `rust-old/`: the plan of record is
   [pravash-port-plan.md](pravash-port-plan.md). It follows tanmatra, kimiya and impetus.
 - [x] 2.0 carries every module and feature: bridge, ai, logging, `parallel` (on `thread.cyr`) and serde (on
   `#derive`). The plan's §1.1 language review of Cyrius 6.7.18 found no language reason to defer any of them
@@ -12,7 +12,7 @@
   pravash ships local stand-ins marked `UPSTREAM(Ln)` and converts them when the library lands (plan §8, the
   conversion ledger)
 - [x] Decisions D1–D6 (plan §0.2), made 2026-11-11:
-  - **D1:** tag and publish 1.3.0 after the oracle hooks land.
+  - **D1:** tag and publish 1.3.0 after the dump hooks land.
   - **D2:** a local `crmath`, plus the ganita request.
   - **D3:** f32 hash keys ported faithfully, then switched to f64 before 2.0 (switched in M5 part e).
   - **D4:** JSON that decodes compatibly, with no text identity required.
@@ -31,7 +31,7 @@
   - ADRs 0001–0003;
   - `cyrius.cyml`, with every Cyrius gate green.
 - [x] M0 step 4: the semantics probe (port-parity §1)
-- [x] M0 step 5: the golden-value generator (`scripts/oracle/`: constants 29 + math 33,239 rows, validated)
+- [x] M0 step 5: the golden-value generator (`scripts/golden/`: constants 29 + math 33,239 rows, validated)
 - [x] M0 step 6: `src/constants.cyr` (public + std float constants, compiled and compared by `probe_tables.py`)
 - [x] M0 step 7: the parity harness (`tests/parity.tcyr`: 5,149 ok, 0 failed; the rest measured or pending)
 - [x] M0 step 8: the cross-target baselines (identical bits on x86_64 ELF, PE and aarch64; K = 2 for the primitives, 0 for cbrt)
@@ -39,8 +39,8 @@
 - [x] M0 step 10: upstream requests filed (hisab ×3, ganita, cyrius ×4, sakshi) and the conversion ledger seeded and checked in CI
 - [x] **M0 done 2026-11-11.**
 - [x] M1 part 1: `src/mathx.cyr`, the first `[lib]` and `dist/pravash.cyr` (6,371 rows newly gated, bit-exact)
-- [x] M1 part 2: `src/crmath.cyr`, `src/crlog.cyr` and the MPFR-corrected oracle (ADR 0004): every class C math
-  row at 0 ulp, 43 rows more accurate than the oracle
+- [x] M1 part 2: `src/crmath.cyr`, `src/crlog.cyr` and the MPFR-corrected rows (ADR 0004): every class C math
+  row at 0 ulp, 43 rows more accurate than Rust 1.3.0
 - [x] M1 part 3: error, vec3, common (3,683 rows bit-exact, 47 + 6 Rust tests ported, surface parity in CI)
 - [x] M1 part 4: buoyancy, vortex, bridge, the M1 JSON (7,973 + 302 rows, 45 + 2 + 11 Rust tests)
 - [x] **M1 done 2026-11-11.**
@@ -48,7 +48,7 @@
 - [x] **M2 done 2026-11-11.**
 - [x] M3 part a: `FluidGrid` (569 rows, 188 class S step rows on the periodic and multigrid projections, all
   bit-exact; 44 of 49 + 5 Rust tests), the DST / IDST / CG transcriptions, the exact fmod (L14)
-- [x] M3 part b: the DST and CG rows (21 + 49, the corrected oracle's `grid.cr.tsv` 20), 188 step rows on those
+- [x] M3 part b: the DST and CG rows (21 + 49, the correctly rounded rows's `grid.cr.tsv` 20), 188 step rows on those
   projections, the DST plans (the 63 × 63 DST step 719 ms → 8.6 ms, the bits unchanged)
 - [x] M3 part c: `MacGrid`, k-ε and the ghost fluid (293 rows, 135 class S step rows, all bit-exact; the last 5
   Rust tests of `grid.rs`)
@@ -58,13 +58,13 @@
   gives its one-thread words)
 - [x] **M3 done 2026-11-12.**
 - [x] M4 part a: the SPH kernels, the equations of state, the non-Newtonian models and the helpers (804 rows, 16
-  against the corrected oracle, all bit-exact; 22 Rust tests); private constants generated
+  against the correctly rounded rows, all bit-exact; 22 Rust tests); private constants generated
 - [x] M4 part b: the neighbour grid (f32 keys, L4), the cell key, the lists, `sort_by_zorder` (L9) (50 rows, all
   bit-exact, and the 2,460 cell-key rows pending since M0)
 - [x] M4 part c: density, the forces, the brute-force `step` (as `sph_step`), the particle blocks, split and merge
-  (198 rows, 5 against the corrected oracle; 10 Rust tests and 4 integration tests)
+  (198 rows, 5 against the correctly rounded rows; 10 Rust tests and 4 integration tests)
 - [x] M4 part d: viscoelastic, heat, phase change, combustion, contact angle, delta-SPH, the MLS corrections (L7, the
-  oracle's own LU), implicit viscosity, secondary particles (318 rows, 1 against the corrected oracle; 11 Rust tests)
+  1.3.0's own LU), implicit viscosity, secondary particles (318 rows, 1 against the correctly rounded rows; 11 Rust tests)
 - [x] **M4 done 2026-11-12.**
 - [x] M5 part a: the `SphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension), `adaptive_dt` (66 rows,
   every one bit-exact on the first replay; 19 Rust tests and 5 integration tests)
@@ -81,29 +81,33 @@
 - [x] M6 part b: the `FlipSolver` (FLIP/PIC, APIC, the projection, `apic_c`'s resize; 245 rows, every one bit-exact
   on the first replay; the 11 FLIP tests and the 2 FLIP integration tests)
 - [x] M6 part c: MPM (`ConstitutiveModel` and its codec, `MpmParticle`, the 2×2 SVD, Drucker–Prager, `MpmSolver`;
-  1,335 rows in a new golden module: 1,318 bit-exact against the oracle, and 17 against the corrected oracle where
+  1,335 rows in a new golden module: 1,318 bit-exact against Rust 1.3.0, and 17 against the correctly rounded rows where
   glibc misrounds a hypot, atan2, sin, cos, ln or exp; all 13 Rust tests)
 - [x] **M6 done 2026-11-12.**
 - [x] M7 part a: compute (`PackedParticles` and its f32 packing, the kernel-parameter records and their JSON, the
   backend traits, `KernelDerivatives` and `autodiff_gradient` on hisab's tape outside the bundle; 1,228 rows in a new
   golden module; all 11 Rust tests; the f32 JSON reads as serde_json's, ledger L15)
 - [x] M7 part b: ai (`DaimonConfig`, `HooshConfig`, Rust's Debug with a generated escape table; 579 rows) and logging (the sakshi init, the PRAVASH_LOG filter as EnvFilter decides it, the chrome://tracing writer of L11, and every Rust
-  span and warning across the modules; 251 rows, 152 of them traces recorded from the oracle)
+  span and warning across the modules; 251 rows, 152 of them traces recorded from Rust 1.3.0)
 - [x] **M7 done 2026-11-12.**
 - [x] M8 part a: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI). All 405 Rust tests are
   accounted for: 391 ported to same-named groups, including Rust's 7 `ignore`d doc examples written against the
-  API and run, and 14 n/a (the oracle hooks' own tests)
+  API and run, and 14 n/a (the dump hooks' own tests)
 - [x] M8 part b: the benchmark record: Rust's 21 criterion groups (57 rows) in both columns, plus thread-count rows
   (median 4.4× Rust's time, 0.76× to 37×; the SPH step 2.2–3.2× faster at 8 threads)
 - [x] M8 part c: the full surface-parity diff (derives, trait methods and the reverse direction; six missing clones
   ported, three Rust-private types made private), the README, the migration guide, the CHANGELOG's Breaking section,
   Rust's examples ported with their outputs, and the docs' code compiled and run (`scripts/doc_examples.py`, in CI)
 - [x] M8 part d: Rust's derived `Debug` on the 36 public types without it (`x.debug(sb, alternate)` for `{:?}` and
-  `{:#?}`), golden rows from the oracle, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
+  `{:#?}`), golden rows from Rust 1.3.0, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
   a `#derive(Debug)` request filed at cyrius
 - [x] M8 part e: VERSION 2.0.0, the release gate on three targets (every suite, not only the corpus), the fuzz
   harness (`tests/pravash.fcyr`: the 22 JSON readers and the `PRAVASH_LOG` parser, in CI), and CI and the release
   freed of Rust: no job builds, tests or reads `rust-old/`
+- [x] Rust leaves the tree (2026-11-13, after the 2.0.0 tag): `rust-old/`, the Rust generator, the Rust probes, and
+  the tools that ran or read Rust (the surface diff, the Rust-test ledger, the benchmark recorder, the examples'
+  `.out` derivation) are removed, all kept at the tag 2.0.0 (commit `0f2b054`). The corpus, the generated sources,
+  the `.out` files and the records stay, frozen; `validate.py` checks the corpus without Rust
 - [ ] The maintainer's steps: tag 2.0.0 (the release workflow checks VERSION and `cyrius.cyml` against it and
   publishes the CHANGELOG's section), the 1.3.x deprecation notice on crates.io, and the consumers' first Cyrius
   builds (kiran, joshua, impetus)

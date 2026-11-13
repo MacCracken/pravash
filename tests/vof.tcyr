@@ -1,4 +1,4 @@
-# vof.tcyr — the ported Rust tests of rust-old/src/vof.rs (M3 part d).
+# vof.tcyr — the ported tests of Rust 1.3.0's src/vof.rs (M3 part d).
 #
 # Every test keeps its Rust name as its group, in Rust's order: all 8. Re-expressed for the Cyrius shapes (ADR 0002
 # #1, #8, #14): `.unwrap()` on `new` and `advect` is an assertion that the call was Ok; `is_err()` is the `PV_ERR_*`

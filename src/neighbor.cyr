@@ -13,7 +13,7 @@
 # `_sh_cell_coord`, and a particle's lists are the 27 cells at its own key ± 1 on each axis, in integers. Rust 1.3.0
 # keys f32 positions (hisab 1.4.0) and finds each neighbour cell by re-keying an f32 probe point at its centre, which
 # at |x| ≈ 10⁶ lands in another cell for 89% of the points (port-parity §4.4) and can list a cell twice. The rows the
-# switch changes are checked against tests/golden/<module>.d3.tsv, the f64 lists of scripts/oracle/validate.py.
+# switch changes are checked against tests/golden/<module>.d3.tsv, the f64 lists of scripts/golden/validate.py.
 #
 # A grid built by `PvNeighborGrid_build` (M6 part a) holds the cells only, with no lists: it is the caller's stand-in
 # for the hisab `SpatialHash` that `drag_from_particles_indexed` queries (ADR 0002 #23). Its extra column orders the
@@ -90,7 +90,7 @@ fn _pv_nb_key(x: f64, inv: f64): i64 {
     return _pv_as_i64(fl);
 }
 
-# The cell key of position p (one axis) at smoothing radius h: floor(p · fl(1/h)) as i64. The f64 form of the oracle
+# The cell key of position p (one axis) at smoothing radius h: floor(p · fl(1/h)) as i64. The f64 form of Rust 1.3.0
 # hook `sph_cell_key`, whose f32 rows are mapped by name (ADR 0002 #2).
 #must_use
 fn _pv_sph_cell_key(p: f64, h: f64): i64 {

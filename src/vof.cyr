@@ -1,4 +1,4 @@
-# vof.cyr — the volume-of-fluid field of rust-old/src/vof.rs (`VofField`, M3 part d).
+# vof.cyr — the volume-of-fluid field of Rust 1.3.0's src/vof.rs (`VofField`, M3 part d).
 #
 # A volume fraction α ∈ [0, 1] per cell of an nx × ny grid: 0 empty, 1 full. `advect` moves it with donor-cell face
 # fluxes, closed walls on the boundary ring, and sub-steps that keep the Courant number at or below 0.5. Every

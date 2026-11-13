@@ -1,4 +1,4 @@
-# error.cyr — pravash's error codes (port of rust-old/src/error.rs).
+# error.cyr — pravash's error codes (port of Rust 1.3.0's src/error.rs).
 #
 # A fallible pravash function returns a value-form Result whose Err payload is one of these codes:
 # `var t, v = f(..); if (is_err_result(t) == 1) { .. v is the code .. }`. The golden token

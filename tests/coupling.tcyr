@@ -1,4 +1,4 @@
-# coupling.tcyr — the ported Rust tests of rust-old/src/coupling.rs: all 33, in Rust's order (M6 part a: the 22 of
+# coupling.tcyr — the ported tests of Rust 1.3.0's src/coupling.rs: all 33, in Rust's order (M6 part a: the 22 of
 # the shapes, the bodies, the coupling, added mass, drag and the level set; part b: the FLIP solver's 11).
 #
 # Slices are (pointer, count) (ADR 0002 #9). Rust's hisab `SpatialHash` is the caller's cells-only

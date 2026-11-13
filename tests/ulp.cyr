@@ -1,6 +1,6 @@
 # ulp.cyr — float comparison for the parity harness and the reference-value tests.
 #
-# The rules are scripts/oracle/README.md, Format 1 (port plan §5). Copied unchanged from impetus's
+# The rules are scripts/golden/README.md, Format 1 (port plan §5). Copied unchanged from impetus's
 # tests/ulp.cyr, itself tanmatra's (same format, same rules); keep them in step.
 # - Bits: identical, and any NaN matches any NaN.
 # - ulp distance: on the ordered-integer line, where +0 and -0 are the same point.

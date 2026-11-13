@@ -15,9 +15,10 @@ shallow water, buoyancy and drag, vortex dynamics, interface tracking, fluid–b
 - **License**: GPL-3.0-only
 - **Language**: Cyrius. The toolchain is pinned in `cyrius.cyml` `[package].cyrius`
 - **Version**: `VERSION` at the project root is the source of truth. Don't inline the number here
-- **Rust oracle**: pravash 1.3.0 plus the hidden `oracle` hooks, frozen at `rust-old/` with its `Cargo.lock`
+- **Rust 1.3.0**: the source of the ported functionality. The tree holds no Rust. The crate is at the tag `1.3.0`;
+  the copy the corpus was recorded from (`rust-old/`, with dump hooks) and the Rust generator are at the tag `2.0.0`
 - **Plan of record**: [`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md), with
-  [ADR 0001](docs/adr/0001-cyrius-port-with-rust-oracle.md) (the method),
+  [ADR 0001](docs/adr/0001-cyrius-port-of-rust-1.3.0.md) (the method),
   [ADR 0002](docs/adr/0002-port-api-divergences.md) (2.0 API changes) and
   [ADR 0003](docs/adr/0003-local-stand-ins-for-library-gaps.md) (stand-ins for library gaps)
 - **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md) · [First-Party Documentation](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-documentation.md)
@@ -41,19 +42,14 @@ cyrius deps                                    # resolve dependencies (vendors l
 cyrius build src/main.cyr build/pravash        # compile
 cyrius test                                    # run tests/*.tcyr (parity + reference tests)
 cyrius bench                                   # run tests/*.bcyr
-cargo +1.99.1 test --manifest-path rust-old/Cargo.toml --all-features                     # the Rust oracle, read-only
-cargo +1.99.1 test --manifest-path rust-old/Cargo.toml --features oracle,coupling --test oracle   # oracle hooks without parallel
-cargo +1.99.1 run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check        # golden corpus up to date
-cargo +1.99.1 run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # ... and thread-count free
-python3 -I -B scripts/oracle/validate.py .                                               # independent check of the corpus
-python3 -I -B scripts/oracle/validate.py . --write                                       # regenerate the corrected oracle and cr tables (MPFR)
-python3 -I -B scripts/oracle/probe_tables.py .                                           # generated constants compile to the oracle's bits
-python3 -I -B scripts/oracle/examples.py .                                               # docs/examples/*.out derived from the oracle
+python3 -I -B scripts/golden/validate.py .           # recompute every row of the frozen corpus
+python3 -I -B scripts/golden/validate.py . --write   # regenerate the correctly rounded rows, the f64-key rows and cr tables (MPFR)
+python3 -I -B scripts/golden/probe_tables.py .       # generated constants compile to 1.3.0's bits
 ```
 
-The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI (the
-runner's glibc differs): `--check` refuses another platform by name. Run them with `cargo +1.99.1`, the rustc the
-corpus was recorded on. CI and the release never build, test or read `rust-old/`.
+The golden corpus (`tests/golden/`) is frozen at 2.0.0 ([`scripts/golden/README.md`](scripts/golden/README.md)).
+`validate.py` calls the recorded glibc (2.44) for its class-C rows, so it runs locally, not in CI (the runner's glibc
+differs).
 
 ## Development Process
 
@@ -84,8 +80,6 @@ cyrius distlib --all && cyrius distlib --check   # once [lib] exists (M1)
 cyrius deps --locked
 cyrius audit
 python3 -I scripts/upstream_ledger.py --check    # once the ledger exists (M0 step 10)
-python3 -I -B scripts/surface_parity.py .        # from M1 part 3: every ported Rust item has its counterpart
-python3 -I -B scripts/rust_test_ledger.py . --check   # from M8 part a: every Rust test ported or recorded
 python3 -I -B scripts/doc_examples.py .          # from M8 part c: the docs' code blocks and the examples run
 cyrius fuzz tests/pravash.fcyr                   # from M8 part e: the JSON readers and the PRAVASH_LOG parser
 ```
@@ -102,10 +96,11 @@ and `build` drive, never from `cyrius lint`. Each one is a bug:
 
 1. Work phase — one module at a time, in the order the port plan gives
 2. Cleanliness check
-3. Test + benchmark additions: golden parity rows, single-step rows, reference tests, benches
-4. Run benchmarks, recorded against the Rust numbers (`docs/benchmarks-rust-v-cyrius.md`)
-5. Internal review — performance, memory (flat heap per step), throughput, correctness, and a surface-parity
-   diff against `rust-old/src/`
+3. Test + benchmark additions: reference tests (analytic values, or MPFR through `scripts/golden/mpfr_ref.py`),
+   regression tests, benches
+4. Run benchmarks against the previous Cyrius numbers (the 2.0.0 record beside Rust 1.3.0's is
+   `docs/benchmarks-rust-v-cyrius.md`)
+5. Internal review — performance, memory (flat heap per step), throughput, correctness
 6. Cleanliness check — must be clean after the review
 7. Deeper tests/benchmarks from the review
 8. Benchmarks again — prove the wins
@@ -129,13 +124,14 @@ and `build` drive, never from `cyrius lint`. Each one is a bug:
 
 ## Key Principles
 
-- **Cross-check against `rust-old/`.** The port's correctness bar is "matches what Rust did", within the
-  tolerance class the port plan (§5) assigns. Diverge only with an ADR in `docs/adr/`.
+- **The frozen corpus is the parity bar.** `tests/golden/` records what Rust 1.3.0 did. The port matches each row
+  within the tolerance class the port plan (§5) assigns, or its correctly rounded row where accuracy wins
+  (ADR 0004). Diverge from a row only with an ADR in `docs/adr/`.
 - **Accuracy beats glibc.** Parity is functional. Use correctly rounded primitives, never ones that copy
   glibc's last-ulp errors (port plan §0.1, §5).
 - **No deferral without a language check.** A Rust feature leaves the scope only for a reason written down
   against the port plan's language review (§1.1): a missing capability named with its guide or stdlib
-  section, a measured cost, or no oracle. Re-check before inheriting another port's deferral.
+  section, a measured cost, or nothing to test against. Re-check before inheriting another port's deferral.
 - **Upstream requests never block.** A gap in hisab, ganita or the stdlib is filed in that project with
   pravash's numbers, and pravash ships a local stand-in meanwhile. Each stand-in carries an
   `UPSTREAM(Ln)` note and a row in the conversion ledger (port plan §8), and is converted when the library
@@ -169,8 +165,10 @@ and `build` drive, never from `cyrius lint`. Each one is a bug:
   - Use the canonical `ganita_f64_*` names, not the deprecated short aliases.
   - For cross-target determinism use the `_polyfill` transcendentals or the correctly rounded stand-ins
     (port plan §7.1).
-- **Constants are generated, never typed by hand.** `scripts/oracle/` writes them from the oracle.
-  Regenerate them; never edit them.
+- **Constants are generated, never typed by hand.** `src/constants.cyr`, `src/constants_private.cyr`,
+  `src/str_debug_data.cyr` and `tests/constants_rows.cyr` were written from Rust 1.3.0 at 2.0.0 and are frozen.
+  `validate.py --write` writes the MPFR ones (`src/crmath_data.cyr`, `src/crlog_data.cyr`, the `.cr.tsv` and
+  `.d3.tsv` rows). Never edit any of them by hand.
 - **Names.** Every public global carries the `PV_` prefix (constants, enum members, tables); private helpers
   use `_pv_`; public structs are `Pv<Name>`. A bundle shares one namespace with its consumers.
 - **Function names follow the Rust API**, except where ADR 0002 changes them.
@@ -185,9 +183,10 @@ and `build` drive, never from `cyrius lint`. Each one is a bug:
 
 - **Do not commit or push** — the user handles all git operations (commit, push, tag)
 - **NEVER use `gh` CLI** — use `curl` to the GitHub API only
-- **Do not modify `rust-old/`** — it is the parity oracle. Tools that drive it (golden and table generators)
-  live in `scripts/oracle/` and depend on it by path. A wrong oracle value is fixed as Rust 1.3.x, by the
-  maintainer, and the corpus regenerated
+- **Do not bring Rust back.** No Rust source, toolchain file, cargo step or Rust-dependent check goes in the tree, CI
+  or the release. Rust 1.3.0 is at the tag `1.3.0`; `rust-old/` and the generator are at the tag `2.0.0`
+- Do not patch the frozen corpus (`tests/golden/*.tsv`): the port's own answers go in the derived `.cr.tsv` and
+  `.d3.tsv` rows, with an ADR
 - Do not modify `lib/` files (vendored stdlib / dep symlinks)
 - Do not hardcode toolchain versions in CI YAML — `cyrius = "X.Y.Z"` in `cyrius.cyml` is the source of truth
 - Do not widen a parity tolerance class to make a row pass. Class-C bounds are set by the rule in
@@ -198,8 +197,7 @@ and `build` drive, never from `cyrius lint`. Each one is a bug:
 - Do not break backward compatibility without a major version bump
 - Do not skip benchmarks before claiming performance improvements
 - Do not skip tests before claiming changes work
-- Do not commit `build/` or `rust-old/target/`. `rust-old/Cargo.lock` **is** committed: the frozen oracle
-  needs its exact dependency versions (ADR 0001)
+- Do not commit `build/`
 
 ## Documentation Structure
 
@@ -213,14 +211,13 @@ docs/:
   development/roadmap.md           — planned work only; done work goes in the CHANGELOG
   development/history.md           — milestone history of the Rust line
   development/port-parity.md       — measured parity baselines and probe results (M0 steps 8–9)
-  development/rust-test-ledger.md  — every Rust test's port or reason (generated by scripts/rust_test_ledger.py)
+  development/rust-test-ledger.md  — every Rust test's port or reason (the 2.0.0 record, frozen)
   guides/migration-2.0.md          — moving from the Rust crate 1.3 to the Cyrius library 2.0
   examples/                        — Rust's examples ported, each with the output it must print
   benchmarks-rust-v-cyrius.md      — Rust vs Cyrius benchmark record
   adr/NNNN-title.md                — architecture decision records (template.md)
   architecture/                    — non-obvious constraints
   guides/                          — task-oriented how-tos
-rust-old/docs/                     — the Rust 1.3.0 architecture overview and migration guide, kept for reference
 ```
 
 ADR format: `# NNNN — Title`, then Status, Context, Decision, Consequences (see `docs/adr/template.md`).

@@ -21,7 +21,7 @@ Decisions about pravash — what we chose, the context, and the consequences we 
 
 | # | Title | Status |
 |---|---|---|
-| [0001](0001-cyrius-port-with-rust-oracle.md) | Port to Cyrius, with Rust 1.3.0 frozen as the parity oracle | Accepted |
+| [0001](0001-cyrius-port-of-rust-1.3.0.md) | Port Rust 1.3.0's functionality to Cyrius | Accepted |
 | [0002](0002-port-api-divergences.md) | API differences between Rust 1.3.0 and Cyrius 2.0.0 | Accepted |
 | [0003](0003-local-stand-ins-for-library-gaps.md) | Local stand-ins for library gaps, converted when the library ships | Accepted |
-| [0004](0004-correct-rounding-is-the-accuracy-target.md) | Correct rounding is the accuracy target, gated exactly against a corrected oracle | Accepted |
+| [0004](0004-correct-rounding-is-the-accuracy-target.md) | Correct rounding is the accuracy target, gated exactly against a correctly rounded rows | Accepted |

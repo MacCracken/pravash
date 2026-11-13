@@ -2,7 +2,7 @@
 
 pravash 2.0 is the Rust crate 1.3.0's functionality, ported to Cyrius, with correct rounding as the accuracy bar
 ([ADR 0004](../adr/0004-correct-rounding-is-the-accuracy-target.md)). The Rust crate's last release is 1.3.0; its
-source is kept in `rust-old/` for reference, and nothing in 2.0 builds, tests or releases from it. This guide is for code that used the Rust crate (kiran, joshua and impetus are the intended
+source is at the tag `1.3.0`, and 2.0 holds no Rust. This guide is for code that used the Rust crate (kiran, joshua and impetus are the intended
 consumers): what to declare, how each Rust idiom reads in Cyrius, and the deliberate changes, each with the code
 that handles it. [ADR 0002](../adr/0002-port-api-divergences.md) records every change in full, one row each.
 
@@ -33,7 +33,7 @@ features become one bundle, and dead-code elimination drops what a program doesn
 | `buoyancy`, `vortex`, `coupling`, `compute`, `ai`, `logging` | in the bundle |
 | `full` | the bundle |
 | `parallel` | a thread count you set at run time: `solver.set_threads(n)`, `grid.set_threads(n)` (#6 below) |
-| `oracle` | not shipped; it exists only in `rust-old/` to drive the golden generator |
+| `oracle` (hidden dump hooks) | not shipped: it existed only to record the golden corpus |
 
 One function is outside the bundle. `KernelDerivatives::autodiff_gradient` records on hisab's tape, and hisab is
 only a test-scope dependency of pravash, so `PvKernelDerivatives_autodiff_gradient` is in `src/compute_ad.cyr`. A
@@ -277,7 +277,7 @@ Rust's prints. The two SPH examples match Rust's first frame, then separate. In 
 f32 keys put a particle at x = 0.3999999999999997 into the next cell, so 49 particles sum the same neighbours in another
 order, and the scene, which reaches 6,800 m/s by frame 10, grows the difference. validate.py's transcription of the
 solver reproduces Rust's numbers on f32 keys and the port's on f64 keys, so the keys are the only difference
-(`scripts/oracle/examples.py`).
+([where the outputs come from](../examples/README.md#where-the-outputs-come-from)).
 
 ### #8 `sort_by_zorder` breaks ties by index
 
@@ -368,10 +368,10 @@ if (flow_regime_debug(PV_FLOW_REGIME_LAMINAR, regime, 1) != 0) { return 1; }    
   and multi-step trajectories of each solver. Two kinds of rows are accepted under an ADR instead of matching
   Rust's bits ([port-parity.md](../development/port-parity.md)): those the f64 neighbour keys change (#7), checked
   against validate.py's f64 transcription instead, and those where glibc misrounds one of `exp`, `ln`, `log10`,
-  `powf`, `sin`, `cos`, `atan2` or `hypot`, checked against an MPFR-corrected oracle
+  `powf`, `sin`, `cos`, `atan2` or `hypot`, checked against MPFR-corrected rows
   ([ADR 0004](../adr/0004-correct-rounding-is-the-accuracy-target.md)). Rust's std calls glibc, and 2.0 computes the
   correctly rounded value, so a trajectory can drift from Rust's from that step on.
-- **Defaults and constants** are Rust's, generated from the oracle.
+- **Defaults and constants** are Rust's, generated from Rust 1.3.0.
 - **Validation**: each config check and each refusal is Rust's, with the same error variant as a code.
 - **The tests**: all 405 Rust tests are ported or accounted for in the
   [Rust-test ledger](../development/rust-test-ledger.md).

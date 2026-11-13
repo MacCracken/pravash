@@ -1,8 +1,8 @@
 # parity_core.cyr — the golden-corpus replay machinery.
 #
-# Copied from impetus's tests/parity_core.cyr (its version with the corrected oracle, impetus ADR 0011), itself
+# Copied from impetus's tests/parity_core.cyr (its version with the correctly rounded rows, impetus ADR 0011), itself
 # kimiya's (kimiya ADR 0006) and tanmatra's (same format, same outcomes). The changes from impetus's: the
-# corrected oracle is pravash's ADR 0004, and the error names are `PV_ERR_*`. As in impetus's, an error code is
+# correctly rounded rows is pravash's ADR 0004, and the error names are `PV_ERR_*`. As in impetus's, an error code is
 # named through the harness's `_par_error_name` hook, kimiya's transitional rule is off (_PAR_CR_TRANSITIONAL),
 # and a row may carry 8,192 tokens per list. tests/parity.tcyr includes the src modules it needs, then this
 # file, and defines:
@@ -17,16 +17,16 @@
 # - `_par_shadows(mp, ml, fp, fl, cls)`: optional extra, ungated comparisons of the same row
 #   against another Cyrius candidate, each recorded with `_par_shadow_record`.
 # It runs `_par_main()`, whose result is the exit code. Format and comparison rules:
-# scripts/oracle/README.md.
+# scripts/golden/README.md.
 #
-# The corrected oracle (ADR 0004): before a module is replayed, tests/golden/<module>.cr.tsv is loaded when it
+# The correctly rounded rows (ADR 0004): before a module is replayed, tests/golden/<module>.cr.tsv is loaded when it
 # exists. A golden row with a correction (matched by its exact fn and inputs text) is compared against the corrected
-# outputs, under its class and bound: a pass is *accepted (ADR 4)*, anything else fails, including the oracle's
+# outputs, under its class and bound: a pass is *accepted (ADR 4)*, anything else fails, including 1.3.0's
 # own misrounded outputs (kimiya's transitional rule, _PAR_CR_TRANSITIONAL, is off). A correction that matches no
 # golden row fails its module.
 #
-# The f64-key oracle (pravash ADR 0002 #2, the D3 switch of M5 part e) works the same way: tests/golden/<module>.d3.tsv
-# holds the outputs of each row whose result changes on f64 neighbour keys (scripts/oracle/validate.py), and a pass
+# The f64-key rows (pravash ADR 0002 #2, the D3 switch of M5 part e) works the same way: tests/golden/<module>.d3.tsv
+# holds the outputs of each row whose result changes on f64 neighbour keys (scripts/golden/validate.py), and a pass
 # against them is *accepted (ADR 2)*. Both files load into one table, each row tagged with its ADR.
 
 # ── tokens ──────────────────────────────────────────────────────────────────────────
@@ -50,8 +50,8 @@ var _par_got_v = 0;
 var _par_got_l = 0;
 var _par_got_n = 0;
 # A second wanted-output list. On a row with an ADR 0004 correction the two are swapped: _par_want_* holds the
-# corrected outputs (the reference) and _par_alt_* the oracle's own.
-# kimiya's transitional rule (its M3c-1): a corrected row the port fails, but whose oracle outputs it
+# corrected outputs (the reference) and _par_alt_* 1.3.0's own.
+# kimiya's transitional rule (its M3c-1): a corrected row the port fails, but whose recorded outputs it
 # matches, is measured rather than failed. Off in pravash (as in impetus), whose primitives are correctly
 # rounded from the start: matching glibc's misrounding is a failure (ADR 0004).
 var _PAR_CR_TRANSITIONAL = 0;
@@ -259,7 +259,7 @@ fn _par_got_s(p, len) {
     _par_got_n = _par_got_n + 1;
 }
 
-# Appends text as a golden `s:` token: percent-encoded as scripts/oracle/src/tsv.rs does
+# Appends text as a golden `s:` token: percent-encoded as scripts/golden/src/tsv.rs does
 # (every byte outside 0x21..0x7e, and `%`, as %XX), since the harness compares the raw body.
 fn _par_got_text(p, len) {
     var out = alloc(len * 3 + 8);
@@ -311,10 +311,10 @@ var _par_fn_acc = 0;
 var _par_fn_diff = 0;  # shadow slots only: rows where the candidate differs
 var _par_fn_adr6 = 0;  # rows accepted under ADR 4 (a pass against the corrected outputs)
 var _par_fn_adr2 = 0;  # rows accepted under ADR 0002 #2 (a pass against the f64-key outputs)
-var _par_fn_glibc = 0; # measured rows that match only the oracle's misrounded outputs (the transitional rule, off)
+var _par_fn_glibc = 0; # measured rows that match only 1.3.0's misrounded outputs (the transitional rule, off)
 var _par_fn_cr = 0;    # rows with an ADR 0004 correction
 var _par_fn_cr0 = 0;   # ... whose port outputs are bit-identical to the corrected outputs
-var _par_fn_crg = 0;   # ... whose port outputs are bit-identical to the oracle's
+var _par_fn_crg = 0;   # ... whose port outputs are bit-identical to 1.3.0's
 var _par_fn_h = 0;     # 6 buckets per fn
 var _par_fn_max = 0;
 var _par_fn_n = 0;
@@ -457,7 +457,7 @@ fn _par_compare(slot, cls, fp, fl): i64 {
 
 # Records a shadow comparison: the got list (filled by the caller from another Cyrius
 # candidate for the same row) against the row's wanted outputs, under the row's class, in the
-# slot named `name`. Never gated: it reports how far the candidate is from the oracle
+# slot named `name`. Never gated: it reports how far the candidate is from Rust 1.3.0
 # (bit-identical, differs, or measured for class C), e.g. a polyfill beside the builtin.
 fn _par_shadow_record(name, cls) {
     var slot = _par_fn_slot(name, strlen(name), cls);
@@ -553,8 +553,8 @@ fn _par_report_fns() {
     }
 }
 
-# ── the corrected oracle (ADR 0004) ─────────────────────────────────────────────────
-# tests/golden/<module>.cr.tsv (scripts/oracle/validate.py --write; format: scripts/oracle/README.md):
+# ── the correctly rounded rows (ADR 0004) ─────────────────────────────────────────────────
+# tests/golden/<module>.cr.tsv (scripts/golden/validate.py --write; format: scripts/golden/README.md):
 # fn <TAB> inputs <TAB> corrected outputs <TAB> note, one row per golden row whose outputs change when every primitive
 # result is correctly rounded. The fn and inputs fields are the golden row's, byte for byte: the key. The table holds
 # 8 words per row (fn, fn length, inputs, inputs length, outputs, outputs length, used, unused) and points into the
@@ -708,7 +708,7 @@ fn _par_cr_find(fp, fl, ip, il): i64 {
     return 0 - 1;
 }
 
-# Swaps the wanted-output list with the alternate one (on a corrected row: the corrected and the oracle's outputs).
+# Swaps the wanted-output list with the alternate one (on a corrected row: the corrected and 1.3.0's outputs).
 fn _par_swap_want() {
     var k = _par_want_k;
     var v = _par_want_v;
@@ -811,7 +811,7 @@ fn _par_module(mp, ml): i64 {
                 _par_want_n = _par_tokens(buf + t3 + 1, t4 - t3 - 1, _par_want_k, _par_want_v, _par_want_l);
                 if (_par_in_n < 0 || _par_want_n < 0) { bad = 1; }
             }
-            # ADR 0004: a row with a correction is compared against the corrected outputs; the oracle's own move to
+            # ADR 0004: a row with a correction is compared against the corrected outputs; 1.3.0's own move to
             # the alternate list. A row of the f64-key table (ADR 0002 #2, tag 2) likewise.
             var cr = 0 - 1;
             var crbad = 0;
@@ -838,8 +838,8 @@ fn _par_module(mp, ml): i64 {
                 if (handled == 0) { outcome = 3; }
                 elif (handled == 1) { outcome = _par_compare(slot, cls, fp, fl); }
             }
-            # A corrected row: is the port bit-identical to the corrected outputs, to the oracle's? And, under the
-            # transitional rule, when it fails against the corrected outputs: does it match the oracle's misrounded
+            # A corrected row: is the port bit-identical to the corrected outputs, to 1.3.0's? And, under the
+            # transitional rule, when it fails against the corrected outputs: does it match 1.3.0's misrounded
             # outputs under the same class and bound? Then it still uses a glibc-like primitive, and is measured.
             var glibc = 0;
             if (cr >= 0 && tag == 4 && handled == 1) {
@@ -861,7 +861,7 @@ fn _par_module(mp, ml): i64 {
             var adr = 0;
             if (bad == 0 && outcome == 0 && glibc == 0) { adr = _par_accepted(fp, fl, buf + t2 + 1, t3 - t2 - 1); }
             if (outcome == 1 && cr >= 0 && tag == 2) {
-                # ADR 0002 #2: the port matches the f64-key oracle where the f32 keys gave other lists.
+                # ADR 0002 #2: the port matches the f64-key rows where the f32 keys gave other lists.
                 _par_bump(_par_fn_acc, slot);
                 _par_bump(_par_fn_adr2, slot);
                 _par_rows_acc = _par_rows_acc + 1;
@@ -869,7 +869,7 @@ fn _par_module(mp, ml): i64 {
                 d3_acc = d3_acc + 1;
             }
             elif (outcome == 1 && cr >= 0) {
-                # ADR 4: the port matches the corrected oracle where the oracle's libm misrounded.
+                # ADR 4: the port matches the correctly rounded rows where 1.3.0's libm misrounded.
                 _par_bump(_par_fn_acc, slot);
                 _par_bump(_par_fn_adr6, slot);
                 _par_rows_acc = _par_rows_acc + 1;
@@ -972,7 +972,7 @@ fn _par_module(mp, ml): i64 {
     }
     _par_report_fns();
     if (_par_cr_n4 > 0) {
-        print("  ADR 0004 corrected oracle, ", 29);
+        print("  ADR 0004 correctly rounded rows, ", 29);
         print(&_par_cr_file, strlen(&_par_cr_file));
         print(": ", 2);
         fmt_int(_par_cr_n4);
@@ -993,7 +993,7 @@ fn _par_module(mp, ml): i64 {
         println(" matching no golden row");
     }
     if (_par_cr_n2 > 0) {
-        print("  ADR 0002 #2 f64-key oracle, ", 30);
+        print("  ADR 0002 #2 f64-key rows, ", 30);
         print(&_par_d3_file, strlen(&_par_d3_file));
         print(": ", 2);
         fmt_int(_par_cr_n2);

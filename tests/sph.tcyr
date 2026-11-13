@@ -1,4 +1,4 @@
-# sph.tcyr — the ported Rust tests of rust-old/src/sph.rs (M4 and M5).
+# sph.tcyr — the ported tests of Rust 1.3.0's src/sph.rs (M4 and M5).
 #
 # Every test keeps its Rust name as its group, in Rust's order. M4 part a ports the 22 of the kernels, the equations
 # of state, the non-Newtonian models and the totals; part b `test_zorder_negative_coordinates`; part c the density,
@@ -6,7 +6,7 @@
 # `create_particle_block`; part d the 11 of its tests that make their lists by brute force (Rust's
 # `brute_neighbors`), `test_degenerate_inputs_no_panic` among them. The five that make them with `SphSolver::step`
 # wait for M5, with the solver's own. Three
-# Cyrius-only groups check what part b adds without an oracle: the merge sort's stability, the neighbour lists
+# Cyrius-only groups check what part b adds without a reference: the merge sort's stability, the neighbour lists
 # against a brute-force search, and the record layout `_pv_nb_col` assumes. Three more check part c's no-panic paths
 # (ADR 0002 #8): the out-of-range reads, the refused sizes, and the state a diverging step leaves.
 # Last, Rust's two `ignore`d doc examples, written against the API and run (`doc_*`, M8 part a).

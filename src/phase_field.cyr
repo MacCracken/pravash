@@ -1,4 +1,4 @@
-# phase_field.cyr — the Allen–Cahn phase field of rust-old/src/phase_field.rs (`PhaseField`, M3 part d).
+# phase_field.cyr — the Allen–Cahn phase field of Rust 1.3.0's src/phase_field.rs (`PhaseField`, M3 part d).
 #
 # An order parameter φ ∈ [−1, 1] per cell of an nx × ny grid: −1 phase A, +1 phase B, the interface at 0. `step`
 # integrates ∂φ/∂t + u·∇φ = M·(ε²·∇²φ − (φ³ − φ)) by forward Euler, with first-order upwind advection, then copies

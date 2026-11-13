@@ -1,4 +1,4 @@
-# common.tcyr — the ported Rust tests of rust-old/src/common.rs (M1 part 3).
+# common.tcyr — the ported tests of Rust 1.3.0's src/common.rs (M1 part 3).
 #
 # Every test keeps its Rust name as its group; all 49 are ported. The two serde tests go through src/json.cyr (part
 # 4). Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9, #10): `is_err()` is `is_err_result`,

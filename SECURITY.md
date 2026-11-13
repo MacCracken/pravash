@@ -5,7 +5,7 @@
 | Version | Language | Status |
 |---|---|---|
 | 2.0.x | Cyrius | Supported: the current line, the port of 1.3.0 (`docs/development/pravash-port-plan.md`) |
-| 1.3.x | Rust | Supported. The final Rust line, frozen in `rust-old/` as the port's oracle. Security fixes ship as 1.3.x |
+| 1.3.x | Rust | Supported. The final Rust line, at the tag `1.3.0`. Security fixes ship as 1.3.x |
 | < 1.3 | Rust | Not supported |
 
 ## Reporting a Vulnerability

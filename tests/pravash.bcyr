@@ -430,7 +430,7 @@ fn bench_m1b() {
 }
 
 # ── shallow water (M2): Rust's criterion benches shallow_step, shallow_volume, shallow_disturbance ──
-# rust-old/benches/benchmarks.rs: an n × n grid (n = 32, 64, 128) at dx 0.1 and depth 1. The step and disturbance
+# Rust 1.3.0's benches/benchmarks.rs: an n × n grid (n = 32, 64, 128) at dx 0.1 and depth 1. The step and disturbance
 # benches time a fresh clone each iteration (criterion's iter_batched excludes the clone; so does this: it clones
 # outside the timed batch, into a pool).
 
@@ -533,7 +533,7 @@ fn bench_shallow() {
 
 # ── grid (M3): Rust's criterion benches grid_diffuse, grid_max_speed, grid_step, grid_step_maccormack,
 # grid_step_periodic ──
-# rust-old/benches/benchmarks.rs. diffuse: an n × n field of zeros with 100 at n²/2, rate 0.1, dt 0.01, dx 0.1, 20
+# Rust 1.3.0's benches/benchmarks.rs. diffuse: an n × n field of zeros with 100 at n²/2, rate 0.1, dt 0.01, dx 0.1, 20
 # sweeps, on a fresh copy each time. max_speed: vx = sin(0.01·i), vy = cos(0.01·i) at dx 0.01. The steps: the smoke
 # config (the DST projection), with MacCormack at dt 0.01, or on periodic walls (Gauss–Seidel), on an n × n grid
 # (n = 15, 30, 63) at dx 0.1 with density 1 and vy 1 on four cells of row 2. Clones are made outside the timed batch,
@@ -702,10 +702,11 @@ fn bench_grid() {
 }
 
 # ── grid, part c (M3): MacGrid, KEpsilon, apply_ghost_fluid ──
-# Rust has no criterion bench for these; scripts/probes/rust/src/bin/bench_grid_c.rs times the same bodies on the
-# oracle. Each times `iters` calls on one state (which evolves the same way on both sides): mac_step on an n × n grid
-# at dx 0.1 with a 4 × 2 density blob at the floor's centre and the smoke config; kepsilon_step from `new(n, n)`
-# under a solid-body rotation, dx 0.1, dt 0.01; ghost_fluid on a zero pressure and a circle's signed distance.
+# Rust has no criterion bench for these; a twin, scripts/probes/rust/src/bin/bench_grid_c.rs (at the tag 2.0.0),
+# timed the same bodies on Rust 1.3.0. Each times `iters` calls on one state (which evolves the same way on both
+# sides): mac_step on an n × n grid at dx 0.1 with a 4 × 2 density blob at the floor's centre and the smoke config;
+# kepsilon_step from `new(n, n)` under a solid-body rotation, dx 0.1, dt 0.01; ghost_fluid on a zero pressure and a
+# circle's signed distance.
 
 fn _bench_mac_step(n, iters) {
     var g: PvMacGrid;
@@ -812,10 +813,10 @@ fn bench_grid_c() {
 }
 
 # ── vof and phase_field (M3 part d) ──
-# Rust has no criterion bench for these; scripts/probes/rust/src/bin/bench_vof_pf.rs times the same bodies on the
-# oracle. Each times `iters` calls on one state: vof_advect on an n × n field at dx 0.1 with [0.2·L, 0.6·L]² filled
-# (L = n·dx), in the rotation u = −0.1·(y − c), v = 0.1·(x − c), dt 0.01; phase_field_step with a disc of radius
-# 0.25·L at the centre, in the same rotation, dt 0.001.
+# Rust has no criterion bench for these; a twin, scripts/probes/rust/src/bin/bench_vof_pf.rs (at the tag 2.0.0),
+# timed the same bodies on Rust 1.3.0. Each times `iters` calls on one state: vof_advect on an n × n field at dx 0.1
+# with [0.2·L, 0.6·L]² filled (L = n·dx), in the rotation u = −0.1·(y − c), v = 0.1·(x − c), dt 0.01;
+# phase_field_step with a disc of radius 0.25·L at the centre, in the same rotation, dt 0.001.
 
 # The rotation u = −0.1·(y − c), v = 0.1·(x − c) on an n × n grid into the n² words at vx and vy.
 fn _bench_rotation(n, vx, vy) {

@@ -1,4 +1,4 @@
-# sph_fns.cyr — the SPH free functions of rust-old/src/sph.rs (M4 parts c and d).
+# sph_fns.cyr — the SPH free functions of Rust 1.3.0's src/sph.rs (M4 parts c and d).
 #
 # Part c: the brute-force O(n²) density and forces, the free step (`sph_step`: Rust's `step`, renamed because one
 # namespace serves pravash and its consumers, ADR 0002 #17), the particle block, and adaptive splitting and
@@ -9,9 +9,9 @@
 # freed before it returns: the heap is flat across steps (port plan §7.5).
 #
 # UPSTREAM(L7): ganita:docs/development/issues/2026-11-11-mat-inv-allocates-per-call.md
-#   `_pv_invert_3x3`, the MLS 3×3 inverse: an allocation-free transcription of the oracle's (hisab 1.4.0
+#   `_pv_invert_3x3`, the MLS 3×3 inverse: an allocation-free transcription of 1.3.0's (hisab 1.4.0
 #   `matrix_inverse`); replace it with ganita's `mat_inv_into` once it ships with hisab's absolute 1e-12 pivot test
-#   and non-finite behaviour, or as an ADR divergence; parity: the `oracle::invert_3x3` and MLS rows (class B).
+#   and non-finite behaviour, or as an ADR divergence; parity: the `sph::invert_3x3` and MLS rows (class B).
 
 # ── density and the forces (brute force) ────────────────────────────────────────────
 
@@ -980,11 +980,11 @@ fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f
 # ── part d: the MLS gradient corrections ────────────────────────────────────────────
 
 # The inverse of the 3×3 row-major matrix at m into out (9 words): 1, or 0 for a largest pivot below 1e-12 (hisab's
-# `EPSILON_F64`, an absolute threshold; out unchanged). The oracle's own algorithm, allocation-free: hisab 1.4.0
+# `EPSILON_F64`, an absolute threshold; out unchanged). 1.3.0's own algorithm, allocation-free: hisab 1.4.0
 # `matrix_inverse`, an LU decomposition with partial pivoting (the first largest |pivot| below the diagonal; a NaN pivot
 # stays, as `val > NaN` never holds), then a dense forward and back substitution of each unit column, `a − b·c` as
 # written (no fused multiply-add). ganita's `mat_inv` is not the same function at the edges: it refuses any non-finite
-# entry and scales its singular threshold by the matrix, so it differs from the oracle on 12 of the 60 inverse rows (a
+# entry and scales its singular threshold by the matrix, so it differs from Rust 1.3.0 on 12 of the 60 inverse rows (a
 # 1e-13 diagonal, a 1e-12 pivot, 1e300 entries, every ±∞ and NaN entry; port-parity §18). Mirrors `invert_3x3`.
 #must_use
 fn _pv_invert_3x3(m, out): i64 {

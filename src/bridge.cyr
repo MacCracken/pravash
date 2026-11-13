@@ -1,5 +1,5 @@
 # bridge.cyr — cross-crate bridges: primitive values from pavan (aerodynamics), ushma (thermodynamics) and goonj
-# (acoustics) to pravash's fluid parameters (port of rust-old/src/bridge.rs).
+# (acoustics) to pravash's fluid parameters (port of Rust 1.3.0's src/bridge.rs).
 #
 # Rust's operation order throughout; the literals are Rust's (2.414e-5 written positionally: there is no exponent
 # notation). temperature_to_water_viscosity's powf and tke_to_broadband_noise_db's log10 are the correctly rounded

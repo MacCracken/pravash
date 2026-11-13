@@ -1,4 +1,4 @@
-# sph_dfsph.cyr — `SphSolver::step_dfsph` of rust-old/src/sph.rs (M5 part c): Divergence-Free SPH (Bender & Koschier
+# sph_dfsph.cyr — `SphSolver::step_dfsph` of Rust 1.3.0's src/sph.rs (M5 part c): Divergence-Free SPH (Bender & Koschier
 # 2015), on the solver of src/sph.cyr.
 #
 # The paper's order, as Rust's:

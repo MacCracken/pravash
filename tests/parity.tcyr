@@ -1,7 +1,7 @@
 # parity.tcyr — replays the golden corpus (tests/golden/*.tsv) against the port.
 #
 # Port plan §4 step 7, adapted from impetus's tests/parity_2d.tcyr (its M0 version), itself kimiya's
-# and tanmatra's. Format and comparison rules: scripts/oracle/README.md. The module list is
+# and tanmatra's. Format and comparison rules: scripts/golden/README.md. The module list is
 # tests/golden/modules.txt, which the generator writes. The replay machinery is
 # tests/parity_core.cyr; this file holds the hooks and the dispatchers.
 #
@@ -12,8 +12,8 @@
 # - measured: class C, with no bound set yet for its function. The ulp distance is recorded but
 #   not gated. Bounds are set per function before its first gated comparison (M0 step 8,
 #   docs/development/port-parity.md);
-# - accepted (ADR 4): a row of the corrected oracle (tests/golden/<module>.cr.tsv, ADR 0004) where the
-#   oracle's libm misrounded and the port matches the correctly rounded outputs instead;
+# - accepted (ADR 4): a row of the correctly rounded rows (tests/golden/<module>.cr.tsv, ADR 0004) where the
+#   1.3.0's libm misrounded and the port matches the correctly rounded outputs instead;
 # - accepted (another ADR): a divergence an ADR accepts (none yet);
 # - pending: its function isn't ported yet (no dispatcher entry).
 #
@@ -183,7 +183,7 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _pv_max(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _pv_min(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::rem") == 1) { var r: f64 = _pv_fmod(x, y); _par_got_f(r); return 1; }
-    if (_par_eq(fp, fl, "oracle::sph_cell_key") == 1) { _par_got_i(_pv_sph_cell_key(x, y)); return 1; }
+    if (_par_eq(fp, fl, "sph::cell_key") == 1) { _par_got_i(_pv_sph_cell_key(x, y)); return 1; }
     if (_par_in_n < 3) { return 0; }
     var z: f64 = _par_in(2);
     if (_par_eq(fp, fl, "f64::clamp") == 1) { var r: f64 = _pv_clamp(x, y, z); _par_got_f(r); return 1; }
@@ -191,7 +191,7 @@ fn _par_math(fp, fl): i64 {
 }
 
 # ── common (M1 part 3) ──────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_common.rs. A particle is 18 tokens, a config 14, a material 4.
+# Token layouts: scripts/golden/src/m_common.rs. A particle is 18 tokens, a config 14, a material 4.
 
 # The particle whose 18 tokens start at input k, into *p.
 fn _par_particle_in(k, p: *PvFluidParticle) {
@@ -284,7 +284,7 @@ fn _par_as_handles(p): *PvArenaHandle {
     return p;
 }
 
-# One `ParticleArena::scenario` row (the op codes: scripts/oracle/src/m_common.rs).
+# One `ParticleArena::scenario` row (the op codes: scripts/golden/src/m_common.rs).
 fn _par_arena_scenario(): i64 {
     var cap = _par_in(0);
     var a: *PvParticleArena = PvParticleArena_new(cap);
@@ -472,7 +472,7 @@ fn _par_common(fp, fl): i64 {
 }
 
 # ── buoyancy, vortex, bridge (M1 part 4) ─────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_buoyancy.rs, m_vortex.rs, m_bridge.rs.
+# Token layouts: scripts/golden/src/m_buoyancy.rs, m_vortex.rs, m_bridge.rs.
 
 # Appends an f64 Result: `f:` for Ok, `E:<Variant>` for Err.
 fn _par_f64_result(t, v) {
@@ -609,7 +609,7 @@ fn _par_bridge(fp, fl): i64 {
 }
 
 # ── json (M1 part 4) ───────────────────────────────────────────────────────────────
-# Each row decodes the oracle's document (D4: the same bits), then round-trips the port's own encoding of the
+# Each row decodes 1.3.0's document (D4: the same bits), then round-trips the port's own encoding of the
 # decoded value: write it, read it back, compare the bytes. A failed round trip makes the row unusable (-1, counted
 # as a failure). The `_bayan_*` rows (bayan's stricter policies) have no entry: pending.
 
@@ -724,7 +724,7 @@ fn _par_json(fp, fl): i64 {
 }
 
 # ── shallow (M2) ────────────────────────────────────────────────────────────────────
-# A state is 11 scalars and 5 `v:<n>` fields (scripts/oracle/src/m_shallow.rs).
+# A state is 11 scalars and 5 `v:<n>` fields (scripts/golden/src/m_shallow.rs).
 
 # A column of `n` f64 words from the input tokens at k into *c (empty first): 1, or 0 for no memory.
 fn _par_col_in(k, n, c: *PvColumn): i64 {
@@ -926,7 +926,7 @@ fn _par_shallow(fp, fl): i64 {
 }
 
 # ── grid (M3) ───────────────────────────────────────────────────────────────────────
-# A state is nx, ny, dx and 4 `v:<n>` fields; a config is 13 tokens (scripts/oracle/src/m_grid.rs).
+# A state is nx, ny, dx and 4 `v:<n>` fields; a config is 13 tokens (scripts/golden/src/m_grid.rs).
 
 # The state whose tokens start at input k into *g (scratch and levels empty): the index after it, or -1 for no
 # memory.
@@ -1017,7 +1017,7 @@ fn _par_gc_out(c: *PvGridConfig) {
     return 0;
 }
 
-# The JSON rows: decode the oracle's document, then round-trip the port's encoding of the result.
+# The JSON rows: decode 1.3.0's document, then round-trip the port's encoding of the result.
 fn _par_grid_json(fp, fl): i64 {
     var doc = _par_in_cstr(0);
     if (doc == 0) { return 0 - 1; }
@@ -1075,7 +1075,7 @@ fn _par_vcol_in(k, c: *PvColumn): i64 {
 }
 
 # ── sph (M4) ────────────────────────────────────────────────────────────────────────
-# scripts/oracle/src/m_sph.rs: part a, the kernels, the equations of state, the non-Newtonian viscosity models and
+# scripts/golden/src/m_sph.rs: part a, the kernels, the equations of state, the non-Newtonian viscosity models and
 # the batch and whole-system helpers.
 
 # The kernel named by fp at (r, h) (kernel_wendland_c4_grad for any other name: the caller checks the name).
@@ -1372,7 +1372,7 @@ fn _par_sph_d(fp, fl): i64 {
     if (_par_sph_listed(fp, fl) == 1) { return 1; }
     var sr = _par_sph_solver(fp, fl);
     if (sr != 0) { return sr; }
-    if (_par_eq(fp, fl, "oracle::invert_3x3") == 1) {
+    if (_par_eq(fp, fl, "sph::invert_3x3") == 1) {
         var m[72];
         var out[72];
         for (var a = 0; a < 9; a = a + 1) { store64(&m + a * 8, _par_in(a)); }
@@ -1544,7 +1544,7 @@ fn _par_sph(fp, fl): i64 {
         PvNeighborGrid_init(&g);
         if (_pv_nb_build(&g, ps, n, h) == 0) { return 0 - 1; }
         # The f64 grid's dump (ADR 0002 #2): its cell size, point and cell counts, each point's key, the lists. The
-        # oracle's rows (an f32 grid, with its f32 positions) are all mapped by name in sph.d3.tsv.
+        # 1.3.0's rows (an f32 grid, with its f32 positions) are all mapped by name in sph.d3.tsv.
         _par_got_f(_pv_bits(g.cell_size));
         _par_got_i(g.len);
         _par_got_i(g.cells);
@@ -1694,7 +1694,7 @@ fn _par_sph(fp, fl): i64 {
 
 # ── vof and phase_field (M3 part d) ─────────────────────────────────────────────────
 # A VOF state is nx, ny, dx, `v:` alpha; a phase-field state is nx, ny, dx, `v:` phi, mobility, epsilon
-# (scripts/oracle/src/m_vof.rs, m_phase_field.rs). Each row's field is built as the generator's `fresh` builds it:
+# (scripts/golden/src/m_vof.rs, m_phase_field.rs). Each row's field is built as the generator's `fresh` builds it:
 # `new(nx, ny, dx)`, or `new(4, 4, 0.1)` when that is refused or the size is 2^16 or more, then the public fields.
 
 # 1 when a side is below 2^16 (as a usize), so `fresh` builds the field at its own size.
@@ -1985,9 +1985,9 @@ fn _par_phase_field(fp, fl): i64 {
 
 # ── grid, part c (M3): KEpsilon, apply_ghost_fluid, MacGrid ──────────────────────────
 # A k-ε state is `v:` k, `v:` epsilon and the three constants; a MAC state is nx, ny, dx and 4 `v:<n>` fields
-# (scripts/oracle/src/m_grid_c.rs).
+# (scripts/golden/src/m_grid_c.rs).
 
-# The k-ε state at input k into *m, made as the oracle makes it (`new(k.len(), 1)`, then the public fields, so the
+# The k-ε state at input k into *m, made as Rust 1.3.0 makes it (`new(k.len(), 1)`, then the public fields, so the
 # scratch is k's length): the index after it, or -1 for no memory.
 fn _par_ke_in(k, m: *PvKEpsilon): i64 {
     var nk = _par_in(k);
@@ -2363,9 +2363,10 @@ fn _par_grid(fp, fl): i64 {
         fd.drop();
         return 1;
     }
-    if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1
-      || _par_eq(fp, fl, "oracle::pressure_solve_multigrid") == 1
-      || _par_eq(fp, fl, "oracle::pressure_solve_dst") == 1 || _par_eq(fp, fl, "oracle::pressure_solve_cg") == 1) {
+    if (_par_eq(fp, fl, "FluidGrid::pressure_solve_gauss_seidel") == 1
+      || _par_eq(fp, fl, "FluidGrid::pressure_solve_multigrid") == 1
+      || _par_eq(fp, fl, "FluidGrid::pressure_solve_dst") == 1
+      || _par_eq(fp, fl, "FluidGrid::pressure_solve_cg") == 1) {
         var pc: PvColumn;
         var dc: PvColumn;
         var k1 = _par_vcol_in(0, &pc);
@@ -2374,16 +2375,16 @@ fn _par_grid(fp, fl): i64 {
         if (k2 < 0) { return 0 - 1; }
         var nx = _par_in(k2);
         var ny = _par_in(k2 + 1);
-        if (_par_eq(fp, fl, "oracle::pressure_solve_gauss_seidel") == 1) {
+        if (_par_eq(fp, fl, "FluidGrid::pressure_solve_gauss_seidel") == 1) {
             _pv_fg_pressure_gs(pc.data, dc.data, nx, ny, _par_in(k2 + 2));
             _par_col_out(&pc);
-        } elif (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1
-          || _par_eq(fp, fl, "oracle::pressure_solve_cg") == 1) {
+        } elif (_par_eq(fp, fl, "FluidGrid::pressure_solve_dst") == 1
+          || _par_eq(fp, fl, "FluidGrid::pressure_solve_cg") == 1) {
             # Fresh solver scratch per row, as the hooks' callers have none (the grid's persists across steps).
             var sa: PvColumn = PvColumn_new();
             var sb: PvColumn = PvColumn_new();
             var sc: PvColumn = PvColumn_new();
-            if (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1) {
+            if (_par_eq(fp, fl, "FluidGrid::pressure_solve_dst") == 1) {
                 var tx: PvColumn = PvColumn_new();
                 var ty: PvColumn = PvColumn_new();
                 var td, vd = _pv_fg_pressure_dst(pc.data, pc.len, dc.data, nx, ny, &sa, &sb, &sc, &tx, &ty);
@@ -2468,7 +2469,7 @@ fn _par_grid(fp, fl): i64 {
 }
 
 # ── coupling (M6) ───────────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_coupling.rs. A shape is 5 tokens (`e:BodyShape.<Variant>`, the radius, the
+# Token layouts: scripts/golden/src/m_coupling.rs. A shape is 5 tokens (`e:BodyShape.<Variant>`, the radius, the
 # half-extents), a body 15 (position, velocity, mass, shape, force).
 
 # The shape whose 5 tokens start at input k into *s: 1, or 0 for a variant the port doesn't know.
@@ -2594,7 +2595,7 @@ fn _par_coupling_json(fp, fl): i64 {
     return 1;
 }
 
-# Appends a FLIP solver's dump: its seven grid fields, then the APIC matrices (scripts/oracle/src/m_coupling.rs).
+# Appends a FLIP solver's dump: its seven grid fields, then the APIC matrices (scripts/golden/src/m_coupling.rs).
 fn _par_flip_dump(s: *PvFlipSolver) {
     for (var k = 0; k < 8; k = k + 1) { _par_col_out(_pv_flip_col(s, k)); }
     return 0;
@@ -2815,7 +2816,7 @@ fn _par_coupling(fp, fl): i64 {
 }
 
 # ── mpm (M6 part c) ─────────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_mpm.rs. A model is 6 tokens (`e:ConstitutiveModel.<Variant>`, the bulk modulus,
+# Token layouts: scripts/golden/src/m_mpm.rs. A model is 6 tokens (`e:ConstitutiveModel.<Variant>`, the bulk modulus,
 # the viscosity, E, ν, the friction angle), an MPM particle 11 (F row-major, the model, the reference volume).
 
 # The model whose 6 tokens start at input k into *m: 1, or 0 for a variant the port doesn't know.
@@ -2962,7 +2963,7 @@ fn _par_mpm(fp, fl): i64 {
 }
 
 # ── compute (M7 part a) ─────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_compute.rs. An SoA is 18 `v:` columns (the phase as `i:`); a packed record is
+# Token layouts: scripts/golden/src/m_compute.rs. An SoA is 18 `v:` columns (the phase as `i:`); a packed record is
 # `i:` count and three `v:` columns of widened f32s.
 
 # The SoA whose columns start at input k into *s, which starts empty: the input after it, or -1 for no memory.
@@ -3262,7 +3263,7 @@ fn _par_compute(fp, fl): i64 {
 }
 
 # ── ai (M7 part b) ─────────────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_ai.rs. A daimon config is `s:` endpoint then `s:` key or `n:`; a hoosh config
+# Token layouts: scripts/golden/src/m_ai.rs. A daimon config is `s:` endpoint then `s:` key or `n:`; a hoosh config
 # `s:`.
 
 # Appends the n bytes at p as an `s:` token, or `n:` when p is 0.
@@ -3378,7 +3379,7 @@ fn _par_ai(fp, fl): i64 {
 }
 
 # ── logging (M7 part b) ────────────────────────────────────────────────────────────────
-# Token layouts: scripts/oracle/src/m_logging.rs.
+# Token layouts: scripts/golden/src/m_logging.rs.
 
 # The trace rows: sakshi's events, as the generator's capture subscriber records them — `>name{…}` when a span is
 # entered, `<name` when it exits, `LEVEL target: message …` for an event — each kept as text until the row ends.
@@ -3941,7 +3942,7 @@ fn _par_logging(fp, fl): i64 {
 
 # ── debug (M8 part d) ───────────────────────────────────────────────────────────────
 # `f64::debug` and `f32::debug` give one text; `<Type>::debug` takes the value's fields in declaration order and
-# gives `{:?}` and `{:#?}` (token layouts: scripts/oracle/src/m_debug.rs).
+# gives `{:?}` and `{:#?}` (token layouts: scripts/golden/src/m_debug.rs).
 
 # 1 when input token k's body is `text`.
 fn _par_tok_is(k, text): i64 {
@@ -4641,7 +4642,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
 }
 
 # Shadow comparisons, never gated: the same golden rows through another Cyrius candidate. On a row
-# of the corrected oracle the reference is the corrected outputs, so each shadow's histogram is its
+# of the correctly rounded rows the reference is the corrected outputs, so each shadow's histogram is its
 # distance from the correctly rounded value there and from glibc's elsewhere.
 # - M1a part 1's counterparts, which part 2 replaced: the polyfill exp and ln, the sin and cos
 #   builtins (the polyfills on every target), ganita's hypot and pow, and ganita's atan2 on the
@@ -4729,11 +4730,11 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 # §2.2) and never raised to make a row pass. They hold on x86_64 ELF, x86_64 PE and aarch64, which
 # give the same bits for every dispatched function (the digests).
 # - Every std transcendental gets K = 0 (ADR 0004): the port's are correctly rounded, so each row
-#   must equal the corrected oracle bit for bit, which is glibc's value where glibc rounded
+#   must equal the correctly rounded rows bit for bit, which is glibc's value where glibc rounded
 #   correctly and MPFR's where it didn't (tests/golden/math.cr.tsv). M0's K = 2 compared two
 #   implementations each about 1 ulp from the correct value; with one side exact, any distance is a
 #   defect.
-# - cbrt has had K = 0 since M0: the oracle's (compiler_builtins) and ganita's are both correctly
+# - cbrt has had K = 0 since M0: 1.3.0's (compiler_builtins) and ganita's are both correctly
 #   rounded, and equal on every row (port-parity §3).
 # - pravash's own class-C functions get K_F = 2·S·c + 2 at their milestones (port-parity, the rule).
 #must_use
@@ -4749,7 +4750,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::cbrt") == 1) { return 0; }
     # M1 part 4's class C functions: Rust's operations on the correctly rounded primitives, so each row equals the
-    # corrected oracle (the oracle's operations with every exp, ln, log10 and powf correctly rounded) bit for bit.
+    # correctly rounded rows (1.3.0's operations with every exp, ln, log10 and powf correctly rounded) bit for bit.
     if (_par_eq(fp, fl, "lamb_oseen_velocity") == 1) { return 0; }
     if (_par_eq(fp, fl, "kolmogorov_scale") == 1) { return 0; }
     if (_par_eq(fp, fl, "temperature_to_water_viscosity") == 1) { return 0; }
@@ -4757,56 +4758,57 @@ fn _par_c_bound(fp, fl): i64 {
     # M2: sediment's cbrt is correctly rounded on both sides (port-parity §3).
     if (_par_eq(fp, fl, "update_sediment") == 1) { return 0; }
     # The shallow-water step (class S): Rust's operations on the correctly rounded damping powf and cbrt, so every
-    # field of every step row is bit for bit the oracle's (the corrected oracle's where glibc's pow misrounds).
+    # field of every step row is bit for bit 1.3.0's (the correctly rounded rows's where glibc's pow misrounds).
     if (_par_eq(fp, fl, "ShallowWater::step") == 1) { return 0; }
     # The grid step (class S), on every projection (periodic Gauss–Seidel, multigrid, DST, CG): +, −, ×, ÷, √,
     # floor, the exact fmod and the DST's correctly rounded sines and cosines in Rust's order, so every field is the
-    # oracle's bit for bit (the corrected oracle's where glibc misrounds one of the DST's sines or cosines).
+    # 1.3.0's bit for bit (the correctly rounded rows's where glibc misrounds one of the DST's sines or cosines).
     if (_par_eq(fp, fl, "FluidGrid::step") == 1) { return 0; }
     # M3 part b: the DST pressure solve's sines and cosines are correctly rounded (src/crmath.cyr) and everything
-    # else is +, −, ×, ÷ in Rust's order, so each row equals the corrected oracle bit for bit (the oracle's own row
+    # else is +, −, ×, ÷ in Rust's order, so each row equals the correctly rounded rows bit for bit (1.3.0's own row
     # where glibc rounded every sine and cosine correctly). The DST step rows take the same bound, 0, above.
-    if (_par_eq(fp, fl, "oracle::pressure_solve_dst") == 1) { return 0; }
+    if (_par_eq(fp, fl, "FluidGrid::pressure_solve_dst") == 1) { return 0; }
     # M3 part c: the k-ε source step and the MAC step (class S) are +, −, ×, ÷ and the sampler's floor in Rust's
-    # order, so every field is the oracle's bit for bit.
+    # order, so every field is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "KEpsilon::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "MacGrid::step") == 1) { return 0; }
     # M3 part d: the VOF advection and the phase-field step (class S) are +, −, ×, ÷, √, ceil and clamp in Rust's
-    # order, so every field is the oracle's bit for bit.
+    # order, so every field is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "VofField::advect") == 1) { return 0; }
     if (_par_eq(fp, fl, "PhaseField::step") == 1) { return 0; }
     # M4 part a: the Tait equation of state's ln and powf, and the non-Newtonian models' powf, are correctly rounded
     # (src/crmath.cyr, src/crlog.cyr) and the rest is Rust's arithmetic in order, so each row equals the corrected
-    # oracle bit for bit (the oracle's own where glibc rounded correctly).
+    # 1.3.0 bit for bit (1.3.0's own where glibc rounded correctly).
     if (_par_eq(fp, fl, "equation_of_state_tait") == 1) { return 0; }
     if (_par_eq(fp, fl, "NonNewtonianViscosity::effective_viscosity") == 1) { return 0; }
     # M4 part c: the split ring's cosines and sines are correctly rounded and the rest is Rust's arithmetic in order,
-    # so each row equals the corrected oracle bit for bit. The free step (class S) is +, −, ×, ÷ and √ in Rust's
-    # order, so every particle of every row is the oracle's bit for bit.
+    # so each row equals the correctly rounded rows bit for bit. The free step (class S) is +, −, ×, ÷ and √ in Rust's
+    # order, so every particle of every row is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "split_particle") == 1) { return 0; }
     if (_par_eq(fp, fl, "step") == 1) { return 0; }
     # M4 part d: the contact angle's cosine is correctly rounded and the rest is Rust's arithmetic in order, so each
-    # row equals the corrected oracle bit for bit.
+    # row equals the correctly rounded rows bit for bit.
     if (_par_eq(fp, fl, "apply_contact_angle") == 1) { return 0; }
     # M5 part a: the solver's step (class S) is +, −, ×, ÷, √ and part b's f32 keys in Rust's order, so every
-    # particle of every row is the oracle's bit for bit.
+    # particle of every row is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "SphSolver::step") == 1) { return 0; }
-    # M5 part b: PCISPH (class S) is the same arithmetic in Rust's order, so every particle is the oracle's bit for bit.
+    # M5 part b: PCISPH (class S) is the same arithmetic in Rust's order, so every particle is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) { return 0; }
     # M5 part c: DFSPH (class S), likewise.
     if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) { return 0; }
     # M5 part d: the multiphase step (class S), likewise.
     if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) { return 0; }
     # M6 part b: the FLIP step (class S) is +, −, ×, ÷, floor, |x| and Rust's min, max and clamp in Rust's order, so
-    # every particle and grid value of every row is the oracle's bit for bit.
+    # every particle and grid value of every row is 1.3.0's bit for bit.
     if (_par_eq(fp, fl, "FlipSolver::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "FlipSolver::scenario") == 1) { return 0; }
     # M6 part c: MPM's stress and step are Rust's arithmetic in order on the correctly rounded ln, exp, sin, cos, hypot
-    # and atan2, so each row equals the corrected oracle bit for bit (the oracle's own where glibc rounded every call
+    # and atan2, so each row equals the correctly rounded rows bit for bit (1.3.0's own where glibc rounded every call
     # correctly).
     if (_par_eq(fp, fl, "MpmParticle::stress") == 1) { return 0; }
     if (_par_eq(fp, fl, "MpmSolver::step") == 1) { return 0; }
-    # M7 part a: dTait/dρ is Rust's arithmetic on the correctly rounded powf, so each row equals the corrected oracle.
+    # M7 part a: dTait/dρ is Rust's arithmetic on the correctly rounded powf, so each row equals its correctly
+    # rounded row.
     if (_par_eq(fp, fl, "KernelDerivatives::dtait_drho") == 1) { return 0; }
     return 0 - 1;
 }

@@ -1,6 +1,6 @@
 # Examples
 
-Rust 1.3.0's three examples (`rust-old/examples/`), ported. Each is a whole consumer program: it includes
+Rust 1.3.0's three examples (`examples/` at the tag 1.3.0), ported. Each is a whole consumer program: it includes
 `lib/pravash.cyr`, where `cyrius deps` vendors the bundle. They print through the stdlib's `fmt`, which a consumer
 lists in its own `[deps] stdlib` (the bundle doesn't need it).
 
@@ -24,7 +24,7 @@ file.
 
 ## Where the outputs come from
 
-The `.out` files are derived from the oracle by `scripts/oracle/examples.py` (local only, like `validate.py`):
+The `.out` files were derived from Rust 1.3.0 at 2.0.0 and are frozen, like the golden corpus:
 
 - **`shallow_water.out`** is exactly what Rust 1.3.0's example prints.
 - **`basic_fluid.out` and `multiphase.out`** are Rust's output with each frame line recomputed by `validate.py`'s

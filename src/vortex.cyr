@@ -1,9 +1,9 @@
 # vortex.cyr — vortex dynamics: vorticity, the Lamb–Oseen and Rankine vortices, enstrophy and the Kolmogorov scale
-# (port of rust-old/src/vortex.rs).
+# (port of Rust 1.3.0's src/vortex.rs).
 #
 # Rust's operation order throughout. The transcendentals are the correctly rounded ones (src/mathx.cyr, ADR 0004), so
-# lamb_oseen_velocity and kolmogorov_scale equal the oracle's operations with every exp and ln correctly rounded (the
-# corrected oracle where glibc misrounds). 2π is `2.0 * PI`, exact.
+# lamb_oseen_velocity and kolmogorov_scale equal 1.3.0's operations with every exp and ln correctly rounded (the
+# correctly rounded rows where glibc misrounds). 2π is `2.0 * PI`, exact.
 
 # The 2D vorticity, ω = ∂vy/∂x − ∂vx/∂y. Mirrors `vorticity_2d`.
 #must_use

@@ -1,4 +1,4 @@
-# grid.tcyr — the ported Rust tests of rust-old/src/grid.rs: `FluidGrid` (M3 parts a–b), `KEpsilon`,
+# grid.tcyr — the ported tests of Rust 1.3.0's src/grid.rs: `FluidGrid` (M3 parts a–b), `KEpsilon`,
 # `apply_ghost_fluid` and `MacGrid` (part c).
 #
 # Every test keeps its Rust name as its group, in Rust's order: all 49 are ported, and `potential_flow`, `div_norm`

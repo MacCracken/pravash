@@ -1,7 +1,7 @@
 # crmath.tcyr — Cyrius-only tests of the correctly rounded primitives (ADR 0004): src/crmath.cyr's exp, sin,
 # cos, hypot, pow and atan2 (impetus's, its ADR 0011) and src/crlog.cyr's ln and log10 (kimiya's, its ADR 0006).
 #
-# Against the oracle, the golden math rows gate them at 0 ulp (tests/parity.tcyr, with the corrected oracle where
+# Against Rust 1.3.0, the golden math rows gate them at 0 ulp (tests/parity.tcyr, with the correctly rounded rows where
 # glibc misrounds). These check what the corpus can't say directly: the IEEE special cases, the exact cases, the
 # known hard-to-round arguments, that the fast and slow paths agree wherever both run, and that the fast phases
 # decide ordinary arguments (phase 2 costs about 25×, the slow path about 250×). Adapted from impetus's

@@ -1,4 +1,4 @@
-# compute_ad.cyr — `KernelDerivatives::autodiff_gradient` of rust-old/src/compute.rs (M7 part a), on hisab's
+# compute_ad.cyr — `KernelDerivatives::autodiff_gradient` of Rust 1.3.0's src/compute.rs (M7 part a), on hisab's
 # reverse-mode tape (`ad_tape_*`, `ad_*`).
 #
 # Outside the `[lib]` bundle (ADR 0002 #26): it is pravash's one call into hisab, which stays a test-scope dependency,

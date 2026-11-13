@@ -1,7 +1,7 @@
 # grid_solve.cyr — the library solvers the grid's pressure projection calls: hisab 1.4.0's direct DST-I and IDST-I
 # and its matrix-free linear conjugate gradient, transcribed into caller scratch (ADR 0003).
 #
-# Each is 1.4.0's algorithm in its operation order, so the rows compare against the oracle's own calls: the sums run
+# Each is 1.4.0's algorithm in its operation order, so the rows compare against 1.3.0's own calls: the sums run
 # in index order, the transforms' sines are correctly rounded (src/crmath.cyr, ledger L1, ADR 0004), and nothing
 # allocates. The caller owns every buffer, so the step path stays flat (port plan §7.5).
 #

@@ -1,4 +1,4 @@
-# logging.cyr — rust-old/src/logging.rs (M7 part b): pravash's tracing on sakshi, and the init helpers.
+# logging.cyr — Rust 1.3.0's src/logging.rs (M7 part b): pravash's tracing on sakshi, and the init helpers.
 #
 # Rust's pravash traces through `tracing`: a TRACE span on each operation (`sph::step{n=10}`) and a WARN event where an
 # input is ignored, under the targets `pravash::<module>`; `logging::init*` installs a subscriber. Here they go

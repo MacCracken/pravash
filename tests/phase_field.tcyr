@@ -1,4 +1,4 @@
-# phase_field.tcyr — the ported Rust tests of rust-old/src/phase_field.rs (M3 part d).
+# phase_field.tcyr — the ported tests of Rust 1.3.0's src/phase_field.rs (M3 part d).
 #
 # Every test keeps its Rust name as its group, in Rust's order: all 11. Re-expressed for the Cyrius shapes (ADR 0002
 # #1, #8, #14): `.unwrap()` on `new` and `step` is an assertion that the call was Ok; `is_err()` is the `PV_ERR_*`

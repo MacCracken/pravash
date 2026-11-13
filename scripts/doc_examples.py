@@ -7,8 +7,8 @@ The Cyrius form of Rust's doc tests and `cargo run --example`. Usage, from the r
 A block that defines `fn main` is a whole consumer program: its `include "lib/pravash.cyr"` is pointed at `dist/`,
 where a consumer's `cyrius deps` would have vendored the bundle. Any other block is a fragment: it goes into
 `fn main(): i64 { alloc_init(); <block> return 0; }` after the bundle's include. Each docs/examples/<name>.cyr is a
-whole program too, and must print exactly docs/examples/<name>.out (scripts/oracle/examples.py derives those from
-the oracle), be formatted, and lint clean (lint runs on the built copy, whose include points at dist/). Each program
+whole program too, and must print exactly docs/examples/<name>.out (each recorded from Rust 1.3.0's example at 2.0.0,
+frozen), be formatted, and lint clean (lint runs on the built copy, whose include points at dist/). Each program
 is built with `cyrius build` into build/doc_examples/ and run. A compile warning, a failed build, a nonzero exit, an
 example's other output, formatting or lint fails the check: exit 1, naming the block.
 """

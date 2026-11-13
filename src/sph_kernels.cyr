@@ -1,5 +1,5 @@
 # sph_kernels.cyr — the SPH smoothing kernels, the equations of state and the small particle helpers of
-# rust-old/src/sph.rs (M4 part a).
+# Rust 1.3.0's src/sph.rs (M4 part a).
 #
 # The 3D kernels (Müller et al. 2003: poly6 for density, the spiky gradient for pressure, the viscosity Laplacian),
 # the Wendland C2 and C4 kernels and gradients, the linear and Tait equations of state, the non-Newtonian

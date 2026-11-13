@@ -1,4 +1,4 @@
-# flip.cyr — the FLIP/PIC solver of rust-old/src/coupling.rs (M6 part b): particles advected on a background grid,
+# flip.cyr — the FLIP/PIC solver of Rust 1.3.0's src/coupling.rs (M6 part b): particles advected on a background grid,
 # their velocities splatted to it (P2G), the grid projected by Gauss–Seidel, and the grid velocity carried back
 # (G2P) as a FLIP/PIC blend or, with `use_apic`, as APIC's affine transfer.
 #

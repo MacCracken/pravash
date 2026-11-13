@@ -1,4 +1,4 @@
-# grid.cyr — 2D incompressible Euler / Navier–Stokes on a uniform grid (port of rust-old/src/grid.rs, `FluidGrid`).
+# grid.cyr — 2D incompressible Euler / Navier–Stokes on a uniform grid (port of Rust 1.3.0's src/grid.rs, `FluidGrid`).
 #
 # `PvFluidGrid` mirrors `FluidGrid`: nx × ny cells of size dx, row-major (index y·nx + x), with a ghost ring: the
 # public fields `vx`, `vy`, `pressure` and `density` are columns (src/column.cyr) a caller may resize, as Rust's

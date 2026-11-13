@@ -1,5 +1,5 @@
 # common.cyr — shared fluid types: materials, particles, configuration, the SoA layout and the particle arena
-# (port of rust-old/src/common.rs).
+# (port of Rust 1.3.0's src/common.rs).
 #
 # Shapes (port plan §7.3, ADR 0002 #1, #8 and #9):
 # - `PvFluidParticle` is a 144-byte record laid out as Rust's `FluidParticle` (probe 2, port-parity §4.2): three

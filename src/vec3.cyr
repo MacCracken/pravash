@@ -3,7 +3,7 @@
 # `PvVec3` is a 24-byte value, stored inline in the records that hold one (`PvFluidParticle.position`). Each
 # operation is glam 0.29.3's (`src/f64/dvec3.rs`) in its exact order: `dot` is (x·x' + y·y') + z·z', `length`
 # its square root, `distance` the length of the difference, with no fused operations, as rustc compiles them. So
-# the results have the oracle's bits (class A). Operations arrive with the modules that call them. Hot loops read
+# the results have 1.3.0's bits (class A). Operations arrive with the modules that call them. Hot loops read
 # the components into f64 locals instead of passing values (port-parity §4.2: a struct value costs 2.5×).
 #
 # UPSTREAM(L3): hisab:docs/development/issues/2026-11-09-allocator-scoped-calls.md

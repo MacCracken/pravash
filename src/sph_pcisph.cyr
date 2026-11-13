@@ -1,4 +1,4 @@
-# sph_pcisph.cyr — `SphSolver::step_pcisph` of rust-old/src/sph.rs (M5 part b): Predictive-Corrective Incompressible
+# sph_pcisph.cyr — `SphSolver::step_pcisph` of Rust 1.3.0's src/sph.rs (M5 part b): Predictive-Corrective Incompressible
 # SPH (Solenthaler & Pajarola 2009), on the solver of src/sph.cyr.
 #
 # Rust's order throughout:

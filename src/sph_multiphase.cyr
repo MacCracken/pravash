@@ -1,4 +1,4 @@
-# sph_multiphase.cyr — `PhaseProperties`, `MultiPhaseConfig` and `SphSolver::step_multiphase` of rust-old/src/sph.rs
+# sph_multiphase.cyr — `PhaseProperties`, `MultiPhaseConfig` and `SphSolver::step_multiphase` of Rust 1.3.0's src/sph.rs
 # (M5 part d), on the solver of src/sph.cyr.
 #
 # The multiphase step is the WCSPH step with per-particle materials: each particle's phase selects its rest density and

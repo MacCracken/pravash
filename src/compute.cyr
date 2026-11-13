@@ -1,4 +1,4 @@
-# compute.cyr — the compute-backend surface of rust-old/src/compute.rs (M7 part a): f32 particle buffers packed from
+# compute.cyr — the compute-backend surface of Rust 1.3.0's src/compute.rs (M7 part a): f32 particle buffers packed from
 # the SoA for a GPU upload and unpacked back, the kernel parameter records a backend reads, the operations and the two
 # backend traits (implemented by a consumer; pravash's solvers never dispatch to one), and the analytical kernel
 # derivatives.
