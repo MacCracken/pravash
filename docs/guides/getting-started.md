@@ -35,12 +35,14 @@ cyrius distlib && cyrius distlib --check    # dist/pravash.cyr, the bundle consu
 
 ## The checks against the oracle
 
-The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI. Run `cargo`
-from the repo root, where `rust-toolchain.toml` pins the oracle's rustc 1.99.1.
+These are porting tools: they run locally, and neither CI nor the release runs them or anything else in `rust-old/`.
+The generator and `validate.py` are tied to the recorded glibc (2.44), and the generator to rustc 1.99.1, the
+toolchain the corpus was recorded on: run it as `cargo +1.99.1 …` (on 1.100, Unicode 18 changes
+`src/str_debug_data.cyr` and its `--check` fails).
 
 ```sh
-cargo test --manifest-path rust-old/Cargo.toml --all-features                          # the oracle itself
-cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check      # the corpus is current
+cargo +1.99.1 test --manifest-path rust-old/Cargo.toml --all-features                          # the oracle itself
+cargo +1.99.1 run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check      # the corpus is current
 python3 -I -B scripts/oracle/validate.py .            # every row recomputed in Python, without Rust
 python3 -I -B scripts/oracle/probe_tables.py .        # each generated constant compiles to the oracle's bits
 python3 -I -B scripts/oracle/examples.py .            # docs/examples/*.out are the oracle's

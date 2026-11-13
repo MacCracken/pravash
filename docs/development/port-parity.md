@@ -2449,10 +2449,14 @@ the port's, for the inputs a consumer doesn't control:
 No invariant broke. The first draft accepted only 206 documents, since nearly every mutation broke the syntax; the
 mutation that replaces a whole number keeps the shape, so the round trip runs on 1,582.
 
-**The oracle's toolchain.** The root `rust-toolchain.toml` pins rustc 1.99.1, the oracle's, for every `cargo` command
-run from the repo root: the frozen crate, the generator and the probes. `rust-old/` keeps its own `stable` file,
-unedited. CI's oracle job installs what the root file names, in place of `stable`. Plain `cargo run … -- --check`
-passes again; on 1.100 it fails on `src/str_debug_data.cyr` (§31).
+**No Rust in CI or the release.** `release.yml` gates on the whole of `ci.yml` (`needs: [ci]`), and `ci.yml` still
+carried M0's `rust-oracle` job: cargo building and testing the 1.3.0 crate in `rust-old/`. So a 2.0.0 tag couldn't
+publish unless Rust built and passed. That made the release depend on Rust, which a port must not do: what was
+ported is 1.3.0's functionality, and the bar is correct rounding, which Rust on glibc doesn't meet (ADR 0004). The
+job is removed. So are the two CI steps that read `rust-old/`'s source, surface parity and the Rust-test ledger, which
+stay local porting tools. No root toolchain pin: the local tools that run Rust use `cargo +1.99.1`, the toolchain the
+corpus was recorded on (on 1.100 the generator's `--check` fails on `src/str_debug_data.cyr`, §31). The earlier
+parts' release audits should have caught the job; none did.
 
 **Cleanup.** The scaffold's `tests/pravash.tcyr` smoke test is gone; its comment said the parity harness replaces it
 at M0 step 7.

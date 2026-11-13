@@ -7,20 +7,17 @@
 [![CI](https://github.com/MacCracken/pravash/actions/workflows/ci.yml/badge.svg)](https://github.com/MacCracken/pravash/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-pravash **2.0** is a Cyrius library: a parity port of the Rust crate **1.3.0**, which stays frozen in
-[`rust-old/`](rust-old/) as the reference implementation. It is checked against Rust value by value:
-- **68,007 golden rows** in 18 modules replay Rust's own results on x86_64 Linux, x86_64 Windows (PE) and aarch64,
-  with the same output bits on all three. 67,276 match Rust within their tolerance class. 728 are accepted under an
-  ADR instead: 597 that the f64 neighbour keys change, checked against an independent f64 transcription (ADR 0002
-  #2), and 131 where glibc misrounds and the port gives the correctly rounded value
-  ([ADR 0004](docs/adr/0004-correct-rounding-is-the-accuracy-target.md)). 3 wait on bayan's JSON policies. Every
-  grid and SPH solver step row also runs at 2, 3, 4 and 8 threads and gives the one-thread bits.
-- **The Rust tests:** all 405 are ported to a test of the same name or accounted for in the
-  [Rust-test ledger](docs/development/rust-test-ledger.md): 391 ported, and the 14 tests of the oracle hooks not
-  applicable.
-- **The surface:** every public Rust item has its Cyrius counterpart, and every public Cyrius name maps back to a
-  Rust item or a recorded reason (`scripts/surface_parity.py`), and each of Rust's 157 derives (the serde pair,
-  Default, Clone, PartialEq, Debug) has its counterpart.
+pravash **2.0** is a Cyrius library: the functionality of the Rust crate **1.3.0**, ported, with correct rounding as
+the accuracy bar ([ADR 0004](docs/adr/0004-correct-rounding-is-the-accuracy-target.md)). Rust on glibc misrounds
+some transcendentals; 2.0 gives the correctly rounded value, and the same bits on every target. Nothing builds,
+tests or releases from Rust: the 1.3.0 source is kept in [`rust-old/`](rust-old/) for reference only.
+- **68,007 golden rows** in 18 modules, the test corpus taken from 1.3.0's behaviour and corrected wherever glibc
+  misrounds, replay with the same output bits on x86_64 Linux, x86_64 Windows (PE) and aarch64. Every grid and SPH
+  solver step also gives the same bits at 2, 3, 4 and 8 threads. Python recomputes every row independently
+  (`scripts/oracle/validate.py`).
+- **The functionality:** every public item of 1.3.0 and each of its 157 derives (the serde pair, Default, Clone,
+  PartialEq, Debug) has its counterpart, and all 405 of its tests are ported or accounted for
+  ([the Rust-test ledger](docs/development/rust-test-ledger.md)).
 
 2.0 changes the API in deliberate places ([ADR 0002](docs/adr/0002-port-api-divergences.md)). Moving from the
 Rust crate: [the migration guide](docs/guides/migration-2.0.md). The [port plan](docs/development/pravash-port-plan.md)
@@ -153,17 +150,11 @@ cyrius audit                                # fmt, lint, docs, tests and benches
 cyrius distlib                              # dist/pravash.cyr
 ```
 
-The oracle and the checks against it (`cargo` from the repo root runs the oracle's rustc 1.99.1, pinned by
-`rust-toolchain.toml`):
-
-```sh
-cargo test --manifest-path rust-old/Cargo.toml --all-features                          # the Rust 1.3.0 oracle
-cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check      # the corpus is current
-python3 -I -B scripts/oracle/validate.py .            # the corpus, recomputed without Rust
-python3 -I -B scripts/surface_parity.py .             # every Rust item has its Cyrius name, and back
-python3 -I -B scripts/rust_test_ledger.py . --check   # every Rust test is accounted for
-python3 -I -B scripts/doc_examples.py .               # the docs' code blocks and the examples compile and run
-```
+CI and the release run only the commands above, `scripts/upstream_ledger.py --check` and
+`python3 -I -B scripts/doc_examples.py .` (the docs' code blocks and the examples compile and run). The porting tools
+run locally, never in CI: the corpus generator and the Rust probes (on `rust-old/`, with `cargo +1.99.1`, the
+toolchain the corpus was recorded on), `scripts/oracle/validate.py` (the corpus recomputed in Python),
+`scripts/surface_parity.py` and `scripts/rust_test_ledger.py` (1.3.0's items and tests against the port's).
 
 ## Documentation
 

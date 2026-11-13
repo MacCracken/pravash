@@ -102,8 +102,8 @@
   `{:#?}`), golden rows from the oracle, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
   a `#derive(Debug)` request filed at cyrius
 - [x] M8 part e: VERSION 2.0.0, the release gate on three targets (every suite, not only the corpus), the fuzz
-  harness (`tests/pravash.fcyr`: the 22 JSON readers and the `PRAVASH_LOG` parser, in CI), and the oracle's toolchain
-  pinned at the repo root (`rust-toolchain.toml`, rustc 1.99.1)
+  harness (`tests/pravash.fcyr`: the 22 JSON readers and the `PRAVASH_LOG` parser, in CI), and CI and the release
+  freed of Rust: no job builds, tests or reads `rust-old/`
 - [ ] The maintainer's steps: tag 2.0.0 (the release workflow checks VERSION and `cyrius.cyml` against it and
   publishes the CHANGELOG's section), the 1.3.x deprecation notice on crates.io, and the consumers' first Cyrius
   builds (kiran, joshua, impetus)

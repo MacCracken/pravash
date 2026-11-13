@@ -63,14 +63,15 @@ Changed, Fixed and Performance.
     level is in 0 … 5, and the same text gives the same levels.
   - **The run:** 13,200 documents, 1,582 of them accepted, and 40,000 strings, 21,381 of them parsed strictly. No
     invariant broke.
-- **`rust-toolchain.toml`** at the repo root pins the oracle's rustc 1.99.1 for every `cargo` command run from there
-  (the oracle, the generator, the probes); `rust-old/` stays unedited. Stable moved to 1.100.0 on 2026-11-09, and on
-  it the generator writes another `src/str_debug_data.cyr` (Unicode 18), which failed `--check` (port-parity §31).
 
 ### Changed (Cyrius)
 - **VERSION is 2.0.0.**
-- **CI** installs the toolchain `rust-toolchain.toml` names for the oracle job, where it installed `stable`, and runs
-  `cyrius fuzz`.
+- **CI and the release no longer depend on Rust or `rust-old/`.** The `rust-oracle` job, which built and tested the
+  1.3.0 crate with cargo and gated every release through `needs: [ci]`, is removed. So are the two steps that read
+  `rust-old/`'s source, surface parity and the Rust-test ledger, which stay local porting tools. CI runs the build,
+  the tests (also bounds-checked), `deps --locked`, the audit, the upstream ledger, `distlib --check`, the doc
+  examples and `cyrius fuzz`. The local tools that run Rust use `cargo +1.99.1`, the toolchain the corpus was
+  recorded on.
 - **The release gate** (22 gates) runs every suite on x86_64 ELF, x86_64 PE and aarch64, not only the corpus: 1,437
   checks on each, and the corpus's 67,276 rows ok on each with the same bits.
 - **The two trace-file tests** (`logging_trace_file`, `doc_init_profiling`) no longer assert that `chdir` succeeds.

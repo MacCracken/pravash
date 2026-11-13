@@ -6,8 +6,8 @@ workflow, coding standards, and review process.
 pravash 2.0 is a Cyrius library, the port of the Rust crate 1.3.0. The plan of record is
 [`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md), and
 [`docs/guides/getting-started.md`](docs/guides/getting-started.md) is the guide to working on it. The Rust 1.3.0 crate
-in `rust-old/` is the frozen parity oracle: don't change it. Its toolchain, rustc 1.99.1, is pinned by the root
-`rust-toolchain.toml`.
+in `rust-old/` is kept for reference: don't change it. Nothing in the build, the tests, CI or the release depends on
+it; the local porting tools run it with `cargo +1.99.1`.
 
 ## Development Setup
 

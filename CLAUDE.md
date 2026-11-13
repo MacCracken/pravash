@@ -41,10 +41,10 @@ cyrius deps                                    # resolve dependencies (vendors l
 cyrius build src/main.cyr build/pravash        # compile
 cyrius test                                    # run tests/*.tcyr (parity + reference tests)
 cyrius bench                                   # run tests/*.bcyr
-cargo test --manifest-path rust-old/Cargo.toml --all-features                     # the Rust oracle, read-only
-cargo test --manifest-path rust-old/Cargo.toml --features oracle,coupling --test oracle   # oracle hooks without parallel
-cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check        # golden corpus up to date
-cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # ... and thread-count free
+cargo +1.99.1 test --manifest-path rust-old/Cargo.toml --all-features                     # the Rust oracle, read-only
+cargo +1.99.1 test --manifest-path rust-old/Cargo.toml --features oracle,coupling --test oracle   # oracle hooks without parallel
+cargo +1.99.1 run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check        # golden corpus up to date
+cargo +1.99.1 run --release --locked --manifest-path scripts/oracle/Cargo.toml --features parallel -- --check   # ... and thread-count free
 python3 -I -B scripts/oracle/validate.py .                                               # independent check of the corpus
 python3 -I -B scripts/oracle/validate.py . --write                                       # regenerate the corrected oracle and cr tables (MPFR)
 python3 -I -B scripts/oracle/probe_tables.py .                                           # generated constants compile to the oracle's bits
@@ -52,8 +52,8 @@ python3 -I -B scripts/oracle/examples.py .                                      
 ```
 
 The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI (the
-runner's glibc differs): `--check` refuses another platform by name. The oracle's rustc (1.99.1) is pinned by the
-root `rust-toolchain.toml` for every `cargo` command run from the repo root; `rust-old/`'s own file names `stable`.
+runner's glibc differs): `--check` refuses another platform by name. Run them with `cargo +1.99.1`, the rustc the
+corpus was recorded on. CI and the release never build, test or read `rust-old/`.
 
 ## Development Process
 

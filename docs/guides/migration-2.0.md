@@ -1,13 +1,14 @@
 # Moving from pravash 1.3 (Rust) to 2.0 (Cyrius)
 
-pravash 2.0 is the Cyrius port of the Rust crate 1.3.0. The Rust crate stays at 1.3.0, frozen in `rust-old/` as the
-parity oracle. This guide is for code that used the Rust crate (kiran, joshua and impetus are the intended
+pravash 2.0 is the Rust crate 1.3.0's functionality, ported to Cyrius, with correct rounding as the accuracy bar
+([ADR 0004](../adr/0004-correct-rounding-is-the-accuracy-target.md)). The Rust crate's last release is 1.3.0; its
+source is kept in `rust-old/` for reference, and nothing in 2.0 builds, tests or releases from it. This guide is for code that used the Rust crate (kiran, joshua and impetus are the intended
 consumers): what to declare, how each Rust idiom reads in Cyrius, and the deliberate changes, each with the code
 that handles it. [ADR 0002](../adr/0002-port-api-divergences.md) records every change in full, one row each.
 
-The physics doesn't change. For the same inputs, a 2.0 step computes the bits Rust 1.3.0 computes, with the
-exceptions in [What stays the same](#what-stays-the-same): the SPH neighbour keys (#7 below) and the places where
-glibc misrounds.
+The physics doesn't change. For the same inputs, a 2.0 step computes what Rust 1.3.0 computes, except where 1.3.0 is
+inaccurate: where glibc misrounds, 2.0 gives the correctly rounded value, and the SPH neighbour keys are f64 (#7
+below); see [What stays the same](#what-stays-the-same).
 
 Every `cyrius` block below compiles and runs against the shipped bundle: `python3 -I -B scripts/doc_examples.py .`
 wraps each fragment in a `main`, includes `dist/pravash.cyr`, and fails on a compile warning or a nonzero exit.
