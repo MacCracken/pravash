@@ -2808,12 +2808,160 @@ fn _par_coupling(fp, fl): i64 {
     return 0;
 }
 
+# ── mpm (M6 part c) ─────────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_mpm.rs. A model is 6 tokens (`e:ConstitutiveModel.<Variant>`, the bulk modulus,
+# the viscosity, E, ν, the friction angle), an MPM particle 11 (F row-major, the model, the reference volume).
+
+# The model whose 6 tokens start at input k into *m: 1, or 0 for a variant the port doesn't know.
+fn _par_law_in(k, m: *PvConstitutiveLaw): i64 {
+    var p = _par_in(k);
+    var n = load64(_par_in_l + k * 8);
+    var kind = 0 - 1;
+    if (_par_eq(p, n, "ConstitutiveModel.Fluid") == 1) { kind = PV_CONSTITUTIVE_MODEL_FLUID; }
+    if (_par_eq(p, n, "ConstitutiveModel.NeoHookean") == 1) { kind = PV_CONSTITUTIVE_MODEL_NEO_HOOKEAN; }
+    if (_par_eq(p, n, "ConstitutiveModel.DruckerPrager") == 1) { kind = PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER; }
+    if (kind < 0) { return 0; }
+    m.kind = kind;
+    m.bulk_modulus = _par_in(k + 1);
+    m.viscosity = _par_in(k + 2);
+    m.youngs_modulus = _par_in(k + 3);
+    m.poisson_ratio = _par_in(k + 4);
+    m.friction_angle = _par_in(k + 5);
+    return 1;
+}
+
+# Appends the model's 6 tokens.
+fn _par_law_out(m: *PvConstitutiveLaw) {
+    _par_got_e(_par_enum_text("ConstitutiveModel", constitutive_model_name(m.kind)));
+    _par_got_f(_pv_bits(m.bulk_modulus));
+    _par_got_f(_pv_bits(m.viscosity));
+    _par_got_f(_pv_bits(m.youngs_modulus));
+    _par_got_f(_pv_bits(m.poisson_ratio));
+    _par_got_f(_pv_bits(m.friction_angle));
+    return 0;
+}
+
+# The MPM particle whose 11 tokens start at input k into *mp: 1, or 0 for an unknown model.
+fn _par_mp_in(k, mp: *PvMpmParticle): i64 {
+    var a: f64 = _par_in(k);
+    var b: f64 = _par_in(k + 1);
+    var c: f64 = _par_in(k + 2);
+    var d: f64 = _par_in(k + 3);
+    mp.deformation_grad = PvMat2_new(a, b, c, d);
+    if (_par_law_in(k + 4, _pv_mpm_model(mp)) == 0) { return 0; }
+    mp.volume_0 = _par_in(k + 10);
+    return 1;
+}
+
+# Appends the MPM particle's 11 tokens.
+fn _par_mp_out(mp: *PvMpmParticle) {
+    _par_got_f(_pv_bits(mp.deformation_grad.m00));
+    _par_got_f(_pv_bits(mp.deformation_grad.m01));
+    _par_got_f(_pv_bits(mp.deformation_grad.m10));
+    _par_got_f(_pv_bits(mp.deformation_grad.m11));
+    _par_law_out(_pv_mpm_model(mp));
+    _par_got_f(_pv_bits(mp.volume_0));
+    return 0;
+}
+
+# The mpm rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
+fn _par_mpm(fp, fl): i64 {
+    var law: PvConstitutiveLaw;
+    var mp: PvMpmParticle;
+    if (_par_eq(fp, fl, "ConstitutiveModel::from_json") == 1) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var jt, jv = constitutive_model_from_json(doc, strlen(doc), &law);
+        if (is_err_result(jt) == 1) { _par_got_err(jv); return 1; }
+        _par_law_out(&law);
+        var sb = str_builder_new();
+        if (constitutive_model_to_json(&law, sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var l2: PvConstitutiveLaw;
+        var t2, v2 = constitutive_model_from_json(d, n, &l2);
+        if (is_err_result(t2) == 1 || memeq(&law, &l2, sizeof(PvConstitutiveLaw)) != 1) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ConstitutiveModel::validate") == 1) {
+        if (_par_law_in(0, &law) == 0) { return 0 - 1; }
+        var vt, vv = constitutive_model_validate(&law);
+        if (is_err_result(vt) == 1) { _par_got_err(vv); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MpmParticle::new") == 1) {
+        if (_par_law_in(0, &law) == 0) { return 0 - 1; }
+        var np: PvMpmParticle = PvMpmParticle_new(law, _par_in(6));
+        _par_mp_out(&np);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MpmParticle::det_f") == 1 || _par_eq(fp, fl, "MpmParticle::stress") == 1) {
+        if (_par_mp_in(0, &mp) == 0) { return 0 - 1; }
+        if (_par_eq(fp, fl, "MpmParticle::det_f") == 1) {
+            var det: f64 = mp.det_f();
+            _par_got_f(_pv_bits(det));
+            return 1;
+        }
+        var st: PvMat2 = mp.stress();
+        _par_got_f(_pv_bits(st.m00));
+        _par_got_f(_pv_bits(st.m01));
+        _par_got_f(_pv_bits(st.m10));
+        _par_got_f(_pv_bits(st.m11));
+        return 1;
+    }
+    var s: PvMpmSolver;
+    if (_par_eq(fp, fl, "MpmSolver::new") == 1) {
+        var nt, nv = PvMpmSolver_new(_par_in(0), _par_in(1), _par_in(2), &s);
+        if (is_err_result(nt) == 1) { _par_got_err(nv); return 1; }
+        _par_got_i(s.nx);
+        _par_got_i(s.ny);
+        _par_got_f(_pv_bits(s.dx));
+        for (var k = 0; k < 5; k = k + 1) {
+            var c: *PvColumn = _pv_mpm_col(&s, k);
+            _par_got_i(c.len);
+        }
+        PvMpmSolver_drop(&s);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MpmSolver::step") == 0) { return 0; }
+    var st2, sv2 = PvMpmSolver_new(_par_in(0), _par_in(1), _par_in(2), &s);
+    if (is_err_result(st2) == 1) { return 0 - 1; }
+    var g: PvVec3 = PvVec3_new(_par_in(3), _par_in(4), _par_in(5));
+    var dt: f64 = _par_in(6);
+    var steps = _par_in(7);
+    var pb, pn, pk = _par_particles_in(8);
+    var nm = _par_in(pk);
+    var mb = fl_alloc(nm * sizeof(PvMpmParticle) + 8);
+    var ms: *PvMpmParticle = _pv_as_mpm_particles(mb);
+    for (var j = 0; j < nm; j = j + 1) {
+        if (_par_mp_in(pk + 1 + j * 11, ms + j) == 0) { return 0 - 1; }
+    }
+    var failed = 0;
+    for (var i = 0; failed == 0 && i < steps; i = i + 1) {
+        var tt, tv = s.step(_pv_as_particles(pb), pn, ms, nm, g, dt);
+        if (is_err_result(tt) == 1) {
+            _par_got_err(tv);
+            failed = 1;
+        }
+    }
+    if (failed == 0) {
+        _par_ps_out(pb, pn);
+        _par_got_i(nm);
+        for (var q = 0; q < nm; q = q + 1) { _par_mp_out(ms + q); }
+        for (var c2 = 0; c2 < 5; c2 = c2 + 1) { _par_col_out(_pv_mpm_col(&s, c2)); }
+    }
+    fl_free(pb);
+    fl_free(mb);
+    PvMpmSolver_drop(&s);
+    return 1;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
     if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
     if (_par_eq(mp, ml, "coupling") == 1) { return _par_coupling(fp, fl); }
+    if (_par_eq(mp, ml, "mpm") == 1) { return _par_mpm(fp, fl); }
     if (_par_eq(mp, ml, "vortex") == 1) { return _par_vortex(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
@@ -2991,6 +3139,11 @@ fn _par_c_bound(fp, fl): i64 {
     # every particle and grid value of every row is the oracle's bit for bit.
     if (_par_eq(fp, fl, "FlipSolver::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "FlipSolver::scenario") == 1) { return 0; }
+    # M6 part c: MPM's stress and step are Rust's arithmetic in order on the correctly rounded ln, exp, sin, cos, hypot
+    # and atan2, so each row equals the corrected oracle bit for bit (the oracle's own where glibc rounded every call
+    # correctly).
+    if (_par_eq(fp, fl, "MpmParticle::stress") == 1) { return 0; }
+    if (_par_eq(fp, fl, "MpmSolver::step") == 1) { return 0; }
     return 0 - 1;
 }
 

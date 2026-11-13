@@ -1881,6 +1881,75 @@ fn bench_coupling_b() {
     return 0;
 }
 
+# ── mpm (M6 part c) ──
+# mpm_c/*: against scripts/probes/rust/src/bin/bench_mpm_c.rs (bodies in its header): one step of the plan's three
+# scenes on a 16 × 16 solver (dx 0.05), the particles and MPM states copied in before each step.
+
+# One `mpm_c` row: 100 steps of the block [x0, x1] × [y0, y1] at spacing 0.025 and density 1000, all of `law`.
+fn _bench_mpm(name, x0: f64, x1: f64, y0: f64, y1: f64, law: PvConstitutiveLaw) {
+    var sp: f64 = 0.025;
+    var v0: f64 = sp * sp;
+    var n = 0;
+    var ps: *PvFluidParticle = _pv_as_particles(fl_alloc(200 * sizeof(PvFluidParticle)));
+    var ms: *PvMpmParticle = _pv_as_mpm_particles(fl_alloc(200 * sizeof(PvMpmParticle)));
+    var tol: f64 = 0.000000000001;
+    var jy: f64 = 0.0;
+    var yy: f64 = y0;
+    while (yy <= y1 + tol) {
+        var ix: f64 = 0.0;
+        var xx: f64 = x0;
+        while (xx <= x1 + tol) {
+            var m: f64 = 1000.0 * v0;
+            var q: PvFluidParticle = PvFluidParticle_new_2d(xx, yy, m);
+            var d: *PvFluidParticle = ps + n;
+            *d = q;
+            var mq: PvMpmParticle = PvMpmParticle_new(law, v0);
+            var e: *PvMpmParticle = ms + n;
+            *e = mq;
+            n = n + 1;
+            ix = ix + 1.0;
+            xx = x0 + ix * sp;
+        }
+        jy = jy + 1.0;
+        yy = y0 + jy * sp;
+    }
+    var wp: *PvFluidParticle = _pv_as_particles(fl_alloc(n * sizeof(PvFluidParticle)));
+    var wm: *PvMpmParticle = _pv_as_mpm_particles(fl_alloc(n * sizeof(PvMpmParticle)));
+    var s: PvMpmSolver;
+    var nt, nv = PvMpmSolver_new(16, 16, 0.05, &s);
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var b = bench_new(_bench_name_n(name, n, ""));
+    bench_batch_start(b);
+    for (var k = 0; k < 100; k = k + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var a: *PvFluidParticle = wp + c;
+            var a0: *PvFluidParticle = ps + c;
+            *a = *a0;
+            var w: *PvMpmParticle = wm + c;
+            var w0: *PvMpmParticle = ms + c;
+            *w = *w0;
+        }
+        var t, v = s.step(wp, n, wm, n, g, 0.001);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, 100);
+    bench_report(b);
+    PvMpmSolver_drop(&s);
+    fl_free(wm);
+    fl_free(wp);
+    fl_free(ms);
+    fl_free(ps);
+    return 0;
+}
+
+# The MPM rows: the plan's three scenes.
+fn bench_mpm_c() {
+    _bench_mpm("mpm_c/elastic_", 0.3, 0.5, 0.45, 0.65, PvConstitutiveLaw_neo_hookean(10000.0, 0.3));
+    _bench_mpm("mpm_c/sand_", 0.35, 0.45, 0.025, 0.4, PvConstitutiveLaw_drucker_prager(10000.0, 0.3, 30.0));
+    _bench_mpm("mpm_c/fluid_", 0.05, 0.25, 0.025, 0.4, PvConstitutiveLaw_fluid(1000.0, 0.0));
+    return 0;
+}
+
 # Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
@@ -1911,6 +1980,7 @@ fn main(): i64 {
     bench_sph_m5e();
     bench_coupling_a();
     bench_coupling_b();
+    bench_mpm_c();
     return 0;
 }
 

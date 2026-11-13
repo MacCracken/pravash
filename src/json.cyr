@@ -3,9 +3,9 @@
 #
 # Types: `FluidMaterial`, `FluidParticle`, `FluidConfig`, `ParticleSoa` (src/common.cyr), `FlowRegime` and the unit
 # struct `DragCoefficient` (src/buoyancy.cyr); later milestones add their own (`ShallowWater`, the grid types, and
-# M6's `BodyShape` and `RigidBody`, each in its own section below). The text is not serde_json's byte for byte (D4):
-# floats are bayan's Grisu2 digits, which round-trip exactly; NaN and ±∞ are written `null`, as serde_json writes
-# them, and like serde_json's such a document doesn't read back.
+# M6's `BodyShape`, `RigidBody` and `ConstitutiveModel`, each in its own section below). The text is not serde_json's
+# byte for byte (D4): floats are bayan's Grisu2 digits, which round-trip exactly; NaN and ±∞ are written `null`, as
+# serde_json writes them, and like serde_json's such a document doesn't read back.
 #
 # Writers: `x.to_json(sb)` appends to a `str_builder` through its non-aborting `_a` calls (the default allocator) and
 # returns 0, or -1 when a grow failed (ADR 0002 #8: nothing aborts). Fields go in Rust's declaration order; a
@@ -1088,5 +1088,87 @@ fn PvRigidBody_from_json(buf, len, out: *PvRigidBody): Result {
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
     var src: *PvRigidBody = _pv_as_bodies(&w);
     *out = *src;
+    return Ok(0);
+}
+
+# ── ConstitutiveModel (M6 part c) ─────────────────────────────────────────────────────
+
+# Appends the model as serde_json writes a `ConstitutiveModel`, externally tagged: `{"Fluid":{"bulk_modulus":K,
+# "viscosity":μ}}`, `{"NeoHookean":{"youngs_modulus":E,"poisson_ratio":ν}}` or `{"DruckerPrager":{…,
+# "friction_angle":φ}}`. 0, or -1 when the builder can't grow or the kind is outside the enum.
+#must_use
+fn constitutive_model_to_json(m: *PvConstitutiveLaw, sb): i64 {
+    if (m.kind == PV_CONSTITUTIVE_MODEL_FLUID) {
+        var rc = _pv_jw(sb, "{\"Fluid\":{");
+        rc = rc | _pv_jw_key(sb, "bulk_modulus", 1);
+        rc = rc | _pv_jw_f64(sb, m.bulk_modulus);
+        rc = rc | _pv_jw_key(sb, "viscosity", 0);
+        rc = rc | _pv_jw_f64(sb, m.viscosity);
+        rc = rc | _pv_jw(sb, "}}");
+        return rc;
+    }
+    if (m.kind != PV_CONSTITUTIVE_MODEL_NEO_HOOKEAN && m.kind != PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER) {
+        return 0 - 1;
+    }
+    var re = 0;
+    if (m.kind == PV_CONSTITUTIVE_MODEL_NEO_HOOKEAN) {
+        re = _pv_jw(sb, "{\"NeoHookean\":{");
+    } else {
+        re = _pv_jw(sb, "{\"DruckerPrager\":{");
+    }
+    re = re | _pv_jw_key(sb, "youngs_modulus", 1);
+    re = re | _pv_jw_f64(sb, m.youngs_modulus);
+    re = re | _pv_jw_key(sb, "poisson_ratio", 0);
+    re = re | _pv_jw_f64(sb, m.poisson_ratio);
+    if (m.kind == PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER) {
+        re = re | _pv_jw_key(sb, "friction_angle", 0);
+        re = re | _pv_jw_f64(sb, m.friction_angle);
+    }
+    re = re | _pv_jw(sb, "}}");
+    return re;
+}
+
+# Reads a `ConstitutiveModel` document into *out: the one-key object `{"Variant": fields}`, the fields as a struct
+# variant's (an object by name, unknown names ignored, or an array of exactly its fields). Ok(0), or
+# Err(PV_ERR_DESERIALIZE) with *out untouched. (No validation: serde fills the fields; `constitutive_model_validate`
+# checks them.)
+#must_use
+fn constitutive_model_from_json(buf, len, out: *PvConstitutiveLaw): Result {
+    var v = _pv_jr_parse(buf, len);
+    if (v == 0) { return Err(PV_ERR_DESERIALIZE); }
+    if (bayan_json_v_tag(v) != JTAG_OBJ || bayan_json_v_obj_len(v) != 1) { return Err(PV_ERR_DESERIALIZE); }
+    var key = bayan_json_v_obj_key(v, 0);
+    var body = bayan_json_v_obj_val(v, 0);
+    var w[24];
+    if (str_eq_cstr(key, "Fluid") == 1) {
+        var ff = _pv_jr_form(body, 2);
+        if (ff == 0) { return Err(PV_ERR_DESERIALIZE); }
+        var ok = _pv_jr_f64(_pv_jr_at(body, ff, 0, "bulk_modulus"), &w);
+        ok = ok & _pv_jr_f64(_pv_jr_at(body, ff, 1, "viscosity"), &w + 8);
+        if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+        var k: f64 = load64(&w);
+        var mu: f64 = load64(&w + 8);
+        var fl: PvConstitutiveLaw = PvConstitutiveLaw_fluid(k, mu);
+        *out = fl;
+        return Ok(0);
+    }
+    var dp = str_eq_cstr(key, "DruckerPrager");
+    if (str_eq_cstr(key, "NeoHookean") == 0 && dp == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var fe = _pv_jr_form(body, 2 + dp);
+    if (fe == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var oe = _pv_jr_f64(_pv_jr_at(body, fe, 0, "youngs_modulus"), &w);
+    oe = oe & _pv_jr_f64(_pv_jr_at(body, fe, 1, "poisson_ratio"), &w + 8);
+    if (dp == 1) { oe = oe & _pv_jr_f64(_pv_jr_at(body, fe, 2, "friction_angle"), &w + 16); }
+    if (oe == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var e: f64 = load64(&w);
+    var nu: f64 = load64(&w + 8);
+    if (dp == 1) {
+        var phi: f64 = load64(&w + 16);
+        var d: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(e, nu, phi);
+        *out = d;
+        return Ok(0);
+    }
+    var nh: PvConstitutiveLaw = PvConstitutiveLaw_neo_hookean(e, nu);
+    *out = nh;
     return Ok(0);
 }

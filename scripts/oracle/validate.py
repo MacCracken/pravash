@@ -4905,6 +4905,282 @@ def check_coupling(rows):
     return counts
 
 
+# ── mpm (M6 part c) ────────────────────────────────────────────────────────────────────────
+# rust-old/src/mpm.rs transcribed, in Rust's order, on m_mpm.rs's token layouts: a model (kind, K, μ, E, ν, φ), an MPM
+# particle [F(4), model(6), V₀]. P supplies the transcendentals: glibc's for the record, MPFR's for mpm.cr.tsv. Each
+# step scene's trajectory is cached across its frames, per P.
+MP_GLIBC = dict(GLIBC, hypot=_libm.hypot, atan2=_libm.atan2)
+MPM_CACHE = {}
+MP_RADS = math.pi / 180.0
+
+
+def mp_logged(log):
+    """MPFR's correctly rounded primitives for MPM, each call glibc rounds otherwise recorded into `log`."""
+    p = dict(mpfr_logged(log))
+
+    def binary(name):
+        def f(a, b):
+            want = MPFR.cr2(name, a, b)
+            got = MP_GLIBC[name](a, b)
+            if not same(got, want):
+                log.append(f"{name}(f:{bits(a):016x}, f:{bits(b):016x}) glibc f:{bits(got):016x} "
+                           f"correctly rounded f:{bits(want):016x}")
+            return want
+        return f
+    p["hypot"] = binary("hypot")
+    p["atan2"] = binary("atan2")
+    return p
+
+
+def mp_validate(m):
+    kind, k, mu, e, nu, phi = m
+    if kind == "e:ConstitutiveModel.Fluid":
+        if k <= 0.0 or not fin(k) or mu < 0.0 or not fin(mu):
+            return "E:InvalidParameter"
+        return None
+    if e <= 0.0 or not fin(e) or nu <= -1.0 or nu >= 0.5 or not fin(nu):
+        return "E:InvalidParameter"
+    if kind == "e:ConstitutiveModel.DruckerPrager" and not (0.0 <= phi < 90.0):
+        return "E:InvalidParameter"
+    return None
+
+
+def mp_lame(e, nu):
+    return fdiv(e, 2.0 * (1.0 + nu)), fdiv(e * nu, (1.0 + nu) * (1.0 - 2.0 * nu))
+
+
+def mp_svd2(a, P):
+    a00, a01, a10, a11 = a
+    e, f, g, h = 0.5 * (a00 + a11), 0.5 * (a00 - a11), 0.5 * (a10 + a01), 0.5 * (a10 - a01)
+    q, r = P["hypot"](e, h), P["hypot"](f, g)
+    a1, a2 = P["atan2"](g, f), P["atan2"](h, e)
+    theta, phi = 0.5 * (a2 - a1), 0.5 * (a2 + a1)
+    return (P["cos"](phi), P["sin"](phi)), (q + r, q - r), (P["cos"](theta), P["sin"](theta))
+
+
+def mp_compose2(u, s, vt):
+    (cu, su), (cv, sv) = u, vt
+    m00, m01, m10, m11 = cu * s[0], (-su) * s[1], su * s[0], cu * s[1]
+    return [m00 * cv + m01 * sv, (-m00) * sv + m01 * cv, m10 * cv + m11 * sv, (-m10) * sv + m11 * cv]
+
+
+def mp_dp_project(f, e, nu, phi_deg, P):
+    mu, lam = mp_lame(e, nu)
+    u, s, vt = mp_svd2(f, P)
+    e0, e1 = P["log"](r_max(s[0], 1e-6)), P["log"](r_max(s[1], 1e-6))
+    tr = e0 + e1
+    if tr > 0.0:
+        return mp_compose2(u, (1.0, 1.0), vt)
+    dev0, dev1 = e0 - 0.5 * tr, e1 - 0.5 * tr
+    dev_norm = P["hypot"](dev0, dev1)
+    sin_phi = P["sin"](phi_deg * MP_RADS)
+    alpha = fdiv(math.sqrt(2.0 / 3.0) * 2.0 * sin_phi, 3.0 - sin_phi)
+    delta_gamma = dev_norm + fdiv(2.0 * lam + 2.0 * mu, 2.0 * mu) * tr * alpha
+    if delta_gamma <= 0.0 or dev_norm <= 0.0:
+        return list(f)
+    scale = fdiv(delta_gamma, dev_norm)
+    return mp_compose2(u, (P["exp"](e0 - scale * dev0), P["exp"](e1 - scale * dev1)), vt)
+
+
+def mp_stress(mp, P):
+    f00, f01, f10, f11 = mp[0:4]
+    kind, k, _, e, nu, _ = mp[4:10]
+    j = r_max(f00 * f11 - f01 * f10, 1e-10)
+    if kind == "e:ConstitutiveModel.Fluid":
+        s = k * (j - 1.0)
+        return [s, 0.0, 0.0, s]
+    mu, lam = mp_lame(e, nu)
+    if kind == "e:ConstitutiveModel.NeoHookean":
+        ln_j = P["log"](j)
+        inv_j = fdiv(1.0, j)
+        fft00, fft01, fft11 = f00 * f00 + f01 * f01, f00 * f10 + f01 * f11, f10 * f10 + f11 * f11
+        return [mu * inv_j * (fft00 - 1.0) + lam * ln_j * inv_j, mu * inv_j * fft01, mu * inv_j * fft01,
+                mu * inv_j * (fft11 - 1.0) + lam * ln_j * inv_j]
+    (cu, su), sg, _ = mp_svd2(mp[0:4], P)
+    e0, e1 = P["log"](r_max(sg[0], 1e-6)), P["log"](r_max(sg[1], 1e-6))
+    tr = e0 + e1
+    t0 = fdiv(2.0 * mu * e0 + lam * tr, j)
+    t1 = fdiv(2.0 * mu * e1 + lam * tr, j)
+    off = (t0 - t1) * cu * su
+    return [t0 * cu * cu + t1 * su * su, off, off, t0 * su * su + t1 * cu * cu]
+
+
+def mp_step(s, ps, ms, g, dt, P):
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    if len(ps) != len(ms):
+        return "E:InvalidParameter"
+    for mp in ms:
+        e = mp_validate(mp[4:10])
+        if e:
+            return e
+        if not fin(mp[10]) or mp[10] <= 0.0:
+            return "E:InvalidParameter"
+    nx, ny, dx = s["nx"], s["ny"], s["dx"]
+    inv_dx = fdiv(1.0, dx)
+    x_max, y_max = float(nx - 1) * dx, float(ny - 1) * dx
+    n = nx * ny
+    mass, vx, vy, fx, fy = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
+    for p, mp in zip(ps, ms):
+        x0, sx = fl_axis(p[0] * inv_dx, nx)
+        y0, sy = fl_axis(p[1] * inv_dx, ny)
+        st = mp_stress(mp, P)
+        vol = mp[10] * abs(mp[0] * mp[3] - mp[1] * mp[2])
+        ws = ((1.0 - sx) * (1.0 - sy), sx * (1.0 - sy), (1.0 - sx) * sy, sx * sy)
+        for k, (ix, iy) in enumerate(((x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1))):
+            w = ws[k]
+            idx = iy * nx + ix
+            mass[idx] = mass[idx] + w * p[11]
+            vx[idx] = vx[idx] + w * p[11] * p[3]
+            vy[idx] = vy[idx] + w * p[11] * p[4]
+            wy = (1.0 - sy) if iy == y0 else sy
+            wx = (1.0 - sx) if ix == x0 else sx
+            gw_x = (-1.0 if ix == x0 else 1.0) * wy * inv_dx
+            gw_y = (-1.0 if iy == y0 else 1.0) * wx * inv_dx
+            fx[idx] = fx[idx] - vol * (st[0] * gw_x + st[1] * gw_y)
+            fy[idx] = fy[idx] - vol * (st[2] * gw_x + st[3] * gw_y)
+    for gy in range(ny):
+        for gx in range(nx):
+            i = gy * nx + gx
+            if mass[i] <= 1e-20:
+                continue
+            inv_m = fdiv(1.0, mass[i])
+            a = vx[i] * inv_m + (g[0] + fx[i] * inv_m) * dt
+            b = vy[i] * inv_m + (g[1] + fy[i] * inv_m) * dt
+            if (gx == 0 and a < 0.0) or (gx == nx - 1 and a > 0.0):
+                a = 0.0
+            if (gy == 0 and b < 0.0) or (gy == ny - 1 and b > 0.0):
+                b = 0.0
+            vx[i], vy[i] = a, b
+    for p, mp in zip(ps, ms):
+        x0, sx = fl_axis(p[0] * inv_dx, nx)
+        y0, sy = fl_axis(p[1] * inv_dx, ny)
+        ws = ((1.0 - sx) * (1.0 - sy), sx * (1.0 - sy), (1.0 - sx) * sy, sx * sy)
+        idxs = (y0 * nx + x0, y0 * nx + x0 + 1, (y0 + 1) * nx + x0, (y0 + 1) * nx + x0 + 1)
+        gxs = [g_ * inv_dx for g_ in (-(1.0 - sy), 1.0 - sy, -sy, sy)]
+        gys = [g_ * inv_dx for g_ in (-(1.0 - sx), -sx, 1.0 - sx, sx)]
+        nvx = nvy = dxx = dxy = dyx = dyy = 0.0
+        for k in range(4):
+            a, b = vx[idxs[k]], vy[idxs[k]]
+            nvx = nvx + ws[k] * a
+            nvy = nvy + ws[k] * b
+            dxx = dxx + a * gxs[k]
+            dxy = dxy + a * gys[k]
+            dyx = dyx + b * gxs[k]
+            dyy = dyy + b * gys[k]
+        f00, f01, f10, f11 = mp[0:4]
+        nf = [(1.0 + dt * dxx) * f00 + dt * dxy * f10, (1.0 + dt * dxx) * f01 + dt * dxy * f11,
+              dt * dyx * f00 + (1.0 + dt * dyy) * f10, dt * dyx * f01 + (1.0 + dt * dyy) * f11]
+        if mp[4] == "e:ConstitutiveModel.DruckerPrager":
+            nf = mp_dp_project(nf, mp[7], mp[8], mp[9], P)
+        det = nf[0] * nf[3] - nf[1] * nf[2]
+        mp[0:4] = nf if (1e-4 <= det <= 1e4 and fin(det)) else [1.0, 0.0, 0.0, 1.0]
+        p[3], p[4] = nvx, nvy
+        p[0], p[1], p[2] = p[0] + p[3] * dt, p[1] + p[4] * dt, p[2] + p[5] * dt
+        if p[0] < 0.0:
+            p[0], p[3] = 0.0, r_max(p[3], 0.0)
+        elif p[0] > x_max:
+            p[0], p[3] = x_max, r_min(p[3], 0.0)
+        if p[1] < 0.0:
+            p[1], p[4] = 0.0, r_max(p[4], 0.0)
+        elif p[1] > y_max:
+            p[1], p[4] = y_max, r_min(p[4], 0.0)
+    s.update(mass=mass, vx=vx, vy=vy, fx=fx, fy=fy)
+    return None
+
+
+def mp_parts(x, k):
+    ps, k = cp_parts(x, k)
+    m = x[k]
+    return ps, [list(x[k + 1 + 11 * j:k + 12 + 11 * j]) for j in range(m)]
+
+
+def mpm_want(func, x, P, pname="glibc"):
+    """An mpm row's recomputed outputs (P: the transcendentals), or None for a function without a check."""
+    if func == "ConstitutiveModel::validate":
+        e = mp_validate(x[0:6])
+        return [e] if e else []
+    if func == "MpmParticle::new":
+        return [1.0, 0.0, 0.0, 1.0] + list(x[0:6]) + [x[6]]
+    if func == "MpmParticle::det_f":
+        return [x[0] * x[3] - x[1] * x[2]]
+    if func == "MpmParticle::stress":
+        return mp_stress(x[0:11], P)
+    if func == "MpmSolver::new":
+        nxu, nyu = x[0] % 2 ** 64, x[1] % 2 ** 64
+        if nxu < 4 or nyu < 4:
+            return ["E:InvalidGridResolution"]
+        if not (x[2] > 0.0) or not fin(x[2]):
+            return ["E:InvalidParameter"]
+        if nxu * nyu >= 2 ** 64:
+            return ["E:InvalidGridResolution"]
+        return [nxu, nyu, x[2]] + [nxu * nyu] * 5
+    if func == "MpmSolver::step":
+        steps = x[7]
+        key = (pname,) + tuple(bits(v) if isinstance(v, float) else v for v in x[0:7] + x[8:])
+        start, st = 0, None
+        for done, cached in MPM_CACHE.get(key, []):
+            if start <= done <= steps:
+                start, st = done, cached
+        if st is None:
+            s = {"nx": x[0], "ny": x[1], "dx": x[2]}
+            ps, ms = mp_parts(x, 8)
+            e = None
+        else:
+            s, ps, ms, e = dict(st[0]), [list(p) for p in st[1]], [list(m) for m in st[2]], st[3]
+        for _ in range(start, steps):
+            if e:
+                break
+            e = mp_step(s, ps, ms, x[3:6], x[6], P)
+        MPM_CACHE.setdefault(key, []).append((steps, (dict(s), [list(p) for p in ps], [list(m) for m in ms], e)))
+        if e:
+            return [e]
+        out = [len(ps)] + [v for p in ps for v in p] + [len(ms)] + [v for m in ms for v in m]
+        for f_ in ("mass", "vx", "vy", "fx", "fy"):
+            col = s.get(f_, [0.0] * (x[0] * x[1]))
+            out += [("v", len(col))] + col
+        return out
+    return None
+
+
+def mpm_json(doc):
+    try:
+        v = j_load(doc)
+        if not (isinstance(v, tuple) and v[0] == "obj" and len(v[1]) == 1):
+            raise JsonRefused("not a one-key object")
+        key, val = v[1][0]
+        if key == "Fluid":
+            k, mu = (j_f64(e) for e in j_struct(val, ["bulk_modulus", "viscosity"]))
+            return ["e:ConstitutiveModel.Fluid", k, mu, 0.0, 0.0, 0.0]
+        if key == "NeoHookean":
+            e, nu = (j_f64(e) for e in j_struct(val, ["youngs_modulus", "poisson_ratio"]))
+            return ["e:ConstitutiveModel.NeoHookean", 0.0, 0.0, e, nu, 0.0]
+        if key == "DruckerPrager":
+            e, nu, phi = (j_f64(e) for e in j_struct(val, ["youngs_modulus", "poisson_ratio", "friction_angle"]))
+            return ["e:ConstitutiveModel.DruckerPrager", 0.0, 0.0, e, nu, phi]
+        raise JsonRefused("no variant")
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def check_mpm(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        got = [tok_val(t) for t in outs]
+        if func == "ConstitutiveModel::from_json":
+            want = mpm_json(unpct(ins[0][2:]))
+        else:
+            want = mpm_want(func, [tok_val(t) for t in ins], MP_GLIBC)
+        if want is None:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    MPM_CACHE.clear()
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -4977,6 +5253,17 @@ def corrections(module, rows):
                 continue
             seen = list(dict.fromkeys(log))
             out.append((fn, " ".join(ins), tokens_text(want), "oracle (state); " + "; ".join(seen)))
+            continue
+        if module == "mpm" and fn in ("MpmParticle::stress", "MpmSolver::step"):
+            x = [tok_val(t) for t in ins]
+            want = mpm_want(fn, x, mp_logged(log), "mpfr")
+            got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            seen = list(dict.fromkeys(log))
+            more = f"; … and {len(seen) - 3} more" if len(seen) > 3 else ""
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle " + ("(state)" if fn == "MpmSolver::step" else
+                        " ".join(outs)) + "; " + "; ".join(seen[:3]) + more))
             continue
         if module in ("vortex", "bridge") and fn in M1B_C:
             x = [tok_val(t) for t in ins]
@@ -5250,6 +5537,12 @@ def main():
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
             print(f"coupling: {len(rows)} rows recomputed ({summary})")
             check_d3(root, "coupling", path, rows)
+        elif path.stem == "mpm":
+            counts = check_mpm(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"mpm: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "mpm", path, rows)
+            MPM_CACHE.clear()
         elif path.stem == "json":
             counts = check_json(rows)
             summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))

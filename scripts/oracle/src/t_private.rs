@@ -73,6 +73,10 @@ fn sources() -> Vec<Source> {
             file: "coupling.rs",
             excused: &[],
         },
+        Source {
+            file: "mpm.rs",
+            excused: &[],
+        },
     ]
 }
 

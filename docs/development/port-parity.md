@@ -1919,3 +1919,104 @@ The restructure, each step bit-neutral (an A/B, pinned):
 - **`_pv_bits` inlined:** `src/mathx.cyr`, the one helper of these that `#inline` accepts.
 
 Together they make the step 1.46× (25 particles) to 1.6× (225) faster than the first version.
+
+## 26. M6 part c: MPM (2026-11-12); M6 complete
+
+**`src/mpm.cyr`** ports `mpm.rs` (ADR 0002 #25):
+- **The model.** `ConstitutiveModel` is the kind enum `PvConstitutiveModel` and the payload struct `PvConstitutiveLaw`.
+  `constitutive_model_validate` applies Rust's rules in Rust's order: K and the viscosity; E and ν through
+  `validate_elastic`; φ in [0, 90).
+- **The matrices.** The `[f64; 4]` matrices are `PvMat2`, which a call can return by value (Cyrius returns at most
+  three values).
+- **The algebra.** The private `svd2`, `compose2` and `drucker_prager_project` work on word pointers. The SVD's
+  hypot, atan2, sin and cos, the Hencky strain's ln, and the projection's exp and sin are the correctly rounded
+  primitives (ADR 0004).
+- **The step,** in Rust's order:
+  - every check first (dt, the two counts, then each particle's model and reference volume), so a refusal changes
+    nothing;
+  - P2G: w·m, (w·m)·v, and −V·(σ·∇w), with ∇w = ±(the other axis's weight)·(1/dx);
+  - the grid: nodes of mass ≤ 1e-20 keep their momentum (a NaN mass is not ≤, so its node is updated); the walls
+    zero the outward component;
+  - G2P: F ← (I + dt·L)·F, the Drucker–Prager projection, and the clamp, which resets F unless 1e-4 ≤ det F ≤ 1e4;
+  - advection (z by its own velocity), then the walls.
+
+The cell lookup is the FLIP solver's (`_pv_flip_axis`, the same expression). `MIN_SINGULAR_VALUE` is generated
+(`t_private.rs` now scans `mpm.rs`).
+
+**The rows** (`m_mpm.rs`, seed 0x60_c0_0c, a new module): 1,336.
+- **`ConstitutiveModel::validate`** (87, class A): each parameter at its edges (ν at −1, 0.5 and just inside; φ at 0,
+  −0, 90 and just inside) and as each special.
+- **`MpmParticle::stress`** (876, class C) and **`det_f`** (102, class B): eight models over 102 deformation
+  gradients, the models' specials at a stretched F.
+  - The gradients: the identity; stretches and compressions; shears; 3-4-5 and 5-12-13 rotations alone and stretched
+    (rational, so the inputs need no transcendentals); the Rust tests'; an inversion and a singular F; a det outside
+    the clamp; each special in each entry; 40 seeded.
+- **`MpmSolver::step`** (192, class S): trajectories of one fresh solver.
+  - The plan's three scenes (density 1000 at spacing 0.025), at frames 1, 2, 10, 60 and 300: an elastic block falling
+    to the floor (Neo-Hookean, E 1e4, ν 0.3), a sand column (Drucker–Prager, φ 30°) and a fluid column (K 1e3)
+    collapsing. Also a column of the three materials stacked, and sand at φ 0.
+  - The Rust tests' scenes.
+  - The refusals in order; the specials as dt, as gravity, in a particle's slots, in F's entries and as V₀.
+  - Particles past the walls, moving outward, in 3D.
+  - The clamp: determinants on both sides of each bound.
+  - 30 seeded mixed scenes.
+- **`MpmParticle::new`** (4) and **`MpmSolver::new`** (16): every refusal, class A. **`ConstitutiveModel::from_json`**
+  (59): serde_json's documents and hand-written ones, the seq form, fields missing, extra, duplicated and wrong-typed,
+  the bare `"Fluid"`.
+
+`validate.py` transcribes the module with the transcendentals as a parameter: glibc's (ctypes) to check the record,
+MPFR's to write the corrected oracle `mpm.cr.tsv`. Each step trajectory is cached across its frames, per source. It
+covers 56,347 rows with 0 failures, in about 90 s.
+
+**Result:**
+- **On the first replay** every row matched but 17: 3 stresses and 14 steps, at up to 2 ulp on the stresses and
+  diverging on the steps. validate.py's MPFR transcription changes exactly those 17. With `mpm.cr.tsv` the port
+  matches all 17 bit for bit (*accepted (ADR 4)*, port = corrected 17, = glibc's 0).
+  - Their notes name the calls glibc misrounds: hypot 18 times among the first three of each row, cos 7, sin 6,
+    log 4, atan2 3, exp 1.
+  - The long trajectories misround hundreds of calls each (one note ends "… and 652 more").
+- **The replay:** 14 modules, 0 failing | rows: 55,616 ok, 0 failed, 0 measured, 3 pending, 728 accepted (ADR 4: 131,
+  ADR 2: 597).
+- **The mutation tests found one gap.** On the first run 28 of 31 port mutations failed rows. A 32nd, μ's Lamé formula,
+  used a variable before its declaration and didn't compile. Rewritten (μ without the 2), it fails 697. Of the three
+  survivors:
+  - the clamp's lower bound at 1e-3 was a gap, in the port and the transcription alike: no row's determinant lay
+    between 1e-4 and 1e-3. A row of soft particles at det 5e-4, 9e3, 5e-5 and 1.1e4 closes it (no random numbers
+    drawn), and the mutants fail it, as a 2e4 upper bound does;
+  - dropping the projection's |dev| ≤ 0 guard is equivalent. At |dev| = 0, Δγ = ((2λ + 2μ)/(2μ))·tr·α with tr ≤ 0 and
+    α ≥ 0. Since 2λ + 2μ = E/((1 + ν)(1 − 2ν)) > 0 for a valid ν, Δγ ≤ 0 and the first test returns;
+  - skipping a node of NaN mass is equivalent at the rows' resolution: its momentum is NaN too, so its velocity is NaN
+    either way, and the harness matches any NaN.
+- **Mutations of the transcription:** 8 of 8 caught with the gap's row:
+  - the SVD's q from hypot(f, h);
+  - α without the 2;
+  - Neo-Hookean without 1/J on ln J;
+  - the low wall zeroing vx;
+  - the clamp at 1e-3;
+  - φ = 90 accepted;
+  - Drucker–Prager decoded from two fields;
+  - the corrected oracle taking glibc's hypot, which leaves `mpm.cr.tsv` stale.
+
+**Tests** (`tests/mpm.tcyr`, 42 checks):
+- all 13 Rust tests in Rust's order. The SVD, compose and projection tests call the private functions;
+- four Cyrius-only groups:
+  - the layouts (the model 48 bytes, a particle 88 with its model at byte 32, the solver 144);
+  - the refusals of `new` and of validation at every edge, and a kind outside the enum (refused, a NaN stress);
+  - the step's refusals in Rust's order with nothing changed, and the clamp resetting det 2e4 and 5e-5;
+  - 30 steps of three materials taking no heap.
+
+`cyrius lint` found a real fault in the first version of the SVD test: a `var vals[16]` (16 bytes) holding 128.
+Fixed before the gates.
+
+Surface parity: 401 items ok, 0 pending, 0 missing. With it every module of M6 is ported.
+
+**Speed** (benchmarks-rust-v-cyrius, M6 part c; Rust's criterion suite has no MPM group):
+
+| Bench (a twin) | Cyrius / Rust |
+|---|---|
+| one step of the elastic block, 81 particles | 8.7–9.1× |
+| one step of the fluid column, 144 | 6.8× |
+| one step of the sand column, 80 | 45× |
+
+The sand column's ratio is the correctly rounded primitives' cost, about 22 calls a particle (L1). The numbers are
+appended to ganita's request.

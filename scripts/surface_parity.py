@@ -32,9 +32,9 @@ from pathlib import Path
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
 MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph",
-           "coupling"]
+           "coupling", "mpm"]
 PENDING_MODULES = {
-    "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
+    "compute": "M7", "logging": "M7", "ai": "M7",
 }
 DEFERRED_MODULES = {}
 NOT_APPLICABLE_MODULES = {

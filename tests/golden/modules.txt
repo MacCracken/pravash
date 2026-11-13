@@ -7,6 +7,7 @@ coupling
 grid
 json
 math
+mpm
 phase_field
 shallow
 sph

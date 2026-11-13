@@ -1,0 +1,463 @@
+# mpm.tcyr — the ported Rust tests of rust-old/src/mpm.rs (M6 part c): all 13, in Rust's order.
+#
+# Slices are (pointer, count) (ADR 0002 #9); Rust's `[f64; 4]` is a `PvMat2`. The tests of the private `svd2`,
+# `compose2` and `drucker_prager_project` call them by their Cyrius names. Cyrius-only groups follow: the record
+# layouts, the refusals of construction, validation and the step (in Rust's order, nothing changed), the det(F)
+# clamp, a kind outside the enum, and 30 steps of three materials taking no heap.
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+# A buffer of n particles, each `FluidParticle::new_2d(0, 0, 0.01)`.
+fn particles(n): i64 {
+    var buf = fl_alloc(n * sizeof(PvFluidParticle) + 8);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var i = 0; i < n; i = i + 1) {
+        var p: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 0.01);
+        memcpy(ps + i, &p, sizeof(PvFluidParticle));
+    }
+    return buf;
+}
+
+# Particle i at (x, y) with mass m.
+fn place(buf, i, x: f64, y: f64, m: f64) {
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var p: *PvFluidParticle = ps + i;
+    p.position = PvVec3_new(x, y, 0.0);
+    p.mass = m;
+    return 0;
+}
+
+# A buffer of n MPM particles of `model` and reference volume v0.
+fn mpm_states(n, model: PvConstitutiveLaw, v0: f64): i64 {
+    var buf = fl_alloc(n * sizeof(PvMpmParticle) + 8);
+    var ms: *PvMpmParticle = _pv_as_mpm_particles(buf);
+    for (var i = 0; i < n; i = i + 1) {
+        var m: PvMpmParticle = PvMpmParticle_new(model, v0);
+        memcpy(ms + i, &m, sizeof(PvMpmParticle));
+    }
+    return buf;
+}
+
+# A new solver into *s that must succeed.
+fn mpm_new(s: *PvMpmSolver, nx, ny, dx: f64) {
+    var t, v = PvMpmSolver_new(nx, ny, dx, s);
+    assert_eq(is_ok(t), 1, "MpmSolver::new");
+    return 0;
+}
+
+# The four words of a matrix.
+fn mat_words(m: PvMat2, out) {
+    store64(out, _pv_bits(m.m00));
+    store64(out + 8, _pv_bits(m.m01));
+    store64(out + 16, _pv_bits(m.m10));
+    store64(out + 24, _pv_bits(m.m11));
+    return 0;
+}
+
+# The width max x − min x of the n particles at buf.
+fn extent(buf, n): f64 {
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var lo: f64 = PV_F64_MAX;
+    var hi: f64 = -PV_F64_MAX;
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        lo = _pv_min(lo, p.position.x);
+        hi = _pv_max(hi, p.position.x);
+    }
+    var w: f64 = hi - lo;
+    return w;
+}
+
+# The first five Rust tests: construction, the stresses at rest and stretched, the empty step, a falling particle.
+fn test_basics() {
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var s: PvMpmSolver;
+
+    test_group("test_mpm_solver_new");
+    mpm_new(&s, 16, 16, 0.1);
+    assert_eq(s.nx, 16, "16 cells");
+    PvMpmSolver_drop(&s);
+
+    test_group("test_mpm_particle_stress_fluid");
+    var mf: PvMpmParticle = PvMpmParticle_new(PvConstitutiveLaw_fluid(1000.0, 0.01), 0.001);
+    var sf: PvMat2 = mf.stress();
+    var a0: f64 = f64_abs(sf.m00);
+    assert(a0 < 0.0000000001, "no pressure at J = 1");
+
+    test_group("test_mpm_particle_stress_solid");
+    var ms: PvMpmParticle = PvMpmParticle_new(PvConstitutiveLaw_neo_hookean(1000.0, 0.3), 0.001);
+    ms.deformation_grad = PvMat2_new(1.5, 0.0, 0.0, 1.0);
+    var ss: PvMat2 = ms.stress();
+    assert(ss.m00 > 0.0, "tension in x");
+
+    test_group("test_mpm_step_empty");
+    mpm_new(&s, 8, 8, 0.1);
+    var et, ev = s.step(0, 0, 0, 0, g, 0.01);
+    assert_eq(is_ok(et), 1, "no particles: Ok");
+    PvMpmSolver_drop(&s);
+
+    test_group("test_mpm_step_falls");
+    mpm_new(&s, 16, 16, 0.1);
+    var pb = particles(1);
+    place(pb, 0, 0.8, 0.8, 0.01);
+    var mb = mpm_states(1, PvConstitutiveLaw_fluid(1000.0, 0.01), 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var st, sv = s.step(ps, 1, _pv_as_mpm_particles(mb), 1, g, 0.01);
+    assert(is_ok(st) == 1 && ps.velocity.y < 0.0, "the particle falls");
+    fl_free(pb);
+    fl_free(mb);
+    PvMpmSolver_drop(&s);
+    return 0;
+}
+
+# The audit's regressions (1.3.0), in Rust's order.
+fn test_regressions() {
+    test_group("test_fluid_stress_compressive_under_compression");
+    var mc: PvMpmParticle = PvMpmParticle_new(PvConstitutiveLaw_fluid(1000.0, 0.0), 0.001);
+    mc.deformation_grad = PvMat2_new(0.9, 0.0, 0.0, 1.0);
+    var sc: PvMat2 = mc.stress();
+    var e100: f64 = sc.m00 + 100.0;
+    var ae: f64 = f64_abs(e100);
+    assert(sc.m00 < 0.0 && sc.m11 < 0.0, "compression gives σ < 0");
+    assert(ae < 0.000000001, "σ = K·(J − 1) = −100");
+
+    test_group("test_svd2_reconstructs");
+    var vals[128];   # four row-major 2 × 2 matrices, 16 words
+    store64(&vals, _pv_bits(1.5));
+    store64(&vals + 8, _pv_bits(0.2));
+    store64(&vals + 16, _pv_bits(-0.3));
+    store64(&vals + 24, _pv_bits(0.8));
+    store64(&vals + 32, _pv_bits(1.0));
+    store64(&vals + 40, _pv_bits(0.0));
+    store64(&vals + 48, _pv_bits(0.0));
+    store64(&vals + 56, _pv_bits(1.0));
+    store64(&vals + 64, _pv_bits(0.7));
+    store64(&vals + 72, _pv_bits(-0.4));
+    store64(&vals + 80, _pv_bits(0.9));
+    store64(&vals + 88, _pv_bits(1.1));
+    store64(&vals + 96, _pv_bits(2.0));
+    store64(&vals + 104, _pv_bits(0.0));
+    store64(&vals + 112, _pv_bits(0.0));
+    store64(&vals + 120, _pv_bits(0.5));
+    var good = 1;
+    var svd[48];
+    var rec[32];
+    for (var c = 0; c < 4; c = c + 1) {
+        var a = &vals + c * 32;
+        _pv_mpm_svd2(a, &svd);
+        var s0: f64 = load64(&svd + 16);
+        var s1: f64 = load64(&svd + 24);
+        var as1: f64 = f64_abs(s1);
+        if (!(s0 >= as1)) { good = 0; }
+        _pv_mpm_compose2(&svd, s0, s1, &rec);
+        for (var k = 0; k < 4; k = k + 1) {
+            var r: f64 = load64(&rec + k * 8);
+            var w: f64 = load64(a + k * 8);
+            if (near(r, w, 0.000000000001) == 0) { good = 0; }
+        }
+    }
+    assert_eq(good, 1, "σ₀ ≥ |σ₁|, and U·Σ·Vᵀ = A within 1e-12, for the four matrices");
+
+    test_group("test_drucker_prager_rejects_bad_friction_angle");
+    var nan: f64 = PV_F64_NAN;
+    var bad = 0;
+    var m1: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(10000.0, 0.3, -1.0);
+    var m2: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(10000.0, 0.3, 90.0);
+    var m3: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(10000.0, 0.3, nan);
+    var t1, v1 = constitutive_model_validate(&m1);
+    var t2, v2 = constitutive_model_validate(&m2);
+    var t3, v3 = constitutive_model_validate(&m3);
+    assert(is_err_result(t1) == 1 && is_err_result(t2) == 1 && is_err_result(t3) == 1, "−1, 90 and NaN refused");
+
+    test_group("test_drucker_prager_projection");
+    var fe[32];
+    store64(&fe, _pv_bits(1.2));
+    store64(&fe + 8, _pv_bits(0.0));
+    store64(&fe + 16, _pv_bits(0.0));
+    store64(&fe + 24, _pv_bits(1.1));
+    var fo[32];
+    _pv_mpm_dp_project(&fe, 10000.0, 0.3, 30.0, &fo);
+    _pv_mpm_svd2(&fo, &svd);
+    var t0: f64 = load64(&svd + 16);
+    var t1s: f64 = load64(&svd + 24);
+    assert(near(t0, 1.0, 0.000000000001) == 1 && near(t1s, 1.0, 0.000000000001) == 1, "expansion: the tip");
+    var fc[32];
+    store64(&fc, _pv_bits(0.95));
+    store64(&fc + 8, _pv_bits(0.0));
+    store64(&fc + 16, _pv_bits(0.0));
+    store64(&fc + 24, _pv_bits(0.95));
+    _pv_mpm_dp_project(&fc, 10000.0, 0.3, 30.0, &fo);
+    var same = 1;
+    for (var k2 = 0; k2 < 4; k2 = k2 + 1) {
+        if (load64(&fo + k2 * 8) != load64(&fc + k2 * 8)) { same = 0; }
+    }
+    assert_eq(same, 1, "pure compression: unchanged, bit for bit");
+    var fs[32];
+    store64(&fs, _pv_bits(1.3));
+    store64(&fs + 8, _pv_bits(0.0));
+    store64(&fs + 16, _pv_bits(0.0));
+    store64(&fs + 24, _pv_bits(0.7));
+    _pv_mpm_dp_project(&fs, 10000.0, 0.3, 30.0, &fo);
+    var sv0[48];
+    _pv_mpm_svd2(&fs, &sv0);
+    _pv_mpm_svd2(&fo, &svd);
+    var a0: f64 = load64(&sv0 + 16);
+    var a1: f64 = load64(&sv0 + 24);
+    var b0: f64 = load64(&svd + 16);
+    var b1: f64 = load64(&svd + 24);
+    var la0: f64 = _pv_ln(a0);
+    var la1: f64 = _pv_ln(a1);
+    var lb0: f64 = _pv_ln(b0);
+    var lb1: f64 = _pv_ln(b1);
+    var d0: f64 = la0 - la1;
+    var d1: f64 = lb0 - lb1;
+    var ad0: f64 = f64_abs(d0);
+    var ad1: f64 = f64_abs(d1);
+    assert(ad1 < ad0, "shear under mild compression: the deviatoric strain shrinks");
+
+    test_group("test_drucker_prager_stress_zero_at_rest");
+    var md: PvMpmParticle = PvMpmParticle_new(PvConstitutiveLaw_drucker_prager(10000.0, 0.3, 30.0), 0.001);
+    var sd: PvMat2 = md.stress();
+    var z1: f64 = f64_abs(sd.m00);
+    var z2: f64 = f64_abs(sd.m01);
+    var z3: f64 = f64_abs(sd.m10);
+    var z4: f64 = f64_abs(sd.m11);
+    var tz: f64 = 0.000000000001;
+    assert(z1 < tz && z2 < tz && z3 < tz && z4 < tz, "identity F: no stress");
+
+    test_group("test_step_rejects_invalid_material");
+    var s: PvMpmSolver;
+    mpm_new(&s, 8, 8, 0.1);
+    var pb = particles(1);
+    place(pb, 0, 0.4, 0.4, 0.01);
+    var o: PvVec3 = PvVec3_zero();
+    var mb = mpm_states(1, PvConstitutiveLaw_neo_hookean(10000.0, 0.5), 0.001);
+    var rt, rv = s.step(_pv_as_particles(pb), 1, _pv_as_mpm_particles(mb), 1, o, 0.01);
+    assert(is_err_result(rt) == 1, "ν = 0.5 refused");
+    var mb2 = mpm_states(1, PvConstitutiveLaw_fluid(1000.0, 0.0), -1.0);
+    var rt2, rv2 = s.step(_pv_as_particles(pb), 1, _pv_as_mpm_particles(mb2), 1, o, 0.01);
+    assert(is_err_result(rt2) == 1, "a negative reference volume refused");
+    fl_free(mb);
+    fl_free(mb2);
+    fl_free(pb);
+    PvMpmSolver_drop(&s);
+
+    test_group("test_particles_stay_in_domain");
+    mpm_new(&s, 8, 8, 0.1);
+    var db = particles(1);
+    place(db, 0, 0.35, 0.05, 0.01);
+    var dm = mpm_states(1, PvConstitutiveLaw_fluid(1000.0, 0.0), 0.001);
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var errs = 0;
+    var dp: *PvFluidParticle = _pv_as_particles(db);
+    for (var k3 = 0; k3 < 200; k3 = k3 + 1) {
+        var kt, kv = s.step(dp, 1, _pv_as_mpm_particles(dm), 1, g, 0.005);
+        if (is_err_result(kt) == 1) { errs = errs + 1; }
+    }
+    var inside = dp.position.y >= 0.0 && dp.position.y <= 0.7 && dp.position.x >= 0.0 && dp.position.x <= 0.7;
+    assert(errs == 0 && inside, "200 steps inside [0, 0.7]²");
+    fl_free(db);
+    fl_free(dm);
+    PvMpmSolver_drop(&s);
+
+    test_group("test_fluid_block_resists_compression");
+    mpm_new(&s, 16, 16, 0.05);
+    var bb = particles(64);
+    for (var j = 0; j < 8; j = j + 1) {
+        for (var i = 0; i < 8; i = i + 1) {
+            var fi: f64 = f64_from(i);
+            var fj: f64 = f64_from(j);
+            var x: f64 = 0.25 + fi * 0.025;
+            var y: f64 = 0.25 + fj * 0.025;
+            place(bb, j * 8 + i, x, y, 0.001);
+        }
+    }
+    var v0: f64 = 0.025 * 0.025;
+    var bm = mpm_states(64, PvConstitutiveLaw_fluid(50.0, 0.0), v0);
+    var bms: *PvMpmParticle = _pv_as_mpm_particles(bm);
+    for (var q = 0; q < 64; q = q + 1) {
+        var mq: *PvMpmParticle = bms + q;
+        mq.deformation_grad.m00 = 0.8;
+        mq.deformation_grad.m11 = 0.8;
+    }
+    var w0: f64 = extent(bb, 64);
+    var berr = 0;
+    for (var k4 = 0; k4 < 20; k4 = k4 + 1) {
+        var bt, bv = s.step(_pv_as_particles(bb), 64, bms, 64, o, 0.001);
+        if (is_err_result(bt) == 1) { berr = berr + 1; }
+    }
+    var w1: f64 = extent(bb, 64);
+    assert(berr == 0 && w1 > w0, "a pre-compressed fluid block expands");
+    fl_free(bb);
+    fl_free(bm);
+    PvMpmSolver_drop(&s);
+    return 0;
+}
+
+# Cyrius-only: the layouts, and the refusals of construction and validation.
+fn test_layout_and_refusals() {
+    test_group("mpm_layouts");
+    assert_eq(sizeof(PvConstitutiveLaw), 48, "a model is 48 bytes");
+    assert_eq(sizeof(PvMpmParticle), 88, "an MPM particle is 88 bytes");
+    assert_eq(sizeof(PvMpmSolver), 144, "the solver is 144 bytes");
+    var mp: PvMpmParticle = PvMpmParticle_new(PvConstitutiveLaw_drucker_prager(1.0, 0.25, 30.0), 7.0);
+    var w = _pv_addr(&mp);
+    var phi: f64 = load64(w + 72);
+    var v0: f64 = load64(w + 80);
+    assert(load64(w + 32) == PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER && phi == 30.0 && v0 == 7.0, "Rust's field order");
+    var s: PvMpmSolver;
+    mpm_new(&s, 5, 7, 0.2);
+    var lens = 1;
+    for (var k = 0; k < 5; k = k + 1) {
+        var c: *PvColumn = _pv_mpm_col(&s, k);
+        if (c.len != 35) { lens = 0; }
+    }
+    var c4: *PvColumn = _pv_mpm_col(&s, 4);
+    assert(lens == 1 && c4.data == s.fy.data, "five fields of nx·ny, column 4 fy");
+    PvMpmSolver_drop(&s);
+
+    test_group("mpm_new_refusals");
+    var nan: f64 = PV_F64_NAN;
+    var t1, v1 = PvMpmSolver_new(3, 3, nan, &s);
+    var t2, v2 = PvMpmSolver_new(4, 4, nan, &s);
+    var t3, v3 = PvMpmSolver_new(0 - 1, 4, 1.0, &s);
+    var t4, v4 = PvMpmSolver_new(2305843009213693952, 4, 1.0, &s);
+    assert(v1 == PV_ERR_INVALID_GRID_RESOLUTION && v2 == PV_ERR_INVALID_PARAMETER, "the size first, then dx");
+    assert(v3 == PV_ERR_INVALID_GRID_RESOLUTION, "nx·ny past a usize");
+    assert(v4 == PV_ERR_OUT_OF_MEMORY && s.mass.data == 0, "2^63 nodes: no memory, nothing held");
+
+    test_group("mpm_validate_edges");
+    var inf: f64 = PV_F64_INFINITY;
+    var refused = 0;
+    var accepted = 0;
+    var laws[480];
+    var ms: *PvConstitutiveLaw = _pv_as_law(&laws);
+    var bad: PvConstitutiveLaw = PvConstitutiveLaw_fluid(0.0, 0.0);
+    *ms = bad;
+    var b1: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1.0, -0.000001);
+    *(ms + 1) = b1;
+    var b2: PvConstitutiveLaw = PvConstitutiveLaw_fluid(inf, 0.0);
+    *(ms + 2) = b2;
+    var b3: PvConstitutiveLaw = PvConstitutiveLaw_neo_hookean(1.0, -1.0);
+    *(ms + 3) = b3;
+    var b4: PvConstitutiveLaw = PvConstitutiveLaw_neo_hookean(1.0, 0.5);
+    *(ms + 4) = b4;
+    var b5: PvConstitutiveLaw = PvConstitutiveLaw_neo_hookean(nan, 0.3);
+    *(ms + 5) = b5;
+    var b6: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(1.0, 0.3, 90.0);
+    *(ms + 6) = b6;
+    var b7: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(-1.0, 0.3, 30.0);
+    *(ms + 7) = b7;
+    var g0: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1.0, 0.0);
+    *(ms + 8) = g0;
+    var g1: PvConstitutiveLaw = PvConstitutiveLaw_neo_hookean(1.0, -0.999999);
+    *(ms + 9) = g1;
+    for (var i = 0; i < 10; i = i + 1) {
+        var vt, vv = constitutive_model_validate(ms + i);
+        if (i < 8 && is_err_result(vt) == 1 && vv == PV_ERR_INVALID_PARAMETER) { refused = refused + 1; }
+        if (i >= 8 && is_ok(vt) == 1) { accepted = accepted + 1; }
+    }
+    assert(refused == 8 && accepted == 2, "eight edges refused, two just inside accepted");
+    var odd: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1.0, 0.0);
+    odd.kind = 7;
+    var ot, ov = constitutive_model_validate(&odd);
+    var om: PvMpmParticle = PvMpmParticle_new(odd, 1.0);
+    var os: PvMat2 = om.stress();
+    assert(is_err_result(ot) == 1 && os.m00 != os.m00, "a kind outside the enum: refused, a NaN stress");
+    return 0;
+}
+
+# Cyrius-only: the step's refusals in Rust's order with nothing changed, the det(F) clamp, and the flat heap.
+fn test_step_paths() {
+    test_group("mpm_step_refusals_change_nothing");
+    var s: PvMpmSolver;
+    mpm_new(&s, 8, 8, 0.1);
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var pb = particles(3);
+    for (var i = 0; i < 3; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var x: f64 = 0.3 + fi * 0.05;
+        place(pb, i, x, 0.4, 0.01);
+    }
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var mb = mpm_states(3, PvConstitutiveLaw_neo_hookean(10000.0, 0.3), 0.001);
+    var ms: *PvMpmParticle = _pv_as_mpm_particles(mb);
+    var m2: *PvMpmParticle = ms + 2;
+    m2.volume_0 = 0.0;
+    var nan: f64 = PV_F64_NAN;
+    var a1, b1 = s.step(ps, 3, ms, 3, g, nan);
+    var a2, b2 = s.step(ps, 3, ms, 2, g, 0.01);
+    var a3, b3 = s.step(ps, 3, ms, 3, g, 0.01);
+    assert(b1 == PV_ERR_INVALID_TIMESTEP && b2 == PV_ERR_INVALID_PARAMETER && b3 == PV_ERR_INVALID_PARAMETER,
+      "dt, then the counts, then each particle's model and volume");
+    var p1: *PvFluidParticle = ps + 1;
+    assert(p1.position.x == 0.35 && p1.velocity.y == 0.0 && s.mass.at(0) == 0.0, "nothing changed");
+    m2.volume_0 = 0.001;
+
+    test_group("mpm_det_f_clamp_resets_to_identity");
+    # Two particles of a fluid too soft to move F much in a step (K = 1e-9), at det F 2e4 and 5e-5.
+    var soft: PvConstitutiveLaw = PvConstitutiveLaw_fluid(0.000000001, 0.0);
+    var m0: *PvMpmParticle = ms;
+    m0.model = soft;
+    m0.deformation_grad = PvMat2_new(200.0, 0.0, 0.0, 100.0);
+    var m1: *PvMpmParticle = ms + 1;
+    m1.model = soft;
+    m1.deformation_grad = PvMat2_new(0.001, 0.0, 0.0, 0.05);
+    var ct, cv = s.step(ps, 3, ms, 3, g, 0.001);
+    var id0 = m0.deformation_grad.m00 == 1.0 && m0.deformation_grad.m11 == 1.0 && m0.deformation_grad.m01 == 0.0;
+    var id1 = m1.deformation_grad.m00 == 1.0 && m1.deformation_grad.m11 == 1.0 && m1.deformation_grad.m10 == 0.0;
+    assert(is_ok(ct) == 1 && id0 && id1, "det F of 2e4 and 5e-5: reset to the identity");
+    assert(m2.deformation_grad.m00 != 1.0 || m2.deformation_grad.m11 != 1.0, "an ordinary F is kept");
+    fl_free(pb);
+    fl_free(mb);
+    PvMpmSolver_drop(&s);
+
+    test_group("mpm_steps_take_no_heap");
+    mpm_new(&s, 16, 16, 0.05);
+    var bp, bn = create_particle_block(0.2, 0.2, 0.3, 0.3, 0.025, 0.001);
+    var bm = fl_alloc(bn * sizeof(PvMpmParticle) + 8);
+    var bms: *PvMpmParticle = _pv_as_mpm_particles(bm);
+    for (var k = 0; k < bn; k = k + 1) {
+        var law: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1000.0, 0.0);
+        if (k % 3 == 1) { law = PvConstitutiveLaw_neo_hookean(10000.0, 0.3); }
+        if (k % 3 == 2) { law = PvConstitutiveLaw_drucker_prager(10000.0, 0.3, 30.0); }
+        var mk: PvMpmParticle = PvMpmParticle_new(law, 0.000625);
+        memcpy(bms + k, &mk, sizeof(PvMpmParticle));
+    }
+    var bps: *PvFluidParticle = _pv_as_particles(bp);
+    var ft, fv = s.step(bps, bn, bms, bn, g, 0.001);
+    var used = alloc_used();
+    var errs = 0;
+    for (var q = 0; q < 30; q = q + 1) {
+        var qt, qv = s.step(bps, bn, bms, bn, g, 0.001);
+        if (is_err_result(qt) == 1) { errs = errs + 1; }
+    }
+    assert_eq(alloc_used() - used, 0, "30 more steps of three materials take no heap");
+    assert_eq(errs, 0, "every step Ok");
+    fl_free(bp);
+    fl_free(bm);
+    PvMpmSolver_drop(&s);
+    return 0;
+}
+
+# Runs the ported MPM tests.
+fn main() {
+    alloc_init();
+    test_basics();
+    test_regressions();
+    test_layout_and_refusals();
+    test_step_paths();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

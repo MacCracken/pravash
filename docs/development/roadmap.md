@@ -80,8 +80,11 @@
   module, all but one bit-exact on the first replay and that one mapped to `coupling.d3.tsv`; 22 Rust tests)
 - [x] M6 part b: the `FlipSolver` (FLIP/PIC, APIC, the projection, `apic_c`'s resize; 245 rows, every one bit-exact
   on the first replay; the 11 FLIP tests and the 2 FLIP integration tests)
-- [ ] M6 part c: MPM (`ConstitutiveModel` and its codec, `MpmParticle`, the 2×2 SVD, Drucker–Prager, `MpmSolver`; 13
-  Rust tests)
+- [x] M6 part c: MPM (`ConstitutiveModel` and its codec, `MpmParticle`, the 2×2 SVD, Drucker–Prager, `MpmSolver`;
+  1,335 rows in a new golden module: 1,318 bit-exact against the oracle, and 17 against the corrected oracle where
+  glibc misrounds a hypot, atan2, sin, cos, ln or exp; all 13 Rust tests)
+- [x] **M6 done 2026-11-12.**
+- [ ] M7: compute (`ComputeOp`, `PackedParticles`, `KernelDerivatives`), logging and ai
 
 ### 1.3.0
 

@@ -36,6 +36,7 @@ mod m_grid;
 mod m_grid_c;
 mod m_json;
 mod m_math;
+mod m_mpm;
 mod m_phase_field;
 mod m_shallow;
 mod m_sph;
@@ -64,6 +65,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_grid::emit(),
         m_json::emit(),
         m_math::emit(),
+        m_mpm::emit(),
         m_phase_field::emit(),
         m_shallow::emit(),
         m_sph::emit(),

@@ -3,6 +3,55 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **mpm** (M6 part c): `src/mpm.cyr`, the material point method of `mpm.rs`. M6 is complete. ADR 0002 #25.
+  - **`ConstitutiveModel`** is the kind enum `PvConstitutiveModel` and the payload struct `PvConstitutiveLaw`
+    (`_fluid`, `_neo_hookean`, `_drucker_prager`), with `constitutive_model_validate`. Its JSON codec is in
+    `src/json.cyr`. Rust's `[f64; 4]` matrices are `PvMat2`.
+  - **`PvMpmParticle`** has `PvMpmParticle_new`, `mp.det_f()` and `mp.stress()`: a weakly compressible fluid,
+    Neo-Hookean, and Drucker–Prager in Hencky strain.
+  - **`PvMpmSolver`:** `PvMpmSolver_new` and `s.step(ps, n, mpm, nm, gravity, dt)` in Rust's order.
+    - Every check comes first; nothing changes before they pass.
+    - P2G scatters mass, momentum and stress.
+    - The grid applies gravity and the forces, with separating walls.
+    - G2P updates F, projects Drucker–Prager onto its cone, and resets F when det F leaves [1e-4, 1e4].
+    - Advection, then the walls.
+  - **The private algebra** (the 2 × 2 SVD, `compose2`, the projection) keeps Cyrius names the tests call.
+    `MIN_SINGULAR_VALUE` is generated. The transcendentals (hypot, atan2, sin, cos, ln, exp) are the correctly rounded
+    ones (ADR 0004).
+  - **Parity:** a new golden module, `tests/golden/mpm.tsv`: 1,336 rows.
+    - The rows cover validation over every edge, stresses of every model at stretches, shears, rational rotations,
+      inversions and the specials, and the solver's refusals. The step trajectories are the plan's elastic block,
+      sand column and fluid column to 300 steps, a mixed column, the Rust tests' scenes, the specials and 30 seeded
+      scenes.
+    - 1,319 rows match the oracle bit for bit.
+    - The other 17 (3 stresses, 14 steps) are where glibc misrounds a call, mostly hypot. validate.py writes them to
+      `mpm.cr.tsv` from MPFR, and the port matches every one bit for bit, *accepted (ADR 4)*. Those are exactly the
+      rows the first replay failed against glibc's bits.
+    - validate.py transcribes the module and recomputes every row from both libms.
+  - **Tests:** all 13 Rust tests of `mpm.rs`, plus Cyrius-only groups (the layouts, every refusal with nothing
+    changed, the det(F) clamp, a kind outside the enum, the flat heap): `tests/mpm.tcyr`, 42 checks.
+  - **Mutations:** 28 of 31 port mutations fail rows on the first run. A 32nd, rewritten after it didn't compile,
+    fails 697. validate.py's 7 of 8 are caught.
+    - One gap, shared by both, closed by a row that draws no random numbers: the det(F) clamp's lower bound moved to
+      1e-3. No determinant lay between the two bounds; the new row puts determinants on both sides of each end.
+    - Two survivors are equivalent:
+      - the projection's |dev| = 0 guard: there Δγ ≤ 0 for any valid model;
+      - a node of NaN mass skipped: its velocity is NaN either way.
+
+### Performance
+- **mpm** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M6 part c; pinned, against a Rust
+  twin, one step of the plan's scenes):
+
+  | Scene | Cyrius / Rust |
+  |---|---|
+  | the elastic block, 81 particles | 8.7–9.1× |
+  | the fluid column, 144 | 6.8× |
+  | the sand column, 80 | 45× |
+
+  Drucker–Prager makes about 22 correctly rounded calls a particle per step, at 60–306 ns each against glibc's
+  10–20, so the sand column's gap is ledger L1's. The numbers are appended to ganita's correctly-rounded request.
+
+### Added (Cyrius)
 - **coupling** (M6 part b): `src/flip.cyr`, the `FlipSolver` of `coupling.rs`. ADR 0002 #24.
   - **`PvFlipSolver`:** the public `flip_ratio`, `use_apic` and `narrow_band_cells` (reserved, unread as in Rust),
     then the seven grid fields and the APIC matrices as solver-owned columns.

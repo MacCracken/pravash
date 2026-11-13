@@ -33,3 +33,9 @@ var _PV_SPH_CONVERGENCE_THRESHOLD: f64 = 0.00000001;
 
 # Rust: `PRESSURE_ITERATIONS: usize = 40`
 const _PV_COUPLING_PRESSURE_ITERATIONS = 40;
+
+# ── rust-old/src/mpm.rs ──
+
+# Smallest singular value allowed in the Hencky strain (keeps `ln σ` finite).
+# Rust: `MIN_SINGULAR_VALUE: f64 = 1e-6`
+var _PV_MPM_MIN_SINGULAR_VALUE: f64 = 0.000001;

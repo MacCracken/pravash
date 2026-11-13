@@ -161,6 +161,11 @@ oracle:
   - the two decoders under serde's externally tagged struct-variant semantics;
   - (M6 part b) the `FlipSolver`: P2G, the projection's Gauss–Seidel sweeps with their early stop, both G2P forms and
     the advection, each trajectory cached across its frames, and the scenarios' segments;
+- it recomputes every `mpm` row (M6 part c): validation, the 2 × 2 SVD, the three stresses, the Drucker–Prager
+  projection and the step. The transcendentals (hypot, atan2, sin, cos, ln, exp) come from glibc for the record and
+  from MPFR for the corrected oracle, `mpm.cr.tsv`: the stress and step rows whose outputs change when every call is
+  correctly rounded, each with the first misrounded calls in its note. The step trajectories are cached across their
+  frames, per source of transcendentals;
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what

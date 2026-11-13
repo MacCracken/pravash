@@ -799,3 +799,26 @@ solver, whose warm-started pressure makes the sweeps stop early once the first i
   225–239 µs, `128x128` 4.15–4.45 ms → 3.89–4.16 ms). The grid step moved within the box's noise.
 - **What remains** is the per-cell grid passes (the splat's zeroing, the copies, gravity, the divergence, the sweeps,
   the gradient, the check), 256 cells each, plus the particles: the per-element cost the grid modules measured.
+
+## M6 part c: MPM (2026-11-12)
+
+Pinned to core 15, two interleaved runs. Rust's criterion suite has no MPM group. The twin
+`scripts/probes/rust/src/bin/bench_mpm_c.rs` and `tests/pravash.bcyr`'s `bench_mpm_c` time one step of the plan's
+three scenes on a 16 × 16 solver (dx 0.05): density 1000 at spacing 0.025, gravity, dt 1e-3, with the particles and
+MPM states copied in before each step.
+
+| Bench | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `mpm_c/elastic_81` (Neo-Hookean, E 1e4, ν 0.3) | 4.84–4.90 µs | 42.2–44.4 µs | 8.7–9.1× |
+| `mpm_c/sand_80` (Drucker–Prager, φ 30°) | 10.5–10.6 µs | 478–481 µs | 45× |
+| `mpm_c/fluid_144` (K 1e3) | 8.34–8.40 µs | 56.8–57.1 µs | 6.8× |
+
+**Reading it.**
+- **The sand column is the correctly rounded primitives' cost** (ledger L1). Drucker–Prager makes about 22 calls a
+  particle per step: the stress's SVD (2 hypot, 2 atan2, 2 sin, 2 cos) and 2 ln, then the projection's SVD again, 2
+  ln, a hypot, a sin, and 2 exp when it projects. Timed apart, pinned, they cost 305 ns (atan2), 175 (hypot), 138
+  (sin, cos), 107 (exp) and 60 (ln). None of these arguments takes a slow path: the exact cases (atan2(0, 1),
+  hypot(1, 0), sin(0), exp(0)) cost 11–23 ns, and arguments near them their fast paths' usual costs. glibc's take
+  10–20 ns. About 3.6 µs of correctly rounded calls a particle accounts for most of the step.
+- **The elastic block** makes one ln a particle. **The fluid column** makes none: 6.8× is the port's per-particle and
+  per-node arithmetic, close to the FLIP step's (part b).

@@ -1086,7 +1086,15 @@ fn json_rows(m: &mut Module, rng: &mut Rng) {
 
 fn dump(out: &mut Vec<Tok>, s: &FlipSolver) {
     let d = s.oracle_dump();
-    for v in [&d.vx, &d.vy, &d.vx_old, &d.vy_old, &d.weight, &d.pressure, &d.div] {
+    for v in [
+        &d.vx,
+        &d.vy,
+        &d.vx_old,
+        &d.vy_old,
+        &d.weight,
+        &d.pressure,
+        &d.div,
+    ] {
         col(out, v);
     }
     let flat: Vec<f64> = d.apic_c.iter().flat_map(|c| c.iter().copied()).collect();
@@ -1170,7 +1178,15 @@ struct Seg {
     steps: usize,
 }
 
-fn flip_scenario_row(m: &mut Module, nx: usize, ny: usize, dx: f64, g: DVec3, dt: f64, segs: &[Seg]) {
+fn flip_scenario_row(
+    m: &mut Module,
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    g: DVec3,
+    dt: f64,
+    segs: &[Seg],
+) {
     let mut ins = vec![usz(nx), usz(ny), f(dx)];
     v3(&mut ins, g);
     ins.extend([f(dt), usz(segs.len())]);
@@ -1204,7 +1220,16 @@ fn flip_scenario_row(m: &mut Module, nx: usize, ny: usize, dx: f64, g: DVec3, dt
 
 /// A block of 2D particles over [x0, x1] × [y0, y1] at spacing sp, mass m, moving at (vx, vy).
 #[allow(clippy::too_many_arguments)]
-fn flip_block(x0: f64, x1: f64, y0: f64, y1: f64, sp: f64, m: f64, vx: f64, vy: f64) -> Vec<FluidParticle> {
+fn flip_block(
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+    sp: f64,
+    m: f64,
+    vx: f64,
+    vy: f64,
+) -> Vec<FluidParticle> {
     let mut out = Vec::new();
     let mut j = 0.0;
     while y0 + j * sp <= y1 + 1e-12 {
@@ -1270,12 +1295,78 @@ fn flip_rows(m: &mut Module, rng: &mut Rng) {
         vec![p]
     };
     flip_step_row(m, 8, 8, 0.1, 0.95, false, g, 0.01, 1, &[]);
-    flip_step_row(m, 16, 16, 0.1, 0.95, false, o, 0.1, 1, &one(0.8, 0.8, 1.0, 0.0));
-    flip_step_row(m, 16, 16, 0.1, 0.0, false, g, 0.01, 1, &one(0.8, 0.8, 0.0, 0.0));
-    flip_step_row(m, 8, 8, 0.1, 1.0, false, o, 0.01, 1, &one(0.4, 0.4, 1.0, 0.0));
-    flip_step_row(m, 8, 8, 0.1, 0.0, false, o, 0.01, 1, &one(0.4, 0.4, 1.0, 0.0));
-    flip_step_row(m, 8, 8, 0.1, 0.95, false, o, 0.1, 1, &one(0.05, 0.05, -10.0, -10.0));
-    flip_step_row(m, 8, 8, 0.1, f64::NAN, false, o, 0.01, 1, &one(0.3, 0.3, 0.0, 0.0));
+    flip_step_row(
+        m,
+        16,
+        16,
+        0.1,
+        0.95,
+        false,
+        o,
+        0.1,
+        1,
+        &one(0.8, 0.8, 1.0, 0.0),
+    );
+    flip_step_row(
+        m,
+        16,
+        16,
+        0.1,
+        0.0,
+        false,
+        g,
+        0.01,
+        1,
+        &one(0.8, 0.8, 0.0, 0.0),
+    );
+    flip_step_row(
+        m,
+        8,
+        8,
+        0.1,
+        1.0,
+        false,
+        o,
+        0.01,
+        1,
+        &one(0.4, 0.4, 1.0, 0.0),
+    );
+    flip_step_row(
+        m,
+        8,
+        8,
+        0.1,
+        0.0,
+        false,
+        o,
+        0.01,
+        1,
+        &one(0.4, 0.4, 1.0, 0.0),
+    );
+    flip_step_row(
+        m,
+        8,
+        8,
+        0.1,
+        0.95,
+        false,
+        o,
+        0.1,
+        1,
+        &one(0.05, 0.05, -10.0, -10.0),
+    );
+    flip_step_row(
+        m,
+        8,
+        8,
+        0.1,
+        f64::NAN,
+        false,
+        o,
+        0.01,
+        1,
+        &one(0.3, 0.3, 0.0, 0.0),
+    );
     let mut radial = Vec::new();
     for j in 2..14 {
         for i in 2..14 {
@@ -1296,9 +1387,26 @@ fn flip_rows(m: &mut Module, rng: &mut Rng) {
         .collect();
     flip_step_row(m, 16, 16, 0.1, 0.95, false, g, 0.01, 10, &falling);
     let twenty: Vec<FluidParticle> = (0..20)
-        .map(|i| FluidParticle::new_2d(0.3 + f64::from(i % 5) * 0.05, 0.3 + f64::from(i / 5) * 0.05, 0.01))
+        .map(|i| {
+            FluidParticle::new_2d(
+                0.3 + f64::from(i % 5) * 0.05,
+                0.3 + f64::from(i / 5) * 0.05,
+                0.01,
+            )
+        })
         .collect();
-    flip_step_row(m, 16, 16, 0.1, 0.9, false, DVec3::new(0.0, -1.0, 0.0), 0.01, 100, &twenty);
+    flip_step_row(
+        m,
+        16,
+        16,
+        0.1,
+        0.9,
+        false,
+        DVec3::new(0.0, -1.0, 0.0),
+        0.01,
+        100,
+        &twenty,
+    );
     // The sloshing tank (a block moving right in the left of the tank) and the falling block, by PIC, FLIP 0.95,
     // FLIP 1.0 and APIC, at frames 1, 2, 10, 60 and 300.
     let tank = flip_block(0.15, 0.55, 0.15, 0.85, 0.05, 0.001, 0.5, 0.0);
@@ -1323,8 +1431,30 @@ fn flip_rows(m: &mut Module, rng: &mut Rng) {
     for &x in &specials() {
         flip_step_row(m, 8, 8, 0.1, 0.95, false, g, x, 1, &five);
         flip_step_row(m, 8, 8, 0.1, x, false, g, 0.01, 2, &five);
-        flip_step_row(m, 8, 8, 0.1, 0.95, false, DVec3::new(x, -9.81, 0.0), 0.01, 1, &five);
-        flip_step_row(m, 8, 8, 0.1, 0.95, true, DVec3::new(0.0, x, 0.0), 0.01, 1, &five);
+        flip_step_row(
+            m,
+            8,
+            8,
+            0.1,
+            0.95,
+            false,
+            DVec3::new(x, -9.81, 0.0),
+            0.01,
+            1,
+            &five,
+        );
+        flip_step_row(
+            m,
+            8,
+            8,
+            0.1,
+            0.95,
+            true,
+            DVec3::new(0.0, x, 0.0),
+            0.01,
+            1,
+            &five,
+        );
         for slot in 0..7 {
             let mut ps = five.clone();
             let p = &mut ps[2];
@@ -1354,14 +1484,29 @@ fn flip_rows(m: &mut Module, rng: &mut Rng) {
     // no interior divergence reads it, so vx stays finite and the check must see vy (no random numbers drawn).
     let mut corner = FluidParticle::new_2d(0.0, 0.0, 1.0);
     corner.velocity = DVec3::new(0.0, f64::MAX, 0.0);
-    flip_step_row(m, 8, 8, 0.1, 0.95, false, DVec3::new(0.0, f64::MAX, 0.0), 1.0, 1, &[corner]);
+    flip_step_row(
+        m,
+        8,
+        8,
+        0.1,
+        0.95,
+        false,
+        DVec3::new(0.0, f64::MAX, 0.0),
+        1.0,
+        1,
+        &[corner],
+    );
     // Seeded scenes: grid shapes, cell sizes, blends, APIC, gravities, time steps, clouds in 2D and 3D, some past
     // the walls.
     for k in 0..40 {
         let nx = 4 + usize::try_from(rng.int(0, 16)).unwrap_or(0);
         let ny = 4 + usize::try_from(rng.int(0, 16)).unwrap_or(0);
         let dx = rng.log_uniform(-2.0, 0.0);
-        let ratio = if k % 5 == 0 { rng.uniform(-0.5, 1.5) } else { rng.unit() };
+        let ratio = if k % 5 == 0 {
+            rng.uniform(-0.5, 1.5)
+        } else {
+            rng.unit()
+        };
         let apic = k % 3 == 0;
         let gv = DVec3::new(rng.uniform(-3.0, 3.0), rng.uniform(-12.0, 0.0), 0.0);
         let dt = rng.log_uniform(-4.0, -1.3);
