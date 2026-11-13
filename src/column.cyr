@@ -124,6 +124,12 @@ impl PvColumn {
         return 0;
     }
 
+    # Every slot set to x. Mirrors `slice::fill` on a `Vec<f64>` (`sw.manning_n.fill(0.025)`).
+    fn fill_f(self, x: f64) {
+        self.fill(_pv_bits(x));
+        return 0;
+    }
+
     # Copies `src`'s slots over this column's, which must be as long (0 and nothing copied otherwise). Mirrors
     # `slice::copy_from_slice` (which panics on a length mismatch).
     fn copy_from(self, src: *PvColumn): i64 {

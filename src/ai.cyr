@@ -174,6 +174,35 @@ impl PvHooshConfig {
     }
 }
 
+# A deep copy of `src` into *out (a different config): an owned copy of the endpoint, and of the key when it is
+# Some. 1, or 0 when the memory isn't there (then *out is the empty config, owning nothing). Mirrors the derived
+# `Clone`.
+#must_use
+fn PvDaimonConfig_clone(out: *PvDaimonConfig, src: *PvDaimonConfig): i64 {
+    out.endpoint = "";
+    out.endpoint_len = 0;
+    out.api_key = 0;
+    out.api_key_len = 0;
+    out.owned = 0;
+    if (out.set_endpoint(src.endpoint, src.endpoint_len) == 0) { return 0; }
+    if (src.api_key != 0 && out.set_api_key(src.api_key, src.api_key_len) == 0) {
+        PvDaimonConfig_drop(out);
+        return 0;
+    }
+    return 1;
+}
+
+# A deep copy of `src` into *out (a different config): an owned copy of the endpoint. 1, or 0 when the memory isn't
+# there (then *out is the empty config, owning nothing). Mirrors the derived `Clone`.
+#must_use
+fn PvHooshConfig_clone(out: *PvHooshConfig, src: *PvHooshConfig): i64 {
+    out.endpoint = "";
+    out.endpoint_len = 0;
+    out.owned = 0;
+    if (out.set_endpoint(src.endpoint, src.endpoint_len) == 0) { return 0; }
+    return 1;
+}
+
 # ── Rust's Debug ────────────────────────────────────────────────────────────────────
 # `debug_struct`'s two shapes: `Name { a: x, b: y }`, and the alternate `Name {\n    a: x,\n    b: y,\n}` (a field's
 # value never holds a raw newline here, so PadAdapter's indentation has nothing to add inside one).

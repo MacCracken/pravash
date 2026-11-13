@@ -219,11 +219,49 @@ fn test_cyrius() {
     return 0;
 }
 
+# The derived Clone of DaimonConfig and HooshConfig (M8 part c, the full surface diff): owned copies of the
+# strings, a key only when the source has one.
+fn test_clone() {
+    test_group("clone_daimon_config");
+    var d: PvDaimonConfig = PvDaimonConfig_default();
+    var c: PvDaimonConfig;
+    assert_eq(PvDaimonConfig_clone(&c, &d), 1, "the default clones");
+    assert(is(c.endpoint, c.endpoint_len, "http://localhost:8090") == 1 && c.api_key == 0, "its endpoint, no key");
+    assert(c.owned == 1 && c.endpoint != d.endpoint, "an owned copy of the static endpoint");
+    PvDaimonConfig_drop(&c);
+    assert_eq(d.set_api_key("secret", 6), 1, "a key");
+    assert_eq(PvDaimonConfig_clone(&c, &d), 1, "clone");
+    assert(is(c.api_key, c.api_key_len, "secret") == 1 && c.api_key != d.api_key && c.owned == 3, "the key copied");
+    d.clear_api_key();
+    PvDaimonConfig_drop(&d);
+    assert(is(c.api_key, c.api_key_len, "secret") == 1, "the clone outlives its source");
+    var e: PvDaimonConfig = PvDaimonConfig_default();
+    assert_eq(e.set_api_key("", 0), 1, "Some(\"\")");
+    var ce: PvDaimonConfig;
+    assert_eq(PvDaimonConfig_clone(&ce, &e), 1, "clone");
+    assert(ce.api_key != 0 && ce.api_key_len == 0, "Some(\"\") stays Some");
+    PvDaimonConfig_drop(&c);
+    PvDaimonConfig_drop(&e);
+    PvDaimonConfig_drop(&ce);
+
+    test_group("clone_hoosh_config");
+    var h: PvHooshConfig = PvHooshConfig_default();
+    assert_eq(h.set_endpoint("https://hoosh", 13), 1, "an endpoint");
+    var hc: PvHooshConfig;
+    assert_eq(PvHooshConfig_clone(&hc, &h), 1, "clone");
+    assert(is(hc.endpoint, hc.endpoint_len, "https://hoosh") == 1 && hc.endpoint != h.endpoint, "an owned copy");
+    PvHooshConfig_drop(&h);
+    assert(is(hc.endpoint, hc.endpoint_len, "https://hoosh") == 1 && hc.owned == 1, "outliving its source");
+    PvHooshConfig_drop(&hc);
+    return 0;
+}
+
 # Runs the ported ai tests.
 fn main() {
     alloc_init();
     test_rust();
     test_cyrius();
+    test_clone();
     return assert_summary();
 }
 

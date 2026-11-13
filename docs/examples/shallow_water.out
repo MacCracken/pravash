@@ -1,0 +1,15 @@
+Pravash — Shallow water simulation
+Grid: 40x40, dx=0.1
+
+Frame    0  volume:  16.0244  max_wave: 0.499470
+Frame   20  volume:  16.0244  max_wave: 0.391401
+Frame   40  volume:  16.0244  max_wave: 0.181283
+Frame   60  volume:  16.0244  max_wave: 0.094892
+Frame   80  volume:  16.0244  max_wave: 0.138269
+Frame  100  volume:  16.0244  max_wave: 0.170935
+Frame  120  volume:  16.0244  max_wave: 0.141316
+Frame  140  volume:  16.0244  max_wave: 0.078037
+Frame  160  volume:  16.0244  max_wave: 0.063646
+Frame  180  volume:  16.0244  max_wave: 0.060000
+
+Done.

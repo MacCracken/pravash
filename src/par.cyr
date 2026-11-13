@@ -18,7 +18,7 @@
 # Each pool's channels (four words and a mutex each, from the stdlib's `alloc`) are not returned when it stops: the
 # stdlib has no `chan_free`. A pool starts once per thread-count change, not per step, so the step's heap stays flat.
 
-struct PvPool {
+struct _PvPool {
     threads;   # T: the calling thread and T − 1 workers
     jobs;      # T − 1 job channels, one per worker
     done;      # the answer channel, T − 1 deep
@@ -31,13 +31,13 @@ struct PvPool {
 }
 
 #must_use
-fn _pv_as_pool(p): *PvPool {
+fn _pv_as_pool(p): *_PvPool {
     return p;
 }
 
 # Runs worker w's slice of the current job: [lo + (n·w)/T, lo + (n·(w+1))/T) of the n = hi − lo indices (nothing
 # when the slice is empty).
-fn _pv_pool_run(pool: *PvPool, w) {
+fn _pv_pool_run(pool: *_PvPool, w) {
     var n = pool.hi - pool.lo;
     var a = pool.lo + (n * w) / pool.threads;
     var b = pool.lo + (n * (w + 1)) / pool.threads;
@@ -47,7 +47,7 @@ fn _pv_pool_run(pool: *PvPool, w) {
 
 # A worker's loop: its slice for every job token it receives, then an answer; a 0 token ends it.
 fn _pv_pool_worker(arg): i64 {
-    var pool: *PvPool = _pv_as_pool(load64(arg));
+    var pool: *_PvPool = _pv_as_pool(load64(arg));
     var w = load64(arg + 8);
     var ch = load64(pool.jobs + (w - 1) * 8);
     while (1 == 1) {
@@ -60,7 +60,7 @@ fn _pv_pool_worker(arg): i64 {
 }
 
 # Stops the first `started` workers of *pool and releases its blocks (not its channels: see the file comment).
-fn _pv_pool_stop(pool: *PvPool, started) {
+fn _pv_pool_stop(pool: *_PvPool, started) {
     for (var w = 0; w < started; w = w + 1) { chan_send(load64(pool.jobs + w * 8), 0); }
     for (var w2 = 0; w2 < started; w2 = w2 + 1) { thread_join(load64(pool.handles + w2 * 8)); }
     if (pool.jobs != 0) { fl_free(pool.jobs); }
@@ -74,12 +74,12 @@ fn _pv_pool_stop(pool: *PvPool, started) {
 # the work serially: for a count of 1 or less, on a target without concurrent threads and blocking channels, and
 # when a channel or a thread can't be made (the workers already started are stopped first). Never aborts.
 #must_use
-fn PvPool_new(threads): i64 {
+fn _pv_pool_new(threads): i64 {
     if (threads <= 1 || THREADS_CONCURRENT == 0 || CHAN_BLOCKING == 0) { return 0; }
     _pv_cr_load();
-    var p = fl_alloc(sizeof(PvPool));
+    var p = fl_alloc(sizeof(_PvPool));
     if (p == 0) { return 0; }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     var m = threads - 1;
     pool.threads = threads;
     pool.jobs = fl_alloc(m * 8);
@@ -116,9 +116,9 @@ fn PvPool_new(threads): i64 {
 }
 
 # Stops the pool's workers and releases it (nothing for a pool of 0).
-fn PvPool_drop(p) {
+fn _pv_pool_drop(p) {
     if (p == 0) { return 0; }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     _pv_pool_stop(pool, pool.threads - 1);
     return 0;
 }
@@ -131,7 +131,7 @@ fn _pv_par_for(p, lo, hi, fp, ctx) {
         fncall3(fp, ctx, lo, hi);
         return 0;
     }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     pool.fp = fp;
     pool.ctx = ctx;
     pool.lo = lo;

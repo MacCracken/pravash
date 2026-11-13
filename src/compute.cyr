@@ -117,6 +117,41 @@ fn PvPackedParticles_drop(p: *PvPackedParticles) {
     return 0;
 }
 
+# Column d set to a copy of column s's elements (d holds no storage before): 1, or 0 when the memory isn't there (d
+# then holds none). Rust's `Vec<f32>::clone`.
+#must_use
+fn _pv_f32_clone(d: *PvF32Column, s: *PvF32Column): i64 {
+    d.data = 0;
+    d.len = 0;
+    d.cap = 0;
+    if (s.len == 0) { return 1; }
+    if (d.reserve(s.len) == 0) { return 0; }
+    memcpy(d.data, s.data, s.len * 4);
+    d.len = s.len;
+    return 1;
+}
+
+# A deep copy of `src` into *out (a different record): the count and the three buffers at their own lengths. 1, or 0
+# when the memory isn't there (then *out holds no storage, count 0). Mirrors the derived `Clone`.
+#must_use
+fn PvPackedParticles_clone(out: *PvPackedParticles, src: *PvPackedParticles): i64 {
+    for (var k = 0; k < 3; k = k + 1) {
+        var z: *PvF32Column = _pv_packed_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    out.count = 0;
+    for (var k = 0; k < 3; k = k + 1) {
+        if (_pv_f32_clone(_pv_packed_col(out, k), _pv_packed_col(src, k)) == 0) {
+            PvPackedParticles_drop(out);
+            return 0;
+        }
+    }
+    out.count = src.count;
+    return 1;
+}
+
 # Packs the SoA's complete particles (`consistent_len`, at most u32::MAX) into *out, each value rounded to f32:
 # [x, y, z, mass], [vx, vy, vz, 0] and [density, pressure] per particle. 1, or 0 when the buffers can't be allocated
 # (Rust aborts); *out then holds no storage. Mirrors `PackedParticles::from_soa`.
@@ -387,6 +422,27 @@ fn PvNeuralCorrection_drop(c: *PvNeuralCorrection) {
         b.drop();
     }
     return 0;
+}
+
+# A deep copy of `src` into *out (a different record): both buffers at their own lengths. 1, or 0 when the memory
+# isn't there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvNeuralCorrection_clone(out: *PvNeuralCorrection, src: *PvNeuralCorrection): i64 {
+    out.velocity_delta.data = 0;
+    out.velocity_delta.len = 0;
+    out.velocity_delta.cap = 0;
+    out.pressure_delta.data = 0;
+    out.pressure_delta.len = 0;
+    out.pressure_delta.cap = 0;
+    for (var k = 0; k < 2; k = k + 1) {
+        var d: *PvF32Column = _pv_as_f32_column(_pv_addr(out) + k * 24);
+        var s: *PvF32Column = _pv_as_f32_column(_pv_addr(src) + k * 24);
+        if (_pv_f32_clone(d, s) == 0) {
+            PvNeuralCorrection_drop(out);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 # A learned corrector: takes a coarse state's velocities and pressures (f32 slices) and fills *out with the

@@ -1,0 +1,15 @@
+Pravash — Multi-phase SPH (water + oil)
+Particles: 300 (water + oil)
+
+Frame    0  water: 150  oil: 150  max_speed: 2367.7056
+Frame   10  water: 150  oil: 150  max_speed: 5735.9710
+Frame   20  water: 150  oil: 150  max_speed: 5747.0168
+Frame   30  water: 150  oil: 150  max_speed: 5621.4511
+Frame   40  water: 150  oil: 150  max_speed: 6246.0741
+Frame   50  water: 150  oil: 150  max_speed: 6730.5713
+Frame   60  water: 150  oil: 150  max_speed: 6700.3900
+Frame   70  water: 150  oil: 150  max_speed: 6561.8915
+Frame   80  water: 150  oil: 150  max_speed: 7067.3122
+Frame   90  water: 150  oil: 150  max_speed: 6698.5893
+
+Done.

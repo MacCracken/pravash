@@ -7,12 +7,12 @@
 # `f64::consts::PI` (src/constants.cyr), the floors are the private constants (src/constants_private.cyr), and ln
 # and powf are the correctly rounded ones (ADR 0004).
 #
-# `PvKernelCoeffs` mirrors the private `KernelCoeffs`: the coefficients for one smoothing radius, computed once. Its
+# `_PvKernelCoeffs` mirrors the private `KernelCoeffs`: the coefficients for one smoothing radius, computed once. Its
 # colour-field terms (`poly6_grad_scalar`, `poly6_laplacian`) are reached only from the solver, whose rows cover them
 # at M5; until then `tests/sph.tcyr` checks them (Rust's `test_poly6_kernels_consistent`). The CSF acceleration
 # arrives with the solver.
 
-struct PvKernelCoeffs {
+struct _PvKernelCoeffs {
     h: f64;
     h2: f64;
     poly6: f64;
@@ -24,14 +24,14 @@ struct PvKernelCoeffs {
 
 # A typed view of a word (the solver's pool kernels read their coefficients through one).
 #must_use
-fn _pv_as_kc(p): *PvKernelCoeffs {
+fn _pv_as_kc(p): *_PvKernelCoeffs {
     return p;
 }
 
 # The coefficients for smoothing radius h into *kc (Rust only debug-asserts h > 0; another h gives what its
 # arithmetic gives): h², 315/((64π)·h⁹), −45/(π·h⁶), 45/(π·h⁶) and −945/((32π)·h⁹) twice, with h⁶ = h³·h³ and
 # h⁹ = h⁶·h³. Mirrors `KernelCoeffs::new`.
-fn _pv_kc_init(kc: *PvKernelCoeffs, h: f64) {
+fn _pv_kc_init(kc: *_PvKernelCoeffs, h: f64) {
     var pi: f64 = PV_F64_PI;
     var h2: f64 = h * h;
     var h3: f64 = h2 * h;
@@ -53,7 +53,7 @@ fn _pv_kc_init(kc: *PvKernelCoeffs, h: f64) {
 
 # poly6 at squared distance r2: 0 beyond h², else ((c·d)·d)·d with d = h² − r2. Mirrors `KernelCoeffs::poly6`.
 #must_use
-fn _pv_kc_poly6(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var w: f64 = ((kc.poly6 * d) * d) * d;
@@ -63,7 +63,7 @@ fn _pv_kc_poly6(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The poly6 gradient's scalar at squared distance r2: 0 beyond h², else (c·d)·d with d = h² − r2 and c = −945/(32π·h⁹)
 # (the caller multiplies by the displacement). Mirrors `KernelCoeffs::poly6_grad_scalar`.
 #must_use
-fn _pv_kc_poly6_grad(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6_grad(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var w: f64 = (kc.poly6_grad * d) * d;
@@ -73,7 +73,7 @@ fn _pv_kc_poly6_grad(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The poly6 Laplacian at squared distance r2: 0 beyond h², else (c·d)·(3h² − 7r2) with d = h² − r2. Mirrors
 # `KernelCoeffs::poly6_laplacian`.
 #must_use
-fn _pv_kc_poly6_lap(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6_lap(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var t: f64 = (3.0 * kc.h2) - (7.0 * r2);
@@ -84,7 +84,7 @@ fn _pv_kc_poly6_lap(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The spiky gradient magnitude at distance r: 0 beyond h or for r ≤ 0, else (c·d)·d with d = h − r. Mirrors
 # `KernelCoeffs::spiky_grad`.
 #must_use
-fn _pv_kc_spiky_grad(kc: *PvKernelCoeffs, r: f64): f64 {
+fn _pv_kc_spiky_grad(kc: *_PvKernelCoeffs, r: f64): f64 {
     if (r > kc.h || r <= 0.0) { return 0.0; }
     var d: f64 = kc.h - r;
     var w: f64 = (kc.spiky_grad * d) * d;
@@ -94,7 +94,7 @@ fn _pv_kc_spiky_grad(kc: *PvKernelCoeffs, r: f64): f64 {
 # The viscosity Laplacian at distance r: 0 beyond h or for r ≤ 0, else c·(h − r). Mirrors
 # `KernelCoeffs::visc_laplacian`.
 #must_use
-fn _pv_kc_visc_lap(kc: *PvKernelCoeffs, r: f64): f64 {
+fn _pv_kc_visc_lap(kc: *_PvKernelCoeffs, r: f64): f64 {
     if (r > kc.h || r <= 0.0) { return 0.0; }
     var d: f64 = kc.h - r;
     var w: f64 = kc.visc_lap * d;
@@ -373,7 +373,7 @@ fn batch_poly6(r2, n, h: f64) {
     if (n <= 0) { return (0, 0); }
     var out = fl_alloc(n * 8);
     if (out == 0) { return (0, 0); }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     for (var i = 0; i < n; i = i + 1) {
         var x: f64 = load64(r2 + i * 8);

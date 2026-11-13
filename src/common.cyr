@@ -329,6 +329,28 @@ fn PvParticleSoa_drop(s: *PvParticleSoa) {
     return 0;
 }
 
+# A deep copy of `src` into *out (a different store), each column at its own length: 1, or 0 when the memory isn't
+# there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvParticleSoa_clone(out: *PvParticleSoa, src: *PvParticleSoa): i64 {
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_soa_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var s: *PvColumn = _pv_soa_col(src, k);
+        var d: *PvColumn = _pv_soa_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvParticleSoa_drop(out);
+            return 0;
+        }
+        var ok = d.copy_from(s);
+    }
+    return 1;
+}
+
 # A particle record's 18 words, in column order (declaration order, the conformation's three in the tuple's): the
 # record is laid out exactly as the 18 columns are, so word k of particle i is column k's slot i.
 const _PV_PARTICLE_WORDS = 18;

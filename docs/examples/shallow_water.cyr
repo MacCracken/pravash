@@ -1,0 +1,74 @@
+# pravash 2.0: Rust 1.3.0's `examples/shallow_water.rs` in Cyrius. A splash in a 40 × 40 shallow-water basin over an
+# earth channel's friction, stepped 200 times, with the volume (conserved) and the highest wave every 20 frames. It
+# prints what the Rust example prints (docs/examples/shallow_water.out).
+include "lib/pravash.cyr"
+
+# Prints the text.
+fn put(s) {
+    print(s, strlen(s));
+    return 0;
+}
+
+# Prints n right-aligned in `width` columns: Rust's `{:>width}`.
+fn put_int(n, width) {
+    var buf[24];
+    var len = fmt_int_buf(n, &buf);
+    for (var i = len; i < width; i = i + 1) { print(" ", 1); }
+    print(&buf, len);
+    return 0;
+}
+
+# Prints x with `decimals` places, right-aligned in `width` columns: Rust's `{:>width.decimals}`.
+fn put_f64(x: f64, width, decimals) {
+    var buf[64];
+    var len = fmt_float_buf(x, &buf, decimals);
+    for (var i = len; i < width; i = i + 1) { print(" ", 1); }
+    print(&buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    # Rust's `ShallowWater::new(40, 40, 0.1, 1.0).unwrap()`.
+    var sw: PvShallowWater;
+    var t0, e0 = PvShallowWater_new(40, 40, 0.1, 1.0, &sw);
+    if (is_ok(t0) == 0) { return 1; }
+    sw.manning_n.fill_f(0.025);                 # earth channel friction
+
+    # Drop a splash in the center
+    sw.add_disturbance(2.0, 2.0, 0.3, 0.5);
+
+    println("Pravash — Shallow water simulation");
+    put("Grid: ");
+    put_int(sw.nx, 0);
+    put("x");
+    put_int(sw.ny, 0);
+    put(", dx=");
+    put_f64(sw.dx, 0, 1);
+    println("");
+    println("");
+
+    for (var frame = 0; frame < 200; frame = frame + 1) {
+        var t, err = sw.step(0.001);
+        if (is_ok(t) == 0) { return 1; }
+        if (frame % 20 == 0) {
+            var vol: f64 = sw.total_volume();
+            var max_h: f64 = sw.max_wave_height(1.0);
+            put("Frame ");
+            put_int(frame, 4);
+            put("  volume: ");
+            put_f64(vol, 8, 4);
+            put("  max_wave: ");
+            put_f64(max_h, 8, 6);
+            println("");
+        }
+    }
+
+    println("");
+    println("Done.");
+    PvShallowWater_drop(&sw);
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

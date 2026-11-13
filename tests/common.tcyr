@@ -485,6 +485,50 @@ fn test_serde() {
     return 0;
 }
 
+# The derived Clone of ParticleSoa (M8 part c, the full surface diff): a deep copy, each column at its own length,
+# in storage of its own.
+fn test_clone() {
+    test_group("clone_particle_soa");
+    var three = fl_alloc(3 * sizeof(PvFluidParticle));
+    var b0: PvFluidParticle = PvFluidParticle_new_2d(0.5, 1.5, 1.0);
+    var b1: PvFluidParticle = PvFluidParticle_new_2d(2.5, 3.5, 2.0);
+    var b2: PvFluidParticle = PvFluidParticle_new_2d(4.5, 5.5, 3.0);
+    *at(three, 0) = b0;
+    *at(three, 1) = b1;
+    *at(three, 2) = b2;
+    var s: PvParticleSoa;
+    assert_eq(PvParticleSoa_from_aos(&s, at(three, 0), 3), 1, "from_aos");
+    s.mass.truncate(2);
+    var c: PvParticleSoa;
+    assert_eq(PvParticleSoa_clone(&c, &s), 1, "clone");
+    var same = 1;
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var sc: *PvColumn = _pv_soa_col(&s, k);
+        var cc: *PvColumn = _pv_soa_col(&c, k);
+        if (sc.len != cc.len || (sc.len > 0 && sc.data == cc.data)) { same = 0; }
+        for (var i = 0; i < sc.len; i = i + 1) {
+            var wa = sc.get(i);
+            var wb = cc.get(i);
+            if (wa != wb) { same = 0; }
+        }
+    }
+    assert_eq(same, 1, "all 18 columns copied bit for bit, each into storage of its own");
+    assert(c.mass.len == 2 && c.is_consistent() == 0, "a short column stays short, as Rust's Vec clones do");
+    var w = s.pos_x.set_f(0, 99.0);
+    var cx: f64 = c.pos_x.get_f(0);
+    assert(near(cx, 0.5, EPS) == 1, "the clone doesn't see the source's writes");
+    PvParticleSoa_drop(&s);
+    var cy: f64 = c.pos_y.get_f(2);
+    assert(near(cy, 5.5, EPS) == 1, "and outlives it");
+    PvParticleSoa_drop(&c);
+    var e: PvParticleSoa = PvParticleSoa_new();
+    var ec: PvParticleSoa;
+    assert_eq(PvParticleSoa_clone(&ec, &e), 1, "an empty store clones");
+    assert(ec.is_empty() == 1 && ec.pos_x.data == 0, "to an empty store holding no storage");
+    fl_free(three);
+    return 0;
+}
+
 # Runs the ported common tests.
 fn main() {
     alloc_init();
@@ -497,6 +541,7 @@ fn main() {
     test_soa();
     test_arena();
     test_serde();
+    test_clone();
     return assert_summary();
 }
 

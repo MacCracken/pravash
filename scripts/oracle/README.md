@@ -16,6 +16,7 @@ cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --feature
 python3 -I -B scripts/oracle/validate.py .                                                    # independent re-check
 python3 -I -B scripts/oracle/validate.py . --write                                            # regenerate the corrected oracle, the f64-key oracle and the cr tables
 python3 -I -B scripts/oracle/probe_tables.py .                                                # compile every generated value, compare bits
+python3 -I -B scripts/oracle/examples.py . [--write]                                          # docs/examples/*.out from the Rust examples and validate.py
 ```
 
 The generator depends on the oracle by path, on `hisab =1.4.0` (for glam's `DVec3`, to build `common`'s inputs), and

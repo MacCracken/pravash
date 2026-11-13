@@ -1106,7 +1106,7 @@ fn test_layout() {
     test_group("fg_layout_matches_column_offsets");
     assert_eq(sizeof(PvFluidGrid), 376, "PvFluidGrid: 376 bytes");
     assert_eq(sizeof(PvGridConfig), 104, "PvGridConfig: 104 bytes");
-    assert_eq(sizeof(PvMgLevel), 72, "PvMgLevel: 72 bytes");
+    assert_eq(sizeof(_PvMgLevel), 72, "_PvMgLevel: 72 bytes");
     assert_eq(sizeof(PvMacGrid), 168, "PvMacGrid: 168 bytes");
     assert_eq(sizeof(PvKEpsilon), 120, "PvKEpsilon: 120 bytes");
     assert_eq(fresh(&g, 8, 9, 0.1), 1, "new");
@@ -1130,7 +1130,7 @@ fn test_layout() {
     assert_eq(fg_col_data(&g, 13), g.dst_y.data, "13: dst_y");
     assert(g.dst_x.len == 6 * 6 + 6 && g.dst_y.len == 7 * 7 + 7, "the plans of lengths 6 and 7");
     var lv = load64(g.mg_levels.data);
-    var level: *PvMgLevel = _pv_as_mg_level(lv);
+    var level: *_PvMgLevel = _pv_as_mg_level(lv);
     assert(level.residual.data != 0 && level.coarse_rhs.data != 0 && level.coarse_p.data != 0,
       "the level's columns have storage");
     assert_eq(mg_col_data(lv, 0), level.residual.data, "level column 0: residual");

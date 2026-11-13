@@ -83,7 +83,7 @@ fn PvGridConfig_default(): PvGridConfig {
 
 # One multigrid level as the grid keeps it between steps: the residual (the level's size), the coarse right-hand
 # side and the coarse correction (the next level's size). Mirrors the `(Vec, Vec, Vec)` of `mg_levels`.
-struct PvMgLevel {
+struct _PvMgLevel {
     residual: PvColumn;
     coarse_rhs: PvColumn;
     coarse_p: PvColumn;
@@ -112,20 +112,20 @@ struct PvFluidGrid {
 }
 
 # The number of columns in a `PvFluidGrid`: the 4 public fields, the 4 scratch buffers, `mg_levels` (column 8, whose
-# words are `*PvMgLevel`s), the 3 solver buffers and the 2 DST plans (`_pv_fg_dst_plan`).
+# words are `*_PvMgLevel`s), the 3 solver buffers and the 2 DST plans (`_pv_fg_dst_plan`).
 const _PV_FG_COLUMNS = 14;
 
 # Column k of a grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_a, 5 scratch_b, 6 scratch_c, 7 diffuse_rhs,
 # 8 mg_levels, 9 … 11 solve_a … solve_c, 12 dst_x, 13 dst_y), by its byte offset (a field's address can't be taken;
 # tests/grid.tcyr pins the layout: nx, ny, dx, the fourteen columns, then the thread count and the pool (a
-# `PvPool` pointer, 0 for none: src/par.cyr), 376 bytes).
+# `_PvPool` pointer, 0 for none: src/par.cyr), 376 bytes).
 #must_use
 fn _pv_fg_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
 }
 
 #must_use
-fn _pv_as_mg_level(p): *PvMgLevel {
+fn _pv_as_mg_level(p): *_PvMgLevel {
     return p;
 }
 
@@ -184,7 +184,7 @@ fn _pv_fg_zero(g: *PvFluidGrid) {
 # Releases every field's storage, the multigrid levels included; the grid holds no storage after. Mirrors dropping
 # the `FluidGrid`.
 fn PvFluidGrid_drop(g: *PvFluidGrid) {
-    PvPool_drop(g.pool);
+    _pv_pool_drop(g.pool);
     g.pool = 0;
     _pv_mg_levels_drop(_pv_fg_col(g, 8));
     for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
@@ -1241,7 +1241,7 @@ impl PvFluidGrid {
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
-        PvPool_drop(self.pool);
+        _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;
         return t;
@@ -1413,7 +1413,7 @@ impl PvFluidGrid {
         # The pool behind `threads`, started by the first step after `set_threads` (one that can't be started leaves
         # the grid serial, which gives the same bits).
         if (self.threads > 1 && self.pool == 0) {
-            self.pool = PvPool_new(self.threads);
+            self.pool = _pv_pool_new(self.threads);
             if (self.pool == 0) { self.threads = 1; }
         }
         var pool = self.pool;

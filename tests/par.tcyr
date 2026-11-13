@@ -94,9 +94,9 @@ fn main() {
     store64(&ctx + 8, tids);
 
     test_group("pool_none_below_two_threads");
-    assert_eq(PvPool_new(1), 0, "1 thread: no pool (serial)");
-    assert_eq(PvPool_new(0), 0, "0: no pool");
-    assert_eq(PvPool_new(0 - 3), 0, "negative: no pool");
+    assert_eq(_pv_pool_new(1), 0, "1 thread: no pool (serial)");
+    assert_eq(_pv_pool_new(0), 0, "0: no pool");
+    assert_eq(_pv_pool_new(0 - 3), 0, "negative: no pool");
     for (var i = 0; i < n; i = i + 1) { store64(slots + i * 8, 0); }
     _pv_par_for(0, 0, n, &mark, &ctx);
     assert_eq(all_eq(slots, n, 1), 1, "a pool of 0 runs the whole range once");
@@ -111,17 +111,17 @@ fn main() {
     store64(&counts + 32, 16);
     for (var c = 0; c < 5; c = c + 1) {
         var t = load64(&counts + c * 8);
-        var p = PvPool_new(t);
+        var p = _pv_pool_new(t);
         assert(p != 0, "a pool starts");
         for (var i2 = 0; i2 < n; i2 = i2 + 1) { store64(slots + i2 * 8, 0); }
         _pv_par_for(p, 0, n, &mark, &ctx);
         assert_eq(all_eq(slots, n, 1), 1, "every index exactly once");
         assert_eq(distinct(tids, n), t, "on T distinct threads");
-        PvPool_drop(p);
+        _pv_pool_drop(p);
     }
 
     test_group("pool_short_and_empty_ranges");
-    var p8 = PvPool_new(8);
+    var p8 = _pv_pool_new(8);
     for (var i3 = 0; i3 < n; i3 = i3 + 1) { store64(slots + i3 * 8, 0); }
     _pv_par_for(p8, 10, 13, &mark, &ctx);
     assert(load64(slots + 10 * 8) == 1 && load64(slots + 11 * 8) == 1 && load64(slots + 12 * 8) == 1,
@@ -138,8 +138,8 @@ fn main() {
     var after = alloc_used();
     assert_eq(after - before, 0, "500 calls take no heap");
     assert_eq(all_eq(slots, n, 500), 1, "and each index ran in every one");
-    PvPool_drop(p8);
-    PvPool_drop(0);
+    _pv_pool_drop(p8);
+    _pv_pool_drop(0);
 
     test_group("grid_thread_count_lifecycle");
     var g: PvFluidGrid;

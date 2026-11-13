@@ -722,6 +722,68 @@ fn test_docs() {
     return 0;
 }
 
+# 1 when buffers a and b hold the same f32 bits in storage of their own (or both are empty).
+fn f32_same(a: *PvF32Column, b: *PvF32Column): i64 {
+    if (a.len != b.len) { return 0; }
+    if (a.len == 0) { return 1; }
+    if (a.data == b.data) { return 0; }
+    return memeq(a.data, b.data, a.len * 4);
+}
+
+# The derived Clone of PackedParticles and NeuralCorrection (M8 part c, the full surface diff): the buffers at their
+# own lengths, in storage of their own.
+fn test_clone() {
+    test_group("clone_packed_particles");
+    var pb = particles(3, 1.0, 2.0, 3.0, 0.5);
+    var soa: PvParticleSoa;
+    soa_of(&soa, _pv_as_particles(pb), 3);
+    var pk: PvPackedParticles;
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var w = pk.density_pressure.set(1, 1000.0);
+    var c: PvPackedParticles;
+    assert_eq(PvPackedParticles_clone(&c, &pk), 1, "clone");
+    var same = 1;
+    for (var k = 0; k < 3; k = k + 1) {
+        if (f32_same(_pv_packed_col(&c, k), _pv_packed_col(&pk, k)) == 0) { same = 0; }
+    }
+    assert(c.count == 3 && same == 1, "the count and all three buffers");
+    w = pk.position_mass.set(0, 9.0);
+    var cx: f64 = c.position_mass.at(0);
+    assert(near(cx, 1.0, 0.000001) == 1, "the clone doesn't see the source's writes");
+    PvPackedParticles_drop(&pk);
+    var cd: f64 = c.density_pressure.at(1);
+    assert(near(cd, 1000.0, 0.000001) == 1, "and outlives it");
+    PvPackedParticles_drop(&c);
+    var e: PvPackedParticles;
+    memset(&e, 0, sizeof(PvPackedParticles));
+    assert_eq(PvPackedParticles_clone(&c, &e), 1, "an empty record clones");
+    assert(c.count == 0 && c.position_mass.data == 0 && c.velocity.data == 0, "to one holding no storage");
+    PvParticleSoa_drop(&soa);
+    fl_free(pb);
+
+    test_group("clone_neural_correction");
+    var nc: PvNeuralCorrection;
+    memset(&nc, 0, sizeof(PvNeuralCorrection));
+    assert(nc.velocity_delta.reserve(3) == 1 && nc.pressure_delta.reserve(1) == 1, "room");
+    nc.velocity_delta.push_rounded(0.1);
+    nc.velocity_delta.push_rounded(-0.2);
+    nc.velocity_delta.push_rounded(0.3);
+    nc.pressure_delta.push_rounded(-5.0);
+    var cc: PvNeuralCorrection;
+    assert_eq(PvNeuralCorrection_clone(&cc, &nc), 1, "clone");
+    var vs = f32_same(_pv_as_f32_column(_pv_addr(&cc)), _pv_as_f32_column(_pv_addr(&nc)));
+    var qs = f32_same(_pv_as_f32_column(_pv_addr(&cc) + 24), _pv_as_f32_column(_pv_addr(&nc) + 24));
+    assert(vs == 1 && qs == 1, "the velocity and pressure deltas");
+    PvNeuralCorrection_drop(&nc);
+    var v1: f64 = cc.velocity_delta.at(1);
+    var want: f64 = -0.2;
+    var wf: f32 = want;
+    var w64: f64 = f32_to(wf);
+    assert(v1 == w64, "the clone outlives its source, -0.2 rounded to f32");
+    PvNeuralCorrection_drop(&cc);
+    return 0;
+}
+
 # Runs the ported compute tests.
 fn main() {
     alloc_init();
@@ -731,6 +793,7 @@ fn main() {
     test_derivatives();
     test_f32_reads();
     test_docs();
+    test_clone();
     return assert_summary();
 }
 

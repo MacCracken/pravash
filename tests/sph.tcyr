@@ -858,7 +858,7 @@ fn test_eos_and_totals() {
     test_solver_basics();
 
     test_group("test_poly6_kernels_consistent");
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, 1.0);
     var pg0: f64 = _pv_kc_poly6_grad(&kc, 0.0);
     var apg0: f64 = f64_abs(pg0);
@@ -1557,6 +1557,38 @@ fn test_docs() {
     return 0;
 }
 
+# The derived Clone of MultiPhaseConfig (M8 part c, the full surface diff): the phases and the interface tension,
+# in storage of their own.
+fn test_clone() {
+    test_group("clone_multi_phase_config");
+    var two: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(phase(1000.0, 2000.0, 0.001), phase(1.225, 2000.0,
+        0.00001), 0.072);
+    var c: PvMultiPhaseConfig;
+    assert_eq(PvMultiPhaseConfig_clone(&c, &two), 1, "clone");
+    var it: f64 = c.interface_tension;
+    assert(c.phase_count() == 2 && near(it, 0.072, EPS) == 1, "two phases, the tension");
+    var same = 1;
+    for (var i = 0; i < two.phases.len; i = i + 1) {
+        var wa = two.phases.get(i);
+        var wb = c.phases.get(i);
+        if (wa != wb) { same = 0; }
+    }
+    assert(same == 1 && c.phases.data != two.phases.data, "the phases bit for bit, in a column of its own");
+    var pushed = two.push_phase(phase(800.0, 1500.0, 0.01));
+    assert(pushed == 1 && c.phase_count() == 2, "a phase pushed on the source isn't the clone's");
+    PvMultiPhaseConfig_drop(&two);
+    var rd: f64 = c.phases.get_f(3);
+    assert(near(rd, 1.225, EPS) == 1, "the clone outlives its source");
+    PvMultiPhaseConfig_drop(&c);
+    var e: PvMultiPhaseConfig = _pv_mp_empty(0.5);
+    var ec: PvMultiPhaseConfig;
+    var et: f64 = 0.0;
+    assert_eq(PvMultiPhaseConfig_clone(&ec, &e), 1, "a configuration with no phase clones");
+    et = ec.interface_tension;
+    assert(ec.phase_count() == 0 && ec.phases.data == 0 && near(et, 0.5, EPS) == 1, "with no storage");
+    return 0;
+}
+
 # Runs the ported SPH tests.
 fn main() {
     alloc_init();
@@ -1577,6 +1609,7 @@ fn main() {
     test_part_c_paths();
     test_solver_layout();
     test_docs();
+    test_clone();
     return assert_summary();
 }
 

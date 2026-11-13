@@ -654,7 +654,7 @@ faster, with its rows unchanged.
 `src/grid_solve.cyr` and `src/grid.cyr` go after `src/shallow.cyr` in `[lib]`. `PvFluidGrid` mirrors `FluidGrid`:
 - **The record:** 312 bytes: nx, ny, dx and twelve columns at 24 + 24·k, pinned by a test.
 - **Public fields:** vx, vy, pressure and density are `PvColumn`s, and `step` refuses inconsistent lengths.
-- **Scratch:** the four scratch buffers persist across steps. `mg_levels` is a column of `*PvMgLevel` records,
+- **Scratch:** the four scratch buffers persist across steps. `mg_levels` is a column of `*_PvMgLevel` records,
   each holding three columns. Three Cyrius-only buffers, `solve_a` … `solve_c`, hold what Rust's DST and CG solves
   allocate per call (ADR 0002 #12).
 - **Config and walls:** `PvGridConfig` and `PvBoundaryCondition` (NoSlip 0, FreeSlip 1, Periodic 2) come with
@@ -1008,14 +1008,14 @@ Each made its step 1.17–1.19× faster in a pinned A/B. The rest is a loop of i
 
 ## 14. M3 part e: the worker pool and the grid's parallel loops (2026-11-12)
 
-**`src/par.cyr`** is the pool probe 6 chose (§4.6, D6). A `PvPool` of T threads is the caller plus T − 1 persistent
+**`src/par.cyr`** is the pool probe 6 chose (§4.6, D6). A `_PvPool` of T threads is the caller plus T − 1 persistent
 workers, each parked on its own job channel. `_pv_par_for(pool, lo, hi, fp, ctx)` works like this:
 - it splits [lo, hi) into T contiguous slices, [lo + (n·w)/T, lo + (n·(w+1))/T);
 - it posts a job token to every worker, runs slice 0 itself, and waits for T − 1 answers;
 - every index is written by exactly one thread, so the split changes no bit;
 - a pool of 0 runs the range on the caller.
 
-`PvPool_new(T)` gives no pool, and the caller then runs serially, in these cases:
+`_pv_pool_new(T)` gives no pool, and the caller then runs serially, in these cases:
 - a count of 1 or less;
 - a target where `THREADS_CONCURRENT` or `CHAN_BLOCKING` is 0 (agnos, cx);
 - a failure to make a channel or a thread (the workers already started are stopped).
@@ -1079,7 +1079,7 @@ M4 splits into four parts:
 - **d:** the physics extensions, among them the MLS corrections (L7).
 
 **`src/sph_kernels.cyr`:**
-- **`PvKernelCoeffs`:** `_pv_kc_init` and the poly6, spiky-gradient and viscosity-Laplacian evaluations. Also the two
+- **`_PvKernelCoeffs`:** `_pv_kc_init` and the poly6, spiky-gradient and viscosity-Laplacian evaluations. Also the two
   colour-field terms the solver uses, checked by Rust's `test_poly6_kernels_consistent` until M5's rows reach them.
 - **The seven public kernels.** Each computes only its own coefficient, by `_pv_kc_init`'s expression; see Speed.
 - **`equation_of_state` and `equation_of_state_tait`,** with the γ → 0 `ln` limit.
@@ -2277,3 +2277,78 @@ and the mutation duplicated a name no Rust test has. Any group defined twice in 
 
 **A correction to the plan.** M8's row named 23 Rust benchmarks. `rust-old/benches/benchmarks.rs` registers 21
 criterion groups, which give 57 rows, as `rust-old/bench-history.csv` records. Part b covers those 21.
+
+## 30. M8 part c: the full surface diff, the docs and the examples (2026-11-13)
+
+**The full surface diff.** Through M7, `scripts/surface_parity.py` checked one direction: each public Rust item has
+the Cyrius name the naming rules give. Part c adds three checks:
+- **Each Rust trait's methods**: the 7 of `ComputeBackend`, `NeuralCorrector` and `ReactionProvider` are declared by
+  their `Pv` traits.
+- **Each `#[derive(..)]` on a public type**, read from its attributes: 157 derives on 45 types. Copy, Clone on a Copy
+  type, and PartialEq or Eq on an enum are plain values; the others are functions (`to_json`, `_from_json`,
+  `_default`, `_clone`, `eq`, `debug`, `pv_error_message`). 121 match. Two are exceptions with reasons
+  (`DragCoefficient`'s PartialEq, a unit struct the port holds no value of; `RigidBody`'s Clone, copied by
+  assignment), and two are renamed (`DragCoefficient`'s codecs).
+- **The reverse direction**: each public name the port defines (no `_` prefix) in the bundle and in
+  `src/compute_ad.cyr` is a counterpart the forward check found (351 of 466), or matches one of 18 `CYRIUS_ONLY`
+  rules, each citing the ADR 0002 row or plan section that admits it (115). A rule that matches nothing fails, as an
+  unexplained name does.
+
+It found three things:
+- **Six Rust `Clone`s with no counterpart**, on types whose Cyrius form owns storage: `ParticleSoa`,
+  `MultiPhaseConfig`, `PackedParticles`, `NeuralCorrection`, `DaimonConfig` and `HooshConfig`. A struct assignment
+  would alias their columns or strings, and a second drop would free them twice. Each now has a `PvX_clone(out, src)`
+  deep copy (1, or 0 with nothing held), with a test group: bit for bit, independent of the source, outliving it,
+  and from an empty source. That adds 41 checks: common 117 → 125, sph 195 → 202, compute 97 → 109, ai 42 → 56.
+- **Three Rust-private types that were public names**: `KernelCoeffs`, `FluidGrid`'s multigrid level and the worker
+  pool (Rust's rayon has none) were `PvKernelCoeffs`, `PvMgLevel` and `PvPool`, with `PvPool_new` and `PvPool_drop`.
+  No public signature used them, and 2.0.0 would have frozen them into the surface, so they are `_PvKernelCoeffs`,
+  `_PvMgLevel`, `_PvPool`, `_pv_pool_new` and `_pv_pool_drop`.
+- **Rust's derived `Debug` on 36 public types**, which only the ai configs had. Cyrius's derives are Serialize,
+  Deserialize, accessors, json and cyml (the guide's *Derive* section), and impetus didn't port Debug. The maintainer
+  chose to port it, as M8 part d: a `debug(sb, alternate)` per type, golden rows from the oracle, and a
+  `#derive(Debug)` request filed at cyrius. Until then the 36 are listed as pending.
+
+**Mutations of the diff** (a scratch copy per mutation): 17 of 17 caught.
+- a clone, a JSON codec, a default, an equality, the hand-written `Debug` or a trait method removed;
+- a public fn, struct or constant added, or a private name made public;
+- a `CYRIUS_ONLY` rule removed, a stale rule, a stale derive exception or rename;
+- a derive added on the Rust side, and a Clone derived on a type that owns storage.
+
+The hand-written Debug's removal was caught on the first run, but with the generic message `impl PvDebug for ..`. It
+now names the method it wants, as Default's does.
+
+**The examples.** Rust's `basic_fluid`, `shallow_water` and `multiphase` are ported as `docs/examples/*.cyr` and
+print Rust's lines in Rust's format. `scripts/oracle/examples.py` derives the output each must print.
+- **`shallow_water`** prints exactly what `cargo run --example shallow_water` prints.
+- **The two SPH examples** print Rust's first frame, and different numbers from frame 10. validate.py's
+  transcription of the solver, run on the same scenes, prints Rust's frames exactly on the f32 neighbour keys and the
+  port's frames exactly on the f64 keys. So ADR 0002 #2 is the whole difference.
+
+  In `basic_fluid` the states first differ after the second step. Before it, the f32 keys put a particle at
+  x = 0.3999999999999997 (0.4 rounds up in f32) into cell 8, where the f64 keys put it in cell 7. 49 particles' lists
+  then hold the same neighbours within h in another order: 0 of the 49 differ as sets. Their sums run in another
+  order and differ in the last bits. The scene, which reaches 6,800 m/s by frame 10, grows that into different
+  numbers.
+
+  The README and the migration guide say so. The corpus covers the same effect: the 597 rows ADR 0002 #2 maps are
+  checked against validate.py's f64 transcription.
+
+**The docs' code.** `scripts/doc_examples.py` builds and runs every `cyrius` block in the README and the guides, the
+fragments wrapped in a `main`, and each example against its `.out`. It counts 14 blocks and programs: the README's
+Quick Start (Rust's, ported), 10 in the migration guide, and the three examples, all passing on the first full run.
+It runs in CI after `cyrius distlib --check`. Each example must also be formatted and lint-clean. Lint compiles its
+file, and an example's `lib/pravash.cyr` exists only in a consumer, so lint runs on the built copy, whose include
+points at `dist/`. A first gate that linted the examples as written failed on that include. Its mutations, 7 of 7
+caught:
+- a float-type warning, a nonzero exit and a compile error;
+- an example printing other output;
+- a misindented line or a trailing space (fmt), and a line over 120 characters (lint).
+
+An unused local isn't one of lint's rules. `PvColumn::fill_f(x)`, Rust's `vec.fill(x)` on an f64 field, was
+added for the shallow-water example, which needed the private `_pv_bits` without it. Rust's
+`test_friction_scales_with_roughness` now calls it, through `friction_flow`.
+
+**Not yet scheduled.** `tests/pravash.fcyr` is still the scaffold's stub, whose comment promised the port's targets
+at M8. The Rust crate had no fuzz targets, and the plan never scheduled any. It is listed for part e: targets for the
+JSON readers and the `PRAVASH_LOG` parser, the inputs a consumer doesn't control.

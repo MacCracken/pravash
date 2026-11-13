@@ -18,7 +18,7 @@
 # Σ m_j·poly6(r²) over the n particles at ps within h of *pi (r² ≤ h², *pi itself included), from +0, at the
 # coefficients kc. Mirrors the private `compute_density_inner`.
 #must_use
-fn _pv_density_sum(pi: *PvFluidParticle, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs): f64 {
+fn _pv_density_sum(pi: *PvFluidParticle, ps: *PvFluidParticle, n, kc: *_PvKernelCoeffs): f64 {
     var px: f64 = pi.position.x;
     var py: f64 = pi.position.y;
     var pz: f64 = pi.position.z;
@@ -47,7 +47,7 @@ fn compute_density(idx, ps: *PvFluidParticle, n, h: f64): f64 {
         var nan: f64 = PV_F64_NAN;
         return nan;
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var d: f64 = _pv_density_sum(ps + idx, ps, n, &kc);
     return d;
@@ -64,7 +64,7 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
         var nan: f64 = PV_F64_NAN;
         _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -113,7 +113,7 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
         var nan: f64 = PV_F64_NAN;
         _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -178,7 +178,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
     var dens = block;
     var snap: *PvFluidParticle = _pv_as_particles(block + n * 8);
     var h: f64 = config.smoothing_radius;
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
 
     # The densities, then the pressures.
@@ -507,7 +507,7 @@ fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, 
         var e: *PvFluidParticle = ps + c;
         *d = *e;
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -621,7 +621,7 @@ fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, 
         var q: *PvFluidParticle = ps + c;
         store64(snap + c * 8, _pv_bits(q.temperature));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -929,7 +929,7 @@ fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f
         store64(w + 24, _pv_bits(q.position.z));
         store64(w + 32, _pv_bits(q.mass));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var eps: f64 = (0.01 * h) * h;
@@ -1089,7 +1089,7 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
         _pv_span_end(trace);
         return (out, n);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -1204,7 +1204,7 @@ fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_
         store64(v_old + c0 * 24 + 8, _pv_bits(q.velocity.y));
         store64(v_old + c0 * 24 + 16, _pv_bits(q.velocity.z));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20

@@ -5137,6 +5137,12 @@ impl PvColumn {
         return 0;
     }
 
+    # Every slot set to x. Mirrors `slice::fill` on a `Vec<f64>` (`sw.manning_n.fill(0.025)`).
+    fn fill_f(self, x: f64) {
+        self.fill(_pv_bits(x));
+        return 0;
+    }
+
     # Copies `src`'s slots over this column's, which must be as long (0 and nothing copied otherwise). Mirrors
     # `slice::copy_from_slice` (which panics on a length mismatch).
     fn copy_from(self, src: *PvColumn): i64 {
@@ -5506,6 +5512,28 @@ fn PvParticleSoa_drop(s: *PvParticleSoa) {
         c.drop();
     }
     return 0;
+}
+
+# A deep copy of `src` into *out (a different store), each column at its own length: 1, or 0 when the memory isn't
+# there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvParticleSoa_clone(out: *PvParticleSoa, src: *PvParticleSoa): i64 {
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var z: *PvColumn = _pv_soa_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+        var s: *PvColumn = _pv_soa_col(src, k);
+        var d: *PvColumn = _pv_soa_col(out, k);
+        if (d.resize(s.len, 0) == 0) {
+            PvParticleSoa_drop(out);
+            return 0;
+        }
+        var ok = d.copy_from(s);
+    }
+    return 1;
 }
 
 # A particle record's 18 words, in column order (declaration order, the conformation's three in the tuple's): the
@@ -7262,7 +7290,7 @@ fn _pv_sw_ddepth(sh, gp, k, dry_thr: f64): f64 {
 # Each pool's channels (four words and a mutex each, from the stdlib's `alloc`) are not returned when it stops: the
 # stdlib has no `chan_free`. A pool starts once per thread-count change, not per step, so the step's heap stays flat.
 
-struct PvPool {
+struct _PvPool {
     threads;   # T: the calling thread and T − 1 workers
     jobs;      # T − 1 job channels, one per worker
     done;      # the answer channel, T − 1 deep
@@ -7275,13 +7303,13 @@ struct PvPool {
 }
 
 #must_use
-fn _pv_as_pool(p): *PvPool {
+fn _pv_as_pool(p): *_PvPool {
     return p;
 }
 
 # Runs worker w's slice of the current job: [lo + (n·w)/T, lo + (n·(w+1))/T) of the n = hi − lo indices (nothing
 # when the slice is empty).
-fn _pv_pool_run(pool: *PvPool, w) {
+fn _pv_pool_run(pool: *_PvPool, w) {
     var n = pool.hi - pool.lo;
     var a = pool.lo + (n * w) / pool.threads;
     var b = pool.lo + (n * (w + 1)) / pool.threads;
@@ -7291,7 +7319,7 @@ fn _pv_pool_run(pool: *PvPool, w) {
 
 # A worker's loop: its slice for every job token it receives, then an answer; a 0 token ends it.
 fn _pv_pool_worker(arg): i64 {
-    var pool: *PvPool = _pv_as_pool(load64(arg));
+    var pool: *_PvPool = _pv_as_pool(load64(arg));
     var w = load64(arg + 8);
     var ch = load64(pool.jobs + (w - 1) * 8);
     while (1 == 1) {
@@ -7304,7 +7332,7 @@ fn _pv_pool_worker(arg): i64 {
 }
 
 # Stops the first `started` workers of *pool and releases its blocks (not its channels: see the file comment).
-fn _pv_pool_stop(pool: *PvPool, started) {
+fn _pv_pool_stop(pool: *_PvPool, started) {
     for (var w = 0; w < started; w = w + 1) { chan_send(load64(pool.jobs + w * 8), 0); }
     for (var w2 = 0; w2 < started; w2 = w2 + 1) { thread_join(load64(pool.handles + w2 * 8)); }
     if (pool.jobs != 0) { fl_free(pool.jobs); }
@@ -7318,12 +7346,12 @@ fn _pv_pool_stop(pool: *PvPool, started) {
 # the work serially: for a count of 1 or less, on a target without concurrent threads and blocking channels, and
 # when a channel or a thread can't be made (the workers already started are stopped first). Never aborts.
 #must_use
-fn PvPool_new(threads): i64 {
+fn _pv_pool_new(threads): i64 {
     if (threads <= 1 || THREADS_CONCURRENT == 0 || CHAN_BLOCKING == 0) { return 0; }
     _pv_cr_load();
-    var p = fl_alloc(sizeof(PvPool));
+    var p = fl_alloc(sizeof(_PvPool));
     if (p == 0) { return 0; }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     var m = threads - 1;
     pool.threads = threads;
     pool.jobs = fl_alloc(m * 8);
@@ -7360,9 +7388,9 @@ fn PvPool_new(threads): i64 {
 }
 
 # Stops the pool's workers and releases it (nothing for a pool of 0).
-fn PvPool_drop(p) {
+fn _pv_pool_drop(p) {
     if (p == 0) { return 0; }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     _pv_pool_stop(pool, pool.threads - 1);
     return 0;
 }
@@ -7375,7 +7403,7 @@ fn _pv_par_for(p, lo, hi, fp, ctx) {
         fncall3(fp, ctx, lo, hi);
         return 0;
     }
-    var pool: *PvPool = _pv_as_pool(p);
+    var pool: *_PvPool = _pv_as_pool(p);
     pool.fp = fp;
     pool.ctx = ctx;
     pool.lo = lo;
@@ -7607,7 +7635,7 @@ fn PvGridConfig_default(): PvGridConfig {
 
 # One multigrid level as the grid keeps it between steps: the residual (the level's size), the coarse right-hand
 # side and the coarse correction (the next level's size). Mirrors the `(Vec, Vec, Vec)` of `mg_levels`.
-struct PvMgLevel {
+struct _PvMgLevel {
     residual: PvColumn;
     coarse_rhs: PvColumn;
     coarse_p: PvColumn;
@@ -7636,20 +7664,20 @@ struct PvFluidGrid {
 }
 
 # The number of columns in a `PvFluidGrid`: the 4 public fields, the 4 scratch buffers, `mg_levels` (column 8, whose
-# words are `*PvMgLevel`s), the 3 solver buffers and the 2 DST plans (`_pv_fg_dst_plan`).
+# words are `*_PvMgLevel`s), the 3 solver buffers and the 2 DST plans (`_pv_fg_dst_plan`).
 const _PV_FG_COLUMNS = 14;
 
 # Column k of a grid (0 vx, 1 vy, 2 pressure, 3 density, 4 scratch_a, 5 scratch_b, 6 scratch_c, 7 diffuse_rhs,
 # 8 mg_levels, 9 … 11 solve_a … solve_c, 12 dst_x, 13 dst_y), by its byte offset (a field's address can't be taken;
 # tests/grid.tcyr pins the layout: nx, ny, dx, the fourteen columns, then the thread count and the pool (a
-# `PvPool` pointer, 0 for none: src/par.cyr), 376 bytes).
+# `_PvPool` pointer, 0 for none: src/par.cyr), 376 bytes).
 #must_use
 fn _pv_fg_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 24 + k * 24);
 }
 
 #must_use
-fn _pv_as_mg_level(p): *PvMgLevel {
+fn _pv_as_mg_level(p): *_PvMgLevel {
     return p;
 }
 
@@ -7708,7 +7736,7 @@ fn _pv_fg_zero(g: *PvFluidGrid) {
 # Releases every field's storage, the multigrid levels included; the grid holds no storage after. Mirrors dropping
 # the `FluidGrid`.
 fn PvFluidGrid_drop(g: *PvFluidGrid) {
-    PvPool_drop(g.pool);
+    _pv_pool_drop(g.pool);
     g.pool = 0;
     _pv_mg_levels_drop(_pv_fg_col(g, 8));
     for (var k = 0; k < _PV_FG_COLUMNS; k = k + 1) {
@@ -8765,7 +8793,7 @@ impl PvFluidGrid {
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
-        PvPool_drop(self.pool);
+        _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;
         return t;
@@ -8937,7 +8965,7 @@ impl PvFluidGrid {
         # The pool behind `threads`, started by the first step after `set_threads` (one that can't be started leaves
         # the grid serial, which gives the same bits).
         if (self.threads > 1 && self.pool == 0) {
-            self.pool = PvPool_new(self.threads);
+            self.pool = _pv_pool_new(self.threads);
             if (self.pool == 0) { self.threads = 1; }
         }
         var pool = self.pool;
@@ -10246,12 +10274,12 @@ impl PvPhaseField {
 # `f64::consts::PI` (src/constants.cyr), the floors are the private constants (src/constants_private.cyr), and ln
 # and powf are the correctly rounded ones (ADR 0004).
 #
-# `PvKernelCoeffs` mirrors the private `KernelCoeffs`: the coefficients for one smoothing radius, computed once. Its
+# `_PvKernelCoeffs` mirrors the private `KernelCoeffs`: the coefficients for one smoothing radius, computed once. Its
 # colour-field terms (`poly6_grad_scalar`, `poly6_laplacian`) are reached only from the solver, whose rows cover them
 # at M5; until then `tests/sph.tcyr` checks them (Rust's `test_poly6_kernels_consistent`). The CSF acceleration
 # arrives with the solver.
 
-struct PvKernelCoeffs {
+struct _PvKernelCoeffs {
     h: f64;
     h2: f64;
     poly6: f64;
@@ -10263,14 +10291,14 @@ struct PvKernelCoeffs {
 
 # A typed view of a word (the solver's pool kernels read their coefficients through one).
 #must_use
-fn _pv_as_kc(p): *PvKernelCoeffs {
+fn _pv_as_kc(p): *_PvKernelCoeffs {
     return p;
 }
 
 # The coefficients for smoothing radius h into *kc (Rust only debug-asserts h > 0; another h gives what its
 # arithmetic gives): h², 315/((64π)·h⁹), −45/(π·h⁶), 45/(π·h⁶) and −945/((32π)·h⁹) twice, with h⁶ = h³·h³ and
 # h⁹ = h⁶·h³. Mirrors `KernelCoeffs::new`.
-fn _pv_kc_init(kc: *PvKernelCoeffs, h: f64) {
+fn _pv_kc_init(kc: *_PvKernelCoeffs, h: f64) {
     var pi: f64 = PV_F64_PI;
     var h2: f64 = h * h;
     var h3: f64 = h2 * h;
@@ -10292,7 +10320,7 @@ fn _pv_kc_init(kc: *PvKernelCoeffs, h: f64) {
 
 # poly6 at squared distance r2: 0 beyond h², else ((c·d)·d)·d with d = h² − r2. Mirrors `KernelCoeffs::poly6`.
 #must_use
-fn _pv_kc_poly6(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var w: f64 = ((kc.poly6 * d) * d) * d;
@@ -10302,7 +10330,7 @@ fn _pv_kc_poly6(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The poly6 gradient's scalar at squared distance r2: 0 beyond h², else (c·d)·d with d = h² − r2 and c = −945/(32π·h⁹)
 # (the caller multiplies by the displacement). Mirrors `KernelCoeffs::poly6_grad_scalar`.
 #must_use
-fn _pv_kc_poly6_grad(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6_grad(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var w: f64 = (kc.poly6_grad * d) * d;
@@ -10312,7 +10340,7 @@ fn _pv_kc_poly6_grad(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The poly6 Laplacian at squared distance r2: 0 beyond h², else (c·d)·(3h² − 7r2) with d = h² − r2. Mirrors
 # `KernelCoeffs::poly6_laplacian`.
 #must_use
-fn _pv_kc_poly6_lap(kc: *PvKernelCoeffs, r2: f64): f64 {
+fn _pv_kc_poly6_lap(kc: *_PvKernelCoeffs, r2: f64): f64 {
     if (r2 > kc.h2) { return 0.0; }
     var d: f64 = kc.h2 - r2;
     var t: f64 = (3.0 * kc.h2) - (7.0 * r2);
@@ -10323,7 +10351,7 @@ fn _pv_kc_poly6_lap(kc: *PvKernelCoeffs, r2: f64): f64 {
 # The spiky gradient magnitude at distance r: 0 beyond h or for r ≤ 0, else (c·d)·d with d = h − r. Mirrors
 # `KernelCoeffs::spiky_grad`.
 #must_use
-fn _pv_kc_spiky_grad(kc: *PvKernelCoeffs, r: f64): f64 {
+fn _pv_kc_spiky_grad(kc: *_PvKernelCoeffs, r: f64): f64 {
     if (r > kc.h || r <= 0.0) { return 0.0; }
     var d: f64 = kc.h - r;
     var w: f64 = (kc.spiky_grad * d) * d;
@@ -10333,7 +10361,7 @@ fn _pv_kc_spiky_grad(kc: *PvKernelCoeffs, r: f64): f64 {
 # The viscosity Laplacian at distance r: 0 beyond h or for r ≤ 0, else c·(h − r). Mirrors
 # `KernelCoeffs::visc_laplacian`.
 #must_use
-fn _pv_kc_visc_lap(kc: *PvKernelCoeffs, r: f64): f64 {
+fn _pv_kc_visc_lap(kc: *_PvKernelCoeffs, r: f64): f64 {
     if (r > kc.h || r <= 0.0) { return 0.0; }
     var d: f64 = kc.h - r;
     var w: f64 = kc.visc_lap * d;
@@ -10612,7 +10640,7 @@ fn batch_poly6(r2, n, h: f64) {
     if (n <= 0) { return (0, 0); }
     var out = fl_alloc(n * 8);
     if (out == 0) { return (0, 0); }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     for (var i = 0; i < n; i = i + 1) {
         var x: f64 = load64(r2 + i * 8);
@@ -11254,7 +11282,7 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
 # Σ m_j·poly6(r²) over the n particles at ps within h of *pi (r² ≤ h², *pi itself included), from +0, at the
 # coefficients kc. Mirrors the private `compute_density_inner`.
 #must_use
-fn _pv_density_sum(pi: *PvFluidParticle, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs): f64 {
+fn _pv_density_sum(pi: *PvFluidParticle, ps: *PvFluidParticle, n, kc: *_PvKernelCoeffs): f64 {
     var px: f64 = pi.position.x;
     var py: f64 = pi.position.y;
     var pz: f64 = pi.position.z;
@@ -11283,7 +11311,7 @@ fn compute_density(idx, ps: *PvFluidParticle, n, h: f64): f64 {
         var nan: f64 = PV_F64_NAN;
         return nan;
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var d: f64 = _pv_density_sum(ps + idx, ps, n, &kc);
     return d;
@@ -11300,7 +11328,7 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
         var nan: f64 = PV_F64_NAN;
         _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -11349,7 +11377,7 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
         var nan: f64 = PV_F64_NAN;
         _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -11414,7 +11442,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
     var dens = block;
     var snap: *PvFluidParticle = _pv_as_particles(block + n * 8);
     var h: f64 = config.smoothing_radius;
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
 
     # The densities, then the pressures.
@@ -11743,7 +11771,7 @@ fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, 
         var e: *PvFluidParticle = ps + c;
         *d = *e;
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -11857,7 +11885,7 @@ fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, 
         var q: *PvFluidParticle = ps + c;
         store64(snap + c * 8, _pv_bits(q.temperature));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -12165,7 +12193,7 @@ fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f
         store64(w + 24, _pv_bits(q.position.z));
         store64(w + 32, _pv_bits(q.mass));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var eps: f64 = (0.01 * h) * h;
@@ -12325,7 +12353,7 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
         _pv_span_end(trace);
         return (out, n);
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -12440,7 +12468,7 @@ fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_
         store64(v_old + c0 * 24 + 8, _pv_bits(q.velocity.y));
         store64(v_old + c0 * 24 + 16, _pv_bits(q.velocity.z));
     }
-    var kc: PvKernelCoeffs;
+    var kc: _PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -12736,7 +12764,7 @@ fn PvSphSolver_default(): PvSphSolver {
 # Releases the solver's buffers and stops its pool; it is a fresh solver again, keeping its settings (its thread count
 # among them: the next step starts a new pool) and its grid's cell size.
 fn PvSphSolver_drop(s: *PvSphSolver) {
-    PvPool_drop(s.pool);
+    _pv_pool_drop(s.pool);
     s.pool = 0;
     PvNeighborGrid_drop(_pv_sph_grid(s));
     for (var k = 0; k < _PV_SOLVER_COLUMNS; k = k + 1) {
@@ -12750,14 +12778,14 @@ fn PvSphSolver_drop(s: *PvSphSolver) {
 # leaves the solver serial, which gives the same bits): its pointer, or 0 to run serially.
 fn _pv_sph_pool(s: *PvSphSolver): i64 {
     if (s.threads > 1 && s.pool == 0) {
-        s.pool = PvPool_new(s.threads);
+        s.pool = _pv_pool_new(s.threads);
         if (s.pool == 0) { s.threads = 1; }
     }
     return s.pool;
 }
 
 # Packs a density kernel's context (the particles, offsets, indices, densities, coefficients) into the 5 words at ctx.
-fn _pv_sph_density_ctx(ctx, ps: *PvFluidParticle, off, idx, dens, kc: *PvKernelCoeffs) {
+fn _pv_sph_density_ctx(ctx, ps: *PvFluidParticle, off, idx, dens, kc: *_PvKernelCoeffs) {
     store64(ctx, _pv_addr(ps));
     store64(ctx + 8, off);
     store64(ctx + 16, idx);
@@ -12775,7 +12803,7 @@ fn _pv_sph_density_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var dens = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var h2: f64 = kc.h2;
     for (var i = a; i < b; i = i + 1) {
         var pi: *PvFluidParticle = ps + i;
@@ -12810,7 +12838,7 @@ fn _pv_sph_accel_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var acc = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
     var viscosity: f64 = load64(ctx + 48);
     var st: f64 = load64(ctx + 56);
@@ -12908,7 +12936,7 @@ impl PvSphSolver {
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
-        PvPool_drop(self.pool);
+        _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;
         return t;
@@ -12970,7 +12998,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
         var idx = g.indices.data;
@@ -13206,7 +13234,7 @@ fn PvSphSolver_adaptive_dt(ps: *PvFluidParticle, n, smoothing_radius: f64, visco
 # The PCISPH prediction for each of the n snapshot particles: the symmetric pressure acceleration of `pressures` over
 # the lists (j ≠ i, 1e-20 ≤ r² ≤ h², each ρ floored at 1e-10), then v* = v + (a_np + a_p)·dt and x* = x + v*·dt from the
 # snapshot's velocity and position. Mirrors the private `pcisph_predict`.
-fn _pv_pcisph_predict(s: *PvSphSolver, n, kc: *PvKernelCoeffs, dt: f64) {
+fn _pv_pcisph_predict(s: *PvSphSolver, n, kc: *_PvKernelCoeffs, dt: f64) {
     var g: *PvNeighborGrid = _pv_sph_grid(s);
     var off = g.offsets.data;
     var idx = g.indices.data;
@@ -13276,7 +13304,7 @@ fn _pv_pcisph_predict(s: *PvSphSolver, n, kc: *PvKernelCoeffs, dt: f64) {
 # prototype is the first with the most neighbours and, among those, the largest denom, counting only |denom| > 1e-20.
 # 1/denom of the prototype, or 0 without one. Mirrors `step_pcisph`'s δ block.
 #must_use
-fn _pv_pcisph_delta(s: *PvSphSolver, n, kc: *PvKernelCoeffs, dt: f64, rest_density: f64): f64 {
+fn _pv_pcisph_delta(s: *PvSphSolver, n, kc: *_PvKernelCoeffs, dt: f64, rest_density: f64): f64 {
     var g: *PvNeighborGrid = _pv_sph_grid(s);
     var off = g.offsets.data;
     var idx = g.indices.data;
@@ -13379,7 +13407,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
         var dt: f64 = config.dt;
@@ -13584,7 +13612,7 @@ impl PvSphSolver {
 # for r² ≤ h² (itself included), and αᵢ = max(ρᵢ, 1e-10)/(|Σ gⱼ|² + Σ |gⱼ|²), gⱼ = (xᵢ − xⱼ)·((mⱼ·W'(r))/r) over j ≠ i
 # with 1e-20 ≤ r² ≤ h²; α = 0 when that denominator is not above 1e-20. The densities are written to the particles as
 # they go (the sums read only positions and masses). Mirrors the private `dfsph_density_alpha`.
-fn _pv_dfsph_density_alpha(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs) {
+fn _pv_dfsph_density_alpha(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *_PvKernelCoeffs) {
     var g: *PvNeighborGrid = _pv_sph_grid(s);
     var off = g.offsets.data;
     var idx = g.indices.data;
@@ -13646,7 +13674,7 @@ fn _pv_dfsph_density_alpha(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *PvKern
 # Particle i's density change rate Dρᵢ/Dt = Σⱼ mⱼ·((vᵢ − vⱼ)·gⱼ), gⱼ = (xᵢ − xⱼ)·(W'(r)/r), over j ≠ i with
 # 1e-20 ≤ r² ≤ h², from +0. Mirrors the private `dfsph_density_rate`.
 #must_use
-fn _pv_dfsph_density_rate(s: *PvSphSolver, ps: *PvFluidParticle, kc: *PvKernelCoeffs, i): f64 {
+fn _pv_dfsph_density_rate(s: *PvSphSolver, ps: *PvFluidParticle, kc: *_PvKernelCoeffs, i): f64 {
     var g: *PvNeighborGrid = _pv_sph_grid(s);
     var off = g.offsets.data;
     var idx = g.indices.data;
@@ -13686,7 +13714,7 @@ fn _pv_dfsph_density_rate(s: *PvSphSolver, ps: *PvFluidParticle, kc: *PvKernelCo
 # vᵢ −= dvᵢ·dt with dvᵢ = Σⱼ (xᵢ − xⱼ)·(((mⱼ·(κᵢ/ρᵢ + κⱼ/ρⱼ))·W'(r))/r) over j ≠ i with 1e-20 ≤ r² ≤ h², each ρ floored
 # at 1e-10, for each of the n particles (the sums read positions, densities and κ, never the velocities, so the order
 # doesn't matter). Mirrors the private `dfsph_apply_kappa`.
-fn _pv_dfsph_apply_kappa(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *PvKernelCoeffs, dt: f64) {
+fn _pv_dfsph_apply_kappa(s: *PvSphSolver, ps: *PvFluidParticle, n, kc: *_PvKernelCoeffs, dt: f64) {
     var g: *PvNeighborGrid = _pv_sph_grid(s);
     var off = g.offsets.data;
     var idx = g.indices.data;
@@ -13762,7 +13790,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
         var dt: f64 = config.dt;
@@ -13996,6 +14024,21 @@ fn PvMultiPhaseConfig_drop(c: *PvMultiPhaseConfig) {
     return 0;
 }
 
+# A deep copy of `src` into *out (a different configuration): the phases and the interface tension. 1, or 0 when the
+# memory isn't there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvMultiPhaseConfig_clone(out: *PvMultiPhaseConfig, src: *PvMultiPhaseConfig): i64 {
+    out.interface_tension = src.interface_tension;
+    out.phases.data = 0;
+    out.phases.len = 0;
+    out.phases.cap = 0;
+    if (out.phases.resize(src.phases.len, 0) == 0) { return 0; }
+    # `phases` is the first field, so the record's address is its column's.
+    var s: *PvColumn = _pv_as_columns(src);
+    var ok = out.phases.copy_from(s);
+    return 1;
+}
+
 # The properties of phase `phase` (a word read as Rust's `u8 as usize`), falling back to phase 0 when it is outside
 # the list, and to (1000, 2000, 0) when the list is empty: (rest density, gas constant, viscosity). Mirrors the private
 # `MultiPhaseConfig::get` and its local `FALLBACK`.
@@ -14022,7 +14065,7 @@ fn _pv_mp_accel_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var acc = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
     var phase_config: *PvMultiPhaseConfig = _pv_as_mp(load64(ctx + 48));
     var st: f64 = load64(ctx + 56);
@@ -14170,7 +14213,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
         var idx = g.indices.data;
@@ -16326,6 +16369,41 @@ fn PvPackedParticles_drop(p: *PvPackedParticles) {
     return 0;
 }
 
+# Column d set to a copy of column s's elements (d holds no storage before): 1, or 0 when the memory isn't there (d
+# then holds none). Rust's `Vec<f32>::clone`.
+#must_use
+fn _pv_f32_clone(d: *PvF32Column, s: *PvF32Column): i64 {
+    d.data = 0;
+    d.len = 0;
+    d.cap = 0;
+    if (s.len == 0) { return 1; }
+    if (d.reserve(s.len) == 0) { return 0; }
+    memcpy(d.data, s.data, s.len * 4);
+    d.len = s.len;
+    return 1;
+}
+
+# A deep copy of `src` into *out (a different record): the count and the three buffers at their own lengths. 1, or 0
+# when the memory isn't there (then *out holds no storage, count 0). Mirrors the derived `Clone`.
+#must_use
+fn PvPackedParticles_clone(out: *PvPackedParticles, src: *PvPackedParticles): i64 {
+    for (var k = 0; k < 3; k = k + 1) {
+        var z: *PvF32Column = _pv_packed_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    out.count = 0;
+    for (var k = 0; k < 3; k = k + 1) {
+        if (_pv_f32_clone(_pv_packed_col(out, k), _pv_packed_col(src, k)) == 0) {
+            PvPackedParticles_drop(out);
+            return 0;
+        }
+    }
+    out.count = src.count;
+    return 1;
+}
+
 # Packs the SoA's complete particles (`consistent_len`, at most u32::MAX) into *out, each value rounded to f32:
 # [x, y, z, mass], [vx, vy, vz, 0] and [density, pressure] per particle. 1, or 0 when the buffers can't be allocated
 # (Rust aborts); *out then holds no storage. Mirrors `PackedParticles::from_soa`.
@@ -16596,6 +16674,27 @@ fn PvNeuralCorrection_drop(c: *PvNeuralCorrection) {
         b.drop();
     }
     return 0;
+}
+
+# A deep copy of `src` into *out (a different record): both buffers at their own lengths. 1, or 0 when the memory
+# isn't there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvNeuralCorrection_clone(out: *PvNeuralCorrection, src: *PvNeuralCorrection): i64 {
+    out.velocity_delta.data = 0;
+    out.velocity_delta.len = 0;
+    out.velocity_delta.cap = 0;
+    out.pressure_delta.data = 0;
+    out.pressure_delta.len = 0;
+    out.pressure_delta.cap = 0;
+    for (var k = 0; k < 2; k = k + 1) {
+        var d: *PvF32Column = _pv_as_f32_column(_pv_addr(out) + k * 24);
+        var s: *PvF32Column = _pv_as_f32_column(_pv_addr(src) + k * 24);
+        if (_pv_f32_clone(d, s) == 0) {
+            PvNeuralCorrection_drop(out);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 # A learned corrector: takes a coarse state's velocities and pressures (f32 slices) and fills *out with the
@@ -17001,6 +17100,35 @@ impl PvHooshConfig {
         rc = rc | _pv_dbg_close(sb, alternate);
         return rc;
     }
+}
+
+# A deep copy of `src` into *out (a different config): an owned copy of the endpoint, and of the key when it is
+# Some. 1, or 0 when the memory isn't there (then *out is the empty config, owning nothing). Mirrors the derived
+# `Clone`.
+#must_use
+fn PvDaimonConfig_clone(out: *PvDaimonConfig, src: *PvDaimonConfig): i64 {
+    out.endpoint = "";
+    out.endpoint_len = 0;
+    out.api_key = 0;
+    out.api_key_len = 0;
+    out.owned = 0;
+    if (out.set_endpoint(src.endpoint, src.endpoint_len) == 0) { return 0; }
+    if (src.api_key != 0 && out.set_api_key(src.api_key, src.api_key_len) == 0) {
+        PvDaimonConfig_drop(out);
+        return 0;
+    }
+    return 1;
+}
+
+# A deep copy of `src` into *out (a different config): an owned copy of the endpoint. 1, or 0 when the memory isn't
+# there (then *out is the empty config, owning nothing). Mirrors the derived `Clone`.
+#must_use
+fn PvHooshConfig_clone(out: *PvHooshConfig, src: *PvHooshConfig): i64 {
+    out.endpoint = "";
+    out.endpoint_len = 0;
+    out.owned = 0;
+    if (out.set_endpoint(src.endpoint, src.endpoint_len) == 0) { return 0; }
+    return 1;
 }
 
 # ── Rust's Debug ────────────────────────────────────────────────────────────────────

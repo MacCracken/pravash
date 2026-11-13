@@ -88,6 +88,21 @@ fn PvMultiPhaseConfig_drop(c: *PvMultiPhaseConfig) {
     return 0;
 }
 
+# A deep copy of `src` into *out (a different configuration): the phases and the interface tension. 1, or 0 when the
+# memory isn't there (then *out holds no storage). Mirrors the derived `Clone`.
+#must_use
+fn PvMultiPhaseConfig_clone(out: *PvMultiPhaseConfig, src: *PvMultiPhaseConfig): i64 {
+    out.interface_tension = src.interface_tension;
+    out.phases.data = 0;
+    out.phases.len = 0;
+    out.phases.cap = 0;
+    if (out.phases.resize(src.phases.len, 0) == 0) { return 0; }
+    # `phases` is the first field, so the record's address is its column's.
+    var s: *PvColumn = _pv_as_columns(src);
+    var ok = out.phases.copy_from(s);
+    return 1;
+}
+
 # The properties of phase `phase` (a word read as Rust's `u8 as usize`), falling back to phase 0 when it is outside
 # the list, and to (1000, 2000, 0) when the list is empty: (rest density, gas constant, viscosity). Mirrors the private
 # `MultiPhaseConfig::get` and its local `FALLBACK`.
@@ -114,7 +129,7 @@ fn _pv_mp_accel_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var acc = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
     var phase_config: *PvMultiPhaseConfig = _pv_as_mp(load64(ctx + 48));
     var st: f64 = load64(ctx + 56);
@@ -262,7 +277,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
         var idx = g.indices.data;

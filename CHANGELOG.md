@@ -2,6 +2,78 @@
 
 ## [Unreleased]
 
+### Breaking
+- **pravash 2.0 is a Cyrius library.** The Rust crate stays at 1.3.0, frozen in `rust-old/` as the parity oracle;
+  2.0 is its port, with the same physics and Rust's names. Code that used the Rust crate moves by
+  [the migration guide](docs/guides/migration-2.0.md), which shows each change below with code that compiles and
+  runs. [ADR 0002](docs/adr/0002-port-api-divergences.md) records each one in full; the numbers below are its rows.
+  - **The dependency:** `[deps.pravash]` with `modules = ["dist/pravash.cyr"]`. The Cargo features are one bundle;
+    `parallel` is a thread count, `set_threads(n)` (#4, #5).
+  - **Errors** are `PV_ERR_*` codes in a value-form `Result`, with no detail strings. Two codes are new:
+    `PV_ERR_DESERIALIZE` and `PV_ERR_OUT_OF_MEMORY`, where Rust aborts. A panic becomes a neutral value: NaN, 0 or
+    (0, 0) (#1, #8, #11).
+  - **Memory** is explicit: a `PvX_drop` per type that holds storage, and `fl_free` on each returned buffer (#9).
+  - **Slices** are a pointer and a count; a returned `Vec` is a buffer you free; a public `Vec<f64>` field is a
+    `PvColumn`; an `Option` return is an out pointer and 1 / 0 (#9, #11–#14).
+  - **Data-carrying enums** (`NonNewtonianViscosity`, `BodyShape`, `ConstitutiveModel`) are a kind enum and a
+    payload struct (#15, #23, #25).
+  - **Traits** are called through `dyn`. `ReactionProvider::react` returns a `PvReaction`, and the compute traits
+    return a status word (#18, #26).
+  - **Renamed:** `sph::step` is `sph_step`, and `logging::init`, `init_with_level` and `init_profiling` are
+    `logging_init`, `logging_init_with_level` and `logging_init_profiling` (#17, #28).
+  - **SPH neighbour keys are f64** (#2). They fix Rust's f32 precision loss at large coordinates, but near a cell
+    boundary a particle's neighbours can sum in another order, so an SPH trajectory can leave Rust's in its last
+    bits. The SPH examples agree with Rust at frame 0 and not at frame 10.
+  - **`sort_by_zorder`** keeps equal keys in their input order (#3).
+  - **JSON** reads and writes serde_json's documents, but with bayan's digits; three documents serde_json reads are
+    refused or read otherwise (#6, #10).
+  - **Logging** goes through sakshi, whose default prints pravash's warnings to stderr, where Rust with no subscriber
+    printed nothing (#28).
+  - **The ai configs** hold their strings as bytes and are set by methods (#27).
+  - **Not carried:** the `oracle` feature and `PravashError`'s detail strings. `Debug` exists so far only for the ai
+    configs; the other 36 types are M8 part d.
+
+### Added (Cyrius)
+- **The full surface diff** (M8 part c, `scripts/surface_parity.py`). Beyond each public Rust item's counterpart,
+  it now checks:
+  - each Rust trait's methods;
+  - each `#[derive(..)]` on a public type: 157 derives, 121 of them matched (Serialize, Deserialize, Default, Clone,
+    PartialEq), and the 36 `Debug` derives listed as pending part d;
+  - the reverse direction: each of the 466 public Cyrius names is a Rust item's counterpart (351) or Cyrius-only
+    under one of 18 rules that cite the ADR 0002 row or plan section admitting it (115: the drops, the columns,
+    `PvVec3`, the payload structs, the thread counts, the extra error codes, …).
+
+  625 items ok, 0 missing. Its 17 mutations (a clone, a codec, a default, an equality, a hand `Debug` or a trait
+  method removed; a public fn, struct or constant added; a stale or removed rule; a Rust derive added; a private
+  name made public) are all caught.
+- **Six `Clone`s the diff found missing:** `PvParticleSoa_clone`, `PvMultiPhaseConfig_clone`,
+  `PvPackedParticles_clone`, `PvNeuralCorrection_clone`, `PvDaimonConfig_clone` and `PvHooshConfig_clone`. Each is a
+  deep copy into storage of its own: 1, or 0 with nothing held. Tests: a group per type (copied bit for bit,
+  independent of its source, outliving it, empty sources).
+- **`PvColumn::fill_f(x)`**, Rust's `vec.fill(x)` on a `Vec<f64>` field, which needed the private `_pv_bits` before.
+  The Manning-friction test now uses it.
+- **The ported examples** (`docs/examples/`): Rust's `basic_fluid`, `shallow_water` and `multiphase` as Cyrius
+  programs, each with the output it must print (`.out`).
+  - **`scripts/oracle/examples.py`** derives those files from the oracle. The shallow-water output is exactly the
+    Rust example's. For the two SPH examples, validate.py's transcription of the solver reproduces Rust's frames
+    exactly on f32 neighbour keys, and gives the `.out` frames on the port's f64 keys.
+  - **The divergence is ADR 0002 #2's.** At `basic_fluid`'s second step, the f32 keys move a particle at
+    x = 0.3999999999999997 one cell over, so 49 particles sum the same neighbours in another order.
+- **`scripts/doc_examples.py`** builds and runs every `cyrius` block in the README and the guides, and each example
+  against its `.out`. It fails on a compile warning, a failed build, a nonzero exit, other output, or an example that
+  isn't formatted or lint-clean: 14 blocks and programs, all passing, with 7 mutations caught. It runs in CI.
+- **`docs/guides/migration-2.0.md`**, from Rust 1.3 to Cyrius 2.0: the dependency, a table of Rust idioms, and the
+  twelve changes, with 10 blocks that compile and run.
+
+### Changed (Cyrius)
+- **Three Rust-private types are private in Cyrius too:** `PvKernelCoeffs`, `PvMgLevel` and `PvPool` are now
+  `_PvKernelCoeffs`, `_PvMgLevel` and `_PvPool`, and `PvPool_new` / `PvPool_drop` are `_pv_pool_new` /
+  `_pv_pool_drop`. No public signature used them; 2.0.0 would have frozen them into the surface.
+- **The README** is rewritten for the Cyrius library. It covers what is checked against Rust, the features, the
+  dependency, Rust's Quick Start ported and run, the examples, the known limitations, and the build and oracle
+  commands. **`docs/guides/getting-started.md`** is rewritten from the scaffold's stub as the guide to working on
+  pravash.
+
 ### Added (Cyrius)
 - **`scripts/bench_record.py`** (M8 part b) writes the release record's two tables from saved runs. It fails when a
   criterion row or a thread row is missing from any run.
@@ -646,7 +718,7 @@
 ### Added (Cyrius)
 - **sph** (M4 part a): `src/sph_kernels.cyr`.
   - **The kernels:** `kernel_poly6`, `kernel_spiky_grad`, `kernel_viscosity_laplacian`, `kernel_wendland_c2`,
-    `_c2_grad`, `_c4` and `_c4_grad`, with `PvKernelCoeffs` (the private `KernelCoeffs`).
+    `_c2_grad`, `_c4` and `_c4_grad`, with `_PvKernelCoeffs` (the private `KernelCoeffs`).
   - **The equations of state:** `equation_of_state` and `equation_of_state_tait` (the γ → 0 `ln` limit included).
   - **The non-Newtonian viscosity models,** the first data-carrying enum (ADR 0002 #15): `PvNonNewtonianViscosity`,
     `PvNonNewtonianModel` and its constructors, and `non_newtonian_viscosity_effective_viscosity`.
@@ -671,7 +743,7 @@
 
 ### Added (Cyrius)
 - **The worker pool and the grid's thread count** (M3 part e, which completes M3; port plan D6).
-  - **`src/par.cyr`:** `PvPool_new`, `PvPool_drop` and `_pv_par_for`.
+  - **`src/par.cyr`:** `_pv_pool_new`, `_pv_pool_drop` and `_pv_par_for`.
     - The caller plus T − 1 persistent workers on `thread_create` and `chan_*`, each running one contiguous slice of
       an index range.
     - Serial where threads can't run (agnos, cx) or can't be started.
@@ -843,7 +915,7 @@
     Every formula follows Rust's operation order.
   - **`src/grid_solve.cyr`:** hisab 1.4.0's direct DST-I / IDST-I (ledger L6) and matrix-free linear CG (L5),
     transcribed into caller scratch.
-  - **Storage:** the public fields are `PvColumn`s, the multigrid levels persist as `PvMgLevel` records, and three
+  - **Storage:** the public fields are `PvColumn`s, the multigrid levels persist as `_PvMgLevel` records, and three
     Cyrius-only private buffers replace the DST's and CG's per-call allocations (ADR 0002 #12). A step allocates
     nothing once sized.
   - **`PvGridConfig.boundary` outside the enum** is refused with `PV_ERR_INVALID_PARAMETER` (ADR 0002 #12).

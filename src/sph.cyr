@@ -98,7 +98,7 @@ fn PvSphSolver_default(): PvSphSolver {
 # Releases the solver's buffers and stops its pool; it is a fresh solver again, keeping its settings (its thread count
 # among them: the next step starts a new pool) and its grid's cell size.
 fn PvSphSolver_drop(s: *PvSphSolver) {
-    PvPool_drop(s.pool);
+    _pv_pool_drop(s.pool);
     s.pool = 0;
     PvNeighborGrid_drop(_pv_sph_grid(s));
     for (var k = 0; k < _PV_SOLVER_COLUMNS; k = k + 1) {
@@ -112,14 +112,14 @@ fn PvSphSolver_drop(s: *PvSphSolver) {
 # leaves the solver serial, which gives the same bits): its pointer, or 0 to run serially.
 fn _pv_sph_pool(s: *PvSphSolver): i64 {
     if (s.threads > 1 && s.pool == 0) {
-        s.pool = PvPool_new(s.threads);
+        s.pool = _pv_pool_new(s.threads);
         if (s.pool == 0) { s.threads = 1; }
     }
     return s.pool;
 }
 
 # Packs a density kernel's context (the particles, offsets, indices, densities, coefficients) into the 5 words at ctx.
-fn _pv_sph_density_ctx(ctx, ps: *PvFluidParticle, off, idx, dens, kc: *PvKernelCoeffs) {
+fn _pv_sph_density_ctx(ctx, ps: *PvFluidParticle, off, idx, dens, kc: *_PvKernelCoeffs) {
     store64(ctx, _pv_addr(ps));
     store64(ctx + 8, off);
     store64(ctx + 16, idx);
@@ -137,7 +137,7 @@ fn _pv_sph_density_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var dens = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var h2: f64 = kc.h2;
     for (var i = a; i < b; i = i + 1) {
         var pi: *PvFluidParticle = ps + i;
@@ -172,7 +172,7 @@ fn _pv_sph_accel_k(ctx, a, b) {
     var off = load64(ctx + 8);
     var idx = load64(ctx + 16);
     var acc = load64(ctx + 24);
-    var kc: *PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
+    var kc: *_PvKernelCoeffs = _pv_as_kc(load64(ctx + 32));
     var config: *PvFluidConfig = _pv_as_config(load64(ctx + 40));
     var viscosity: f64 = load64(ctx + 48);
     var st: f64 = load64(ctx + 56);
@@ -270,7 +270,7 @@ impl PvSphSolver {
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
-        PvPool_drop(self.pool);
+        _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;
         return t;
@@ -332,7 +332,7 @@ impl PvSphSolver {
         var built = _pv_nb_build(g, ps, n, h);
         _pv_span_end(tb);
         if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
-        var kc: PvKernelCoeffs;
+        var kc: _PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
         var idx = g.indices.data;

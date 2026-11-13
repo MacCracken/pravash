@@ -95,10 +95,16 @@
   API and run, and 14 n/a (the oracle hooks' own tests)
 - [x] M8 part b: the benchmark record: Rust's 21 criterion groups (57 rows) in both columns, plus thread-count rows
   (median 4.4× Rust's time, 0.76× to 37×; the SPH step 2.2–3.2× faster at 8 threads)
-- [ ] M8 part c: the full surface-parity diff, the README, the migration guide, the CHANGELOG's Breaking section,
-  and the docs' examples compiled and run
-- [ ] M8 part d: VERSION 2.0.0 and the release gate on three targets; the 1.3.x deprecation notice (the
-  maintainer's crates.io step) and the consumers' first Cyrius builds
+- [x] M8 part c: the full surface-parity diff (derives, trait methods and the reverse direction; six missing clones
+  ported, three Rust-private types made private), the README, the migration guide, the CHANGELOG's Breaking section,
+  Rust's examples ported with their outputs, and the docs' code compiled and run (`scripts/doc_examples.py`, in CI)
+- [ ] M8 part d: Rust's derived `Debug` on the 36 public types without it (`x.debug(sb, alternate)` for `{:?}` and
+  `{:#?}`), golden rows from the oracle, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
+  a `#derive(Debug)` request filed at cyrius
+- [ ] M8 part e: VERSION 2.0.0 and the release gate on three targets; the fuzz target (`tests/pravash.fcyr` is the
+  scaffold's stub, which promised M8: targets for the JSON readers and the `PRAVASH_LOG` parser, the inputs a
+  consumer doesn't control); the 1.3.x deprecation notice (the maintainer's crates.io step) and the consumers' first
+  Cyrius builds
 
 ### 1.3.0
 

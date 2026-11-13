@@ -1,0 +1,108 @@
+# pravash 2.0: Rust 1.3.0's `examples/multiphase.rs` in Cyrius. A block of oil above a block of water, stepped 100
+# times by the multiphase SPH solver with interface tension, counting each phase and the fastest particle every 10
+# frames. It prints what the Rust example prints (docs/examples/multiphase.out).
+include "lib/pravash.cyr"
+
+# Prints the text.
+fn put(s) {
+    print(s, strlen(s));
+    return 0;
+}
+
+# Prints n right-aligned in `width` columns: Rust's `{:>width}`.
+fn put_int(n, width) {
+    var buf[24];
+    var len = fmt_int_buf(n, &buf);
+    for (var i = len; i < width; i = i + 1) { print(" ", 1); }
+    print(&buf, len);
+    return 0;
+}
+
+# Prints x with `decimals` places, right-aligned in `width` columns: Rust's `{:>width.decimals}`.
+fn put_f64(x: f64, width, decimals) {
+    var buf[64];
+    var len = fmt_float_buf(x, &buf, decimals);
+    for (var i = len; i < width; i = i + 1) { print(" ", 1); }
+    print(&buf, len);
+    return 0;
+}
+
+# The particles at p as a typed pointer (Cyrius has no cast; `create_particle_block` returns an untyped buffer).
+fn particles_at(p): *PvFluidParticle {
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var config: PvFluidConfig = PvFluidConfig_water_2d();
+    var water: PvPhaseProperties;
+    water.rest_density = 1000.0;
+    water.gas_constant = 2000.0;
+    water.viscosity = 0.001;
+    var oil_phase: PvPhaseProperties;
+    oil_phase.rest_density = 800.0;
+    oil_phase.gas_constant = 1500.0;
+    oil_phase.viscosity = 0.03;
+    var phase_config: PvMultiPhaseConfig = PvMultiPhaseConfig_two_phase(water, oil_phase, 0.05);   # interface tension
+
+    # Water block (phase 0, bottom) and oil block (phase 1, top)
+    var wp, wn = create_particle_block(0.2, 0.1, 0.3, 0.2, 0.02, 0.001);
+    var op, on = create_particle_block(0.2, 0.3, 0.3, 0.2, 0.02, 0.0008);
+    var oil: *PvFluidParticle = particles_at(op);
+    for (var i = 0; i < on; i = i + 1) {
+        var q: *PvFluidParticle = oil + i;
+        q.phase = 1;
+    }
+    # Rust's `particles.extend(oil)`: one buffer holding both blocks.
+    var n = wn + on;
+    var size = sizeof(PvFluidParticle);
+    var buf = fl_alloc(n * size);
+    if (buf == 0) { return 1; }
+    memcpy(buf, wp, wn * size);
+    memcpy(buf + wn * size, op, on * size);
+    fl_free(wp);
+    fl_free(op);
+    var particles: *PvFluidParticle = particles_at(buf);
+
+    var solver: PvSphSolver = PvSphSolver_new();
+
+    println("Pravash — Multi-phase SPH (water + oil)");
+    put("Particles: ");
+    put_int(n, 0);
+    println(" (water + oil)");
+    println("");
+
+    for (var frame = 0; frame < 100; frame = frame + 1) {
+        var t, err = solver.step_multiphase(particles, n, &config, &phase_config);
+        if (is_ok(t) == 0) { return 1; }
+        if (frame % 10 == 0) {
+            var ms: f64 = max_speed(particles, n);
+            var water_count = 0;
+            var oil_count = 0;
+            for (var k = 0; k < n; k = k + 1) {
+                var p: *PvFluidParticle = particles + k;
+                if (p.phase == 0) { water_count = water_count + 1; }
+                if (p.phase == 1) { oil_count = oil_count + 1; }
+            }
+            put("Frame ");
+            put_int(frame, 4);
+            put("  water: ");
+            put_int(water_count, 0);
+            put("  oil: ");
+            put_int(oil_count, 0);
+            put("  max_speed: ");
+            put_f64(ms, 8, 4);
+            println("");
+        }
+    }
+
+    println("");
+    println("Done.");
+    PvSphSolver_drop(&solver);
+    PvMultiPhaseConfig_drop(&phase_config);
+    fl_free(buf);
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

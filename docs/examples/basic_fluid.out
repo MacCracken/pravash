@@ -1,0 +1,16 @@
+Pravash — SPH fluid simulation (SphSolver with spatial hash)
+Particles: 225
+Timestep:  0.001 s
+
+Frame    0  KE: 52223.9681  max_speed: 2367.7126
+Frame   10  KE: 641313.8332  max_speed: 6793.7329
+Frame   20  KE: 619455.5680  max_speed: 7174.7574
+Frame   30  KE: 872598.3862  max_speed: 7423.1240
+Frame   40  KE: 583582.2020  max_speed: 5702.6758
+Frame   50  KE: 771412.3407  max_speed: 7493.9711
+Frame   60  KE: 660133.7061  max_speed: 6765.3546
+Frame   70  KE: 748390.0771  max_speed: 7271.2947
+Frame   80  KE: 691280.4520  max_speed: 7305.0718
+Frame   90  KE: 619856.1475  max_speed: 6349.2828
+
+Done.

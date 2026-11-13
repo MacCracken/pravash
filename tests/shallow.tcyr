@@ -309,7 +309,7 @@ fn friction_flow(n: f64): f64 {
     if (fresh(&sw, 20, 6, 0.1, 1.0) == 0) { return nan; }
     sw.damping = 1.0;
     sw.vx.fill(_pv_bits(one));
-    sw.manning_n.fill(_pv_bits(n));
+    sw.manning_n.fill_f(n);
     var bad = steps(&sw, 100, 0.001);
     var s: f64 = sum_abs(sw.vx.data, sw.vx.len);
     PvShallowWater_drop(&sw);
