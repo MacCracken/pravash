@@ -46,11 +46,11 @@ fn _pv_sph_grid(s): *PvNeighborGrid {
 }
 
 # Column k of a solver (0 densities, 1 snapshot, 2 accels, 3 prev_accel, 4 pcisph_accel, 5 pcisph_pressures,
-# 6 pcisph_pred_pos, 7 pcisph_pred_vel, 8 dfsph_alpha, 9 dfsph_kappa), by its byte offset after the 200-byte grid
-# (tests/sph.tcyr pins the layout, 472 bytes).
+# 6 pcisph_pred_pos, 7 pcisph_pred_vel, 8 dfsph_alpha, 9 dfsph_kappa), by its byte offset after the 224-byte grid
+# (tests/sph.tcyr pins the layout, 496 bytes).
 #must_use
 fn _pv_sph_col(s, k): *PvColumn {
-    return _pv_as_columns(_pv_addr(s) + 200 + k * 24);
+    return _pv_as_columns(_pv_addr(s) + sizeof(PvNeighborGrid) + k * 24);
 }
 
 # A fresh solver into *s: an empty grid of cell size 1, no buffers, no surface tension, symplectic Euler, one thread.

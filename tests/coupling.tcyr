@@ -1,0 +1,583 @@
+# coupling.tcyr — the ported Rust tests of rust-old/src/coupling.rs (M6 part a: the 22 tests of the shapes, the
+# bodies, the coupling, added mass, drag and the level set, in Rust's order; part b adds the FLIP solver's 11).
+#
+# Slices are (pointer, count) (ADR 0002 #9). Rust's hisab `SpatialHash` is the caller's cells-only
+# `PvNeighborGrid` (ADR 0002 #23). Five Cyrius-only groups follow: the record layouts, the grid's cell-size rule,
+# the block walk against a brute-force enumeration, the indexed drag against the brute force on clouds (at 10⁶ and
+# 10¹² too, and with an infinite radius, where Rust's f32 hash misses particles or never returns), and the level
+# set's refusals.
+
+include "tests/lib.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+var EPS: f64 = 0.0000000001;   # the Rust tests' 1e-10
+
+# A buffer of n particles, each `FluidParticle::new(position, mass)` at the origin.
+fn particles(n): i64 {
+    var buf = fl_alloc(n * sizeof(PvFluidParticle) + 8);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var o: PvVec3 = PvVec3_zero();
+    for (var i = 0; i < n; i = i + 1) {
+        var p: PvFluidParticle = PvFluidParticle_new(o, 1.0);
+        memcpy(ps + i, &p, sizeof(PvFluidParticle));
+    }
+    return buf;
+}
+
+# Sets particle i's position and mass.
+fn place(buf, i, x: f64, y: f64, z: f64, m: f64) {
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var p: *PvFluidParticle = ps + i;
+    p.position = PvVec3_new(x, y, z);
+    p.mass = m;
+    return 0;
+}
+
+# Sets particle i's velocity.
+fn move(buf, i, vx: f64, vy: f64, vz: f64) {
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var p: *PvFluidParticle = ps + i;
+    p.velocity = PvVec3_new(vx, vy, vz);
+    return 0;
+}
+
+# The seven `BodyShape` tests: the signed distances and the volumes.
+fn test_shapes() {
+    var o: PvVec3 = PvVec3_zero();
+    var unit: PvShape = PvShape_sphere(1.0);
+    var ubox: PvShape = PvShape_box(1.0, 1.0, 1.0);
+
+    test_group("test_sphere_sdf_center");
+    var c: f64 = body_shape_signed_distance(&unit, o, o);
+    assert(near(c, -1.0, EPS) == 1, "−r at the centre");
+
+    test_group("test_sphere_sdf_surface");
+    var s: f64 = body_shape_signed_distance(&unit, PvVec3_new(1.0, 0.0, 0.0), o);
+    assert(near(s, 0.0, EPS) == 1, "0 on the surface");
+
+    test_group("test_sphere_sdf_outside");
+    var out: f64 = body_shape_signed_distance(&unit, PvVec3_new(2.0, 0.0, 0.0), o);
+    assert(near(out, 1.0, EPS) == 1, "1 at twice the radius");
+
+    test_group("test_box_sdf_center");
+    var bc: f64 = body_shape_signed_distance(&ubox, o, o);
+    assert(bc < 0.0, "negative at the centre");
+
+    test_group("test_box_sdf_outside");
+    var bo: f64 = body_shape_signed_distance(&ubox, PvVec3_new(2.0, 0.0, 0.0), o);
+    assert(near(bo, 1.0, EPS) == 1, "1 beyond a face");
+
+    test_group("test_sphere_volume");
+    var expected: f64 = 4.0 / 3.0 * PV_F64_PI;
+    var v: f64 = body_shape_volume(&unit);
+    assert(near(v, expected, EPS) == 1, "4π/3");
+
+    test_group("test_box_volume");
+    var b123: PvShape = PvShape_box(1.0, 2.0, 3.0);
+    var bv: f64 = body_shape_volume(&b123);
+    assert(near(bv, 48.0, EPS) == 1, "8·1·2·3");
+    return 0;
+}
+
+# The four `RigidBody` tests: the normal, the coupling's push and reaction, integration.
+fn test_bodies() {
+    var o: PvVec3 = PvVec3_zero();
+    test_group("test_rigid_body_surface_normal");
+    var body: PvRigidBody = PvRigidBody_new(o, 1.0, PvShape_sphere(1.0));
+    var nrm: PvVec3 = body.surface_normal(PvVec3_new(2.0, 0.0, 0.0));
+    var nx: f64 = nrm.x - 1.0;
+    var anx: f64 = f64_abs(nx);
+    var any: f64 = f64_abs(nrm.y);
+    assert(anx < 0.0001 && any < 0.0001, "the outward x axis");
+
+    test_group("test_coupling_pushes_particle_out");
+    var pb = particles(1);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    ps.density = 1000.0;
+    var bodies[120];
+    var bs: *PvRigidBody = _pv_as_bodies(&bodies);
+    var b0: PvRigidBody = PvRigidBody_new(o, 10.0, PvShape_sphere(0.5));
+    memcpy(bs, &b0, sizeof(PvRigidBody));
+    couple_sph_bodies(ps, 1, bs, 1, 0.1, 1000.0, 10.0);
+    var mag: f64 = ps.acceleration.length();
+    assert(mag > 0.0, "a particle at the centre is accelerated outward");
+    fl_free(pb);
+
+    test_group("test_coupling_newton_third_law");
+    var qb = particles(1);
+    place(qb, 0, 0.6, 0.0, 0.0, 1.0);
+    var qs: *PvFluidParticle = _pv_as_particles(qb);
+    qs.density = 1000.0;
+    memcpy(bs, &b0, sizeof(PvRigidBody));
+    couple_sph_bodies(qs, 1, bs, 1, 0.2, 1000.0, 10.0);
+    var fp: f64 = qs.acceleration.x * qs.mass;
+    var fsum: f64 = fp + bs.force.x;
+    var afs: f64 = f64_abs(fsum);
+    assert(afs < EPS, "equal and opposite");
+    fl_free(qb);
+
+    test_group("test_integrate_bodies");
+    var b1: PvRigidBody = PvRigidBody_new(PvVec3_new(0.0, 1.0, 0.0), 1.0, PvShape_sphere(0.1));
+    memcpy(bs, &b1, sizeof(PvRigidBody));
+    bs.force = PvVec3_zero();
+    integrate_bodies(bs, 1, PvVec3_new(0.0, -9.81, 0.0), 0.01);
+    assert(bs.velocity.y < 0.0 && bs.position.y < 1.0, "falls");
+    return 0;
+}
+
+# The added-mass and drag tests.
+fn test_added_mass_and_drag() {
+    var o: PvVec3 = PvVec3_zero();
+    test_group("test_effective_mass_sphere");
+    var s01: PvShape = PvShape_sphere(0.1);
+    var vol: f64 = body_shape_volume(&s01);
+    var m_eff: f64 = effective_mass(1.0, 1000.0, vol, PV_ADDED_MASS_COEFFICIENT_SPHERE);
+    var added: f64 = 0.5 * 1000.0 * vol;
+    var want: f64 = m_eff - 1.0 - added;
+    var aw: f64 = f64_abs(want);
+    assert(m_eff > 1.0 && aw < EPS, "1 + 0.5·1000·V");
+
+    test_group("test_integrate_with_added_mass_slower");
+    var bodies[240];
+    var bs: *PvRigidBody = _pv_as_bodies(&bodies);
+    var bn: PvRigidBody = PvRigidBody_new(PvVec3_new(0.0, 1.0, 0.0), 1.0, PvShape_sphere(0.1));
+    bn.force = PvVec3_new(10.0, 0.0, 0.0);
+    memcpy(bs, &bn, sizeof(PvRigidBody));
+    memcpy(bs + 1, &bn, sizeof(PvRigidBody));
+    integrate_bodies(bs, 1, o, 0.01);
+    integrate_bodies_with_added_mass(bs + 1, 1, o, 0.01, 1000.0, PV_ADDED_MASS_COEFFICIENT_SPHERE);
+    var b2: *PvRigidBody = bs + 1;
+    var vn: f64 = f64_abs(bs.velocity.x);
+    var va: f64 = f64_abs(b2.velocity.x);
+    assert(va < vn, "added mass reduces the response to a force");
+
+    test_group("test_drag_no_particles");
+    var body: PvRigidBody = PvRigidBody_new(o, 1.0, PvShape_sphere(0.1));
+    var d0: PvVec3 = drag_from_particles(&body, 0, 0, 1000.0, 0.47, 0.2);
+    var ad0: f64 = f64_abs(d0.x);
+    assert(ad0 < 0.00000000000000000001, "no drag without particles");
+
+    test_group("test_drag_opposing_motion");
+    var mover: PvRigidBody = PvRigidBody_new(PvVec3_new(0.5, 0.5, 0.0), 1.0, PvShape_sphere(0.1));
+    mover.velocity = PvVec3_new(1.0, 0.0, 0.0);
+    var pb = particles(5);
+    for (var i = 0; i < 5; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var x: f64 = 0.45 + fi * 0.025;
+        place(pb, i, x, 0.5, 0.0, 0.01);
+    }
+    var dr: PvVec3 = drag_from_particles(&mover, _pv_as_particles(pb), 5, 1000.0, 0.47, 0.2);
+    assert(dr.x < 0.0, "drag opposes the body's motion");
+    fl_free(pb);
+    return 0;
+}
+
+# The three level-set tests.
+fn test_level_sets() {
+    test_group("test_level_set_empty");
+    var ls[128];
+    assert_eq(particle_level_set(&ls, 16, 4, 4, 0.1, 0, 0, 0.05), 1, "filled");
+    var all = 1;
+    for (var i = 0; i < 16; i = i + 1) {
+        var v: f64 = load64(&ls + i * 8);
+        if (v <= 0.0) { all = 0; }
+    }
+    assert_eq(all, 1, "every cell outside");
+
+    test_group("test_level_set_single_particle");
+    var pb = particles(1);
+    place(pb, 0, 0.2, 0.2, 0.0, 0.01);
+    var l5[200];
+    assert_eq(particle_level_set(&l5, 25, 5, 5, 0.1, _pv_as_particles(pb), 1, 0.05), 1, "filled");
+    var mid: f64 = load64(&l5 + (2 * 5 + 2) * 8);
+    var corner: f64 = load64(&l5);
+    assert(mid < 0.0 && corner > 0.0, "inside at the particle, outside at the far corner");
+    fl_free(pb);
+
+    test_group("test_level_set_continuous");
+    var qb = particles(1);
+    place(qb, 0, 0.5, 0.5, 0.0, 0.01);
+    var l10 = fl_alloc(800);
+    assert_eq(particle_level_set(l10, 100, 10, 10, 0.1, _pv_as_particles(qb), 1, 0.1), 1, "filled");
+    var smooth = 1;
+    for (var y = 0; y < 9; y = y + 1) {
+        for (var x = 0; x < 9; x = x + 1) {
+            var d1: f64 = load64(l10 + (y * 10 + x) * 8);
+            var d2: f64 = load64(l10 + (y * 10 + x + 1) * 8);
+            var dd: f64 = d1 - d2;
+            var add: f64 = f64_abs(dd);
+            if (add >= 0.2) { smooth = 0; }
+        }
+    }
+    assert_eq(smooth, 1, "no jump of 0.2 between neighbours");
+    fl_free(l10);
+    fl_free(qb);
+    return 0;
+}
+
+# The 1.3.0 audit's regressions of part a, in Rust's order.
+fn test_regressions() {
+    var o: PvVec3 = PvVec3_zero();
+    test_group("test_drag_is_quadratic_in_speed");
+    var body: PvRigidBody = PvRigidBody_new(o, 1.0, PvShape_sphere(0.1));
+    var pb = particles(1);
+    place(pb, 0, 0.12, 0.0, 0.0, 0.001);
+    move(pb, 0, 2.0, 0.0, 0.0);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var f: PvVec3 = drag_from_particles(&body, ps, 1, 1000.0, 0.47, 0.05);
+    var area: f64 = PV_F64_PI * 0.01;
+    var expected: f64 = 0.5 * 1000.0 * 4.0 * 0.47 * area;
+    var df: f64 = f.x - expected;
+    var adf: f64 = f64_abs(df);
+    var tol: f64 = 0.000000001 * expected;
+    assert(adf < tol, "½·ρ·v²·C_d·A");
+    move(pb, 0, 0.5, 0.0, 0.0);
+    var f2: PvVec3 = drag_from_particles(&body, ps, 1, 1000.0, 0.47, 0.05);
+    var ratio: f64 = f.x / f2.x - 16.0;
+    var ar: f64 = f64_abs(ratio);
+    assert(ar < 0.000000001, "F ∝ v²");
+    fl_free(pb);
+
+    test_group("test_indexed_drag_matches_bruteforce_for_large_body");
+    var big: PvRigidBody = PvRigidBody_new(o, 1.0, PvShape_sphere(1.0));
+    var rb = particles(16);
+    for (var k = 0; k < 16; k = k + 1) {
+        var fk: f64 = f64_from(k);
+        var a: f64 = fk * (2.0 * PV_F64_PI) / 16.0;
+        var ca: f64 = _pv_cos(a);
+        var sa: f64 = _pv_sin(a);
+        var x: f64 = 1.05 * ca;
+        var y: f64 = 1.05 * sa;
+        place(rb, k, x, y, 0.0, 0.001);
+        move(rb, k, 1.0, 0.0, 0.0);
+    }
+    var rs: *PvFluidParticle = _pv_as_particles(rb);
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    assert_eq(is_ok(PvNeighborGrid_build(&g, rs, 16, 0.25)), 1, "built");
+    var brute: PvVec3 = drag_from_particles(&big, rs, 16, 1000.0, 0.47, 0.2);
+    var indexed: PvVec3 = drag_from_particles_indexed(&big, rs, 16, &g, 1000.0, 0.47, 0.2);
+    var bl: f64 = brute.length();
+    var dx: f64 = brute.x - indexed.x;
+    var dy: f64 = brute.y - indexed.y;
+    var dz: f64 = brute.z - indexed.z;
+    var diff: PvVec3 = PvVec3_new(dx, dy, dz);
+    var dl: f64 = diff.length();
+    var tl: f64 = 0.000000001 * bl;
+    assert(bl > 0.0 && dl < tl, "the indexed drag is the brute force's");
+    var short: PvVec3 = drag_from_particles_indexed(&big, rs, 4, &g, 1000.0, 0.47, 0.2);
+    assert(short.x == short.x, "a grid of more particles than the slice: no panic");
+    PvNeighborGrid_drop(&g);
+    fl_free(rb);
+
+    test_group("test_added_mass_free_fall");
+    var shape: PvShape = PvShape_sphere(0.1);
+    var rho: f64 = 1000.0;
+    var sv: f64 = body_shape_volume(&shape);
+    var m: f64 = rho * sv;
+    var bodies[120];
+    var bs: *PvRigidBody = _pv_as_bodies(&bodies);
+    var nb: PvRigidBody = PvRigidBody_new(o, m, shape);
+    memcpy(bs, &nb, sizeof(PvRigidBody));
+    integrate_bodies_with_added_mass(bs, 1, PvVec3_new(0.0, -9.81, 0.0), 0.01, rho, 0.5);
+    var acc: f64 = bs.velocity.y / 0.01;
+    var g15: f64 = 9.81 / 1.5;
+    var ea: f64 = acc + g15;
+    var aea: f64 = f64_abs(ea);
+    assert(aea < 0.000000001, "a = g/1.5");
+
+    test_group("test_level_set_size_mismatch_no_panic");
+    var ls[80];
+    assert_eq(particle_level_set(&ls, 10, 8, 8, 0.1, 0, 0, 0.05), 0, "a size mismatch is refused");
+    return 0;
+}
+
+# Cyrius-only: the record layouts.
+fn test_layout() {
+    test_group("coupling_layout");
+    assert_eq(sizeof(PvShape), 40, "a shape is 40 bytes");
+    assert_eq(sizeof(PvRigidBody), 120, "a body is 120 bytes");
+    var b: PvRigidBody = PvRigidBody_new(PvVec3_new(1.0, 2.0, 3.0), 4.0, PvShape_box(5.0, 6.0, 7.0));
+    var w = _pv_addr(&b);
+    var w9: f64 = load64(w + 48);
+    var w11: f64 = load64(w + 64);
+    var w14: f64 = load64(w + 88);
+    assert(w9 == 4.0 && load64(w + 56) == PV_BODY_SHAPE_BOX && w11 == 0.0 && w14 == 7.0, "Rust's field order");
+    return 0;
+}
+
+# Cyrius-only: `PvNeighborGrid_build` takes the cell sizes hisab 3.4.1's `spatial_hash_new` takes.
+fn test_grid_build() {
+    test_group("grid_build_cell_size_rule");
+    var pb = particles(3);
+    place(pb, 1, 0.3, 0.1, 0.0, 1.0);
+    place(pb, 2, 0.31, 0.12, 0.0, 1.0);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    var zero: f64 = 0.0;
+    var neg: f64 = -1.0;
+    var nan: f64 = PV_F64_NAN;
+    var inf: f64 = PV_F64_INFINITY;
+    var subw = 1;
+    var sub: f64 = load64(&subw);   # the smallest subnormal: 1/cell overflows
+    assert_eq(is_ok(PvNeighborGrid_build(&g, ps, 3, 0.1)), 1, "0.1 builds");
+    assert_eq(g.cells, 2, "two cells");
+    assert_eq(g.xorder.len, 2, "both in x order");
+    assert_eq(g.offsets.len, 0, "no lists");
+    var bad[40];
+    store64(&bad, _pv_bits(zero));
+    store64(&bad + 8, _pv_bits(neg));
+    store64(&bad + 16, _pv_bits(nan));
+    store64(&bad + 24, _pv_bits(inf));
+    store64(&bad + 32, _pv_bits(sub));
+    var refused = 0;
+    for (var k = 0; k < 5; k = k + 1) {
+        var c: f64 = load64(&bad + k * 8);
+        var rt, rv = PvNeighborGrid_build(&g, ps, 3, c);
+        if (is_err_result(rt) == 1 && rv == PV_ERR_INVALID_PARAMETER && g.cells == 0) {
+            refused = refused + 1;
+        }
+    }
+    assert_eq(refused, 5, "0, −1, NaN, ∞ and a subnormal are refused, the grid left empty");
+    var nt, nv = PvNeighborGrid_build(&g, ps, 0 - 1, 0.1);
+    assert_eq(is_err_result(nt) == 1 && nv == PV_ERR_INVALID_PARAMETER, 1, "a negative count is refused");
+    assert_eq(is_ok(PvNeighborGrid_build(&g, ps, 0, 0.1)), 1, "no particles builds an empty grid");
+    assert_eq(g.cells, 0, "no cells");
+    PvNeighborGrid_drop(&g);
+    fl_free(pb);
+    return 0;
+}
+
+# A typed view of a word.
+fn as_grid(p): *PvNeighborGrid {
+    return p;
+}
+
+# The visit for `test_block_walk`: appends each cell's key (three words) and point count at ctx's cursor.
+fn walk_record(ctx, a, b): i64 {
+    var g: *PvNeighborGrid = as_grid(load64(ctx));
+    var at = load64(ctx + 8);
+    var order = g.order.data;
+    var keys = g.keys.data;
+    var first = load64(order + a * 8);
+    store64(at, load64(keys + first * 24));
+    store64(at + 8, load64(keys + first * 24 + 8));
+    store64(at + 16, load64(keys + first * 24 + 16));
+    store64(at + 24, b - a);
+    store64(ctx + 8, at + 32);
+    return 0;
+}
+
+# Cyrius-only: the block walk visits exactly the occupied cells of the block, in (x, y, z) order, with every point,
+# for blocks around and beyond a 3D lattice with gaps.
+fn test_block_walk() {
+    test_group("grid_block_walk_is_rusts_cell_order");
+    var n = 0;
+    var pb = particles(343);
+    for (var z = 0; z < 7; z = z + 1) {
+        for (var y = 0; y < 7; y = y + 1) {
+            for (var x = 0; x < 7; x = x + 1) {
+                if ((x * 3 + y * 5 + z * 7) % 4 != 1) {
+                    var fx: f64 = f64_from(x);
+                    var fy: f64 = f64_from(y);
+                    var fz: f64 = f64_from(z);
+                    var px: f64 = fx * 0.1 - 0.25;
+                    var py: f64 = fy * 0.1 - 0.25;
+                    var pz: f64 = fz * 0.1 - 0.25;
+                    place(pb, n, px, py, pz, 1.0);
+                    n = n + 1;
+                }
+            }
+        }
+    }
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    assert_eq(is_ok(PvNeighborGrid_build(&g, ps, n, 0.1)), 1, "built");
+    var got = fl_alloc(343 * 32);
+    var want = fl_alloc(343 * 32);
+    var ctx[16];
+    var lo[24];
+    var hi[24];
+    var ok = 1;
+    var blocks = 0;
+    for (var b = 0; b < 40; b = b + 1) {
+        # Block corners from a fixed walk through [-6, 6]: some inside, some past the lattice, some empty.
+        var x0 = (b * 7) % 11 - 6;
+        var y0 = (b * 5) % 9 - 5;
+        var z0 = (b * 3) % 7 - 4;
+        var x1 = x0 + (b % 4);
+        var y1 = y0 + ((b / 2) % 5);
+        var z1 = z0 + ((b / 3) % 3);
+        store64(&lo, x0);
+        store64(&lo + 8, y0);
+        store64(&lo + 16, z0);
+        store64(&hi, x1);
+        store64(&hi + 8, y1);
+        store64(&hi + 16, z1);
+        store64(&ctx, &g);
+        store64(&ctx + 8, got);
+        _pv_nb_block(&g, &lo, &hi, &walk_record, &ctx);
+        var ng = (load64(&ctx + 8) - got) / 32;
+        # The brute force: every (x, y, z) of the block in order, with its points counted.
+        var nw = 0;
+        for (var cx = x0; cx <= x1; cx = cx + 1) {
+            for (var cy = y0; cy <= y1; cy = cy + 1) {
+                for (var cz = z0; cz <= z1; cz = cz + 1) {
+                    var cnt = 0;
+                    for (var i = 0; i < n; i = i + 1) {
+                        var p: *PvFluidParticle = ps + i;
+                        var kx = _pv_nb_key(p.position.x, g.inv_cell);
+                        var ky = _pv_nb_key(p.position.y, g.inv_cell);
+                        var kz = _pv_nb_key(p.position.z, g.inv_cell);
+                        if (kx == cx && ky == cy && kz == cz) { cnt = cnt + 1; }
+                    }
+                    if (cnt > 0) {
+                        var at = want + nw * 32;
+                        store64(at, cx);
+                        store64(at + 8, cy);
+                        store64(at + 16, cz);
+                        store64(at + 24, cnt);
+                        nw = nw + 1;
+                    }
+                }
+            }
+        }
+        if (ng != nw) { ok = 0; }
+        for (var w = 0; ok == 1 && w < nw * 4; w = w + 1) {
+            if (load64(got + w * 8) != load64(want + w * 8)) { ok = 0; }
+        }
+        if (nw > 0) { blocks = blocks + 1; }
+    }
+    assert_eq(ok, 1, "the occupied cells of 40 blocks, in (x, y, z) order, each with all its points");
+    assert(blocks > 20, "most blocks hold cells");
+    fl_free(got);
+    fl_free(want);
+    PvNeighborGrid_drop(&g);
+    fl_free(pb);
+    return 0;
+}
+
+# The relative distance |a − b| / |b| of two drags.
+fn rel(a: PvVec3, b: PvVec3): f64 {
+    var dx: f64 = a.x - b.x;
+    var dy: f64 = a.y - b.y;
+    var dz: f64 = a.z - b.z;
+    var d: PvVec3 = PvVec3_new(dx, dy, dz);
+    var dl: f64 = d.length();
+    var bl: f64 = b.length();
+    var r: f64 = dl / bl;
+    return r;
+}
+
+# Cyrius-only: the indexed drag is the brute force's on seeded clouds about a sphere and a box, at the origin, 10⁶
+# and 10¹² (where Rust's f32 cells are 0.06 and 6·10⁴ wide), and for an infinite sample radius, which Rust's query
+# can't walk.
+fn test_indexed_drag() {
+    test_group("indexed_drag_matches_brute_force");
+    var seed = 12345;
+    var n = 400;
+    var pb = particles(n);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    var offs[24];
+    store64(&offs, _pv_bits(0.0));
+    store64(&offs + 8, _pv_bits(1000000.0));
+    store64(&offs + 16, _pv_bits(1000000000000.0));
+    var cases = 0;
+    var agree = 0;
+    for (var oi = 0; oi < 3; oi = oi + 1) {
+        var off: f64 = load64(&offs + oi * 8);
+        for (var shape = 0; shape < 2; shape = shape + 1) {
+            for (var i = 0; i < n; i = i + 1) {
+                seed = (seed * 6364136223846793005 + 1442695040888963407);
+                var u1 = (seed >> 11) & 0xFFFFF;
+                seed = (seed * 6364136223846793005 + 1442695040888963407);
+                var u2 = (seed >> 11) & 0xFFFFF;
+                seed = (seed * 6364136223846793005 + 1442695040888963407);
+                var u3 = (seed >> 11) & 0xFFFFF;
+                var a: f64 = f64_from(u1);
+                var b: f64 = f64_from(u2);
+                var c: f64 = f64_from(u3);
+                var x: f64 = a / 1048576.0 * 1.2 - 0.6 + off;
+                var y: f64 = b / 1048576.0 * 1.2 - 0.6;
+                var z: f64 = c / 1048576.0 * 0.4 - 0.2;
+                place(pb, i, x, y, z, 0.001);
+                var vx: f64 = b / 1048576.0 - 0.3;
+                var vy: f64 = c / 1048576.0 * 0.5;
+                var vz: f64 = a / 1048576.0 * 0.1;
+                move(pb, i, vx, vy, vz);
+            }
+            var sh: PvShape = PvShape_sphere(0.3);
+            if (shape == 1) { sh = PvShape_box(0.25, 0.2, 0.1); }
+            var body: PvRigidBody = PvRigidBody_new(PvVec3_new(off, 0.0, 0.0), 1.0, sh);
+            body.velocity = PvVec3_new(0.5, -0.25, 0.0);
+            var cell: f64 = 0.05;
+            if (oi == 2) { cell = 0.125; }
+            assert_eq(is_ok(PvNeighborGrid_build(&g, ps, n, cell)), 1, "built");
+            var brute: PvVec3 = drag_from_particles(&body, ps, n, 1000.0, 0.47, 0.1);
+            var idx: PvVec3 = drag_from_particles_indexed(&body, ps, n, &g, 1000.0, 0.47, 0.1);
+            var r: f64 = rel(idx, brute);
+            cases = cases + 1;
+            if (r < 0.000000000001) { agree = agree + 1; }
+        }
+    }
+    assert_eq(agree, cases, "every cloud, within 1e-12 (the sums' orders differ)");
+    var inf: f64 = PV_F64_INFINITY;
+    var body2: PvRigidBody = PvRigidBody_new(PvVec3_new(0.0, 0.0, 0.0), 1.0, PvShape_sphere(0.3));
+    body2.velocity = PvVec3_new(0.5, 0.0, 0.0);
+    var b2: PvVec3 = drag_from_particles(&body2, ps, n, 1000.0, 0.47, inf);
+    var i2: PvVec3 = drag_from_particles_indexed(&body2, ps, n, &g, 1000.0, 0.47, inf);
+    var r2: f64 = rel(i2, b2);
+    assert(r2 < 0.000000000001, "an infinite radius walks every cell, once");
+    var nr: f64 = -0.1;
+    var i3: PvVec3 = drag_from_particles_indexed(&body2, ps, n, &g, 1000.0, 0.47, nr);
+    assert(i3.x == 0.0 && i3.y == 0.0 && i3.z == 0.0, "a negative radius samples nothing");
+    var empty: PvNeighborGrid;
+    PvNeighborGrid_init(&empty);
+    var i4: PvVec3 = drag_from_particles_indexed(&body2, ps, n, &empty, 1000.0, 0.47, 0.1);
+    assert(i4.x == 0.0 && i4.y == 0.0 && i4.z == 0.0, "an empty grid finds nothing");
+    PvNeighborGrid_drop(&g);
+    fl_free(pb);
+    return 0;
+}
+
+# Cyrius-only: the level set's refusals (Rust's `checked_mul` and its usize sizes).
+fn test_level_set_refusals() {
+    test_group("level_set_refusals");
+    var ls[64];
+    var big = 4611686018427387904;   # 2^62: nx·ny overflows
+    assert_eq(particle_level_set(&ls, 0, big, 4, 0.1, 0, 0, 0.05), 0, "an overflowing size");
+    assert_eq(particle_level_set(&ls, 4, 0 - 2, 0 - 2, 0.1, 0, 0, 0.05), 0, "negative sizes");
+    assert_eq(particle_level_set(&ls, 0, 0, 5, 0.1, 0, 0, 0.05), 1, "0 × 5 fills nothing");
+    return 0;
+}
+
+# Runs the ported coupling tests.
+fn main() {
+    alloc_init();
+    test_shapes();
+    test_bodies();
+    test_added_mass_and_drag();
+    test_level_sets();
+    test_regressions();
+    test_layout();
+    test_grid_build();
+    test_block_walk();
+    test_indexed_drag();
+    test_level_set_refusals();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

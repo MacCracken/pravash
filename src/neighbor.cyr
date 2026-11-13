@@ -15,9 +15,14 @@
 # at |x| ≈ 10⁶ lands in another cell for 89% of the points (port-parity §4.4) and can list a cell twice. The rows the
 # switch changes are checked against tests/golden/<module>.d3.tsv, the f64 lists of scripts/oracle/validate.py.
 #
+# A grid built by `PvNeighborGrid_build` (M6 part a) holds the cells only, with no lists: it is the caller's stand-in
+# for the hisab `SpatialHash` that `drag_from_particles_indexed` queries (ADR 0002 #23). Its extra column orders the
+# cells by x, then y, then z, the order Rust's `query_radius` visits a block of cells in (`_pv_nb_block`).
+#
 # UPSTREAM(L4): hisab:docs/development/issues/2026-11-11-spatial-hash-per-step-rebuild-allocates.md
 #   replace `PvNeighborGrid` with hisab's `spatial_hash_*` once its query writes into caller storage (its f64 cells
-#   are these keys); parity: the `SphSolver::neighbor_lists` rows of tests/golden/sph.tsv and sph.d3.tsv (class A).
+#   are these keys); parity: the `SphSolver::neighbor_lists` rows of tests/golden/sph.tsv and sph.d3.tsv (class A),
+#   and the `drag_from_particles_indexed` rows of tests/golden/coupling.tsv and coupling.d3.tsv (class B).
 # UPSTREAM(L9): cyrius:docs/development/issues/2026-11-11-no-stable-sort.md
 #   replace `_pv_msort` with the stdlib's stable sort once it ships; parity: the neighbour lists and the
 #   `sort_by_zorder` rows (class A).
@@ -98,7 +103,8 @@ fn _pv_sph_cell_key(p: f64, h: f64): i64 {
 
 # The neighbour grid of one solver: the cell size of the last build (its h) and fl(1/h), the points of that build
 # sorted into cells (their keys, 3 words a point), and the neighbour lists in CSR form. Every column is reused across
-# builds. Starts as `SphSolver::new`'s grid: cell size 1, empty.
+# builds. Starts as `SphSolver::new`'s grid: cell size 1, empty. A cells-only build (`PvNeighborGrid_build`) leaves
+# the lists empty and fills `xorder`, the cells in (x, y, z) order; a solver's build leaves `xorder` empty.
 struct PvNeighborGrid {
     cell_size: f64;
     inv_cell: f64;
@@ -111,17 +117,18 @@ struct PvNeighborGrid {
     offsets: PvColumn;
     indices: PvColumn;
     ckeys: PvColumn;
+    xorder: PvColumn;
 }
 
-# Column k of a grid (0 keys, 1 order, 2 tmp, 3 cstart, 4 offsets, 5 indices, 6 ckeys), by its byte offset
-# (tests/sph.tcyr pins the layout, 200 bytes).
+# Column k of a grid (0 keys, 1 order, 2 tmp, 3 cstart, 4 offsets, 5 indices, 6 ckeys, 7 xorder), by its byte offset
+# (tests/sph.tcyr pins the layout, 224 bytes).
 #must_use
 fn _pv_nb_col(g, k): *PvColumn {
     return _pv_as_columns(_pv_addr(g) + 32 + k * 24);
 }
 
 # The grid's column count.
-const _PV_NB_COLUMNS = 7;
+const _PV_NB_COLUMNS = 8;
 
 # An empty grid of cell size 1 into *g (nothing allocated yet). Mirrors `SpatialHash::new(1.0)` in `SphSolver::new`.
 fn PvNeighborGrid_init(g: *PvNeighborGrid) {
@@ -207,28 +214,25 @@ fn _pv_nb_append(c: *PvColumn, order, a, b): i64 {
     return 1;
 }
 
-# Rebuilds the grid from the n particles at ps and makes their neighbour lists at smoothing radius h (finite and > 0,
-# with 1/h finite: the steps check h as f32), as `SphSolver::build_neighbors` does with f64 keys (ADR 0002 #2):
-# - the cell size is h and every point is keyed by fl(1/h), each build (Rust keeps its old f32 grid when h as f32 is
-#   within f32::EPSILON of it, while keying the probes by the new h: the two sizes no longer differ);
-# - each particle's list is the 27 cells around its own key (c − 1, c, c + 1 per axis, z outermost, then y, then x),
-#   each cell's points in index order; an offset past i64's range (a saturated key) has no cell.
-# 1, or 0 when a column can't grow (the lists are then unusable; Rust aborts). Mirrors `build_neighbors`.
+# Sorts the n particles at ps into the grid's cells at cell size h (finite and > 0, with 1/h finite): the cell size
+# is h and every point is keyed by fl(1/h); the cells are the runs of equal keys in (z, y, x) order, each run's
+# points in index order. 1, or 0 when a column can't grow (the grid is then empty). The lists and `xorder` are left
+# to the caller.
 #must_use
-fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
+fn _pv_nb_cells(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
     var one: f64 = 1.0;
     var inv: f64 = one / h;
     g.cell_size = h;
     g.inv_cell = inv;
+    g.len = 0;
+    g.cells = 0;
     var ckey: *PvColumn = _pv_nb_col(g, 0);
     var cord: *PvColumn = _pv_nb_col(g, 1);
     var ctmp: *PvColumn = _pv_nb_col(g, 2);
     var ccs: *PvColumn = _pv_nb_col(g, 3);
-    var coff: *PvColumn = _pv_nb_col(g, 4);
-    var cidx: *PvColumn = _pv_nb_col(g, 5);
     var cck: *PvColumn = _pv_nb_col(g, 6);
     var ok = ckey.resize(3 * n, 0) & cord.resize(n, 0) & ctmp.resize(n, 0) & ccs.resize(n + 1, 0);
-    ok = ok & coff.resize(n + 1, 0) & cck.resize(3 * n, 0);
+    ok = ok & cck.resize(3 * n, 0);
     if (ok == 0) { return 0; }
     var keys = ckey.data;
     var order = cord.data;
@@ -262,6 +266,29 @@ fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
     store64(cst + cells * 8, n);
     g.cells = cells;
     g.len = n;
+    return 1;
+}
+
+# Rebuilds the grid from the n particles at ps and makes their neighbour lists at smoothing radius h (finite and > 0,
+# with 1/h finite: the steps check h as f32), as `SphSolver::build_neighbors` does with f64 keys (ADR 0002 #2):
+# - the cell size is h and every point is keyed by fl(1/h), each build (Rust keeps its old f32 grid when h as f32 is
+#   within f32::EPSILON of it, while keying the probes by the new h: the two sizes no longer differ);
+# - each particle's list is the 27 cells around its own key (c − 1, c, c + 1 per axis, z outermost, then y, then x),
+#   each cell's points in index order; an offset past i64's range (a saturated key) has no cell.
+# 1, or 0 when a column can't grow (the lists are then unusable; Rust aborts). Mirrors `build_neighbors`.
+#must_use
+fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
+    var cxo: *PvColumn = _pv_nb_col(g, 7);
+    cxo.truncate(0);
+    if (_pv_nb_cells(g, ps, n, h) == 0) { return 0; }
+    var coff: *PvColumn = _pv_nb_col(g, 4);
+    var cidx: *PvColumn = _pv_nb_col(g, 5);
+    if (coff.resize(n + 1, 0) == 0) { return 0; }
+    var keys = g.keys.data;
+    var order = g.order.data;
+    var cst = g.cstart.data;
+    var ck = g.ckeys.data;
+    var cells = g.cells;
     # The lists: for each (dz, dy) row, the first cell at or after x key c − 1 by a binary search, then the row's
     # cells up to c + 1 in x order, which is dx's.
     cidx.truncate(0);
@@ -305,6 +332,138 @@ fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
         store64(off + (q + 1) * 8, cidx.len);
     }
     return 1;
+}
+
+# ── the cells-only grid (M6 part a) ─────────────────────────────────────────────────
+
+# The order of two cells' keys (ctx: the cell-key column's words, x, y, z a cell): comparing x, then y, then z, the
+# order Rust's `query_radius` visits a block in. Distinct cells never tie.
+fn _pv_nb_xcmp(ctx, a, b): i64 {
+    var pa = ctx + a * 24;
+    var pb = ctx + b * 24;
+    for (var k = 0; k < 3; k = k + 1) {
+        var ka = load64(pa + k * 8);
+        var kb = load64(pb + k * 8);
+        if (ka < kb) { return 0 - 1; }
+        if (ka > kb) { return 1; }
+    }
+    return 0;
+}
+
+# The first position in xorder[lo, hi) (xo: cell indices in (x, y, z) order, ck: their keys) whose cell is not before
+# (kx, ky, kz) in that order: a binary search.
+#must_use
+fn _pv_nb_xlower(ck, xo, lo, hi, kx, ky, kz): i64 {
+    while (lo < hi) {
+        var mid = (lo + hi) / 2;
+        var p = ck + load64(xo + mid * 8) * 24;
+        var mx = load64(p);
+        var before = 0;
+        if (mx < kx) {
+            before = 1;
+        } elif (mx == kx) {
+            var my = load64(p + 8);
+            if (my < ky) {
+                before = 1;
+            } elif (my == ky) {
+                if (load64(p + 16) < kz) { before = 1; }
+            }
+        }
+        if (before == 1) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+
+# Rebuilds *g from the n particles at ps at `cell_size`, the cells only: the Cyrius form of a hisab `SpatialHash` of
+# that cell size into which particle i's position is inserted with index i, for i in 0..n, the way
+# `drag_from_particles_indexed` asks its caller to build one (ADR 0002 #23). The keys are f64, floor(x · fl(1/cell))
+# as a saturating i64 per axis (NaN 0), hisab 3.4.1's (ADR 0002 #2), and so is the rule for the cell size: finite
+# and > 0 with 1/cell finite, as `spatial_hash_new` takes it (Rust's f32 hash refuses only cell ≤ 0). The grid then
+# has no neighbour lists. Ok(0); Err(PV_ERR_INVALID_PARAMETER) for any other cell size or n < 0, and
+# Err(PV_ERR_OUT_OF_MEMORY) when a column can't grow; either way *g is then empty, its columns kept.
+#must_use
+fn PvNeighborGrid_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, cell_size: f64): Result {
+    var cxo: *PvColumn = _pv_nb_col(g, 7);
+    var coff: *PvColumn = _pv_nb_col(g, 4);
+    var cidx: *PvColumn = _pv_nb_col(g, 5);
+    cxo.truncate(0);
+    coff.truncate(0);
+    cidx.truncate(0);
+    g.len = 0;
+    g.cells = 0;
+    var one: f64 = 1.0;
+    var inv: f64 = one / cell_size;
+    if (n < 0 || _pv_is_positive(cell_size) == 0 || _pv_is_finite(inv) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    if (_pv_nb_cells(g, ps, n, cell_size) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var cells = g.cells;
+    if (cxo.resize(cells, 0) == 0) {
+        g.len = 0;
+        g.cells = 0;
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    var xo = cxo.data;
+    for (var c = 0; c < cells; c = c + 1) { store64(xo + c * 8, c); }
+    _pv_msort(xo, cells, g.tmp.data, &_pv_nb_xcmp, g.ckeys.data);
+    return Ok(0);
+}
+
+# The cell range [c − r, c + r] of one axis, saturated at i64's ends, for r >= 0.
+fn _pv_nb_span(c, r) {
+    var kmax = 9223372036854775807;
+    var kmin = 0 - 9223372036854775807 - 1;
+    var lo = kmin;
+    var hi = kmax;
+    if (c >= kmin + r) { lo = c - r; }
+    if (c <= kmax - r) { hi = c + r; }
+    return (lo, hi);
+}
+
+# Calls visit(ctx, a, b) for each occupied cell of a cells-only grid inside the block [lo, hi] (three words each,
+# x, y, z; lo <= hi on every axis), in (x, y, z) order, with order[a, b) the cell's points in index order: the cells
+# hisab 1.4.0's `query_radius` walks, in its (dx, dy, dz) order, each cell's items in insertion order. A search
+# skips the block's empty rows, so the walk costs the occupied cells, not the block's volume. A grid whose `xorder`
+# doesn't cover its cells (a solver's) visits nothing.
+fn _pv_nb_block(g: *PvNeighborGrid, lo, hi, visit, ctx) {
+    var cells = g.cells;
+    if (g.xorder.len != cells) { return 0; }
+    var ck = g.ckeys.data;
+    var xo = g.xorder.data;
+    var cst = g.cstart.data;
+    var xlo = load64(lo);
+    var ylo = load64(lo + 8);
+    var zlo = load64(lo + 16);
+    var xhi = load64(hi);
+    var yhi = load64(hi + 8);
+    var zhi = load64(hi + 16);
+    var kmax = 9223372036854775807;
+    var j = _pv_nb_xlower(ck, xo, 0, cells, xlo, ylo, zlo);
+    while (j < cells) {
+        var c = load64(xo + j * 8);
+        var p = ck + c * 24;
+        var cx = load64(p);
+        var cy = load64(p + 8);
+        var cz = load64(p + 16);
+        if (cx > xhi) { return 0; }
+        if (cy < ylo) {
+            j = _pv_nb_xlower(ck, xo, j, cells, cx, ylo, zlo);
+        } elif (cy > yhi) {
+            if (cx == kmax) { return 0; }
+            j = _pv_nb_xlower(ck, xo, j, cells, cx + 1, ylo, zlo);
+        } elif (cz < zlo) {
+            j = _pv_nb_xlower(ck, xo, j, cells, cx, cy, zlo);
+        } elif (cz > zhi) {
+            if (cy == kmax) {
+                if (cx == kmax) { return 0; }
+                j = _pv_nb_xlower(ck, xo, j, cells, cx + 1, ylo, zlo);
+            } else {
+                j = _pv_nb_xlower(ck, xo, j, cells, cx, cy + 1, zlo);
+            }
+        } else {
+            fncall3(visit, ctx, load64(cst + c * 8), load64(cst + (c + 1) * 8));
+            j = j + 1;
+        }
+    }
+    return 0;
 }
 
 # ── the z-order sort ────────────────────────────────────────────────────────────────

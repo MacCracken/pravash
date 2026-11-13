@@ -1700,6 +1700,135 @@ fn _bench_handles(p): *PvArenaHandle {
     return p;
 }
 
+# ── coupling (M6 part a) ──
+# Rust's criterion groups on the same inputs: `coupling_sph_bodies/<n>_particles` (the 0.5 block at (0.1, 0.1),
+# spacing 0.02, about a sphere of 0.1 at (0.3, 0.3) and a box of half-extents 0.05 at (0.5, 0.3); h 0.05, k 1000,
+# c 10), `particle_level_set/<g>x<g>_<n>_particles` (the 0.5 block at (0.1, 0.1), spacing 0.5/√n, onto a g × g grid at
+# dx 0.1, radius 0.05, for (32, 100), (64, 500) and (32, 1000)) and `drag_from_particles/<n>_particles` (the
+# coupling block about the sphere moving at (1, 0, 0); ρ 1000, C_d 0.47, sample radius 0.15). Criterion's
+# `iter_batched` clones the coupling's particles and bodies outside the timing; here the calls repeat on the same
+# ones, whose work doesn't depend on the accelerations they accumulate. coupling_a/*: against
+# scripts/probes/rust/src/bin/bench_coupling_a.rs (bodies in its header).
+
+# A body at (x, y, 0) of the given shape and mass 1, moving at (vx, 0, 0), into the body array at bs + k.
+fn _bench_body(bs, k, x: f64, y: f64, sh: PvShape, vx: f64) {
+    var b: PvRigidBody = PvRigidBody_new(PvVec3_new(x, y, 0.0), 1.0, sh);
+    b.velocity = PvVec3_new(vx, 0.0, 0.0);
+    memcpy(bs + k * sizeof(PvRigidBody), &b, sizeof(PvRigidBody));
+    return 0;
+}
+
+# One `particle_level_set` row: `iters` fills of a g × g grid from the 0.5 block at spacing 0.5/√n.
+fn _bench_level_set(g, n, iters) {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var sp: f64 = 0.5 / rt;
+    var bp, bn = create_particle_block(0.1, 0.1, 0.5, 0.5, sp, 0.001);
+    var ls = fl_alloc(g * g * 8);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "particle_level_set/");
+    str_builder_add_int(sb, g);
+    str_builder_add_cstr(sb, "x");
+    str_builder_add_int(sb, g);
+    str_builder_add_cstr(sb, "_");
+    str_builder_add_int(sb, bn);
+    str_builder_add_cstr(sb, "_particles");
+    var s = str_builder_build(sb);
+    var name = alloc(str_len(s) + 1);
+    memcpy(name, str_data(s), str_len(s));
+    store8(name + str_len(s), 0);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        g_sink = g_sink ^ particle_level_set(ls, g * g, g, g, 0.1, _pv_as_particles(bp), bn, 0.05);
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    fl_free(ls);
+    fl_free(bp);
+    return 0;
+}
+
+# The coupling rows: the three criterion groups, then the twins.
+fn bench_coupling_a() {
+    var bp, bn = create_particle_block(0.1, 0.1, 0.5, 0.5, 0.02, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var bodies = fl_alloc(2 * sizeof(PvRigidBody));
+    _bench_body(bodies, 0, 0.3, 0.3, PvShape_sphere(0.1), 0.0);
+    _bench_body(bodies, 1, 0.5, 0.3, PvShape_box(0.05, 0.05, 0.05), 0.0);
+    var bs: *PvRigidBody = _pv_as_bodies(bodies);
+    var b = bench_new(_bench_name_n("coupling_sph_bodies/", bn, "_particles"));
+    bench_batch_start(b);
+    for (var k = 0; k < 2000; k = k + 1) {
+        couple_sph_bodies(ps, bn, bs, 2, 0.05, 1000.0, 10.0);
+    }
+    bench_batch_stop(b, 2000);
+    bench_report(b);
+    _bench_level_set(32, 100, 200);
+    _bench_level_set(64, 500, 20);
+    _bench_level_set(32, 1000, 20);
+    _bench_body(bodies, 0, 0.3, 0.3, PvShape_sphere(0.1), 1.0);
+    var b2 = bench_new(_bench_name_n("drag_from_particles/", bn, "_particles"));
+    bench_batch_start(b2);
+    for (var k2 = 0; k2 < 20000; k2 = k2 + 1) {
+        var d: PvVec3 = drag_from_particles(bs, ps, bn, 1000.0, 0.47, 0.15);
+        g_sink = g_sink ^ _pv_bits(d.x);
+    }
+    bench_batch_stop(b2, 20000);
+    bench_report(b2);
+    # The twins: the cells-only grid's build and the indexed drag, on this block and a unit block at 0.01.
+    var up, un = create_particle_block(0.0, 0.0, 1.0, 1.0, 0.01, 0.001);
+    var ub = fl_alloc(sizeof(PvRigidBody));
+    _bench_body(ub, 0, 0.5, 0.5, PvShape_sphere(0.1), 1.0);
+    var grid: PvNeighborGrid;
+    PvNeighborGrid_init(&grid);
+    for (var c = 0; c < 2; c = c + 1) {
+        var cp = bp;
+        var cn = bn;
+        var body = bodies;
+        var iters = 2000;
+        if (c == 1) {
+            cp = up;
+            cn = un;
+            body = ub;
+            iters = 200;
+        }
+        var cs: *PvFluidParticle = _pv_as_particles(cp);
+        var bh = bench_new(_bench_name_n("coupling_a/hash_build_", cn, ""));
+        bench_batch_start(bh);
+        for (var h = 0; h < iters / 4; h = h + 1) {
+            var gt, gv = PvNeighborGrid_build(&grid, cs, cn, 0.05);
+            g_sink = g_sink ^ gt;
+        }
+        bench_batch_stop(bh, iters / 4);
+        bench_report(bh);
+        var bi = bench_new(_bench_name_n("coupling_a/drag_indexed_", cn, ""));
+        bench_batch_start(bi);
+        for (var q = 0; q < iters * 4; q = q + 1) {
+            var di: PvVec3 = drag_from_particles_indexed(_pv_as_bodies(body), cs, cn, &grid, 1000.0, 0.47, 0.15);
+            g_sink = g_sink ^ _pv_bits(di.x);
+        }
+        bench_batch_stop(bi, iters * 4);
+        bench_report(bi);
+        if (cn > 1000) {
+            var bb = bench_new(_bench_name_n("coupling_a/drag_brute_", cn, ""));
+            bench_batch_start(bb);
+            for (var r = 0; r < iters; r = r + 1) {
+                var db: PvVec3 = drag_from_particles(_pv_as_bodies(body), cs, cn, 1000.0, 0.47, 0.15);
+                g_sink = g_sink ^ _pv_bits(db.x);
+            }
+            bench_batch_stop(bb, iters);
+            bench_report(bb);
+        }
+    }
+    PvNeighborGrid_drop(&grid);
+    fl_free(ub);
+    fl_free(up);
+    fl_free(bodies);
+    fl_free(bp);
+    return 0;
+}
+
 # Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
@@ -1728,6 +1857,7 @@ fn main(): i64 {
     bench_sph_m5c();
     bench_sph_m5d();
     bench_sph_m5e();
+    bench_coupling_a();
     return 0;
 }
 

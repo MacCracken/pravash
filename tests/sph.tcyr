@@ -768,7 +768,7 @@ fn same_particles(a: *PvFluidParticle, b: *PvFluidParticle, n): i64 {
 # Cyrius-only: the solver's layout, and `reset_integrator` (a reset solver's next Verlet step is a fresh solver's).
 fn test_solver_layout() {
     test_group("solver_layout_matches_column_offsets");
-    assert_eq(sizeof(PvSphSolver), 472, "472 bytes");
+    assert_eq(sizeof(PvSphSolver), 496, "496 bytes");
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
     var bp, bn = create_particle_block(0.2, 0.2, 0.1, 0.1, 0.025, 0.001);
     var ps: *PvFluidParticle = _pv_as_particles(bp);
@@ -1473,7 +1473,7 @@ fn nb_col_data(g: *PvNeighborGrid, k): i64 {
 # Cyrius-only: the record layout the column offsets assume.
 fn test_layout() {
     test_group("nb_layout_matches_column_offsets");
-    assert_eq(sizeof(PvNeighborGrid), 200, "200 bytes");
+    assert_eq(sizeof(PvNeighborGrid), 224, "224 bytes");
     var buf[288];
     var ps: *PvFluidParticle = _pv_as_particles(&buf);
     var q0: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
@@ -1490,6 +1490,8 @@ fn test_layout() {
     assert_eq(nb_col_data(&g, 4), g.offsets.data, "4: offsets");
     assert_eq(nb_col_data(&g, 5), g.indices.data, "5: indices");
     assert_eq(nb_col_data(&g, 6), g.ckeys.data, "6: ckeys");
+    assert_eq(is_ok(PvNeighborGrid_build(&g, ps, 2, 0.1)), 1, "a cells-only build sizes the last");
+    assert(g.xorder.data != 0 && nb_col_data(&g, 7) == g.xorder.data, "7: xorder");
     PvNeighborGrid_drop(&g);
     return 0;
 }

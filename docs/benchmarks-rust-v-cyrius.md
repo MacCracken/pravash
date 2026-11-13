@@ -732,3 +732,45 @@ one; Rust is the `bench_sph_b` twin, two runs interleaved with B):
 - **The 2,500-particle block is 5.2× Rust's time at one thread,** against 2.8–3.0× on the 625 block. The build is
   3.65 ms of the 33 ms (timed apart, on the f32 grid). The rest is the two sums over 490,000 list entries, about 61 ns
   an entry, as on the 625 block (67 ns over 29,929). So the gap is part a's per-pair cost, over 16× more entries.
+
+## M6 part a: the rigid bodies (2026-11-12)
+
+Pinned to core 15, two interleaved runs.
+- **Rust:** its criterion groups `coupling_sph_bodies/625_particles` (the 0.5 block at (0.1, 0.1), spacing 0.02, about
+  a sphere of 0.1 at (0.3, 0.3) and a box of half-extents 0.05 at (0.5, 0.3); h 0.05, k 1000, c 10),
+  `particle_level_set/<g>x<g>_<n>_particles` (the 0.5 block at spacing 0.5/√n onto a g × g grid at dx 0.1, radius
+  0.05) and `drag_from_particles/625_particles` (the sphere moving at (1, 0, 0); ρ 1000, C_d 0.47, sample radius
+  0.15). Criterion's `iter_batched` clones the coupling's particles outside the timing; the Cyrius rows repeat the call
+  on the same particles, whose work doesn't depend on the accelerations they accumulate.
+- **The twin** `scripts/probes/rust/src/bin/bench_coupling_a.rs` times what criterion doesn't: the hash build
+  (`SpatialHash::new(0.05)` and every particle inserted at its f32 position, against `PvNeighborGrid_build`), the
+  indexed drag on it, and the brute force on a unit block at spacing 0.01 (10,000 particles).
+
+| Bench | Rust | Cyrius, first version | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `coupling_sph_bodies/625_particles` | 17.0–18.1 µs | 121–125 µs | 99.2 µs | 5.5–5.8× |
+| `particle_level_set/32x32_100_particles` | 241 µs | 1.02 ms | 1.02 ms | 4.2× |
+| `particle_level_set/64x64_529_particles` | 5.04 ms | 21.4 ms | 21.2 ms | 4.2× |
+| `particle_level_set/32x32_1024_particles` | 2.39 ms | 10.3 ms | 10.2 ms | 4.3× |
+| `drag_from_particles/625_particles` | 1.52–1.53 µs | 18.2–18.7 µs | 12.0–12.1 µs | 7.9× |
+| `coupling_a/hash_build_625` | 29.8–30.0 µs | | 100.5–101.4 µs | 3.4× |
+| `coupling_a/drag_indexed_625` | 26.4–27.1 µs | 24.3–24.4 µs | 19.0 µs | 0.70–0.72× |
+| `coupling_a/hash_build_10000` | 390–392 µs | | 1.97–2.00 ms | 5.1× |
+| `coupling_a/drag_indexed_10000` | 35.2–35.5 µs | 100–101 µs | 78.8–79.8 µs | 2.2–2.3× |
+| `coupling_a/drag_brute_10000` | 25.4–26.1 µs | 275–277 µs | 178–182 µs | 6.8–7.2× |
+
+**Reading it.**
+- **The A/B.** The first version called a seven-argument distance through the body's shape for every particle. The
+  shipped one fills a per-body context once and makes a two-argument call: the drags 1.53–1.57× faster, the indexed
+  drag 1.28–1.29×. Cyrius declines `#inline` for more than two parameters or a body over 32 tokens; writing the
+  distance into the loop by hand was another 1.13×, at the price of a third copy of the formula.
+- **The coupling's normals** built each probe point with `PvVec3_new`; field stores into one local took the coupling
+  from 125 to 98 µs. Most of its time is the 265 interacting pairs' normals, six distances each.
+- **The indexed drag beats Rust's at 625 particles** because Rust's `query_radius` walks every cell of a 3D block
+  (11³ lookups here, for particles on one z layer) and allocates its result. The port's walk visits occupied cells
+  only. At 10,000 particles the 121 occupied cells cost more than Rust's lookups. Rust's indexed drag is slower than
+  its own brute force on both blocks.
+- **The grid build** is 3.4–5.1× Rust's `HashMap` inserts: the keys, the merge sort through a comparator call (L9), and
+  the second sort into x order. It is built once per call site; Rust's test and benchmark rebuild nothing either.
+- **The level set** is the same per-pair cost as part c's brute-force sums: 10 ns a cell–particle pair against Rust's
+  2.4. Walking the particles by address instead of by typed pointer gained nothing.

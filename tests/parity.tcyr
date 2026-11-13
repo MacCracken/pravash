@@ -2461,11 +2461,261 @@ fn _par_grid(fp, fl): i64 {
     return handled;
 }
 
+# ── coupling (M6) ───────────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_coupling.rs. A shape is 5 tokens (`e:BodyShape.<Variant>`, the radius, the
+# half-extents), a body 15 (position, velocity, mass, shape, force).
+
+# The shape whose 5 tokens start at input k into *s: 1, or 0 for a variant the port doesn't know.
+fn _par_shape_in(k, s: *PvShape): i64 {
+    var p = _par_in(k);
+    var n = load64(_par_in_l + k * 8);
+    var kind = 0 - 1;
+    if (_par_eq(p, n, "BodyShape.Sphere") == 1) { kind = PV_BODY_SHAPE_SPHERE; }
+    if (_par_eq(p, n, "BodyShape.Box") == 1) { kind = PV_BODY_SHAPE_BOX; }
+    if (kind < 0) { return 0; }
+    s.kind = kind;
+    s.radius = _par_in(k + 1);
+    var hx: f64 = _par_in(k + 2);
+    var hy: f64 = _par_in(k + 3);
+    var hz: f64 = _par_in(k + 4);
+    s.half_extents = (hx, hy, hz);
+    return 1;
+}
+
+# Appends the shape's 5 tokens.
+fn _par_shape_out(s: *PvShape) {
+    _par_got_e(_par_enum_text("BodyShape", body_shape_name(s.kind)));
+    _par_got_f(_pv_bits(s.radius));
+    _par_got_f(_pv_bits(s.half_extents.0));
+    _par_got_f(_pv_bits(s.half_extents.1));
+    _par_got_f(_pv_bits(s.half_extents.2));
+    return 0;
+}
+
+# The body whose 15 tokens start at input k into *b: 1, or 0 for an unknown shape.
+fn _par_body_in(k, b: *PvRigidBody): i64 {
+    b.position = PvVec3_new(_par_in(k), _par_in(k + 1), _par_in(k + 2));
+    b.velocity = PvVec3_new(_par_in(k + 3), _par_in(k + 4), _par_in(k + 5));
+    b.mass = _par_in(k + 6);
+    if (_par_shape_in(k + 7, _pv_body_shape(b)) == 0) { return 0; }
+    b.force = PvVec3_new(_par_in(k + 12), _par_in(k + 13), _par_in(k + 14));
+    return 1;
+}
+
+# Appends the body's 15 tokens.
+fn _par_body_out(b: *PvRigidBody) {
+    _par_got_f(_pv_bits(b.position.x));
+    _par_got_f(_pv_bits(b.position.y));
+    _par_got_f(_pv_bits(b.position.z));
+    _par_got_f(_pv_bits(b.velocity.x));
+    _par_got_f(_pv_bits(b.velocity.y));
+    _par_got_f(_pv_bits(b.velocity.z));
+    _par_got_f(_pv_bits(b.mass));
+    _par_shape_out(_pv_body_shape(b));
+    _par_got_f(_pv_bits(b.force.x));
+    _par_got_f(_pv_bits(b.force.y));
+    _par_got_f(_pv_bits(b.force.z));
+    return 0;
+}
+
+# The bodies whose 15 tokens each follow the `i:<k>` at input k, as a new buffer: (pointer, count, the input after),
+# or (0, -1, 0) for an unknown shape or no memory.
+fn _par_bodies_in(k) {
+    var nb = _par_in(k);
+    var buf = fl_alloc(nb * sizeof(PvRigidBody) + 8);
+    if (buf == 0) { return (0, 0 - 1, 0); }
+    var bs: *PvRigidBody = _pv_as_bodies(buf);
+    for (var j = 0; j < nb; j = j + 1) {
+        if (_par_body_in(k + 1 + j * 15, bs + j) == 0) {
+            fl_free(buf);
+            return (0, 0 - 1, 0);
+        }
+    }
+    return (buf, nb, k + 1 + nb * 15);
+}
+
+# Appends `i:<n>` and the n particles at buf.
+fn _par_ps_out(buf, n) {
+    _par_got_i(n);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var j = 0; j < n; j = j + 1) { _par_particle_out(ps + j); }
+    return 0;
+}
+
+# Appends `i:<k>` and the k bodies at buf.
+fn _par_bodies_out(buf, nb) {
+    _par_got_i(nb);
+    var bs: *PvRigidBody = _pv_as_bodies(buf);
+    for (var j = 0; j < nb; j = j + 1) { _par_body_out(bs + j); }
+    return 0;
+}
+
+# Appends a vector's 3 tokens.
+fn _par_v3_out(v: PvVec3) {
+    _par_got_f(_pv_bits(v.x));
+    _par_got_f(_pv_bits(v.y));
+    _par_got_f(_pv_bits(v.z));
+    return 0;
+}
+
+# The JSON rows: decode, then round-trip the port's own encoding (D4).
+fn _par_coupling_json(fp, fl): i64 {
+    var doc = _par_in_cstr(0);
+    if (doc == 0) { return 0 - 1; }
+    var dl = strlen(doc);
+    var sb = str_builder_new();
+    if (_par_eq(fp, fl, "BodyShape::from_json") == 1) {
+        var s: PvShape;
+        var t, v = body_shape_from_json(doc, dl, &s);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_shape_out(&s);
+        if (body_shape_to_json(&s, sb) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var s2: PvShape;
+        var t2, v2 = body_shape_from_json(d, n, &s2);
+        if (is_err_result(t2) == 1 || memeq(&s, &s2, sizeof(PvShape)) != 1) { return 0 - 1; }
+        return 1;
+    }
+    var b: PvRigidBody;
+    var tb, vb = PvRigidBody_from_json(doc, dl, &b);
+    if (is_err_result(tb) == 1) { _par_got_err(vb); return 1; }
+    _par_body_out(&b);
+    if (b.to_json(sb) != 0) { return 0 - 1; }
+    var db, nb = _par_sb_text(sb);
+    var b2: PvRigidBody;
+    var tb2, vb2 = PvRigidBody_from_json(db, nb, &b2);
+    if (is_err_result(tb2) == 1 || memeq(&b, &b2, sizeof(PvRigidBody)) != 1) { return 0 - 1; }
+    return 1;
+}
+
+# The coupling rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
+fn _par_coupling(fp, fl): i64 {
+    if (_par_eq(fp, fl, "BodyShape::from_json") == 1 || _par_eq(fp, fl, "RigidBody::from_json") == 1) {
+        return _par_coupling_json(fp, fl);
+    }
+    if (_par_eq(fp, fl, "effective_mass") == 1) {
+        var em: f64 = effective_mass(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(_pv_bits(em));
+        return 1;
+    }
+    var s: PvShape;
+    if (_par_eq(fp, fl, "BodyShape::signed_distance") == 1) {
+        if (_par_shape_in(0, &s) == 0) { return 0 - 1; }
+        var p: PvVec3 = PvVec3_new(_par_in(5), _par_in(6), _par_in(7));
+        var c: PvVec3 = PvVec3_new(_par_in(8), _par_in(9), _par_in(10));
+        var sd: f64 = body_shape_signed_distance(&s, p, c);
+        _par_got_f(_pv_bits(sd));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "BodyShape::volume") == 1) {
+        if (_par_shape_in(0, &s) == 0) { return 0 - 1; }
+        var vol: f64 = body_shape_volume(&s);
+        _par_got_f(_pv_bits(vol));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "BodyShape::bounding_radius") == 1) {
+        if (_par_shape_in(0, &s) == 0) { return 0 - 1; }
+        var br: f64 = body_shape_bounding_radius(&s);
+        _par_got_f(_pv_bits(br));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "BodyShape::projected_area") == 1) {
+        if (_par_shape_in(0, &s) == 0) { return 0 - 1; }
+        var dir: PvVec3 = PvVec3_new(_par_in(5), _par_in(6), _par_in(7));
+        var pa: f64 = body_shape_projected_area(&s, dir);
+        _par_got_f(_pv_bits(pa));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "RigidBody::new") == 1) {
+        if (_par_shape_in(4, &s) == 0) { return 0 - 1; }
+        var pos: PvVec3 = PvVec3_new(_par_in(0), _par_in(1), _par_in(2));
+        var nb0: PvRigidBody = PvRigidBody_new(pos, _par_in(3), s);
+        _par_body_out(&nb0);
+        return 1;
+    }
+    var b: PvRigidBody;
+    if (_par_eq(fp, fl, "RigidBody::signed_distance") == 1 || _par_eq(fp, fl, "RigidBody::surface_normal") == 1) {
+        if (_par_body_in(0, &b) == 0) { return 0 - 1; }
+        var q: PvVec3 = PvVec3_new(_par_in(15), _par_in(16), _par_in(17));
+        if (_par_eq(fp, fl, "RigidBody::signed_distance") == 1) {
+            var bsd: f64 = b.signed_distance(q);
+            _par_got_f(_pv_bits(bsd));
+            return 1;
+        }
+        var nrm: PvVec3 = b.surface_normal(q);
+        _par_v3_out(nrm);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "couple_sph_bodies") == 1) {
+        var pb, pn, pk = _par_particles_in(3);
+        var bb, bn, bk = _par_bodies_in(pk);
+        if (bn < 0) { return 0 - 1; }
+        couple_sph_bodies(_pv_as_particles(pb), pn, _pv_as_bodies(bb), bn, _par_in(0), _par_in(1), _par_in(2));
+        _par_ps_out(pb, pn);
+        _par_bodies_out(bb, bn);
+        fl_free(pb);
+        fl_free(bb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "integrate_bodies") == 1 || _par_eq(fp, fl, "integrate_bodies_with_added_mass") == 1) {
+        var g: PvVec3 = PvVec3_new(_par_in(0), _par_in(1), _par_in(2));
+        var at = 4;
+        if (_par_eq(fp, fl, "integrate_bodies_with_added_mass") == 1) { at = 6; }
+        var ib, inb, ik = _par_bodies_in(at);
+        if (inb < 0) { return 0 - 1; }
+        if (at == 4) {
+            integrate_bodies(_pv_as_bodies(ib), inb, g, _par_in(3));
+        } else {
+            integrate_bodies_with_added_mass(_pv_as_bodies(ib), inb, g, _par_in(3), _par_in(4), _par_in(5));
+        }
+        _par_bodies_out(ib, inb);
+        fl_free(ib);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "drag_from_particles") == 1) {
+        if (_par_body_in(0, &b) == 0) { return 0 - 1; }
+        var db, dn, dk = _par_particles_in(18);
+        var dr: PvVec3 = drag_from_particles(&b, _pv_as_particles(db), dn, _par_in(15), _par_in(16), _par_in(17));
+        _par_v3_out(dr);
+        fl_free(db);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "drag_from_particles_indexed") == 1) {
+        if (_par_body_in(0, &b) == 0) { return 0 - 1; }
+        var xb, xn, xk = _par_particles_in(20);
+        var xs: *PvFluidParticle = _pv_as_particles(xb);
+        var grid: PvNeighborGrid;
+        PvNeighborGrid_init(&grid);
+        var gt, gv = PvNeighborGrid_build(&grid, xs, xn, _par_in(18));
+        if (is_err_result(gt) == 1) { return 0 - 1; }
+        var dx: PvVec3 = drag_from_particles_indexed(&b, xs, _par_in(19), &grid, _par_in(15), _par_in(16), _par_in(17));
+        _par_v3_out(dx);
+        PvNeighborGrid_drop(&grid);
+        fl_free(xb);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "particle_level_set") == 1) {
+        var len = _par_in(2);
+        var ls = fl_alloc(len * 8 + 8);
+        if (ls == 0) { return 0 - 1; }
+        for (var z = 0; z < len; z = z + 1) { store64(ls + z * 8, 0); }
+        var lb, ln, lk = _par_particles_in(5);
+        particle_level_set(ls, len, _par_in(0), _par_in(1), _par_in(3), _pv_as_particles(lb), ln, _par_in(4));
+        _par_got_seq(len);
+        for (var w = 0; w < len; w = w + 1) { _par_got_f(load64(ls + w * 8)); }
+        fl_free(ls);
+        fl_free(lb);
+        return 1;
+    }
+    return 0;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
     if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
+    if (_par_eq(mp, ml, "coupling") == 1) { return _par_coupling(fp, fl); }
     if (_par_eq(mp, ml, "vortex") == 1) { return _par_vortex(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }

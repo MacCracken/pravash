@@ -31,9 +31,10 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
-MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph"]
+MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph",
+           "coupling"]
 PENDING_MODULES = {
-    "coupling": "M6", "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
+    "mpm": "M6", "compute": "M7", "logging": "M7", "ai": "M7",
 }
 DEFERRED_MODULES = {}
 NOT_APPLICABLE_MODULES = {
@@ -58,11 +59,13 @@ PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {}
 # Rust types (with their fields and methods) that arrive with a later part of a ported module: counted and listed.
-PENDING_TYPES = {}
+PENDING_TYPES = {"coupling::FlipSolver": "M6 part b"}
 EXCEPTIONS = {
     "buoyancy::DragCoefficient": "a unit struct that only holds the drag coefficients: PV_DRAG_COEFFICIENT_* "
                                  "(src/constants.cyr); its serde form is drag_coefficient_to_json / _from_json",
     "error::type Result": "the stdlib's value-form Result, whose Err payload is a PV_ERR_* code (ADR 0002 #1)",
+    "coupling::AddedMassCoefficient": "a unit struct that only holds the added-mass coefficients: "
+                                      "PV_ADDED_MASS_COEFFICIENT_* (src/constants.cyr)",
 }
 
 

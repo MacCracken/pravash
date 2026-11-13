@@ -4390,6 +4390,294 @@ def check_sph(rows):
     return counts
 
 
+# ── coupling (M6 part a) ───────────────────────────────────────────────────────────────────
+# rust-old/src/coupling.rs transcribed, in Rust's order, on the token layouts of scripts/oracle/src/m_coupling.rs: a
+# shape (kind, r, hx, hy, hz), a body [pos(3), vel(3), m, shape(5), force(3)], particles as 18 values. Under CP64 the
+# indexed drag's hash is the port's f64 grid (ADR 0002 #2 and #23) instead of the oracle's f32 one.
+CP64 = False
+CP_TINY = 1e-20
+
+
+def cp_sd(sh, px, py, pz, bx, by, bz):
+    kind, r, hx, hy, hz = sh
+    dx, dy, dz = px - bx, py - by, pz - bz
+    if kind == "e:BodyShape.Sphere":
+        return r_sqrt(dx * dx + dy * dy + dz * dz) - r
+    qx, qy, qz = abs(dx) - hx, abs(dy) - hy, abs(dz) - hz
+    mx, my, mz = r_max(qx, 0.0), r_max(qy, 0.0), r_max(qz, 0.0)
+    outside = r_sqrt(mx * mx + my * my + mz * mz)
+    inside = r_min(r_max(r_max(qx, qy), qz), 0.0)
+    return outside + inside
+
+
+def cp_volume(sh):
+    kind, r, hx, hy, hz = sh
+    if kind == "e:BodyShape.Sphere":
+        return (4.0 / 3.0) * math.pi * r * r * r
+    return 8.0 * hx * hy * hz
+
+
+def cp_bounding(sh):
+    kind, r, hx, hy, hz = sh
+    if kind == "e:BodyShape.Sphere":
+        return abs(r)
+    return r_sqrt(hx * hx + hy * hy + hz * hz)
+
+
+def cp_area(sh, dx, dy, dz):
+    kind, r, hx, hy, hz = sh
+    if kind == "e:BodyShape.Sphere":
+        return math.pi * r * r
+    return 4.0 * (abs(dx) * hy * hz + abs(dy) * hx * hz + abs(dz) * hx * hy)
+
+
+def cp_body(x, k):
+    return {"pos": list(x[k:k + 3]), "vel": list(x[k + 3:k + 6]), "m": x[k + 6], "shape": tuple(x[k + 7:k + 12]),
+            "force": list(x[k + 12:k + 15])}
+
+
+def cp_body_toks(b):
+    return b["pos"] + b["vel"] + [b["m"]] + list(b["shape"]) + b["force"]
+
+
+def cp_bodies(x, k):
+    n = x[k]
+    return [cp_body(x, k + 1 + 15 * j) for j in range(n)], k + 1 + 15 * n
+
+
+def cp_parts(x, k):
+    n = x[k]
+    return [list(x[k + 1 + 18 * j:k + 19 + 18 * j]) for j in range(n)], k + 1 + 18 * n
+
+
+def cp_body_sd(b, p):
+    return cp_sd(b["shape"], p[0], p[1], p[2], *b["pos"])
+
+
+def cp_normal(b, p):
+    eps = 1e-6
+    px, py, pz = p
+    sd = lambda a, c, e: cp_sd(b["shape"], a, c, e, *b["pos"])
+    dx = sd(px + eps, py, pz) - sd(px - eps, py, pz)
+    dy = sd(px, py + eps, pz) - sd(px, py - eps, pz)
+    dz = sd(px, py, pz + eps) - sd(px, py, pz - eps)
+    mag = r_sqrt(dx * dx + dy * dy + dz * dz)
+    if mag < CP_TINY:
+        fx, fy, fz = px - b["pos"][0], py - b["pos"][1], pz - b["pos"][2]
+        fmag = r_sqrt(fx * fx + fy * fy + fz * fz)
+        if fmag < CP_TINY:
+            return [1.0, 0.0, 0.0]
+        return [fdiv(fx, fmag), fdiv(fy, fmag), fdiv(fz, fmag)]
+    return [fdiv(dx, mag), fdiv(dy, mag), fdiv(dz, mag)]
+
+
+def cp_couple(ps, bs, h, k, c):
+    for b in bs:
+        b["force"] = [0.0, 0.0, 0.0]
+    for p in ps:
+        for b in bs:
+            sd = cp_body_sd(b, p[0:3])
+            if sd < h:
+                n = cp_normal(b, p[0:3])
+                pen_force = k * (h - sd)
+                rel = [p[3 + a] - b["vel"][a] for a in range(3)]
+                vn = rel[0] * n[0] + rel[1] * n[1] + rel[2] * n[2]
+                damp = (-c) * vn if vn < 0.0 else 0.0
+                total = pen_force + damp
+                m = r_max(p[11], CP_TINY)
+                for a in range(3):
+                    p[6 + a] = p[6 + a] + fdiv(total * n[a], m)
+                    b["force"][a] = b["force"][a] - total * n[a]
+
+
+def cp_integrate(bs, g, dt):
+    for b in bs:
+        inv = fdiv(1.0, r_max(b["m"], CP_TINY))
+        for a in range(3):
+            b["vel"][a] = b["vel"][a] + (b["force"][a] * inv + g[a]) * dt
+        for a in range(3):
+            b["pos"][a] = b["pos"][a] + b["vel"][a] * dt
+
+
+def cp_integrate_added(bs, g, dt, rho, ca):
+    for b in bs:
+        m_eff = b["m"] + ca * rho * cp_volume(b["shape"])
+        inv = fdiv(1.0, r_max(m_eff, CP_TINY))
+        for a in range(3):
+            b["vel"][a] = b["vel"][a] + (b["force"][a] + g[a] * b["m"]) * inv * dt
+        for a in range(3):
+            b["pos"][a] = b["pos"][a] + b["vel"][a] * dt
+
+
+def cp_drag_mean(b, s, count, rho, cd):
+    if count == 0:
+        return [0.0, 0.0, 0.0]
+    rel = [fdiv(s[a], float(count)) - b["vel"][a] for a in range(3)]
+    speed = r_sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2])
+    if speed <= CP_TINY or not math.isfinite(speed):
+        return [0.0, 0.0, 0.0]
+    area = cp_area(b["shape"], *[fdiv(r, speed) for r in rel])
+    k = 0.5 * rho * speed * cd * area
+    return [r * k for r in rel]
+
+
+def cp_drag(b, ps, idxs, rho, cd, sr):
+    s, count = [0.0, 0.0, 0.0], 0
+    for i in idxs:
+        p = ps[i]
+        if abs(cp_body_sd(b, p[0:3])) < sr:
+            s = [s[a] + p[3 + a] for a in range(3)]
+            count += 1
+    return cp_drag_mean(b, s, count, rho, cd)
+
+
+def cp_query32(b, ps, cell, sr):
+    """hisab 1.4.0's `SpatialHash` of f32 cell `cell`, every particle inserted at its f32 position with its index, and
+    `query_radius(body as f32, (sr + R) as f32)`: cells (dx, dy, dz) about the centre's, each in insertion order."""
+    inv = f32(1.0 / f32(cell))
+    cells = {}
+    for i, p in enumerate(ps):
+        cells.setdefault(tuple(nb_key(f32(c), inv) for c in p[0:3]), []).append(i)
+    r32 = f32(sr + cp_bounding(b["shape"]))
+    cr = r_as_i32(_libm.ceil(f32(r32 * inv)))
+    c = [nb_key(f32(v), inv) for v in b["pos"]]
+    out = []
+    for dx in range(-cr, cr + 1):
+        for dy in range(-cr, cr + 1):
+            for dz in range(-cr, cr + 1):
+                out += cells.get((c[0] + dx, c[1] + dy, c[2] + dz), [])
+    return out
+
+
+def cp_query64(b, ps, cell, sr):
+    """The port's cells-only grid at `cell` (f64 keys, ADR 0002 #2), from its definition: the occupied cells within
+    the centre's key ± ⌈r·fl(1/cell)⌉ per axis (saturated), r = sr + R, in (x, y, z) order, each in index order."""
+    inv = 1.0 / cell
+    key = lambda v: r_as_i64(_libm.floor(v * inv))
+    cells = {}
+    for i, p in enumerate(ps):
+        cells.setdefault(tuple(key(c) for c in p[0:3]), []).append(i)
+    cr = r_as_i64(_libm.ceil((sr + cp_bounding(b["shape"])) * inv))
+    if cr < 0:
+        return []
+    lo = [max(key(v) - cr, -(2 ** 63)) for v in b["pos"]]
+    hi = [min(key(v) + cr, 2 ** 63 - 1) for v in b["pos"]]
+    out = []
+    for k in sorted(cells):
+        if all(lo[a] <= k[a] <= hi[a] for a in range(3)):
+            out += cells[k]
+    return out
+
+
+def cp_level_set(nx, ny, n_len, dx, r, ps):
+    ls = [0.0] * n_len
+    nxu, nyu = nx % 2 ** 64, ny % 2 ** 64
+    if nxu * nyu >= 2 ** 64 or nxu * nyu != n_len:
+        return ls
+    far = (float(nxu) + float(nyu)) * dx
+    for y in range(nyu):
+        gy = float(y) * dx
+        for x in range(nxu):
+            gx = float(x) * dx
+            m = far
+            for p in ps:
+                ddx, ddy = gx - p[0], gy - p[1]
+                d = r_sqrt(ddx * ddx + ddy * ddy) - r
+                if d < m:
+                    m = d
+            ls[y * nxu + x] = m
+    return ls
+
+
+def cp_shape_json(v):
+    if not (isinstance(v, tuple) and v[0] == "obj" and len(v[1]) == 1):
+        raise JsonRefused("not a one-key object")
+    key, val = v[1][0]
+    if key == "Sphere":
+        return ["e:BodyShape.Sphere", j_f64(j_struct(val, ["radius"])[0]), 0.0, 0.0, 0.0]
+    if key == "Box":
+        return ["e:BodyShape.Box", 0.0] + [j_f64(e) for e in j_arr(j_struct(val, ["half_extents"])[0], 3)]
+    raise JsonRefused("no variant")
+
+
+def cp_json(func, doc):
+    try:
+        v = j_load(doc)
+        if func == "BodyShape::from_json":
+            return cp_shape_json(v)
+        f = j_struct(v, ["position", "velocity", "mass", "shape", "force"])
+        out = [j_f64(e) for e in j_arr(f[0], 3)] + [j_f64(e) for e in j_arr(f[1], 3)] + [j_f64(f[2])]
+        return out + cp_shape_json(f[3]) + [j_f64(e) for e in j_arr(f[4], 3)]
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def cp_want(func, x):
+    """A coupling row's recomputed outputs, or None for a function without a check."""
+    if func in ("BodyShape::from_json", "RigidBody::from_json"):
+        return None
+    if func == "BodyShape::signed_distance":
+        return [cp_sd(tuple(x[0:5]), *x[5:11])]
+    if func == "BodyShape::volume":
+        return [cp_volume(tuple(x[0:5]))]
+    if func == "BodyShape::bounding_radius":
+        return [cp_bounding(tuple(x[0:5]))]
+    if func == "BodyShape::projected_area":
+        return [cp_area(tuple(x[0:5]), *x[5:8])]
+    if func == "RigidBody::new":
+        return list(x[0:3]) + [0.0, 0.0, 0.0, x[3]] + list(x[4:9]) + [0.0, 0.0, 0.0]
+    if func == "RigidBody::signed_distance":
+        return [cp_body_sd(cp_body(x, 0), x[15:18])]
+    if func == "RigidBody::surface_normal":
+        return cp_normal(cp_body(x, 0), x[15:18])
+    if func == "effective_mass":
+        return [x[0] + x[3] * x[1] * x[2]]
+    if func == "couple_sph_bodies":
+        ps, k = cp_parts(x, 3)
+        bs, _ = cp_bodies(x, k)
+        cp_couple(ps, bs, x[0], x[1], x[2])
+        return [len(ps)] + [v for p in ps for v in p] + [len(bs)] + [v for b in bs for v in cp_body_toks(b)]
+    if func in ("integrate_bodies", "integrate_bodies_with_added_mass"):
+        added = func.endswith("added_mass")
+        bs, _ = cp_bodies(x, 6 if added else 4)
+        if added:
+            cp_integrate_added(bs, x[0:3], x[3], x[4], x[5])
+        else:
+            cp_integrate(bs, x[0:3], x[3])
+        return [len(bs)] + [v for b in bs for v in cp_body_toks(b)]
+    if func == "drag_from_particles":
+        b = cp_body(x, 0)
+        ps, _ = cp_parts(x, 18)
+        return cp_drag(b, ps, range(len(ps)), x[15], x[16], x[17])
+    if func == "drag_from_particles_indexed":
+        b = cp_body(x, 0)
+        ps, _ = cp_parts(x, 20)
+        n = x[19]
+        cand = (cp_query64 if CP64 else cp_query32)(b, ps, x[18], x[17])
+        return cp_drag(b, ps, [i for i in cand if i < n], x[15], x[16], x[17])
+    if func == "particle_level_set":
+        ps, _ = cp_parts(x, 5)
+        return [("v", x[2])] + cp_level_set(x[0], x[1], x[2], x[3], x[4], ps)
+    return None
+
+
+def check_coupling(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        got = [tok_val(t) for t in outs]
+        if func.endswith("::from_json"):
+            want = cp_json(func, unpct(ins[0][2:]))
+        else:
+            want = cp_want(func, [tok_val(t) for t in ins])
+        if want is None:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -4549,6 +4837,7 @@ def check_corrections(root, module, path_tsv, rows):
 
 # The rows the D3 switch can change (ADR 0002 #2): the cell key, the lists, and every solver step.
 D3_FNS = {
+    "coupling": ("drag_from_particles_indexed",),
     "math": ("oracle::sph_cell_key",),
     "sph": ("SphSolver::neighbor_lists", "SphSolver::step", "SphSolver::step_pcisph", "SphSolver::step_dfsph",
             "SphSolver::step_multiphase"),
@@ -4562,12 +4851,13 @@ def _clear_solver_caches():
 
 def d3_rows(module, rows):
     """(fn, inputs text, f64-key outputs text, note) for every row of `module` whose outputs change on the f64 keys."""
-    global NB64
+    global NB64, CP64
     fns = D3_FNS.get(module, ())
     out = []
     if not fns:
         return out
     NB64 = True
+    CP64 = True
     _clear_solver_caches()
     try:
         for fn, cls, ins, outs, where in rows:
@@ -4576,6 +4866,9 @@ def d3_rows(module, rows):
             if fn == "oracle::sph_cell_key":
                 want = [r_cell_key64(tok_f(ins[0]), tok_f(ins[1]))]
                 got = [tok_i(outs[0])]
+            elif module == "coupling":
+                want = cp_want(fn, [tok_val(t) for t in ins])
+                got = [tok_val(t) for t in outs]
             else:
                 want = sph_want(fn, [tok_val(t) for t in ins], GLIBC)
                 got = [tok_val(t) for t in outs]
@@ -4584,6 +4877,7 @@ def d3_rows(module, rows):
             out.append((fn, " ".join(ins), tokens_text(want), "oracle (f32 keys) " + " ".join(outs)[:200]))
     finally:
         NB64 = False
+        CP64 = False
         _clear_solver_caches()
     return out
 
@@ -4601,8 +4895,10 @@ def d3_text(module, golden_header, rows):
         "scripts/oracle/validate.py; do not edit.",
         "# regenerate: python3 -I scripts/oracle/validate.py . --write",
         "# columns: fn<TAB>inputs<TAB>outputs<TAB>note (fn, inputs: the golden row's, byte for byte; outputs: the "
-        "oracle's operations on f64 cell keys, each list the cells at a particle's key ± 1; note: the oracle's own "
-        "outputs, on its f32 keys)",
+        + ("oracle's operations on the port's cells-only f64 grid, the block about the body's key in (x, y, z) "
+           "order (ADR 0002 #23)" if module == "coupling" else
+           "oracle's operations on f64 cell keys, each list the cells at a particle's key ± 1")
+        + "; note: the oracle's own outputs, on its f32 keys)",
         f"# rows: {len(rows3)}",
     ]
     return "\n".join(head + ["\t".join(f) for f in rows3]) + "\n"
@@ -4722,6 +5018,11 @@ def main():
             print(f"{path.stem}: {len(rows)} rows recomputed ({summary})")
             if path.stem != "buoyancy":
                 check_corrections(root, path.stem, path, rows)
+        elif path.stem == "coupling":
+            counts = check_coupling(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"coupling: {len(rows)} rows recomputed ({summary})")
+            check_d3(root, "coupling", path, rows)
         elif path.stem == "json":
             counts = check_json(rows)
             summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))

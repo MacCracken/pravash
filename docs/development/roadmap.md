@@ -75,7 +75,12 @@
 - [x] M5 part e: the three parallel SPH loops on the worker pool (every step row at 2–8 threads gives the serial
   bits), then the D3 switch to f64 keys (596 rows mapped by name to the `.d3.tsv` tables, all passing)
 - [x] **M5 done 2026-11-12.**
-- [ ] M6: coupling (FLIP/APIC, rigid bodies) and MPM
+- [x] M6 part a: the rigid bodies of `coupling.rs` (`BodyShape`, `RigidBody`, the two-way coupling, added mass, both
+  drags, the indexed one through a cells-only neighbour grid, the particle level set, JSON; 4,798 rows in a new golden
+  module, all but one bit-exact on the first replay and that one mapped to `coupling.d3.tsv`; 22 Rust tests)
+- [ ] M6 part b: the `FlipSolver` (FLIP/PIC, APIC, the projection, `apic_c`'s resize; the 11 FLIP tests)
+- [ ] M6 part c: MPM (`ConstitutiveModel` and its codec, `MpmParticle`, the 2×2 SVD, Drucker–Prager, `MpmSolver`; 13
+  Rust tests)
 
 ### 1.3.0
 

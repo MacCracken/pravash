@@ -80,5 +80,6 @@ modules = [
     "src/sph_pcisph.cyr",
     "src/sph_dfsph.cyr",
     "src/sph_multiphase.cyr",
+    "src/coupling.cyr",
     "src/json.cyr",
 ]

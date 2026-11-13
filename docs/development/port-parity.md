@@ -1711,3 +1711,117 @@ size within f32::EPSILON of h as f32) holds for a cell size of h.
 | the dense 625-particle step, σ 0.072, 1 / 8 threads | 2.8–3.0× / 1.2–1.45× |
 | the 2,500-particle step, 1 / 8 threads | 5.2× / 2.7–2.9× |
 | the two-phase step, 1 / 8 threads | 2.8–3.0× / 1.8–1.9× |
+
+## 24. M6 part a: the rigid bodies of `coupling` (2026-11-12)
+
+**`src/coupling.cyr`** ports the rigid-body half of `coupling.rs`:
+- **The shapes.** `BodyShape` is the kind enum `PvBodyShape` and the payload struct `PvShape` (port plan §7.3, as
+  ADR 0002 #15). Its signed distance, volume, bounding radius and projected area are free functions by the enum-method
+  rule.
+- **The bodies.** `PvRigidBody` holds Rust's fields in their order, and has `signed_distance` and `surface_normal`
+  (the central difference at ε = 1e-6, with Rust's two fallbacks).
+- **The free functions:** the two-way coupling, integration with and without added mass, both drags and the level set.
+
+Every formula is Rust's in its operation order. That covers glam's dot products, the component-wise vector
+quotients (`sum / count`, `v_rel / |v_rel|`) and Rust's NaN-ignoring min and max.
+
+The free functions take (pointer, count) slices (ADR 0002 #23). One restructure is bit-neutral (the A/B below):
+- **A per-body context:** every distance in the hot loops reads the shape and centre from it, a two-argument call.
+- **Bodies outside particles:** the coupling runs its bodies in the outer loop. Each particle's acceleration still
+  sums the bodies in order, and each body's force sums the particles in order, and no pair reads what another
+  writes.
+
+**The indexed drag's hash** (ADR 0002 #23). Rust's `drag_from_particles_indexed` takes a hisab 1.4.0 `SpatialHash`
+that the caller fills with each particle's f32 position. Its `query_radius` walks the (2⌈r/cell⌉ + 1)³ cells about the
+body centre's cell, x outermost, each cell's items in insertion order.
+
+The port takes the caller's **cells-only `PvNeighborGrid`**, the L4 stand-in, built by `PvNeighborGrid_build`:
+- **The build:** M4 part b's keys and stable sort on the f64 keys of D3, then the cells sorted again into (x, y, z)
+  order in an eighth column, `xorder`. `_pv_nb_build` and the new build share `_pv_nb_cells`.
+- **The walk** (`_pv_nb_block`) runs through `xorder` from the block's first cell. A binary search skips each row,
+  column or z run outside the block, so it visits Rust's cells in Rust's order and costs the occupied cells, never
+  the block's volume.
+- **The cell-size rule** is hisab 3.4.1's `spatial_hash_new`: finite and > 0 with 1/cell finite.
+
+Rust's walk has no such bound. An infinite radius is i32::MAX cells a side and never returns, and a block past i32's
+range panics in the oracle's overflow-checked build. So no row has a radius that is ±∞ as f32; `tests/coupling.tcyr`
+covers the infinite radius instead.
+
+Hisab 3.4.1's own `spatial_hash_query_radius` wasn't usable as the counterpart, for the two reasons below. Both are
+now appended to L4's request, which the conversion needs answered:
+- **The per-call allocation:** it allocates its result vector, L4's open request.
+- **The order:** it switches to insertion order whenever the block holds more cells than the hash has entries
+  (`full_scan`), which would reorder the drag's sum.
+
+**The rows** (`m_coupling.rs`, seed 0x60_c0_0a): 4,798, class B, with `RigidBody::new` and the two decoders class A.
+- the shapes over the specials, degenerate and negative sizes, points at the centre, on faces, edges and corners, and
+  random ones about three centres; volumes and bounding radii over sizes k/7 and (k/3, k/7, k/11) (no random numbers
+  drawn);
+- the bodies' normals at the centre (the direction fallback), a box's centre (zero differences) and near the surface;
+- the coupling on the Rust tests' scenes, the benchmark's block, approaching and receding particles, massless, NaN and ∞
+  masses, negative damping, the specials as h, k and c, and seeded clouds about one to four bodies in 2D and 3D;
+- integration over odd masses, the specials as dt, ρ and C_a, and each `AddedMassCoefficient`;
+- both drags on the Rust tests' scenes, 40 seeded clouds at five cell sizes (and half slices for the indexed form), the
+  specials, a NaN particle and a NaN body, bodies at 10⁴, 10⁶ and 3·10⁶, and a 9 × 9 × 9 lattice taller and wider than
+  the block (no random numbers drawn);
+- the level set on the Rust tests' grids, every refusal (a mismatch either way, an overflowing product, sizes a usize
+  holds but an i64 doesn't), the specials, NaN and ∞ particles, and seeded clouds;
+- the flow scene, a stream at +x past a sphere and a box: the coupling, both integrations and both drags on frames 0,
+  1, 5, 20 and 40;
+- 103 `BodyShape` and 30 `RigidBody` documents, serde_json's own and hand-written. The hand-written ones cover the
+  struct variant as an object and as an array, the bare `"Sphere"`, null, missing, duplicated and unknown fields,
+  arrays of the wrong length, two keys and an unknown variant.
+
+`validate.py` transcribes every function from the Rust source:
+- the indexed drag on hisab 1.4.0's f32 hash (`cp_query32`), and again on the port's f64 grid (`cp_query64`, from its
+  definition: the block's occupied keys in sorted order) for `coupling.d3.tsv`;
+- the decoders under serde's externally tagged struct-variant semantics.
+
+It covers 54,766 rows with 0 failures, in about 85 s.
+
+**Result:**
+- **On the first replay** every row but one was bit-exact. The exception was an indexed drag about a body at 10⁶ with
+  cells of 0.1. There the f32 positions are 0.0625 apart, so the oracle's cells order the particles differently and its
+  sum is 3 ulp away. validate.py's f64
+  transcription changes exactly that row, `coupling.d3.tsv` holds it, and it passes against it.
+- **The full replay:** 13 modules, 0 failing | rows: 54,052 ok, 0 failed, 0 measured, 3 pending, 711 accepted
+  (ADR 4: 114, ADR 2: 597). Every coupling value is at 0 ulp.
+- **The mutation tests found two gaps.** On the first run 27 of 31 port mutations failed rows. A 32nd, whose pattern
+  matched twice, was replaced by a misnamed `Box` key, which fails 47 rows. Of the four survivors:
+  - a walk that skips the rest of an x column when z leaves the block was a gap. No cloud had cells beyond the block
+    in z, and only `tests/coupling.tcyr` caught it. The 9 × 9 × 9 lattice rows close it: 3 rows now fail;
+  - a level set accepted when nx·ny < len was a gap. A row with a longer buffer closes it;
+  - skipping a zero-cell block (`cr >= 0` → `cr > 0`) is equivalent. ⌈r·fl(1/cell)⌉ = 0 means r ≤ 0 or NaN, and then
+    no particle can have |sd| < sr;
+  - computing the sphere volume as c·((r·r)·r) instead of Rust's ((c·r)·r)·r moves 25 of the new volume rows by 1 ulp.
+    That is inside class B's 2-ulp bound, so it shows in the histogram (`max:1`) but passes, as M3 part c's ghost
+    Laplacian did. validate.py's exact recomputation still pins every bit of the rows.
+- **Mutations of the transcription:** 8 of 8 caught (a sphere's + r; the f32 query z outermost; the f64 grid in z-major
+  order, caught by `coupling.d3.tsv`; no force reset; the level set's far value; a struct variant taking an array of
+  any length; the drag area of the unnormalised velocity; the coupling rows not recomputed).
+
+**Tests** (`tests/coupling.tcyr`, 55 checks):
+- the 22 Rust tests of the shapes, the bodies, the coupling, added mass, drag and the level set, in Rust's order (the
+  FLIP solver's 11 come with part b). `test_indexed_drag_matches_bruteforce_for_large_body` builds the grid where Rust
+  builds its hash;
+- five Cyrius-only groups: the record layouts (the shape at byte 56); the cell-size rule (0, −1, NaN, ∞ and a
+  subnormal refused, the grid left empty); the block walk against a brute-force enumeration on 40 blocks about a 3D
+  lattice with gaps; the indexed drag against the brute force on seeded clouds at the origin, 10⁶ and 10¹² and with an
+  infinite radius; the level set's refusals.
+
+`tests/sph.tcyr` pins the grid's new layout (224 bytes, eight columns; the solver 496): 192 checks.
+`tests/integration.tcyr` adds the two coupling integration tests (31 of 33, 77 checks). Rust's
+`coupling_sphere_falls_through_fluid` couples `&mut [body.clone()]`, a temporary, so its body falls under gravity
+alone while the particles feel it; the port couples a copy too.
+
+Surface parity: 386 items ok (the FLIP solver's 9 pending part b), 0 missing.
+
+**Speed** (benchmarks-rust-v-cyrius, M6 part a):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| criterion `coupling_sph_bodies/625_particles` | 5.5–5.8× |
+| criterion `drag_from_particles/625_particles` | 7.9× |
+| criterion `particle_level_set`, the three sizes | 4.2–4.3× |
+| the indexed drag, 625 / 10,000 particles (a twin) | 0.70–0.72× / 2.2–2.3× |
+| the grid build against hisab's hash, 625 / 10,000 | 3.4× / 5.1× |

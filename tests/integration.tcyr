@@ -5,9 +5,9 @@
 # grid sections, then grid_invalid_dx_rejected from its edge cases; `is_err()` is the `PV_ERR_*` code Rust's path
 # returns), and serde_roundtrip_all_types, whose four types all read and write JSON now (serde_json is `to_json` /
 # `Pv*_from_json`). M4 part c: the four free-function SPH tests, in `test_sph` (Rust's `sph::step` is `sph_step`,
-# ADR 0002 #17; `.unwrap()` asserts every step was Ok). M5 part a: the five solver tests, in `test_solver`. The rest
-# arrive with their milestones:
-# - the coupling and FLIP tests: M6.
+# ADR 0002 #17; `.unwrap()` asserts every step was Ok). M5 part a: the five solver tests, in `test_solver`. M6 part a:
+# the two coupling tests, in `test_coupling`. The rest arrive with their milestones:
+# - the two FLIP tests: M6 part b.
 
 include "tests/lib.cyr"
 
@@ -418,6 +418,41 @@ fn test_shallow() {
     return 0;
 }
 
+# M6 part a: the coupling tests. Rust's first couples a clone of the body (`&mut [body.clone()]`), so the body's own
+# force stays zero and it falls under gravity alone while the particles feel it; the port couples a copy too.
+fn test_coupling() {
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    test_group("coupling_sphere_falls_through_fluid");
+    var bp, bn = create_particle_block(0.2, 0.1, 0.6, 0.4, 0.03, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var s: PvSphSolver = PvSphSolver_new();
+    var body: PvRigidBody = PvRigidBody_new(PvVec3_new(0.5, 0.7, 0.0), 0.1, PvShape_sphere(0.05));
+    var y_start: f64 = body.position.y;
+    var errs = 0;
+    var copy: PvRigidBody;
+    for (var k = 0; k < 50; k = k + 1) {
+        var st, sv = s.step(ps, bn, &cfg, 0.001);
+        if (is_err_result(st) == 1) { errs = errs + 1; }
+        copy = body;
+        couple_sph_bodies(ps, bn, &copy, 1, 0.05, 500.0, 5.0);
+        integrate_bodies(&body, 1, cfg.gravity, cfg.dt);
+    }
+    assert_eq(errs, 0, "50 steps, every one Ok");
+    assert(body.position.y < y_start && _pv_is_finite(body.position.y) == 1, "the body falls, and stays finite");
+    PvSphSolver_drop(&s);
+    fl_free(bp);
+
+    test_group("coupling_body_receives_force");
+    var one: PvFluidParticle = PvFluidParticle_new(PvVec3_new(0.55, 0.0, 0.0), 1.0);
+    one.density = 1000.0;
+    one.velocity = PvVec3_new(1.0, 0.0, 0.0);
+    var b2: PvRigidBody = PvRigidBody_new(PvVec3_new(0.5, 0.0, 0.0), 10.0, PvShape_sphere(0.1));
+    couple_sph_bodies(&one, 1, &b2, 1, 0.15, 1000.0, 10.0);
+    var fm: f64 = b2.force.length();
+    assert(fm > 0.0, "the body receives a force from the particle");
+    return 0;
+}
+
 # Runs the ported integration tests.
 fn main() {
     alloc_init();
@@ -528,6 +563,7 @@ fn main() {
     c2.dt = 1.0;
     assert(near(c1.dt, 0.001, 0.0000000001) == 1, "a copy, not an alias");
     test_solver();
+    test_coupling();
     return assert_summary();
 }
 

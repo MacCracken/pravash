@@ -2,9 +2,10 @@
 # crate's serde_json writes decode to the same bits, and every document written here decodes back to the same bits.
 #
 # Types: `FluidMaterial`, `FluidParticle`, `FluidConfig`, `ParticleSoa` (src/common.cyr), `FlowRegime` and the unit
-# struct `DragCoefficient` (src/buoyancy.cyr). The text is not serde_json's byte for byte (D4): floats are bayan's
-# Grisu2 digits, which round-trip exactly; NaN and ±∞ are written `null`, as serde_json writes them, and like
-# serde_json's such a document doesn't read back.
+# struct `DragCoefficient` (src/buoyancy.cyr); later milestones add their own (`ShallowWater`, the grid types, and
+# M6's `BodyShape` and `RigidBody`, each in its own section below). The text is not serde_json's byte for byte (D4):
+# floats are bayan's Grisu2 digits, which round-trip exactly; NaN and ±∞ are written `null`, as serde_json writes
+# them, and like serde_json's such a document doesn't read back.
 #
 # Writers: `x.to_json(sb)` appends to a `str_builder` through its non-aborting `_a` calls (the default allocator) and
 # returns 0, or -1 when a grow failed (ADR 0002 #8: nothing aborts). Fields go in Rust's declaration order; a
@@ -20,8 +21,8 @@
 #   `null` and can't read them back), and so is a number beyond f64's range (`1e400`);
 # - a u8 (the phase) takes a JSON integer in 0 … 255 only (`1.0`, `-1` and `256` are refused);
 # - a vector takes an array of exactly 3 numbers; a `Vec<f64>` / `Vec<u8>` any number;
-# - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`; the unit struct `DragCoefficient`
-#   is `null`.
+# - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`, a struct variant (`BodyShape`'s)
+#   the one-key object `{"Name":fields}`, its fields read as a struct's; the unit struct `DragCoefficient` is `null`.
 # Anything else is Err(PV_ERR_DESERIALIZE), and *out is then untouched (a `ParticleSoa` holds no storage). Two bayan
 # policies are stricter than serde_json, so a few documents serde_json reads are refused here (impetus port plan §8,
 # S3 and S4, filed at bayan): an integer above i64::MAX (serde_json reads one into an f64), and a duplicated unknown
@@ -988,5 +989,104 @@ fn PvPhaseField_from_json(buf, len, out: *PvPhaseField): Result {
     out.dx = dx;
     out.mobility = mob;
     out.epsilon = eps;
+    return Ok(0);
+}
+
+# ── BodyShape, RigidBody (M6 part a) ──────────────────────────────────────────────────
+
+# Appends the shape as serde_json writes a `BodyShape`, externally tagged: `{"Sphere":{"radius":r}}` or
+# `{"Box":{"half_extents":[hx,hy,hz]}}`. 0, or -1 when the builder can't grow or the kind is outside the enum.
+#must_use
+fn body_shape_to_json(s: *PvShape, sb): i64 {
+    if (s.kind == PV_BODY_SHAPE_SPHERE) {
+        var rc = _pv_jw(sb, "{\"Sphere\":{\"radius\":");
+        rc = rc | _pv_jw_f64(sb, s.radius);
+        rc = rc | _pv_jw(sb, "}}");
+        return rc;
+    }
+    if (s.kind == PV_BODY_SHAPE_BOX) {
+        var rb = _pv_jw(sb, "{\"Box\":{\"half_extents\":");
+        rb = rb | _pv_jw_f64x3(sb, s.half_extents.0, s.half_extents.1, s.half_extents.2);
+        rb = rb | _pv_jw(sb, "}}");
+        return rb;
+    }
+    return 0 - 1;
+}
+
+# A `BodyShape` node into *out: the one-key object `{"Variant": fields}`, the fields as a struct variant's (an object
+# by name, unknown names ignored, or an array of exactly its fields). A bare `"Sphere"` is refused, as serde refuses
+# a unit form for a struct variant. 1, or 0 with *out untouched.
+fn _pv_jr_shape(v, out: *PvShape): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_OBJ || bayan_json_v_obj_len(v) != 1) { return 0; }
+    var key = bayan_json_v_obj_key(v, 0);
+    var body = bayan_json_v_obj_val(v, 0);
+    var f = _pv_jr_form(body, 1);
+    if (f == 0) { return 0; }
+    var w[24];
+    if (str_eq_cstr(key, "Sphere") == 1) {
+        if (_pv_jr_f64(_pv_jr_at(body, f, 0, "radius"), &w) == 0) { return 0; }
+        var r: f64 = load64(&w);
+        var sp: PvShape = PvShape_sphere(r);
+        *out = sp;
+        return 1;
+    }
+    if (str_eq_cstr(key, "Box") == 1) {
+        if (_pv_jr_f64x3(_pv_jr_at(body, f, 0, "half_extents"), &w) == 0) { return 0; }
+        var hx: f64 = load64(&w);
+        var hy: f64 = load64(&w + 8);
+        var hz: f64 = load64(&w + 16);
+        var bx: PvShape = PvShape_box(hx, hy, hz);
+        *out = bx;
+        return 1;
+    }
+    return 0;
+}
+
+# Reads a `BodyShape` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched.
+#must_use
+fn body_shape_from_json(buf, len, out: *PvShape): Result {
+    var v = _pv_jr_parse(buf, len);
+    if (_pv_jr_shape(v, out) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    return Ok(0);
+}
+
+impl PvRigidBody {
+    # Appends the body as serde_json writes a `RigidBody`: 0, or -1 when the builder can't grow or the shape's kind
+    # is outside the enum.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "position", 1);
+        rc = rc | _pv_jw_f64x3(sb, self.position.x, self.position.y, self.position.z);
+        rc = rc | _pv_jw_key(sb, "velocity", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.velocity.x, self.velocity.y, self.velocity.z);
+        rc = rc | _pv_jw_key(sb, "mass", 0);
+        rc = rc | _pv_jw_f64(sb, self.mass);
+        rc = rc | _pv_jw_key(sb, "shape", 0);
+        rc = rc | body_shape_to_json(_pv_body_shape(self), sb);
+        rc = rc | _pv_jw_key(sb, "force", 0);
+        rc = rc | _pv_jw_f64x3(sb, self.force.x, self.force.y, self.force.z);
+        rc = rc | _pv_jw(sb, "}");
+        return rc;
+    }
+}
+
+# Reads a `RigidBody` document into *out: Ok(0), or Err(PV_ERR_DESERIALIZE) with *out untouched.
+#must_use
+fn PvRigidBody_from_json(buf, len, out: *PvRigidBody): Result {
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 5);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    # Read into the record's 15 words (position, velocity, mass, the shape's 5, force), then copy it whole.
+    var w[120];
+    var ok = _pv_jr_f64x3(_pv_jr_at(v, f, 0, "position"), &w);
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 1, "velocity"), &w + 24);
+    ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "mass"), &w + 48);
+    ok = ok & _pv_jr_shape(_pv_jr_at(v, f, 3, "shape"), _pv_body_shape(&w));
+    ok = ok & _pv_jr_f64x3(_pv_jr_at(v, f, 4, "force"), &w + 96);
+    if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var src: *PvRigidBody = _pv_as_bodies(&w);
+    *out = *src;
     return Ok(0);
 }

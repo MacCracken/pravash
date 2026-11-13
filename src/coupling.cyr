@@ -1,0 +1,667 @@
+# coupling.cyr — fluid–body coupling of rust-old/src/coupling.rs (M6 part a): rigid bodies with their shapes and
+# signed distances, the two-way SPH coupling, body integration with and without added mass, drag from nearby
+# particles (by brute force and through a caller's neighbour grid), and the particle level set. The FLIP/APIC solver
+# arrives with part b.
+#
+# `BodyShape` is a data-carrying enum: the kind enum `PvBodyShape` and the payload struct `PvShape`, the union of
+# the variants' fields (port plan §7.3, ADR 0002 #23). Every formula is Rust's in its operation order: glam's dot
+# products ((x·x' + y·y') + z·z'), vector-by-scalar products and quotients component by component, Rust's NaN-
+# ignoring min and max. A shape kind outside the enum, which Rust can't hold, gives NaN. Slices are (pointer, count)
+# (ADR 0002 #9); a body is a `PvRigidBody` record. Rust's `trace_span!`s and the level set's size warning arrive with
+# M7's logging.
+#
+# `drag_from_particles_indexed` takes the caller's `PvNeighborGrid`, built by `PvNeighborGrid_build` (src/neighbor.cyr),
+# where Rust takes a hisab 1.4.0 `SpatialHash` the caller fills with each particle's f32 position: the grid's keys are
+# f64 (ADR 0002 #2), and the rows they change are checked against tests/golden/coupling.d3.tsv.
+#
+# The distance loops read each body's shape and centre from a context filled once (`_PvSdCtx`), a two-argument call:
+# Cyrius declines `#inline` for the seven-argument form (docs/benchmarks-rust-v-cyrius.md, M6 part a, 1.5× on the
+# drags). `couple_sph_bodies` runs its bodies outside its particles, which keeps every sum in Rust's order.
+
+# ── BodyShape ───────────────────────────────────────────────────────────────────────
+
+# The kind of a body shape: explicit, append-only values (Rust's `#[non_exhaustive]` enum in declaration order). Its
+# payload is `PvShape`. Mirrors `BodyShape`.
+enum PvBodyShape {
+    PV_BODY_SHAPE_SPHERE = 0;
+    PV_BODY_SHAPE_BOX = 1;
+}
+
+# A body shape: its kind and the union of the variants' fields (a field the kind doesn't use is 0). A sphere has a
+# radius; a box its half-extents (hx, hy, hz), an axis-aligned box about the body's centre. Mirrors `BodyShape`.
+struct PvShape {
+    kind;
+    radius: f64;
+    half_extents: (f64, f64, f64);
+}
+
+# A sphere of `radius`. Mirrors `BodyShape::Sphere { radius }`.
+#must_use
+fn PvShape_sphere(radius: f64): PvShape {
+    var s: PvShape;
+    s.kind = PV_BODY_SHAPE_SPHERE;
+    s.radius = radius;
+    s.half_extents = (0.0, 0.0, 0.0);
+    return s;
+}
+
+# An axis-aligned box with half-extents (hx, hy, hz). Mirrors `BodyShape::Box { half_extents }`.
+#must_use
+fn PvShape_box(hx: f64, hy: f64, hz: f64): PvShape {
+    var s: PvShape;
+    s.kind = PV_BODY_SHAPE_BOX;
+    s.radius = 0.0;
+    s.half_extents = (hx, hy, hz);
+    return s;
+}
+
+# The Rust variant name of a shape kind (`"Sphere"`), or "Unknown".
+#must_use
+fn body_shape_name(k): i64 {
+    match k {
+        PV_BODY_SHAPE_SPHERE => { return "Sphere"; }
+        PV_BODY_SHAPE_BOX => { return "Box"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# A shape about a centre, as the distance loops read it: the kind, the radius, the half-extents and the centre. Each
+# loop fills one per body, so a particle's distance is a two-argument call.
+struct _PvSdCtx {
+    kind;
+    r: f64;
+    hx: f64;
+    hy: f64;
+    hz: f64;
+    bx: f64;
+    by: f64;
+    bz: f64;
+}
+
+# Fills *c with shape s about (bx, by, bz).
+fn _pv_sd_ctx(c: *_PvSdCtx, s: *PvShape, bx: f64, by: f64, bz: f64) {
+    c.kind = s.kind;
+    c.r = s.radius;
+    c.hx = s.half_extents.0;
+    c.hy = s.half_extents.1;
+    c.hz = s.half_extents.2;
+    c.bx = bx;
+    c.by = by;
+    c.bz = bz;
+    return 0;
+}
+
+# The signed distance from the point at q (three f64 words, x, y, z: a `PvVec3`, or a particle, whose position comes
+# first) to the shape of *c, d = q − centre per axis:
+#   sphere √((dx² + dy²) + dz²) − r;
+#   box √((max(qx, 0)² + max(qy, 0)²) + max(qz, 0)²) + min(max(max(qx, qy), qz), 0), q = |d| − half-extent.
+# NaN for a kind outside the enum.
+#must_use
+fn _pv_sd_at(c: *_PvSdCtx, q): f64 {
+    var x: f64 = load64(q);
+    var y: f64 = load64(q + 8);
+    var z: f64 = load64(q + 16);
+    var dx: f64 = x - c.bx;
+    var dy: f64 = y - c.by;
+    var dz: f64 = z - c.bz;
+    if (c.kind == PV_BODY_SHAPE_SPHERE) {
+        var d2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+        var r: f64 = f64_sqrt(d2);
+        var sd: f64 = r - c.r;
+        return sd;
+    }
+    if (c.kind == PV_BODY_SHAPE_BOX) {
+        var zero: f64 = 0.0;
+        var ax: f64 = f64_abs(dx);
+        var ay: f64 = f64_abs(dy);
+        var az: f64 = f64_abs(dz);
+        var qx: f64 = ax - c.hx;
+        var qy: f64 = ay - c.hy;
+        var qz: f64 = az - c.hz;
+        var mx: f64 = _pv_max(qx, zero);
+        var my: f64 = _pv_max(qy, zero);
+        var mz: f64 = _pv_max(qz, zero);
+        var o2: f64 = ((mx * mx) + (my * my)) + (mz * mz);
+        var outside: f64 = f64_sqrt(o2);
+        var m1: f64 = _pv_max(qx, qy);
+        var m2: f64 = _pv_max(m1, qz);
+        var inside: f64 = _pv_min(m2, zero);
+        var sb: f64 = outside + inside;
+        return sb;
+    }
+    var nan: f64 = PV_F64_NAN;
+    return nan;
+}
+
+# The signed distance from `point` to the shape's surface about `body_pos`: negative inside, positive outside. NaN
+# for a kind outside the enum. Mirrors `BodyShape::signed_distance`.
+#must_use
+fn body_shape_signed_distance(s: *PvShape, point: PvVec3, body_pos: PvVec3): f64 {
+    var c: _PvSdCtx;
+    _pv_sd_ctx(&c, s, body_pos.x, body_pos.y, body_pos.z);
+    var q: PvVec3 = point;
+    var sd: f64 = _pv_sd_at(&c, &q);
+    return sd;
+}
+
+# The shape's volume: a sphere's ((fl(4/3)·π)·r)·r·r, a box's ((8·hx)·hy)·hz. NaN for a kind outside the enum.
+# Mirrors `BodyShape::volume`.
+#must_use
+fn body_shape_volume(s: *PvShape): f64 {
+    match s.kind {
+        PV_BODY_SHAPE_SPHERE => {
+            var four: f64 = 4.0;
+            var c: f64 = four / 3.0;
+            var cp: f64 = c * PV_F64_PI;
+            var r: f64 = s.radius;
+            var v: f64 = ((cp * r) * r) * r;
+            return v;
+        }
+        PV_BODY_SHAPE_BOX => {
+            var eight: f64 = 8.0;
+            var vb: f64 = ((eight * s.half_extents.0) * s.half_extents.1) * s.half_extents.2;
+            return vb;
+        }
+        _ => {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+    }
+    var nan2: f64 = PV_F64_NAN;
+    return nan2;
+}
+
+# The radius of the smallest sphere about the body's centre that holds the shape: a sphere's |r|, a box's
+# √((hx² + hy²) + hz²). NaN for a kind outside the enum. Mirrors `BodyShape::bounding_radius`.
+#must_use
+fn body_shape_bounding_radius(s: *PvShape): f64 {
+    match s.kind {
+        PV_BODY_SHAPE_SPHERE => {
+            var r: f64 = f64_abs(s.radius);
+            return r;
+        }
+        PV_BODY_SHAPE_BOX => {
+            var hx: f64 = s.half_extents.0;
+            var hy: f64 = s.half_extents.1;
+            var hz: f64 = s.half_extents.2;
+            var d2: f64 = ((hx * hx) + (hy * hy)) + (hz * hz);
+            var rb: f64 = f64_sqrt(d2);
+            return rb;
+        }
+        _ => {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+    }
+    var nan2: f64 = PV_F64_NAN;
+    return nan2;
+}
+
+# The area of the shape projected on the plane normal to (dx, dy, dz) (a unit direction): a sphere's (π·r)·r, a
+# box's 4·(((|dx|·hy)·hz + (|dy|·hx)·hz) + (|dz|·hx)·hy).
+#must_use
+fn _pv_shape_area(s: *PvShape, dx: f64, dy: f64, dz: f64): f64 {
+    match s.kind {
+        PV_BODY_SHAPE_SPHERE => {
+            var r: f64 = s.radius;
+            var a: f64 = (PV_F64_PI * r) * r;
+            return a;
+        }
+        PV_BODY_SHAPE_BOX => {
+            var hx: f64 = s.half_extents.0;
+            var hy: f64 = s.half_extents.1;
+            var hz: f64 = s.half_extents.2;
+            var ax: f64 = f64_abs(dx);
+            var ay: f64 = f64_abs(dy);
+            var az: f64 = f64_abs(dz);
+            var t: f64 = (((ax * hy) * hz) + ((ay * hx) * hz)) + ((az * hx) * hy);
+            var four: f64 = 4.0;
+            var ab: f64 = four * t;
+            return ab;
+        }
+        _ => {
+            var nan: f64 = PV_F64_NAN;
+            return nan;
+        }
+    }
+    var nan2: f64 = PV_F64_NAN;
+    return nan2;
+}
+
+# The cross-section area of the shape on the plane normal to the unit direction `dir`. NaN for a kind outside the
+# enum. Mirrors `BodyShape::projected_area`.
+#must_use
+fn body_shape_projected_area(s: *PvShape, dir: PvVec3): f64 {
+    var a: f64 = _pv_shape_area(s, dir.x, dir.y, dir.z);
+    return a;
+}
+
+# ── RigidBody ───────────────────────────────────────────────────────────────────────
+
+# A rigid body that interacts with fluid particles: its centre, velocity, mass and shape, and the force the fluid
+# put on it (reset by each `couple_sph_bodies`). Mirrors `RigidBody`.
+struct PvRigidBody {
+    position: PvVec3;
+    velocity: PvVec3;
+    mass: f64;
+    shape: PvShape;
+    force: PvVec3;
+}
+
+# A typed view of a word (a body array's address).
+#must_use
+fn _pv_as_bodies(p): *PvRigidBody {
+    return p;
+}
+
+# A typed view of a word (a shape's address).
+#must_use
+fn _pv_as_shape(p): *PvShape {
+    return p;
+}
+
+# Body b's shape, at byte offset 56 (tests/coupling.tcyr pins the layout).
+#must_use
+fn _pv_body_shape(b): *PvShape {
+    return _pv_as_shape(_pv_addr(b) + 56);
+}
+
+# A body at rest at `position`: no velocity or force. Mirrors `RigidBody::new`.
+#must_use
+fn PvRigidBody_new(position: PvVec3, mass: f64, shape: PvShape): PvRigidBody {
+    var b: PvRigidBody;
+    b.position = position;
+    b.velocity = PvVec3_zero();
+    b.mass = mass;
+    b.shape = shape;
+    b.force = PvVec3_zero();
+    return b;
+}
+
+# The unit surface normal at (px, py, pz) of the shape of *c: the central difference of the signed distance at ε = 1e-6
+# per axis, normalised. When its length is below 1e-20 it is the direction from the centre to the point, or (1, 0, 0)
+# when that is below 1e-20 too.
+fn _pv_sd_normal(c: *_PvSdCtx, px: f64, py: f64, pz: f64): (f64, f64, f64) {
+    var eps: f64 = 0x3EB0C6F7A0B5ED8D;   # 1e-6
+    var tiny: f64 = 0x3BC79CA10C924223;  # 1e-20
+    var xp: f64 = px + eps;
+    var xm: f64 = px - eps;
+    var yp: f64 = py + eps;
+    var ym: f64 = py - eps;
+    var zp: f64 = pz + eps;
+    var zm: f64 = pz - eps;
+    var q: PvVec3;
+    q.x = xp;
+    q.y = py;
+    q.z = pz;
+    var a1: f64 = _pv_sd_at(c, &q);
+    q.x = xm;
+    var a2: f64 = _pv_sd_at(c, &q);
+    var dx: f64 = a1 - a2;
+    q.x = px;
+    q.y = yp;
+    var b1: f64 = _pv_sd_at(c, &q);
+    q.y = ym;
+    var b2: f64 = _pv_sd_at(c, &q);
+    var dy: f64 = b1 - b2;
+    q.y = py;
+    q.z = zp;
+    var c1: f64 = _pv_sd_at(c, &q);
+    q.z = zm;
+    var c2: f64 = _pv_sd_at(c, &q);
+    var dz: f64 = c1 - c2;
+    var m2: f64 = ((dx * dx) + (dy * dy)) + (dz * dz);
+    var mag: f64 = f64_sqrt(m2);
+    if (mag < tiny) {
+        var fx: f64 = px - c.bx;
+        var fy: f64 = py - c.by;
+        var fz: f64 = pz - c.bz;
+        var f2: f64 = ((fx * fx) + (fy * fy)) + (fz * fz);
+        var fmag: f64 = f64_sqrt(f2);
+        if (fmag < tiny) { return (1.0, 0.0, 0.0); }
+        var ux: f64 = fx / fmag;
+        var uy: f64 = fy / fmag;
+        var uz: f64 = fz / fmag;
+        return (ux, uy, uz);
+    }
+    var nx: f64 = dx / mag;
+    var ny: f64 = dy / mag;
+    var nz: f64 = dz / mag;
+    return (nx, ny, nz);
+}
+
+# Fills *c with body b's shape and centre.
+fn _pv_body_sd_ctx(c: *_PvSdCtx, b: *PvRigidBody) {
+    _pv_sd_ctx(c, _pv_body_shape(b), b.position.x, b.position.y, b.position.z);
+    return 0;
+}
+
+impl PvRigidBody {
+    # The signed distance from `point` to the body's surface. Mirrors `RigidBody::signed_distance`.
+    #must_use
+    fn signed_distance(self, point: PvVec3): f64 {
+        var c: _PvSdCtx;
+        _pv_body_sd_ctx(&c, self);
+        var q: PvVec3 = point;
+        var sd: f64 = _pv_sd_at(&c, &q);
+        return sd;
+    }
+
+    # The unit surface normal at `point`: the central difference of the signed distance at ε = 1e-6, normalised;
+    # the direction from the centre when that is shorter than 1e-20, and (1, 0, 0) at the centre itself. Mirrors
+    # `RigidBody::surface_normal`.
+    #must_use
+    fn surface_normal(self, point: PvVec3): PvVec3 {
+        var c: _PvSdCtx;
+        _pv_body_sd_ctx(&c, self);
+        var n0, n1, n2 = _pv_sd_normal(&c, point.x, point.y, point.z);
+        var nx: f64 = n0;
+        var ny: f64 = n1;
+        var nz: f64 = n2;
+        return PvVec3_new(nx, ny, nz);
+    }
+}
+
+# ── two-way coupling and integration ────────────────────────────────────────────────
+
+# The two-way forces between the n particles at ps and the nb bodies at bodies, with h the smoothing radius, k the
+# stiffness and c the damping. Every body's force is reset; then, for each particle and body where the particle's
+# signed distance sd is below h, the total t = k·(h − sd) + (−c·vn when the normal relative speed vn is negative, else
+# 0) pushes the particle out along the surface normal n (acceleration += (t·n)/max(m, 1e-20)) and the body takes −t·n.
+# Rust's loop runs bodies inside particles; this one runs particles inside bodies, which sums each particle's
+# acceleration over the bodies and each body's force over the particles in the same order (no pair reads what
+# another writes). Mirrors `couple_sph_bodies`.
+fn couple_sph_bodies(ps: *PvFluidParticle, n, bodies: *PvRigidBody, nb, smoothing_radius: f64, stiffness: f64,
+  damping: f64) {
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var zero: f64 = 0.0;
+    var nd: f64 = -damping;
+    var c: _PvSdCtx;
+    for (var j = 0; j < nb; j = j + 1) {
+        var bj: *PvRigidBody = bodies + j;
+        _pv_body_sd_ctx(&c, bj);
+        var bvx: f64 = bj.velocity.x;
+        var bvy: f64 = bj.velocity.y;
+        var bvz: f64 = bj.velocity.z;
+        var fx: f64 = 0.0;
+        var fy: f64 = 0.0;
+        var fz: f64 = 0.0;
+        for (var i = 0; i < n; i = i + 1) {
+            var p: *PvFluidParticle = ps + i;
+            var sd: f64 = _pv_sd_at(&c, p);
+            if (sd < smoothing_radius) {
+                var n0, n1, n2 = _pv_sd_normal(&c, p.position.x, p.position.y, p.position.z);
+                var nx: f64 = n0;
+                var ny: f64 = n1;
+                var nz: f64 = n2;
+                var penetration: f64 = smoothing_radius - sd;
+                var pen_force: f64 = stiffness * penetration;
+                var rx: f64 = p.velocity.x - bvx;
+                var ry: f64 = p.velocity.y - bvy;
+                var rz: f64 = p.velocity.z - bvz;
+                var vn: f64 = ((rx * nx) + (ry * ny)) + (rz * nz);
+                var damp_force: f64 = zero;
+                if (vn < 0.0) { damp_force = nd * vn; }
+                var total: f64 = pen_force + damp_force;
+                var m: f64 = _pv_max(p.mass, tiny);
+                var tx: f64 = total * nx;
+                var ty: f64 = total * ny;
+                var tz: f64 = total * nz;
+                var ax: f64 = p.acceleration.x + tx / m;
+                var ay: f64 = p.acceleration.y + ty / m;
+                var az: f64 = p.acceleration.z + tz / m;
+                p.acceleration.x = ax;
+                p.acceleration.y = ay;
+                p.acceleration.z = az;
+                fx = fx - tx;
+                fy = fy - ty;
+                fz = fz - tz;
+            }
+        }
+        bj.force = PvVec3_new(fx, fy, fz);
+    }
+    return 0;
+}
+
+# Integrates the nb bodies at bodies over dt: v += (F·(1/max(m, 1e-20)) + g)·dt, then x += v·dt. Mirrors
+# `integrate_bodies`.
+fn integrate_bodies(bodies: *PvRigidBody, nb, gravity: PvVec3, dt: f64) {
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var one: f64 = 1.0;
+    var gx: f64 = gravity.x;
+    var gy: f64 = gravity.y;
+    var gz: f64 = gravity.z;
+    for (var b = 0; b < nb; b = b + 1) {
+        var body: *PvRigidBody = bodies + b;
+        var m: f64 = _pv_max(body.mass, tiny);
+        var inv: f64 = one / m;
+        var vx: f64 = body.velocity.x + ((body.force.x * inv) + gx) * dt;
+        var vy: f64 = body.velocity.y + ((body.force.y * inv) + gy) * dt;
+        var vz: f64 = body.velocity.z + ((body.force.z * inv) + gz) * dt;
+        body.velocity = PvVec3_new(vx, vy, vz);
+        var x: f64 = body.position.x + vx * dt;
+        var y: f64 = body.position.y + vy * dt;
+        var z: f64 = body.position.z + vz * dt;
+        body.position = PvVec3_new(x, y, z);
+    }
+    return 0;
+}
+
+# The effective mass with added mass, m + (C_a·ρ)·V. Mirrors `effective_mass`.
+#must_use
+fn effective_mass(body_mass: f64, fluid_density: f64, body_volume: f64, ca: f64): f64 {
+    var a: f64 = (ca * fluid_density) * body_volume;
+    var m: f64 = body_mass + a;
+    return m;
+}
+
+# Integrates the nb bodies at bodies over dt with added mass: m_eff = effective_mass(m, ρ, V, C_a) for the shape's
+# volume V, then v += ((F + g·m)·(1/max(m_eff, 1e-20)))·dt and x += v·dt. Gravity acts on the body's own mass only.
+# Mirrors `integrate_bodies_with_added_mass`.
+fn integrate_bodies_with_added_mass(bodies: *PvRigidBody, nb, gravity: PvVec3, dt: f64, fluid_density: f64,
+  ca: f64) {
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    var one: f64 = 1.0;
+    var gx: f64 = gravity.x;
+    var gy: f64 = gravity.y;
+    var gz: f64 = gravity.z;
+    for (var b = 0; b < nb; b = b + 1) {
+        var body: *PvRigidBody = bodies + b;
+        var vol: f64 = body_shape_volume(_pv_body_shape(body));
+        var m: f64 = body.mass;
+        var m_eff: f64 = effective_mass(m, fluid_density, vol, ca);
+        var me: f64 = _pv_max(m_eff, tiny);
+        var inv: f64 = one / me;
+        var vx: f64 = body.velocity.x + ((body.force.x + gx * m) * inv) * dt;
+        var vy: f64 = body.velocity.y + ((body.force.y + gy * m) * inv) * dt;
+        var vz: f64 = body.velocity.z + ((body.force.z + gz * m) * inv) * dt;
+        body.velocity = PvVec3_new(vx, vy, vz);
+        var x: f64 = body.position.x + vx * dt;
+        var y: f64 = body.position.y + vy * dt;
+        var z: f64 = body.position.z + vz * dt;
+        body.position = PvVec3_new(x, y, z);
+    }
+    return 0;
+}
+
+# ── drag ────────────────────────────────────────────────────────────────────────────
+
+# The quadratic drag on b from the mean of `count` sampled velocities (sum (sx, sy, sz)): v_rel = s/count − v_b, and
+# v_rel·(((0.5·ρ)·|v_rel|)·C_d)·A(v_rel/|v_rel|); zero for no samples and for |v_rel| ≤ 1e-20 or not finite. Mirrors
+# the private `drag_from_mean_velocity`.
+#must_use
+fn _pv_drag_mean(b: *PvRigidBody, sx: f64, sy: f64, sz: f64, count, fluid_density: f64, cd: f64): PvVec3 {
+    if (count == 0) { return PvVec3_zero(); }
+    var c: f64 = f64_from(count);
+    var rx: f64 = sx / c - b.velocity.x;
+    var ry: f64 = sy / c - b.velocity.y;
+    var rz: f64 = sz / c - b.velocity.z;
+    var s2: f64 = ((rx * rx) + (ry * ry)) + (rz * rz);
+    var speed: f64 = f64_sqrt(s2);
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    if (speed <= tiny || _pv_is_finite(speed) == 0) { return PvVec3_zero(); }
+    var ux: f64 = rx / speed;
+    var uy: f64 = ry / speed;
+    var uz: f64 = rz / speed;
+    var area: f64 = _pv_shape_area(_pv_body_shape(b), ux, uy, uz);
+    var half: f64 = 0.5;
+    var k: f64 = (((half * fluid_density) * speed) * cd) * area;
+    var fx: f64 = rx * k;
+    var fy: f64 = ry * k;
+    var fz: f64 = rz * k;
+    return PvVec3_new(fx, fy, fz);
+}
+
+# The drag on `body` from the n particles at ps: the mean velocity of those whose |signed distance| is below
+# `sample_radius`, summed in index order, through the quadratic drag ½·ρ·|v_rel|·v_rel·C_d·A. Mirrors
+# `drag_from_particles`.
+#must_use
+fn drag_from_particles(body: *PvRigidBody, ps: *PvFluidParticle, n, fluid_density: f64, drag_coefficient: f64,
+  sample_radius: f64): PvVec3 {
+    var sx: f64 = 0.0;
+    var sy: f64 = 0.0;
+    var sz: f64 = 0.0;
+    var count = 0;
+    var c: _PvSdCtx;
+    _pv_body_sd_ctx(&c, body);
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *PvFluidParticle = ps + i;
+        var sd: f64 = _pv_sd_at(&c, p);
+        var ad: f64 = f64_abs(sd);
+        if (ad < sample_radius) {
+            sx = sx + p.velocity.x;
+            sy = sy + p.velocity.y;
+            sz = sz + p.velocity.z;
+            count = count + 1;
+        }
+    }
+    var f: PvVec3 = _pv_drag_mean(body, sx, sy, sz, count, fluid_density, drag_coefficient);
+    return f;
+}
+
+# The context of one indexed drag sum: the body's distance context, the particles and their count, the sample radius,
+# the grid's order column, then the running sums and count.
+struct _PvDragCtx {
+    sdc: *_PvSdCtx;
+    ps: *PvFluidParticle;
+    n;
+    sample_radius: f64;
+    order;
+    sx: f64;
+    sy: f64;
+    sz: f64;
+    count;
+}
+
+# A typed view of a word (a drag context's address).
+#must_use
+fn _pv_as_drag(p): *_PvDragCtx {
+    return p;
+}
+
+# The block walk's visit: adds the velocities of cell order[a, b)'s particles that are in the slice (index < n) and
+# within the sample radius of the surface.
+fn _pv_drag_visit(ctx, a, b): i64 {
+    var d: *_PvDragCtx = _pv_as_drag(ctx);
+    var sr: f64 = d.sample_radius;
+    for (var r = a; r < b; r = r + 1) {
+        var idx = load64(d.order + r * 8);
+        if (idx < d.n) {
+            var p: *PvFluidParticle = d.ps + idx;
+            var sd: f64 = _pv_sd_at(d.sdc, p);
+            var ad: f64 = f64_abs(sd);
+            if (ad < sr) {
+                d.sx = d.sx + p.velocity.x;
+                d.sy = d.sy + p.velocity.y;
+                d.sz = d.sz + p.velocity.z;
+                d.count = d.count + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# The drag on `body` from the n particles at ps, through the caller's cells-only grid built over them
+# (`PvNeighborGrid_build`): the candidates are the points of the cells within c ± ⌈r·fl(1/cell)⌉ of the body centre's
+# cell c per axis, r = sample_radius + the shape's bounding radius, walked in Rust's (x, y, z) cell order, each cell's
+# points in index order; one at index n or more (a grid built over more particles) is skipped. Then the same filter
+# and drag as `drag_from_particles`. A NaN r searches c alone, a negative one nothing (Rust's ranges); a grid not
+# built by `PvNeighborGrid_build` finds nothing. Mirrors `drag_from_particles_indexed` (ADR 0002 #23).
+#must_use
+fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid: *PvNeighborGrid,
+  fluid_density: f64, drag_coefficient: f64, sample_radius: f64): PvVec3 {
+    var inv: f64 = grid.inv_cell;
+    var br: f64 = body_shape_bounding_radius(_pv_body_shape(body));
+    var qr: f64 = sample_radius + br;
+    var qi: f64 = qr * inv;
+    var qc: f64 = f64_ceil(qi);
+    var cr = _pv_as_i64(qc);
+    var c: _PvSdCtx;
+    _pv_body_sd_ctx(&c, body);
+    var d: _PvDragCtx;
+    d.sdc = &c;
+    d.ps = ps;
+    d.n = n;
+    d.sample_radius = sample_radius;
+    d.order = grid.order.data;
+    d.sx = 0.0;
+    d.sy = 0.0;
+    d.sz = 0.0;
+    d.count = 0;
+    if (cr >= 0) {
+        var lo[24];
+        var hi[24];
+        var cx = _pv_nb_key(body.position.x, inv);
+        var cy = _pv_nb_key(body.position.y, inv);
+        var cz = _pv_nb_key(body.position.z, inv);
+        var xl, xh = _pv_nb_span(cx, cr);
+        var yl, yh = _pv_nb_span(cy, cr);
+        var zl, zh = _pv_nb_span(cz, cr);
+        store64(&lo, xl);
+        store64(&lo + 8, yl);
+        store64(&lo + 16, zl);
+        store64(&hi, xh);
+        store64(&hi + 8, yh);
+        store64(&hi + 16, zh);
+        _pv_nb_block(grid, &lo, &hi, &_pv_drag_visit, &d);
+    }
+    var f: PvVec3 = _pv_drag_mean(body, d.sx, d.sy, d.sz, d.count, fluid_density, drag_coefficient);
+    return f;
+}
+
+# ── the particle level set ──────────────────────────────────────────────────────────
+
+# Fills the nx × ny level set at ls (len words) from the n particles at ps: each cell (x, y), at (x·dx, y·dx), gets
+# min(far, min over the particles of √(Δx² + Δy²) − particle_radius) in index order, far = (nx + ny)·dx; positive
+# outside the fluid, negative inside (a brute-force O(cells · n) search, as Rust's). 1, or 0 with nothing written
+# when nx·ny is not len or overflows, or nx or ny is negative (Rust warns and returns). Mirrors `particle_level_set`.
+fn particle_level_set(ls, len, nx, ny, dx: f64, ps: *PvFluidParticle, n, particle_radius: f64): i64 {
+    if (nx < 0 || ny < 0) { return 0; }
+    if (nx > 0 && ny > 9223372036854775807 / nx) { return 0; }
+    if (nx * ny != len) { return 0; }
+    var fx: f64 = f64_from(nx);
+    var fy: f64 = f64_from(ny);
+    var far: f64 = (fx + fy) * dx;
+    for (var k = 0; k < len; k = k + 1) { store64(ls + k * 8, _pv_bits(far)); }
+    for (var y = 0; y < ny; y = y + 1) {
+        var yf: f64 = f64_from(y);
+        var gy: f64 = yf * dx;
+        for (var x = 0; x < nx; x = x + 1) {
+            var xf: f64 = f64_from(x);
+            var gx: f64 = xf * dx;
+            var min_dist: f64 = far;
+            for (var i = 0; i < n; i = i + 1) {
+                var p: *PvFluidParticle = ps + i;
+                var ddx: f64 = gx - p.position.x;
+                var ddy: f64 = gy - p.position.y;
+                var d2: f64 = (ddx * ddx) + (ddy * ddy);
+                var r: f64 = f64_sqrt(d2);
+                var dist: f64 = r - particle_radius;
+                if (dist < min_dist) { min_dist = dist; }
+            }
+            store64(ls + (y * nx + x) * 8, _pv_bits(min_dist));
+        }
+    }
+    return 1;
+}

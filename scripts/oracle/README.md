@@ -111,6 +111,10 @@ searches them), with the oracle's operations otherwise unchanged. The format is 
 - **The outputs** of a `neighbor_lists` row are the f64 grid's dump: its cell size (h), the point and cell counts,
   each point's key and the lists. The oracle's dump also held the f32 positions, so every such row is here.
 - **The note:** `oracle (f32 keys)` and the start of the oracle's own outputs.
+- **`coupling.d3.tsv`** (M6 part a, ADR 0002 #23) holds the `drag_from_particles_indexed` rows whose sum the f64 keys
+  reorder. The oracle fills a hisab `SpatialHash` with f32 positions. The port's cells-only grid keys them in f64
+  and walks the block in the same (x, y, z) cell order. validate.py's `cp_query64` transcribes that grid from its
+  definition: a dict of cells, and the block's occupied keys in sorted order.
 - **A module the switch doesn't change** has no `.d3.tsv`.
 
 The same `--write` writes the tables of the correctly rounded primitives:
@@ -149,6 +153,12 @@ oracle:
   (hisab 1.4.0's LU) and the contact angle (its cosine from glibc and MPFR); and M5's solver step, on the grid
   transcription, each scene's trajectory cached across its frames, and its PCISPH, DFSPH and multiphase steps; and,
   for the f64-key oracle, every list-dependent row again on `nb_build64` (M5 part e);
+- it recomputes every `coupling` row (M6 part a):
+  - the shapes, the bodies' signed distances and normals, the two-way coupling, both integrations, the brute-force
+    drag and the level set, in Rust's and glam's order;
+  - the indexed drag on a transcription of hisab 1.4.0's f32 `SpatialHash` and its `query_radius`, and again for
+    `coupling.d3.tsv` on the port's f64 grid;
+  - the two decoders under serde's externally tagged struct-variant semantics;
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what

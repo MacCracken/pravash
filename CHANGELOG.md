@@ -3,6 +3,63 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **coupling** (M6 part a): `src/coupling.cyr`, the rigid bodies of `coupling.rs`. The FLIP solver follows in part b.
+  ADR 0002 #23.
+  - **`BodyShape`** is the kind enum `PvBodyShape` and the payload struct `PvShape` (`PvShape_sphere(r)`,
+    `PvShape_box(hx, hy, hz)`). Its methods are `body_shape_signed_distance`, `_volume`, `_bounding_radius` and
+    `_projected_area`.
+  - **`PvRigidBody`** has `PvRigidBody_new`, `b.signed_distance(point)` and `b.surface_normal(point)`.
+  - **The free functions:** `couple_sph_bodies`, `integrate_bodies`, `effective_mass`,
+    `integrate_bodies_with_added_mass`, `drag_from_particles` and `particle_level_set`. The level set returns 1, or 0
+    when it leaves the buffer unchanged.
+  - **`drag_from_particles_indexed`** takes the caller's cells-only neighbour grid, built by the new
+    `PvNeighborGrid_build(g, ps, n, cell_size)`, where Rust takes a hisab `SpatialHash` of f32 positions.
+    - The grid's keys are the f64 keys (ADR 0002 #2), and it takes the cell sizes hisab 3.4.1 takes.
+    - The query visits the occupied cells of Rust's block in Rust's (x, y, z) order, so any radius returns. Rust's
+      walks every cell of the block, so an infinite radius never returns.
+    - The grid gains an eighth column (224 bytes; the solver 496).
+  - **JSON:** hand codecs for `BodyShape`, externally tagged with struct-variant fields, and `RigidBody`
+    (`src/json.cyr`).
+  - **Parity:** a new golden module, `tests/golden/coupling.tsv`: 4,798 rows from the generator's
+    `m_coupling.rs`.
+    - Every row but one is bit-exact on the first replay.
+    - The exception is an indexed drag about a body at 10⁶, where the f32 hash orders the particles differently. It
+      is mapped to `coupling.d3.tsv` from validate.py's f64 transcription and *accepted (ADR 2)*.
+    - validate.py recomputes every row, including the indexed drag on transcriptions of both hashes.
+  - **Tests:** `tests/coupling.tcyr` ports 22 of `coupling.rs`'s 33 Rust tests (the FLIP solver's 11 come with part
+    b), plus Cyrius-only groups: 55 checks. `tests/integration.tcyr` adds the two coupling integration tests (31 of
+    33). Rust's `coupling_sphere_falls_through_fluid` couples a clone of the body, so the port couples a copy.
+    - The record layouts and the grid's cell-size rule.
+    - The block walk against a brute-force enumeration on 40 blocks.
+    - The indexed drag against the brute force at the origin, 10⁶ and 10¹², and with an infinite radius.
+    - The level set's refusals.
+  - **Mutations:** 27 of 31 port mutations fail rows on the first run, a 32nd (a misnamed `Box` key) fails 47, and
+    all 8 of validate.py's are caught.
+    - Two survivors were corpus gaps, closed by rows that draw no random numbers: a walk that skipped a column, and a
+      level set longer than nx·ny.
+    - One is equivalent: a zero-cell block is only reached when no particle can pass the filter.
+    - Rust's grouping of the sphere volume, changed, moves 25 rows by 1 ulp. That is inside class B's bound, so it
+      shows in the histogram only.
+
+### Performance
+- **coupling** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M6 part a; pinned to core 15,
+  against Rust's criterion groups and a twin):
+
+  | Row | Cyrius / Rust |
+  |---|---|
+  | `couple_sph_bodies`, 625 particles | 5.5–5.8× |
+  | `drag_from_particles`, 625 | 7.9× |
+  | `particle_level_set`, all three sizes | 4.2–4.3× |
+  | `drag_from_particles_indexed`, 625 | 0.70–0.72× |
+  | `drag_from_particles_indexed`, 10,000 | 2.2–2.3× |
+  | the grid build | 3.4× (625), 5.1× (10,000) |
+
+  - **Where the speed came from:** the distance loops now read the shape from a per-body context through a
+    two-argument call, and the coupling runs its bodies outside its particles. The bits are the same.
+  - **A/B against the first version:** the drag 1.53× faster, the indexed drag 1.29×, the coupling 1.27×.
+  - **Why the indexed drag can beat Rust's:** Rust's query walks every cell of a 3D block, even for 2D particles.
+
+### Added (Cyrius)
 - **sph** (M5 part e): the solver's thread count, and the D3 switch to f64 neighbour keys. M5 is complete.
   - **`s.set_threads(n)`** (ADR 0002 #4, amended): the solver's pool runs Rust's three `parallel` loops, `step`'s
     densities and accelerations and `step_multiphase`'s accelerations, as `_pv_par_for` kernels. Each particle is
