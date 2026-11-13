@@ -87,7 +87,10 @@
 - [x] M7 part a: compute (`PackedParticles` and its f32 packing, the kernel-parameter records and their JSON, the
   backend traits, `KernelDerivatives` and `autodiff_gradient` on hisab's tape outside the bundle; 1,228 rows in a new
   golden module; all 11 Rust tests; the f32 JSON reads as serde_json's, ledger L15)
-- [ ] M7 part b: logging (the sakshi init, the chrome://tracing writer of L11) and ai (`DaimonConfig`, `HooshConfig`)
+- [x] M7 part b: ai (`DaimonConfig`, `HooshConfig`, Rust's Debug with a generated escape table; 579 rows) and logging (the sakshi init, the PRAVASH_LOG filter as EnvFilter decides it, the chrome://tracing writer of L11, and every Rust
+  span and warning across the modules; 251 rows, 152 of them traces recorded from the oracle)
+- [x] **M7 done 2026-11-12.**
+- [ ] M8: release 2.0.0 (the migration guide, the 1.3.x deprecations, the consumers' first Cyrius builds)
 
 ### 1.3.0
 

@@ -1,4 +1,5 @@
 # pravash golden corpus: one module per line; tests/parity.tcyr replays each
+ai
 bridge
 buoyancy
 common
@@ -7,6 +8,7 @@ constants
 coupling
 grid
 json
+logging
 math
 mpm
 phase_field

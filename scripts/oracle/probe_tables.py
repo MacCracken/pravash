@@ -25,6 +25,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The one resolver notice the probe's build may print (see where the build is checked). It is matched whole, so a
+# changed or a second notice still fails the probe.
+SAKSHI_LEAF_NOTICE = (
+    "warning: refusing to overwrite stdlib leaf 'sakshi' -- a dependency resolves a package of the same name."
+)
+
 
 def upper_snake(camel):
     out = ""
@@ -125,7 +131,14 @@ def main():
         ["cyrius", "build", str(src.relative_to(root)), "build/probe_tables"],
         cwd=root, capture_output=True, text=True,
     )
-    diag = [l for l in (out.stdout + out.stderr).splitlines() if re.search(r"\b(error|warning)\b", l)]
+    # One resolver notice is not the probe's: hisab 3.4.1 (test scope) declares a sakshi package beside pravash's
+    # stdlib leaf, so every build in this tree prints it, the stdlib copy wins and the two are byte-identical
+    # (cyrius.cyml; hisab:docs/development/issues/2026-11-11-deps-sakshi-package-warns-every-consumer.md). Every other
+    # line naming an error or a warning still fails the probe.
+    diag = [
+        l for l in (out.stdout + out.stderr).splitlines()
+        if re.search(r"\b(error|warning)\b", l) and l != SAKSHI_LEAF_NOTICE
+    ]
     if out.returncode != 0 or diag:
         print("\n".join(diag) or out.stdout + out.stderr)
         print("FAIL the probe did not build cleanly")

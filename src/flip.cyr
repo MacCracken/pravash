@@ -125,6 +125,7 @@ fn _pv_flip_apic_resize(s: *PvFlipSolver, n): i64 {
 # `use_apic` and it has one, else zero; then each node with a weight above 1e-20 is divided by it. Mirrors the private
 # `particles_to_grid`.
 fn _pv_flip_p2g(s: *PvFlipSolver, ps: *PvFluidParticle, n) {
+    var trace = _pv_span(_PV_LOG_COUPLING, "flip::p2g", "n", n, 0, 0, 0, 0);
     var nx = s.nx;
     var ny = s.ny;
     var dx: f64 = s.dx;
@@ -216,7 +217,7 @@ fn _pv_flip_p2g(s: *PvFlipSolver, ps: *PvFluidParticle, n) {
             store64(vy + i * 8, _pv_bits(qb));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # The bilinear sample of the nx-wide field at f at the cell (x0, y0) and fractions (sx, sy) of a grid position:
@@ -243,6 +244,7 @@ fn _pv_flip_sample(f, nx, x0, y0, sx: f64, sy: f64): f64 {
 # change. 1, or 0 when the APIC column can't grow (nothing changed). Mirrors the private `grid_to_particles`.
 #must_use
 fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "flip::g2p", "n", n, 0, 0, 0, 0);
     var nx = s.nx;
     var ny = s.ny;
     var dx: f64 = s.dx;
@@ -251,7 +253,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
     var vx = s.vx.data;
     var vy = s.vy.data;
     if (s.use_apic == 1) {
-        if (_pv_flip_apic_resize(s, n) == 0) { return 0; }
+        if (_pv_flip_apic_resize(s, n) == 0) { _pv_span_end(trace); return 0; }
         var ac = s.apic_c.data;
         for (var pi = 0; pi < n; pi = pi + 1) {
             var p: *PvFluidParticle = ps + pi;
@@ -312,7 +314,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
             store64(ac + pi * 32 + 16, _pv_bits(c10));
             store64(ac + pi * 32 + 24, _pv_bits(c11));
         }
-        return 1;
+        _pv_span_end(trace); return 1;
     }
     var flip: f64 = _pv_clamp(s.flip_ratio, 0.0, 1.0);
     var pic: f64 = one - flip;
@@ -337,7 +339,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
         pq.velocity.x = bx;
         pq.velocity.y = by;
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 impl PvFlipSolver {
@@ -372,12 +374,13 @@ impl PvFlipSolver {
     # Ok(0). Mirrors `FlipSolver::step`.
     #must_use
     fn step(self, ps: *PvFluidParticle, n, gravity: PvVec3, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (_pv_is_finite(self.flip_ratio) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var trace = _pv_span(_PV_LOG_COUPLING, "flip::step", "n", n, 0, 0, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (_pv_is_finite(self.flip_ratio) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var nx = self.nx;
         var ny = self.ny;
         if (self.use_apic == 1 && self.apic_c.len != 4 * n) {
-            if (_pv_flip_apic_resize(self, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+            if (_pv_flip_apic_resize(self, n) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         }
         _pv_flip_p2g(self, ps, n);
         var cells = nx * ny;
@@ -470,9 +473,9 @@ impl PvFlipSolver {
             var fy: f64 = load64(vy + q * 8);
             var zx: f64 = fx - fx;
             var zy: f64 = fy - fy;
-            if (!(zx == 0.0) || !(zy == 0.0)) { return Err(PV_ERR_DIVERGED); }
+            if (!(zx == 0.0) || !(zy == 0.0)) { _pv_span_end(trace); return Err(PV_ERR_DIVERGED); }
         }
-        if (_pv_flip_g2p(self, ps, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_flip_g2p(self, ps, n) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         # Advection, and the clamp to the grid.
         var nxf: f64 = f64_from(nx - 1);
         var nyf: f64 = f64_from(ny - 1);
@@ -501,6 +504,6 @@ impl PvFlipSolver {
                 p.velocity.y = 0.0;
             }
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

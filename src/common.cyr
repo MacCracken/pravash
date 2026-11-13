@@ -624,10 +624,15 @@ impl PvParticleArena {
 
     # Returns a block to the pool: inserted in start order, merged with an adjacent free block on either side,
     # and the watermark shrunk when the block ends there. A stale handle (from before a `compact`), an
-    # out-of-range one, or a block that overlaps a free one (a double free) is ignored. Mirrors `free`.
+    # out-of-range one, or a block that overlaps a free one (a double free) is ignored, with a WARN event naming the
+    # handle's start and length. Mirrors `free`.
     fn free(self, h: PvArenaHandle) {
         if (h.len == 0) { return 0; }
-        if (self._in_range(h) == 0) { return 0; }
+        if (self._in_range(h) == 0) {
+            var stale = "ParticleArena::free: stale or out-of-range handle ignored";
+            _pv_warn(_PV_LOG_COMMON, stale, "start", h.start, "len", h.len, 0, 0);
+            return 0;
+        }
         var end = h.start + h.len;
         # binary_search_by_key on start: the first entry whose start is not below h.start.
         var lo = 0;
@@ -637,11 +642,17 @@ impl PvParticleArena {
             if (self._fs(mid) < h.start) { lo = mid + 1; } else { hi = mid; }
         }
         var pos = lo;
+        var overlaps = 0;
         if (pos > 0) {
-            if (self._fs(pos - 1) + self._fl(pos - 1) > h.start) { return 0; }
+            if (self._fs(pos - 1) + self._fl(pos - 1) > h.start) { overlaps = 1; }
         }
         if (pos < self.free_count) {
-            if (self._fs(pos) < end) { return 0; }
+            if (self._fs(pos) < end) { overlaps = 1; }
+        }
+        if (overlaps == 1) {
+            var dbl = "ParticleArena::free: block already free (double free) ignored";
+            _pv_warn(_PV_LOG_COMMON, dbl, "start", h.start, "len", h.len, 0, 0);
+            return 0;
         }
         if (self._finsert(pos, h.start, h.len) == 0) { return 0; }
         if (pos + 1 < self.free_count) {

@@ -59,9 +59,10 @@ fn compute_density(idx, ps: *PvFluidParticle, n, h: f64): f64 {
 # (its [f64; 3] as a PvVec3, ADR 0002 #17).
 #must_use
 fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::pressure_force", "n", n, 0, 0, 0, 0);
     if (idx < 0 || idx >= n) {
         var nan: f64 = PV_F64_NAN;
-        return PvVec3_new(nan, nan, nan);
+        _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
@@ -99,7 +100,7 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
             }
         }
     }
-    return PvVec3_new(fx, fy, fz);
+    _pv_span_end(trace); return PvVec3_new(fx, fy, fz);
 }
 
 # The viscosity force on particle idx of the n at ps, by brute force: Σⱼ ((μ·mⱼ)·∇²W(r))/ρⱼ · (vⱼ − vᵢ), over j ≠ idx
@@ -107,9 +108,10 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
 # `viscosity_force`.
 #must_use
 fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::viscosity_force", "n", n, 0, 0, 0, 0);
     if (idx < 0 || idx >= n) {
         var nan: f64 = PV_F64_NAN;
-        return PvVec3_new(nan, nan, nan);
+        _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
@@ -147,7 +149,7 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
             }
         }
     }
-    return PvVec3_new(fx, fy, fz);
+    _pv_span_end(trace); return PvVec3_new(fx, fy, fz);
 }
 
 # ── the free step ───────────────────────────────────────────────────────────────────
@@ -165,13 +167,14 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
 # pressures set and the accelerations before it written, as Rust does. Mirrors `step` (ADR 0002 #17).
 #must_use
 fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::step", "n", n, 0, 0, 0, 0);
     var ct, cv = config.validate();
-    if (is_err_result(ct) == 1) { return Err(cv); }
-    if (n <= 0) { return Ok(0); }
+    if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+    if (n <= 0) { _pv_span_end(trace); return Ok(0); }
     var sz = sizeof(PvFluidParticle);
-    if (n > 9223372036854775807 / (sz + 8)) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (n > 9223372036854775807 / (sz + 8)) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
     var block = fl_alloc(n * (sz + 8));
-    if (block == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (block == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
     var dens = block;
     var snap: *PvFluidParticle = _pv_as_particles(block + n * 8);
     var h: f64 = config.smoothing_radius;
@@ -179,6 +182,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
     _pv_kc_init(&kc, h);
 
     # The densities, then the pressures.
+    var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
     for (var i = 0; i < n; i = i + 1) {
         var d: f64 = _pv_density_sum(ps + i, ps, n, &kc);
         store64(dens + i * 8, _pv_bits(d));
@@ -194,7 +198,10 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         *s = *p;
     }
 
+    _pv_span_end(td);
+
     # The accelerations, from the snapshot.
+    var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var lo: f64 = _PV_SPH_MIN_DENSITY;
@@ -243,11 +250,13 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         }
         if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
             fl_free(block);
-            return Err(PV_ERR_DIVERGED);
+            _pv_span_end(tf);
+            _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
         }
         var out: *PvFluidParticle = ps + a;
         out.acceleration = PvVec3_new(ax, ay, az);
     }
+    _pv_span_end(tf);
     fl_free(block);
 
     # Symplectic Euler, then the walls.
@@ -303,7 +312,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         w.position = PvVec3_new(wx, wy, wz);
         w.velocity = PvVec3_new(ux, uy, uz);
     }
-    return Ok(0);
+    _pv_span_end(trace); return Ok(0);
 }
 
 # ── splitting and merging ───────────────────────────────────────────────────────────
@@ -314,15 +323,16 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
 # with `fl_free`; (0, 0) for n_children ≤ 0 or no memory (Rust aborts). Mirrors `split_particle` (ADR 0002 #9).
 #must_use
 fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
-    if (n_children <= 0) { return (0, 0); }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::split_particle", 0, 0, 0, 0, 0, 0);
+    if (n_children <= 0) { _pv_span_end(trace); return (0, 0); }
     var sz = sizeof(PvFluidParticle);
-    if (n_children > 9223372036854775807 / sz) { return (0, 0); }
+    if (n_children > 9223372036854775807 / sz) { _pv_span_end(trace); return (0, 0); }
     var buf = fl_alloc(n_children * sz);
-    if (buf == 0) { return (0, 0); }
+    if (buf == 0) { _pv_span_end(trace); return (0, 0); }
     var out: *PvFluidParticle = _pv_as_particles(buf);
     if (n_children == 1) {
         *out = *parent;
-        return (buf, 1);
+        _pv_span_end(trace); return (buf, 1);
     }
     var nf: f64 = f64_from(n_children);
     var child_mass: f64 = parent.mass / nf;
@@ -339,7 +349,7 @@ fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
         var y: f64 = ch.position.y + (offset * s);
         ch.position = PvVec3_new(x, y, ch.position.z);
     }
-    return (buf, n_children);
+    _pv_span_end(trace); return (buf, n_children);
 }
 
 # One particle from two, conserving mass and momentum: the mass a.m + b.m; position, velocity, density, pressure,
@@ -347,6 +357,7 @@ fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
 # per component; no acceleration; a's phase and conformation. Mirrors `merge_particles`.
 #must_use
 fn merge_particles(a: *PvFluidParticle, b: *PvFluidParticle): PvFluidParticle {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::merge_particles", 0, 0, 0, 0, 0, 0);
     var ma: f64 = a.mass;
     var mb: f64 = b.mass;
     var total: f64 = ma + mb;
@@ -372,7 +383,7 @@ fn merge_particles(a: *PvFluidParticle, b: *PvFluidParticle): PvFluidParticle {
     p.mass = total;
     p.temperature = t;
     p.fuel = fu;
-    return p;
+    _pv_span_end(trace); return p;
 }
 
 # ── the particle block ──────────────────────────────────────────────────────────────
@@ -425,9 +436,19 @@ fn create_particle_block(ox: f64, oy: f64, sx: f64, sy: f64, spacing: f64, mass:
 # 1 when CSR lists fit n particles, as Rust's private `neighbor_lists_valid` checks: n + 1 offsets, never
 # decreasing, the last within the indices, and every index in [0, n). The lists are 8-byte words (Rust's `u32`
 # offsets and `usize` indices), so an offset outside [0, 2³²) or an index read as unsigned at n or more is invalid,
-# values Rust's types can't hold or that index past n. (Rust also logs a warning; logging arrives with M7.)
+# values Rust's types can't hold or that index past n. Invalid lists emit Rust's WARN event (its `n`, and the two
+# lists' lengths).
 #must_use
 fn _pv_lists_valid(offsets, n_off, indices, n_idx, n): i64 {
+    if (_pv_lists_ok(offsets, n_off, indices, n_idx, n) == 1) { return 1; }
+    _pv_warn(_PV_LOG_SPH, "invalid neighbor lists ignored (expected offsets.len() == n + 1, indices < n)", "n", n,
+      "offsets", n_off, "indices", n_idx);
+    return 0;
+}
+
+# The check itself, without the warning.
+#must_use
+fn _pv_lists_ok(offsets, n_off, indices, n_idx, n): i64 {
     if (n_off != n + 1 || n_idx < 0) { return 0; }
     var prev = load64(offsets);
     if (prev < 0) { return 0; }
@@ -473,12 +494,13 @@ fn PvViscoelasticConfig_new(elastic_modulus: f64, relaxation_time: f64): PvVisco
 #must_use
 fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, ve: *PvViscoelasticConfig,
   dt: f64): i64 {
-    if (n <= 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::viscoelastic", "n", n, 0, 0, 0, 0);
+    if (n <= 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
     var sz = sizeof(PvFluidParticle);
-    if (n > 9223372036854775807 / sz) { return 0; }
+    if (n > 9223372036854775807 / sz) { _pv_span_end(trace); return 0; }
     var buf = fl_alloc(n * sz);
-    if (buf == 0) { return 0; }
+    if (buf == 0) { _pv_span_end(trace); return 0; }
     var snap: *PvFluidParticle = _pv_as_particles(buf);
     for (var c = 0; c < n; c = c + 1) {
         var d: *PvFluidParticle = snap + c;
@@ -565,7 +587,7 @@ fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, 
         out.acceleration = PvVec3_new(ax, ay, out.acceleration.z);
     }
     fl_free(buf);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: heat conduction ─────────────────────────────────────────────────────────
@@ -589,11 +611,12 @@ fn PvHeatConfig_new(diffusivity: f64): PvHeatConfig {
 # Mirrors `update_heat` (ADR 0002 #18).
 #must_use
 fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, heat: *PvHeatConfig, dt: f64): i64 {
-    if (n <= 0 || _pv_is_positive(heat.diffusivity) == 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 8) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::heat", "n", n, 0, 0, 0, 0);
+    if (n <= 0 || _pv_is_positive(heat.diffusivity) == 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 8) { _pv_span_end(trace); return 0; }
     var snap = fl_alloc(n * 8);
-    if (snap == 0) { return 0; }
+    if (snap == 0) { _pv_span_end(trace); return 0; }
     for (var c = 0; c < n; c = c + 1) {
         var q: *PvFluidParticle = ps + c;
         store64(snap + c * 8, _pv_bits(q.temperature));
@@ -632,7 +655,7 @@ fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, 
         pi.temperature = pi.temperature + dtemp;
     }
     fl_free(snap);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: phase change ────────────────────────────────────────────────────────────
@@ -675,6 +698,7 @@ fn PvPhaseChangeConfig_water_ice(phase_ice, phase_water): PvPhaseChangeConfig {
 # flips the phase (fuel 0) and moves the temperature by what is left over c; energy back returns stored latent heat
 # first. dt is unused, as Rust's. Mirrors `update_phase_change`.
 fn update_phase_change(ps: *PvFluidParticle, n, config: *PvPhaseChangeConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::phase_change", "n", n, 0, 0, 0, 0);
     var t_trans: f64 = config.transition_temperature;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var l_heat: f64 = _pv_max(config.latent_heat, tiny);
@@ -728,7 +752,7 @@ fn update_phase_change(ps: *PvFluidParticle, n, config: *PvPhaseChangeConfig, dt
             }
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: reactions and combustion ────────────────────────────────────────────────
@@ -787,6 +811,7 @@ impl PvReactionProvider for PvCombustionConfig {
 # Each of the n particles with fuel > 0 reacts through the provider: fuel = max(fuel − consumed, 0) (NaN-ignoring),
 # temperature += heat. Mirrors `update_reaction`.
 fn update_reaction(ps: *PvFluidParticle, n, provider: dyn PvReactionProvider, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::reaction", "n", n, 0, 0, 0, 0);
     for (var i = 0; i < n; i = i + 1) {
         var p: *PvFluidParticle = ps + i;
         if (p.fuel > 0.0) {
@@ -797,13 +822,14 @@ fn update_reaction(ps: *PvFluidParticle, n, provider: dyn PvReactionProvider, dt
             p.temperature = p.temperature + r.heat;
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # Combustion on each of the n particles above ignition with fuel > 0 (a NaN temperature does not burn here):
 # consumed = fuel − fuel/(1 + rate·dt), fuel = max(fuel − consumed, 0), temperature += heat_release·consumed.
 # Mirrors `update_combustion`.
 fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::combustion", "n", n, 0, 0, 0, 0);
     var t_ign: f64 = config.ignition_temperature;
     var rate: f64 = config.reaction_rate;
     var heat: f64 = config.heat_release;
@@ -821,7 +847,7 @@ fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f
             p.temperature = p.temperature + dtemp;
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: the contact angle ───────────────────────────────────────────────────────
@@ -832,9 +858,10 @@ fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f
 # sum's |·|² < 1e-20. cos θ is correctly rounded (ADR 0004). Nothing for h not finite and > 0, or σ or θ not finite.
 # Mirrors `apply_contact_angle`.
 fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_angle: f64, surface_tension: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::contact_angle", "n", n, 0, 0, 0, 0);
     var h: f64 = config.smoothing_radius;
     if (_pv_is_positive(h) == 0 || _pv_is_finite(surface_tension) == 0 || _pv_is_finite(contact_angle) == 0) {
-        return 0;
+        _pv_span_end(trace); return 0;
     }
     var cos_theta: f64 = _pv_cos(contact_angle);
     var accel: f64 = (surface_tension * cos_theta) / h;
@@ -875,7 +902,7 @@ fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_
             p.acceleration = PvVec3_new(ax, ay, az);
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: delta-SPH density diffusion ─────────────────────────────────────────────
@@ -887,11 +914,12 @@ fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_
 #must_use
 fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, speed_of_sound: f64, delta: f64,
   dt: f64): i64 {
-    if (n <= 0 || _pv_is_positive(delta) == 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 40) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::delta_sph", "n", n, 0, 0, 0, 0);
+    if (n <= 0 || _pv_is_positive(delta) == 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 40) { _pv_span_end(trace); return 0; }
     var snap = fl_alloc(n * 40);   # density, x, y, z, mass
-    if (snap == 0) { return 0; }
+    if (snap == 0) { _pv_span_end(trace); return 0; }
     for (var c = 0; c < n; c = c + 1) {
         var q: *PvFluidParticle = ps + c;
         var w = snap + c * 40;
@@ -946,7 +974,7 @@ fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f
         p.density = p.density + dd;
     }
     fl_free(snap);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: the MLS gradient corrections ────────────────────────────────────────────
@@ -1041,9 +1069,15 @@ fn _pv_invert_3x3(m, out): i64 {
 # (0, 0) for n ≤ 0 or no memory (Rust aborts). Mirrors `compute_gradient_corrections` (ADR 0002 #18).
 #must_use
 fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64) {
-    if (n <= 0 || n > 9223372036854775807 / 72) { return (0, 0); }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::mls_correction", "n", n, 0, 0, 0, 0);
+    if (n == 0) {
+        # Rust checks the lists (and warns) for no particles too, unless h refuses first.
+        if (_pv_is_positive(h) == 1) { var lv = _pv_lists_valid(offsets, n_off, indices, n_idx, n); }
+        _pv_span_end(trace); return (0, 0);
+    }
+    if (n < 0 || n > 9223372036854775807 / 72) { _pv_span_end(trace); return (0, 0); }
     var out = fl_alloc(n * 72);
-    if (out == 0) { return (0, 0); }
+    if (out == 0) { _pv_span_end(trace); return (0, 0); }
     for (var c = 0; c < n; c = c + 1) {
         for (var e = 0; e < 9; e = e + 1) {
             var v: f64 = 0.0;
@@ -1051,7 +1085,10 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
             store64(out + (c * 9 + e) * 8, _pv_bits(v));
         }
     }
-    if (_pv_is_positive(h) == 0 || _pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return (out, n); }
+    if (_pv_is_positive(h) == 0 || _pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) {
+        _pv_span_end(trace);
+        return (out, n);
+    }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
@@ -1121,7 +1158,7 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
             for (var t = 0; t < 9; t = t + 1) { store64(out + (i * 9 + t) * 8, load64(&tmp + t * 8)); }
         }
     }
-    return (out, n);
+    _pv_span_end(trace); return (out, n);
 }
 
 # L·∇W for the row-major 3×3 matrix at correction: each row ((r₀·x) + (r₁·y)) + (r₂·z). Mirrors
@@ -1153,13 +1190,14 @@ fn apply_gradient_correction(correction, gw: PvVec3): PvVec3 {
 #must_use
 fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, viscosity: f64, dt: f64,
   iterations): i64 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::implicit_visc", "n", n, 0, 0, 0, 0);
     if (n <= 0 || _pv_is_positive(viscosity) == 0 || _pv_is_positive(h) == 0 || _pv_is_positive(dt) == 0) {
-        return 1;
+        _pv_span_end(trace); return 1;
     }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 24) { return 0; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 24) { _pv_span_end(trace); return 0; }
     var v_old = fl_alloc(n * 24);
-    if (v_old == 0) { return 0; }
+    if (v_old == 0) { _pv_span_end(trace); return 0; }
     for (var c0 = 0; c0 < n; c0 = c0 + 1) {
         var q: *PvFluidParticle = ps + c0;
         store64(v_old + c0 * 24, _pv_bits(q.velocity.x));
@@ -1225,7 +1263,7 @@ fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_
         if (max_change < stop) { it = iterations; }
     }
     fl_free(v_old);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: secondary particles (foam, spray, bubbles) ──────────────────────────────
@@ -1259,8 +1297,9 @@ fn _pv_as_secondaries(p): *PvSecondaryParticle {
 # `generate_secondary_particles` (ADR 0002 #9).
 #must_use
 fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, max_lifetime: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::secondary", "n", n, 0, 0, 0, 0);
     var sz = sizeof(PvSecondaryParticle);
-    if (n <= 0 || n > 9223372036854775807 / sz) { return (0, 0); }
+    if (n <= 0 || n > 9223372036854775807 / sz) { _pv_span_end(trace); return (0, 0); }
     var foam_thr: f64 = accel_threshold * 0.3;
     var count = 0;
     for (var i = 0; i < n; i = i + 1) {
@@ -1268,9 +1307,9 @@ fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, m
         var a: f64 = p.acceleration.length();
         if (a > accel_threshold || a > foam_thr) { count = count + 1; }
     }
-    if (count == 0) { return (0, 0); }
+    if (count == 0) { _pv_span_end(trace); return (0, 0); }
     var buf = fl_alloc(count * sz);
-    if (buf == 0) { return (0, 0); }
+    if (buf == 0) { _pv_span_end(trace); return (0, 0); }
     var k = 0;
     var half: f64 = max_lifetime * 0.5;
     for (var j = 0; j < n; j = j + 1) {
@@ -1300,7 +1339,7 @@ fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, m
             k = k + 1;
         }
     }
-    return (buf, count);
+    _pv_span_end(trace); return (buf, count);
 }
 
 # Advects and ages the n secondary particles at ss, then keeps those still alive (lifetime > 0; NaN is not) in their

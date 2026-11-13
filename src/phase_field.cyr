@@ -149,23 +149,24 @@ impl PvPhaseField {
     # neighbour. Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0),
     # PV_ERR_INVALID_GRID_RESOLUTION (φ not nx·ny long, nx or ny below 3, nx·ny overflowing, where Rust panics),
     # PV_ERR_INVALID_PARAMETER (a velocity that is neither both empty nor both nx·ny long), PV_ERR_OUT_OF_MEMORY (the
-    # scratch can't grow, checked before φ changes; Rust aborts). Rust's divergence warning (|φ| > 1.5) has no
-    # effect on the state and isn't kept. Mirrors `PhaseField::step`.
+    # scratch can't grow, checked before φ changes; Rust aborts). When any interior cell's new φ is beyond ±1.5 before
+    # its clamp, one WARN event per step counts them (`cells`). Mirrors `PhaseField::step`.
     #must_use
     fn step(self, vx, vx_len, vy, vy_len, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_PHASE_FIELD, "phase_field::step", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var nx = self.nx;
         var ny = self.ny;
         if (nx != 0 && ny != 0 && (nx < 0 || ny < 0 || nx > 0x7FFFFFFFFFFFFFFF / ny)) {
-            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+            _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION);
         }
         var n = nx * ny;
-        if (self.phi.len != n || nx < 3 || ny < 3) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (self.phi.len != n || nx < 3 || ny < 3) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         var has_v = 1;
         if (vx_len == 0 && vy_len == 0) { has_v = 0; }
-        if (has_v == 1 && (vx_len != n || vy_len != n)) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (has_v == 1 && (vx_len != n || vy_len != n)) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var sc: *PvColumn = _pv_pf_col(self, 1);
-        if (sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (sc.resize(n, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var inv_dx: f64 = 1.0 / self.dx;
         var inv_dx2: f64 = inv_dx * inv_dx;
         var m: f64 = self.mobility;
@@ -173,6 +174,7 @@ impl PvPhaseField {
         var f = self.phi.data;
         var ph = sc.data;
         _pv_fg_copy(ph, f, n);
+        var diverging = 0;
         for (var y = 1; y < ny - 1; y = y + 1) {
             for (var x = 1; x < nx - 1; x = x + 1) {
                 var i = y * nx + x;
@@ -203,10 +205,23 @@ impl PvPhaseField {
                 # clamp(·, −1, 1) written out (a NaN stays NaN): as a `_pv_clamp` call it made the step 1.18–1.19×
                 # slower (pinned A/B, port-parity §13).
                 var c: f64 = cur + ((adv + react) * dt);
-                if (c < -1.0) { c = -1.0; }
-                if (c > 1.0) { c = 1.0; }
+                # |c| > 1.5 counts as diverging (a NaN doesn't, as Rust's `abs() > 1.5`), tested only past the clamp's
+                # ±1, so the common path pays nothing for it.
+                if (c < -1.0) {
+                    if (c < -1.5) { diverging = diverging + 1; }
+                    c = -1.0;
+                }
+                if (c > 1.0) {
+                    if (c > 1.5) { diverging = diverging + 1; }
+                    c = 1.0;
+                }
                 store64(f + i * 8, _pv_bits(c));
             }
+        }
+        # One warning per step (not per cell), as Rust's.
+        if (diverging > 0) {
+            var msg = "phase field divergence detected (|φ| > 1.5)";
+            _pv_warn(_PV_LOG_PHASE_FIELD, msg, "cells", diverging, 0, 0, 0, 0);
         }
         for (var gx = 0; gx < nx; gx = gx + 1) {
             store64(f + gx * 8, load64(f + (nx + gx) * 8));
@@ -216,6 +231,6 @@ impl PvPhaseField {
             store64(f + (gy * nx) * 8, load64(f + (gy * nx + 1) * 8));
             store64(f + (gy * nx + nx - 1) * 8, load64(f + (gy * nx + nx - 2) * 8));
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

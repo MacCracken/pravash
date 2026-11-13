@@ -510,7 +510,8 @@ fn _pv_zorder_cmp(ctx, a, b): i64 {
 # goes byte by byte). 1, or 0 with nothing changed for fewer than 2 particles or a cell size not finite and > 0 (Rust
 # returns), or when the scratch can't be allocated (Rust aborts). Mirrors `sort_by_zorder`.
 fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
-    if (n < 2 || _pv_is_positive(cell_size) == 0) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::sort_by_zorder", "n", n, 0, 0, 0, 0);
+    if (n < 2 || _pv_is_positive(cell_size) == 0) { _pv_span_end(trace); return 0; }
     var inv: f64 = 1.0 / cell_size;
     var mnx: f64 = PV_F64_MAX;
     var mny: f64 = PV_F64_MAX;
@@ -521,7 +522,7 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
     }
     # One block: the codes, the order, the sort's scratch.
     var keys = fl_alloc(n * 24);
-    if (keys == 0) { return 0; }
+    if (keys == 0) { _pv_span_end(trace); return 0; }
     var order = keys + n * 8;
     var tmp = keys + n * 16;
     for (var j = 0; j < n; j = j + 1) {
@@ -555,5 +556,5 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
         }
     }
     fl_free(keys);
-    return 1;
+    _pv_span_end(trace); return 1;
 }

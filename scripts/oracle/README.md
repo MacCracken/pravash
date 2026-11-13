@@ -20,7 +20,10 @@ python3 -I -B scripts/oracle/probe_tables.py .                                  
 
 The generator depends on the oracle by path, on `hisab =1.4.0` (for glam's `DVec3`, to build `common`'s inputs), and
 on `serde =1.0.229` and `serde_json =1.0.154` with `float_roundtrip` (the JSON rows: the oracle's own versions; the
-default float parse is best-effort). All resolve through `Cargo.lock`, seeded from `rust-old/Cargo.lock`.
+default float parse is best-effort), and on `tracing =0.1.44` and `tracing-subscriber =0.3.23` with only `env-filter`
+(the logging rows: a capture subscriber records each traced call's spans and events, and `EnvFilter` decides the
+`PRAVASH_LOG` rows; M7 part b). All resolve through `Cargo.lock`, seeded from `rust-old/Cargo.lock`; tracing-subscriber's
+eight dependencies came in at M7 part b at exactly the oracle's locked versions.
 
 The format, the comparison rules and the generator's structure are impetus's
 (`/home/macro/Repos/impetus/scripts/oracle/`), which are kimiya's and tanmatra's: every port's harness reads the
@@ -53,6 +56,7 @@ same files. This README records what is specific to pravash.
 |---|---|---|---|---|
 | `constants` | M0 | 35 | `src/m_constants.rs` (the lists and their completeness proofs: `src/t_constants.rs`) | `src/constants.cyr`: 14 public constants and the 6 std float constants pravash uses; `tests/constants_rows.cyr`: the harness's lookup from each golden path to its value |
 | `math` | M0 | 33,239 | `src/m_math.rs` | — |
+| (str Debug escapes) | M7 part b | — | — | `src/str_debug_data.cyr` (`src/t_str_debug.rs`): the 910 ranges of code points rustc 1.99.1's `<str as Debug>` writes as `\u{…}` (Unicode 17.0.0), read char by char, each checked alone and after `a` |
 | (private constants) | M4 part a | — | — | `src/constants_private.cyr` (`src/t_private.rs`): each ported module's private `const`, parsed from its Rust literal; every other one fails the generator unless excused |
 
 ## Format 1
@@ -170,6 +174,15 @@ oracle:
   decoders under serde_json's f32 and u32 reads (each decimal rounded to f32 once, in exact rationals, refused when that
   is ±∞), the closed-form derivatives, and hisab 1.4.0's reverse-mode tape op for op on glibc's functions. The Tait
   derivative's pow comes from MPFR for the corrected oracle too, and changes no row, so there is no `compute.cr.tsv`;
+- it recomputes every `ai` row (M7 part b): the defaults, serde's derive reads of the two configs (Python's json, a lone
+  surrogate refused as serde_json refuses it), serde_json's string escaping, and Rust's `Debug` in both shapes, with
+  `<str as Debug>`'s `\u{…}` set from `src/str_debug_data.cyr`. That table is itself checked against the stdlib's
+  Unicode 17.0.0 categories (`lib/unicode/_categories_data.cyr`), apart from Rust: every code point Rust's printable
+  rule escapes and every Mn and Me must be in it, and the rest must be Mc or Lo (Other_Grapheme_Extend);
+- it recomputes every `logging` filter row through its own transcription of tracing-subscriber 0.3.23's `EnvFilter`
+  (the directive state machine, quirks kept, the longest-prefix match, the lenient default), and checks each trace
+  row's form: spans exited in nesting order, each a pravash span with its declared fields, each event a pravash warning
+  under its module's target with its fields (M7 part b);
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what

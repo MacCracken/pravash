@@ -1,0 +1,345 @@
+# ai.cyr — rust-old/src/ai.rs (M7 part b): the daimon and hoosh service configs, their defaults, and Rust's `Debug` for
+# each, which never prints the daimon key. Their JSON is in src/json.cyr.
+#
+# A config holds its strings as bytes and a length: `endpoint`, and the daimon config's `api_key`, where a 0 pointer is
+# Rust's None and any other pointer Some (Some("") included). Rust's `String`s own their bytes. Here `owned` says which
+# of a config's strings are its own freelist copies (bit 0 the endpoint, bit 1 the key), which `_drop` releases: a
+# default config points at static text and owns nothing, one read from JSON owns its strings, and the setters copy.
+# Rust's `#[non_exhaustive]` stops a consumer building one with a struct literal, so it starts from a default or a
+# document and sets fields; here that is the setters (ADR 0002 #27).
+#
+# `debug(sb, alternate)` is Rust's `{:?}` (alternate 0) and `{:#?}` (1): the derived `Debug` for `HooshConfig` and the
+# hand-written one for `DaimonConfig`, whose key prints as `Some("<redacted>")`. Strings print as `<str as Debug>`
+# does: the named escapes \0 \t \n \r \" \\, `\u{…}` for the code points src/str_debug_data.cyr lists (generated from
+# rustc's core), the rest as they are. A byte that is no part of valid UTF-8 (Rust's strings can't hold one) prints as
+# U+FFFD.
+
+# The `owned` bits.
+const _PV_AI_OWN_ENDPOINT = 1;
+const _PV_AI_OWN_KEY = 2;
+
+# A daimon service's config: its endpoint, and its API key (0 for none). Mirrors `DaimonConfig`.
+struct PvDaimonConfig {
+    endpoint;
+    endpoint_len;
+    api_key;
+    api_key_len;
+    owned;
+}
+
+# A hoosh service's config: its endpoint. Mirrors `HooshConfig`.
+struct PvHooshConfig {
+    endpoint;
+    endpoint_len;
+    owned;
+}
+
+# The daimon default: endpoint http://localhost:8090, no key, nothing owned. Mirrors `DaimonConfig::default`.
+#must_use
+fn PvDaimonConfig_default(): PvDaimonConfig {
+    var c: PvDaimonConfig;
+    c.endpoint = "http://localhost:8090";
+    c.endpoint_len = 21;
+    c.api_key = 0;
+    c.api_key_len = 0;
+    c.owned = 0;
+    return c;
+}
+
+# The hoosh default: endpoint http://localhost:8088, nothing owned. Mirrors `HooshConfig::default`.
+#must_use
+fn PvHooshConfig_default(): PvHooshConfig {
+    var c: PvHooshConfig;
+    c.endpoint = "http://localhost:8088";
+    c.endpoint_len = 21;
+    c.owned = 0;
+    return c;
+}
+
+# A freelist copy of the n bytes at p, NUL-terminated (so Some("") is a nonzero pointer), or 0 for no memory.
+#must_use
+fn _pv_ai_copy(p, n): i64 {
+    if (n < 0) { return 0; }
+    var d = fl_alloc(n + 1);
+    if (d == 0) { return 0; }
+    if (n > 0) { memcpy(d, p, n); }
+    store8(d + n, 0);
+    return d;
+}
+
+# Releases the strings a daimon config owns; it is then the empty config (endpoint "" at a static, no key). Mirrors
+# dropping the `DaimonConfig`.
+fn PvDaimonConfig_drop(c: *PvDaimonConfig) {
+    if ((c.owned & _PV_AI_OWN_ENDPOINT) != 0 && c.endpoint != 0) { fl_free(c.endpoint); }
+    if ((c.owned & _PV_AI_OWN_KEY) != 0 && c.api_key != 0) { fl_free(c.api_key); }
+    c.endpoint = "";
+    c.endpoint_len = 0;
+    c.api_key = 0;
+    c.api_key_len = 0;
+    c.owned = 0;
+    return 0;
+}
+
+# Releases the endpoint a hoosh config owns, as PvDaimonConfig_drop. Mirrors dropping the `HooshConfig`.
+fn PvHooshConfig_drop(c: *PvHooshConfig) {
+    if ((c.owned & _PV_AI_OWN_ENDPOINT) != 0 && c.endpoint != 0) { fl_free(c.endpoint); }
+    c.endpoint = "";
+    c.endpoint_len = 0;
+    c.owned = 0;
+    return 0;
+}
+
+impl PvDaimonConfig {
+    # Sets the endpoint to a copy of the n bytes at p: 1, or 0 when the copy can't be allocated (unchanged). Rust's
+    # `c.endpoint = String::from(..)`.
+    #must_use
+    fn set_endpoint(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_ENDPOINT) != 0 && self.endpoint != 0) { fl_free(self.endpoint); }
+        self.endpoint = d;
+        self.endpoint_len = n;
+        self.owned = self.owned | _PV_AI_OWN_ENDPOINT;
+        return 1;
+    }
+
+    # Sets the key to a copy of the n bytes at p (Some, even for n = 0): 1, or 0 when the copy can't be allocated
+    # (unchanged). Rust's `c.api_key = Some(..)`.
+    #must_use
+    fn set_api_key(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        self.api_key = d;
+        self.api_key_len = n;
+        self.owned = self.owned | _PV_AI_OWN_KEY;
+        return 1;
+    }
+
+    # Removes the key. Rust's `c.api_key = None`.
+    fn clear_api_key(self) {
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        self.api_key = 0;
+        self.api_key_len = 0;
+        self.owned = self.owned & _PV_AI_OWN_ENDPOINT;
+        return 0;
+    }
+
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1) of the config: the endpoint, and `Some("<redacted>")` or
+    # `None` for the key, whose bytes are never read. 0, or -1 when the builder can't grow. Mirrors the hand-written
+    # `impl Debug for DaimonConfig`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dbg_open(sb, "DaimonConfig", alternate);
+        rc = rc | _pv_dbg_field(sb, "endpoint", alternate, 1);
+        rc = rc | _pv_debug_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_field(sb, "api_key", alternate, 0);
+        if (self.api_key == 0) {
+            rc = rc | _pv_jw(sb, "None");
+        } elif (alternate == 0) {
+            rc = rc | _pv_jw(sb, "Some(\"<redacted>\")");
+        } else {
+            rc = rc | _pv_jw(sb, "Some(\n        \"<redacted>\",\n    )");
+        }
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_close(sb, alternate);
+        return rc;
+    }
+}
+
+impl PvHooshConfig {
+    # Sets the endpoint to a copy of the n bytes at p: 1, or 0 when the copy can't be allocated (unchanged).
+    #must_use
+    fn set_endpoint(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_ENDPOINT) != 0 && self.endpoint != 0) { fl_free(self.endpoint); }
+        self.endpoint = d;
+        self.endpoint_len = n;
+        self.owned = _PV_AI_OWN_ENDPOINT;
+        return 1;
+    }
+
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1) of the config. 0, or -1 when the builder can't grow. Mirrors
+    # the derived `Debug` for `HooshConfig`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dbg_open(sb, "HooshConfig", alternate);
+        rc = rc | _pv_dbg_field(sb, "endpoint", alternate, 1);
+        rc = rc | _pv_debug_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_close(sb, alternate);
+        return rc;
+    }
+}
+
+# ── Rust's Debug ────────────────────────────────────────────────────────────────────
+# `debug_struct`'s two shapes: `Name { a: x, b: y }`, and the alternate `Name {\n    a: x,\n    b: y,\n}` (a field's
+# value never holds a raw newline here, so PadAdapter's indentation has nothing to add inside one).
+
+# Appends `Name {` (alternate: `Name {\n`). 0, or -1.
+#must_use
+fn _pv_dbg_open(sb, name, alternate): i64 {
+    var rc = _pv_jw(sb, name);
+    if (alternate == 0) { return rc | _pv_jw(sb, " {"); }
+    return rc | _pv_jw(sb, " {\n");
+}
+
+# Appends a field's name: ` a: ` (`, b: ` after the first; alternate `    a: `). 0, or -1.
+#must_use
+fn _pv_dbg_field(sb, name, alternate, first): i64 {
+    var rc = 0;
+    if (alternate == 1) {
+        rc = _pv_jw(sb, "    ");
+    } elif (first == 1) {
+        rc = _pv_jw(sb, " ");
+    } else {
+        rc = _pv_jw(sb, ", ");
+    }
+    rc = rc | _pv_jw(sb, name);
+    return rc | _pv_jw(sb, ": ");
+}
+
+# Ends a field (alternate: `,\n`). 0, or -1.
+#must_use
+fn _pv_dbg_field_end(sb, alternate): i64 {
+    if (alternate == 0) { return 0; }
+    return _pv_jw(sb, ",\n");
+}
+
+# Appends ` }` (alternate: `}`). 0, or -1.
+#must_use
+fn _pv_dbg_close(sb, alternate): i64 {
+    if (alternate == 0) { return _pv_jw(sb, " }"); }
+    return _pv_jw(sb, "}");
+}
+
+# 1 when `<str as Debug>` writes code point u as `\u{…}` (src/str_debug_data.cyr, by binary search), else 0.
+#must_use
+fn _pv_str_debug_escapes(u): i64 {
+    var lo = 0;
+    var hi = _PV_STR_DEBUG_RANGES - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) / 2;
+        var a = _PV_STR_DEBUG_ESC[2 * mid];
+        var b = _PV_STR_DEBUG_ESC[2 * mid + 1];
+        if (u < a) {
+            hi = mid - 1;
+        } elif (u > b) {
+            lo = mid + 1;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# The code point of the UTF-8 sequence at p (n bytes left, n ≥ 1) and its length: (cp, len), or (-1, 1) when the byte
+# at p starts no valid sequence (an overlong form, a surrogate, past U+10FFFF, a stray continuation, a truncation).
+fn _pv_utf8_next(p, n) {
+    var b0 = load8(p);
+    if (b0 < 128) { return (b0, 1); }
+    var len = 0;
+    var cp = 0;
+    var min = 0;
+    if (b0 >= 194 && b0 <= 223) {
+        len = 2;
+        cp = b0 & 31;
+        min = 128;
+    } elif (b0 >= 224 && b0 <= 239) {
+        len = 3;
+        cp = b0 & 15;
+        min = 2048;
+    } elif (b0 >= 240 && b0 <= 244) {
+        len = 4;
+        cp = b0 & 7;
+        min = 65536;
+    } else {
+        return (0 - 1, 1);
+    }
+    if (n < len) { return (0 - 1, 1); }
+    for (var k = 1; k < len; k = k + 1) {
+        var b = load8(p + k);
+        if ((b & 192) != 128) { return (0 - 1, 1); }
+        cp = (cp << 6) | (b & 63);
+    }
+    if (cp < min || cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return (0 - 1, 1); }
+    return (cp, len);
+}
+
+# Appends the n bytes at p as `<str as Debug>` writes a string, quotes included. 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_debug_str(sb, p, n): i64 {
+    var rc = _pv_jw(sb, "\"");
+    var i = 0;
+    var run = 0;
+    while (i < n) {
+        # Printable ASCII other than `"` and `\` prints as it is (the table holds none of 0x20–0x7E): no decode, no
+        # search.
+        var b0 = load8(p + i);
+        if (b0 >= 32 && b0 <= 126 && b0 != 34 && b0 != 92) {
+            i = i + 1;
+            continue;
+        }
+        var cp, len = _pv_utf8_next(p + i, n - i);
+        var esc = 0;
+        if (cp < 0 || cp == 34 || cp == 92 || cp == 0 || cp == 9 || cp == 10 || cp == 13) {
+            esc = 1;
+        } elif (_pv_str_debug_escapes(cp) == 1) {
+            esc = 1;
+        }
+        if (esc == 0) {
+            i = i + len;
+        } else {
+            # The plain run before it, then the escape.
+            rc = rc | _pv_jw_n(sb, p + run, i - run);
+            if (cp < 0) {
+                var rep[8];
+                store8(&rep, 239);
+                store8(&rep + 1, 191);
+                store8(&rep + 2, 189);
+                rc = rc | _pv_jw_n(sb, &rep, 3);
+            } elif (cp == 34) {
+                rc = rc | _pv_jw(sb, "\\\"");
+            } elif (cp == 92) {
+                rc = rc | _pv_jw(sb, "\\\\");
+            } elif (cp == 0) {
+                rc = rc | _pv_jw(sb, "\\0");
+            } elif (cp == 9) {
+                rc = rc | _pv_jw(sb, "\\t");
+            } elif (cp == 10) {
+                rc = rc | _pv_jw(sb, "\\n");
+            } elif (cp == 13) {
+                rc = rc | _pv_jw(sb, "\\r");
+            } else {
+                rc = rc | _pv_debug_u(sb, cp);
+            }
+            i = i + len;
+            run = i;
+        }
+    }
+    rc = rc | _pv_jw_n(sb, p + run, n - run);
+    return rc | _pv_jw(sb, "\"");
+}
+
+# Appends `\u{…}` for code point cp: lowercase hex, no leading zeros. 0, or -1.
+#must_use
+fn _pv_debug_u(sb, cp): i64 {
+    var buf[16];
+    var d[8];
+    var nd = 0;
+    var v = cp;
+    while (nd == 0 || v != 0) {
+        var h = v & 15;
+        if (h < 10) { store8(&d + nd, 48 + h); } else { store8(&d + nd, 87 + h); }
+        nd = nd + 1;
+        v = v >> 4;
+    }
+    store8(&buf, 92);
+    store8(&buf + 1, 117);
+    store8(&buf + 2, 123);
+    for (var k = 0; k < nd; k = k + 1) { store8(&buf + 3 + k, load8(&d + nd - 1 - k)); }
+    store8(&buf + 3 + nd, 125);
+    return _pv_jw_n(sb, &buf, 4 + nd);
+}

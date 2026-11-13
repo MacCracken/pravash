@@ -374,6 +374,7 @@ impl PvRigidBody {
 # another writes). Mirrors `couple_sph_bodies`.
 fn couple_sph_bodies(ps: *PvFluidParticle, n, bodies: *PvRigidBody, nb, smoothing_radius: f64, stiffness: f64,
   damping: f64) {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::sph_bodies", "n_particles", n, "n_bodies", nb, 0, 0);
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var zero: f64 = 0.0;
     var nd: f64 = -damping;
@@ -421,7 +422,7 @@ fn couple_sph_bodies(ps: *PvFluidParticle, n, bodies: *PvRigidBody, nb, smoothin
         }
         bj.force = PvVec3_new(fx, fy, fz);
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # Integrates the nb bodies at bodies over dt: v += (F·(1/max(m, 1e-20)) + g)·dt, then x += v·dt. Mirrors
@@ -519,6 +520,7 @@ fn _pv_drag_mean(b: *PvRigidBody, sx: f64, sy: f64, sz: f64, count, fluid_densit
 #must_use
 fn drag_from_particles(body: *PvRigidBody, ps: *PvFluidParticle, n, fluid_density: f64, drag_coefficient: f64,
   sample_radius: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::drag_from_particles", 0, 0, 0, 0, 0, 0);
     var sx: f64 = 0.0;
     var sy: f64 = 0.0;
     var sz: f64 = 0.0;
@@ -537,7 +539,7 @@ fn drag_from_particles(body: *PvRigidBody, ps: *PvFluidParticle, n, fluid_densit
         }
     }
     var f: PvVec3 = _pv_drag_mean(body, sx, sy, sz, count, fluid_density, drag_coefficient);
-    return f;
+    _pv_span_end(trace); return f;
 }
 
 # The context of one indexed drag sum: the body's distance context, the particles and their count, the sample radius,
@@ -591,6 +593,7 @@ fn _pv_drag_visit(ctx, a, b): i64 {
 #must_use
 fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid: *PvNeighborGrid,
   fluid_density: f64, drag_coefficient: f64, sample_radius: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::drag_from_particles_indexed", 0, 0, 0, 0, 0, 0);
     var inv: f64 = grid.inv_cell;
     var br: f64 = body_shape_bounding_radius(_pv_body_shape(body));
     var qr: f64 = sample_radius + br;
@@ -627,7 +630,7 @@ fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid
         _pv_nb_block(grid, &lo, &hi, &_pv_drag_visit, &d);
     }
     var f: PvVec3 = _pv_drag_mean(body, d.sx, d.sy, d.sz, d.count, fluid_density, drag_coefficient);
-    return f;
+    _pv_span_end(trace); return f;
 }
 
 # ── the particle level set ──────────────────────────────────────────────────────────
@@ -637,9 +640,16 @@ fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid
 # outside the fluid, negative inside (a brute-force O(cells · n) search, as Rust's). 1, or 0 with nothing written
 # when nx·ny is not len or overflows, or nx or ny is negative (Rust warns and returns). Mirrors `particle_level_set`.
 fn particle_level_set(ls, len, nx, ny, dx: f64, ps: *PvFluidParticle, n, particle_radius: f64): i64 {
-    if (nx < 0 || ny < 0) { return 0; }
-    if (nx > 0 && ny > 9223372036854775807 / nx) { return 0; }
-    if (nx * ny != len) { return 0; }
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::particle_level_set", "nx", nx, "ny", ny, "n", n);
+    # Rust's `nx.checked_mul(ny) != Some(level_set.len())`: an overflow, or any other length.
+    var bad = 0;
+    if (nx < 0 || ny < 0) { bad = 1; }
+    if (bad == 0 && nx > 0 && ny > 9223372036854775807 / nx) { bad = 1; }
+    if (bad == 0 && nx * ny != len) { bad = 1; }
+    if (bad == 1) {
+        _pv_warn(_PV_LOG_COUPLING, "particle_level_set: size mismatch ignored", "nx", nx, "ny", ny, "len", len);
+        _pv_span_end(trace); return 0;
+    }
     var fx: f64 = f64_from(nx);
     var fy: f64 = f64_from(ny);
     var far: f64 = (fx + fy) * dx;
@@ -663,5 +673,5 @@ fn particle_level_set(ls, len, nx, ny, dx: f64, ps: *PvFluidParticle, n, particl
             store64(ls + (y * nx + x) * 8, _pv_bits(min_dist));
         }
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }

@@ -27,6 +27,11 @@ include "src/compute_ad.cyr"
 
 alloc_init();
 
+# Rust's rows ran with no tracing subscriber, so the warnings they provoke (stale arena handles, mismatched sizes,
+# out-of-range phases) printed nothing; sakshi's default (INFO, to stderr) would print each one. The trace rows set
+# their own level and restore this one.
+var _par_quiet = sakshi_set_level(SK_ERROR);
+
 include "tests/parity_core.cyr"
 include "tests/constants_rows.cyr"
 
@@ -3256,10 +3261,690 @@ fn _par_compute(fp, fl): i64 {
     return 0;
 }
 
+# ── ai (M7 part b) ─────────────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_ai.rs. A daimon config is `s:` endpoint then `s:` key or `n:`; a hoosh config
+# `s:`.
+
+# Appends the n bytes at p as an `s:` token, or `n:` when p is 0.
+fn _par_got_opt_text(p, n) {
+    if (p == 0) {
+        _par_got_none();
+        return 0;
+    }
+    _par_got_text(p, n);
+    return 0;
+}
+
+# 1 when the n bytes at a equal the m bytes at b.
+fn _par_same_bytes(a, n, b, m): i64 {
+    if (n != m) { return 0; }
+    if (n == 0) { return 1; }
+    return memeq(a, b, n);
+}
+
+# The ai rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
+fn _par_ai(fp, fl): i64 {
+    var dc: PvDaimonConfig;
+    var hc: PvHooshConfig;
+    if (_par_eq(fp, fl, "DaimonConfig::default") == 1) {
+        dc = PvDaimonConfig_default();
+        _par_got_text(dc.endpoint, dc.endpoint_len);
+        _par_got_opt_text(dc.api_key, dc.api_key_len);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "HooshConfig::default") == 1) {
+        hc = PvHooshConfig_default();
+        _par_got_text(hc.endpoint, hc.endpoint_len);
+        return 1;
+    }
+    var daimon = 0 - 1;
+    if (_par_eq(fp, fl, "DaimonConfig::from_json") == 1) { daimon = 1; }
+    if (_par_eq(fp, fl, "DaimonConfig::to_json") == 1) { daimon = 1; }
+    if (_par_eq(fp, fl, "DaimonConfig::debug") == 1) { daimon = 1; }
+    if (_par_eq(fp, fl, "HooshConfig::from_json") == 1) { daimon = 0; }
+    if (_par_eq(fp, fl, "HooshConfig::to_json") == 1) { daimon = 0; }
+    if (_par_eq(fp, fl, "HooshConfig::debug") == 1) { daimon = 0; }
+    if (daimon < 0) { return 0; }
+    var doc = _par_in_cstr(0);
+    if (doc == 0) { return 0 - 1; }
+    var t = 0;
+    var v = 0;
+    if (daimon == 1) {
+        t, v = PvDaimonConfig_from_json(doc, strlen(doc), &dc);
+    } else {
+        t, v = PvHooshConfig_from_json(doc, strlen(doc), &hc);
+    }
+    if (is_err_result(t) == 1) {
+        _par_got_err(v);
+        return 1;
+    }
+    var sb = str_builder_new();
+    var rc = 0;
+    var last = fp + fl - 5;
+    if (_par_eq(last, 5, "debug") == 1) {
+        var sb1 = str_builder_new();
+        if (daimon == 1) {
+            rc = dc.debug(sb, 0) | dc.debug(sb1, 1);
+        } else {
+            rc = hc.debug(sb, 0) | hc.debug(sb1, 1);
+        }
+        if (rc != 0) { return 0 - 1; }
+        var d0, n0 = _par_sb_text(sb);
+        var d1, n1 = _par_sb_text(sb1);
+        _par_got_text(d0, n0);
+        _par_got_text(d1, n1);
+    } else {
+        if (daimon == 1) { rc = dc.to_json(sb); } else { rc = hc.to_json(sb); }
+        if (rc != 0) { return 0 - 1; }
+        var jd, jn = _par_sb_text(sb);
+        var to_json = _par_eq(fp, fl, "DaimonConfig::to_json") + _par_eq(fp, fl, "HooshConfig::to_json");
+        if (to_json == 1) {
+            _par_got_text(jd, jn);
+        } else {
+            if (daimon == 1) {
+                _par_got_text(dc.endpoint, dc.endpoint_len);
+                _par_got_opt_text(dc.api_key, dc.api_key_len);
+            } else {
+                _par_got_text(hc.endpoint, hc.endpoint_len);
+            }
+        }
+        # The port's own text reads back to the same strings.
+        var t2 = 0;
+        var v2 = 0;
+        var same = 0;
+        if (daimon == 1) {
+            var back: PvDaimonConfig;
+            t2, v2 = PvDaimonConfig_from_json(jd, jn, &back);
+            if (is_err_result(t2) == 0) {
+                same = _par_same_bytes(dc.endpoint, dc.endpoint_len, back.endpoint, back.endpoint_len);
+                if ((dc.api_key == 0) != (back.api_key == 0)) { same = 0; }
+                if (dc.api_key != 0) {
+                    if (_par_same_bytes(dc.api_key, dc.api_key_len, back.api_key, back.api_key_len) == 0) { same = 0; }
+                }
+                PvDaimonConfig_drop(&back);
+            }
+        } else {
+            var hb: PvHooshConfig;
+            t2, v2 = PvHooshConfig_from_json(jd, jn, &hb);
+            if (is_err_result(t2) == 0) {
+                same = _par_same_bytes(hc.endpoint, hc.endpoint_len, hb.endpoint, hb.endpoint_len);
+                PvHooshConfig_drop(&hb);
+            }
+        }
+        if (same == 0) { return 0 - 1; }
+    }
+    if (daimon == 1) { PvDaimonConfig_drop(&dc); } else { PvHooshConfig_drop(&hc); }
+    return 1;
+}
+
+# ── logging (M7 part b) ────────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_logging.rs.
+
+# The trace rows: sakshi's events, as the generator's capture subscriber records them — `>name{…}` when a span is
+# entered, `<name` when it exits, `LEVEL target: message …` for an event — each kept as text until the row ends.
+var _par_tr_text = 0;
+var _par_tr_used = 0;
+var _par_tr_tok = 0;
+var _par_tr_n = 0;
+var _par_tr_level = 0;
+
+# Records the m bytes at q after the n-byte prefix at p as one token (dropped past the buffers).
+fn _par_tr_add(p, n, q, m) {
+    if (_par_tr_n >= 4096 || _par_tr_used + n + m > 262144) { return 0; }
+    var at = _par_tr_text + _par_tr_used;
+    if (n > 0) { memcpy(at, p, n); }
+    if (m > 0) { memcpy(at + n, q, m); }
+    store64(_par_tr_tok + _par_tr_n * 16, at);
+    store64(_par_tr_tok + _par_tr_n * 16 + 8, n + m);
+    _par_tr_used = _par_tr_used + n + m;
+    _par_tr_n = _par_tr_n + 1;
+    return 0;
+}
+
+# sakshi's emit hook during a trace row.
+fn _par_tr_hook(ts, level, category, msg, msg_len, sixth): i64 {
+    if (level == 10) {
+        _par_tr_add(">", 1, msg, msg_len);
+    } elif (level == 11) {
+        var nb = msg_len;
+        for (var k = 0; k < msg_len; k = k + 1) {
+            if (nb == msg_len && load8(msg + k) == 123) { nb = k; }
+        }
+        _par_tr_add("<", 1, msg, nb);
+    } else {
+        var name = "TRACE ";
+        if (level == 1) { name = "ERROR "; }
+        if (level == 2) { name = "WARN "; }
+        if (level == 3) { name = "INFO "; }
+        if (level == 4) { name = "DEBUG "; }
+        _par_tr_add(name, strlen(name), msg, msg_len);
+    }
+    return 0;
+}
+
+# Starts recording: every target at TRACE, sakshi's events to the hook.
+fn _par_trace_begin() {
+    if (_par_tr_text == 0) {
+        _par_tr_text = alloc(262144);
+        _par_tr_tok = alloc(4096 * 16);
+    }
+    _par_tr_used = 0;
+    _par_tr_n = 0;
+    _par_tr_level = sakshi_get_level();
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = _PV_LOG_TRACE; }
+    _pv_log_filtered = 1;
+    var l = sakshi_set_level(SK_TRACE);
+    var h = sakshi_set_emit_hook(&_par_tr_hook);
+    return 0;
+}
+
+# Stops recording, restores sakshi and the filter, and appends the tokens to the got list.
+fn _par_trace_end() {
+    var h = sakshi_clear_emit_hook();
+    var l = sakshi_set_level(_par_tr_level);
+    _pv_log_filtered = 0;
+    for (var k = 0; k < _par_tr_n; k = k + 1) {
+        _par_got_text(load64(_par_tr_tok + k * 16), load64(_par_tr_tok + k * 16 + 8));
+    }
+    return 0;
+}
+
+# A buffer of n zero words (freelist; at least one word).
+fn _par_zeros(n): i64 {
+    var b = fl_alloc(n * 8 + 8);
+    if (b != 0) { memset(b, 0, n * 8 + 8); }
+    return b;
+}
+
+# m_logging.rs's `line(n)`: n particles of mass 0.01 at (0.07 k, 0.01 k, 0), on the freelist (at least one slot).
+fn _par_tr_line(n): i64 {
+    var buf = fl_alloc((n + 1) * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var k = 0; k < n; k = k + 1) {
+        var x: f64 = 0.07 * f64_from(k);
+        var y: f64 = 0.01 * f64_from(k);
+        var q: PvFluidParticle = PvFluidParticle_new(PvVec3_new(x, y, 0.0), 0.01);
+        var d: *PvFluidParticle = ps + k;
+        *d = q;
+    }
+    return buf;
+}
+
+# The coupling trace scenarios (m_logging.rs's coupling_rows): 1 when fp is one, else 0.
+fn _par_trace_coupling(fp, fl): i64 {
+    var sh: PvShape = PvShape_sphere(0.2);
+    if (_par_eq(fp, fl, "couple_sph_bodies") == 1) {
+        var n = _par_in(0);
+        var nb = _par_in(1);
+        var ps = _par_tr_line(n);
+        var bb = fl_alloc((nb + 1) * sizeof(PvRigidBody));
+        var bs: *PvRigidBody = _pv_as_bodies(bb);
+        for (var j = 0; j < nb; j = j + 1) {
+            var bx: f64 = 0.1 * f64_from(j);
+            var b: PvRigidBody = PvRigidBody_new(PvVec3_new(bx, 0.0, 0.0), 1.0, sh);
+            var d: *PvRigidBody = bs + j;
+            *d = b;
+        }
+        couple_sph_bodies(_pv_as_particles(ps), n, bs, nb, 0.1, 100.0, 1.0);
+        fl_free(bb);
+        fl_free(ps);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "drag_from_particles") == 1 || _par_eq(fp, fl, "drag_from_particles_indexed") == 1) {
+        var n2 = _par_in(0);
+        var ps2 = _par_tr_line(n2);
+        var body: PvRigidBody = PvRigidBody_new(PvVec3_new(0.0, 0.0, 0.0), 1.0, sh);
+        if (_par_eq(fp, fl, "drag_from_particles") == 1) {
+            var f1: PvVec3 = drag_from_particles(&body, _pv_as_particles(ps2), n2, 1000.0, 0.47, 0.5);
+        } else {
+            var g: PvNeighborGrid;
+            PvNeighborGrid_init(&g);
+            var gt, gv = PvNeighborGrid_build(&g, _pv_as_particles(ps2), n2, 0.25);
+            if (is_err_result(gt) == 0) {
+                var f2: PvVec3 = drag_from_particles_indexed(&body, _pv_as_particles(ps2), n2, &g, 1000.0, 0.47, 0.5);
+            }
+            PvNeighborGrid_drop(&g);
+        }
+        fl_free(ps2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "particle_level_set") == 1) {
+        var len = _par_in(2);
+        var ls = _par_zeros(len);
+        var n3 = _par_in(3);
+        var ps3 = _par_tr_line(n3);
+        var r = particle_level_set(ls, len, _par_in(0), _par_in(1), 0.1, _pv_as_particles(ps3), n3, 0.05);
+        fl_free(ps3);
+        fl_free(ls);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FlipSolver::step") == 1) {
+        var fs: PvFlipSolver;
+        var t, v = PvFlipSolver_new(8, 8, 0.1, 0.95, &fs);
+        if (is_err_result(t) == 1) { return 1; }
+        fs.use_apic = _par_in(2);
+        var n4 = _par_in(0);
+        var buf = fl_alloc((n4 + 1) * sizeof(PvFluidParticle));
+        var ps4: *PvFluidParticle = _pv_as_particles(buf);
+        for (var k = 0; k < n4; k = k + 1) {
+            var x: f64 = 0.2 + 0.03 * f64_from(k);
+            var q: PvFluidParticle = PvFluidParticle_new_2d(x, 0.3, 0.01);
+            var d4: *PvFluidParticle = ps4 + k;
+            *d4 = q;
+        }
+        var gr: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+        var st, sv = fs.step(ps4, n4, gr, _par_in(1));
+        fl_free(buf);
+        PvFlipSolver_drop(&fs);
+        return 1;
+    }
+    return 0;
+}
+
+# The grid trace scenarios (m_logging.rs's grid_rows): 1 when fp is one, else 0.
+fn _par_trace_grid(fp, fl): i64 {
+    var t = 0;
+    var v = 0;
+    var c: PvGridConfig = PvGridConfig_smoke();
+    if (_par_eq(fp, fl, "FluidGrid::step") == 1) {
+        var g: PvFluidGrid;
+        t, v = PvFluidGrid_new(_par_in(0), _par_in(1), 0.1, &g);
+        if (is_err_result(t) == 1) { return 1; }
+        var flags = _par_in(3);
+        c.boundary = _par_in(2);
+        c.viscosity = _par_in(4);
+        c.vorticity_confinement = _par_in(5);
+        c.dt = _par_in(6);
+        c.use_maccormack = flags & 1;
+        c.use_bfecc = (flags >> 1) & 1;
+        c.use_multigrid = (flags >> 2) & 1;
+        c.use_cg = (flags >> 3) & 1;
+        if ((flags & 16) != 0) { c.smagorinsky_cs = 0.1; }
+        var st, sv = g.step(&c);
+        PvFluidGrid_drop(&g);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidGrid::diffuse") == 1) {
+        var len = _par_in(2);
+        var field = _par_zeros(len);
+        var r = PvFluidGrid_diffuse(field, len, _par_in(0), _par_in(1), 0.01, 0.1, 0.1, _par_in(3));
+        fl_free(field);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KEpsilon::step") == 1) {
+        var ke: PvKEpsilon;
+        if (PvKEpsilon_new(_par_in(0), _par_in(1), &ke) == 0) { return 1; }
+        var kl = _par_in(2);
+        var z = _par_zeros(kl);
+        var kr = ke.step(z, kl, z, kl, _par_in(0), _par_in(1), 0.1, _par_in(3));
+        fl_free(z);
+        PvKEpsilon_drop(&ke);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MacGrid::step") == 1) {
+        var mg: PvMacGrid;
+        t, v = PvMacGrid_new(_par_in(0), _par_in(1), 0.1, &mg);
+        if (is_err_result(t) == 1) { return 1; }
+        c.dt = _par_in(2);
+        var mt, mv = mg.step(&c);
+        PvMacGrid_drop(&mg);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "apply_ghost_fluid") == 1) {
+        var pl = _par_in(2);
+        var ll = _par_in(3);
+        var p = _par_zeros(pl);
+        var ls = _par_zeros(ll);
+        var gr = apply_ghost_fluid(p, pl, ls, ll, _par_in(0), _par_in(1), _par_in(4), 0.07);
+        fl_free(ls);
+        fl_free(p);
+        return 1;
+    }
+    return 0;
+}
+
+# m_logging.rs's `block(side)`: side × side particles of mass 0.01, 0.01 apart, temperature 600, fuel 1, velocity
+# (0.1·(k mod 3), 0), on the freelist (at least one slot).
+fn _par_tr_block(side): i64 {
+    var n = side * side;
+    var buf = fl_alloc((n + 1) * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var k = 0; k < n; k = k + 1) {
+        var x: f64 = 0.01 * f64_from(k % side);
+        var y: f64 = 0.01 * f64_from(k / side);
+        var q: PvFluidParticle = PvFluidParticle_new_2d(x, y, 0.01);
+        var vx: f64 = 0.1 * f64_from(k % 3);
+        q.velocity = PvVec3_new(vx, 0.0, 0.0);
+        q.temperature = 600.0;
+        q.fuel = 1.0;
+        var d: *PvFluidParticle = ps + k;
+        *d = q;
+    }
+    return buf;
+}
+
+# m_logging.rs's `lists(ps, h, kind)` into *w: offsets pointer, count, indices pointer, count (freelist buffers).
+fn _par_tr_lists(ps: *PvFluidParticle, n, h: f64, kind, w) {
+    var off = fl_alloc((n + 2) * 8);
+    var idx = fl_alloc((n * n + 2) * 8);
+    var no = 1;
+    var ni = 0;
+    store64(off, 0);
+    for (var a = 0; a < n; a = a + 1) {
+        var pa: *PvFluidParticle = ps + a;
+        for (var j = 0; j < n; j = j + 1) {
+            var pb: *PvFluidParticle = ps + j;
+            var d: f64 = PvVec3_distance(pa.position, pb.position);
+            if (d < h) {
+                store64(idx + ni * 8, j);
+                ni = ni + 1;
+            }
+        }
+        store64(off + no * 8, ni);
+        no = no + 1;
+    }
+    if (kind == 1) { no = no - 1; }
+    if (kind == 2) {
+        store64(idx + ni * 8, n);
+        ni = ni + 1;
+        store64(off + (no - 1) * 8, load64(off + (no - 1) * 8) + 1);
+    }
+    store64(w, off);
+    store64(w + 8, no);
+    store64(w + 16, idx);
+    store64(w + 24, ni);
+    return 0;
+}
+
+# The SPH trace scenarios (m_logging.rs's sph_rows): 1 when fp is one, else 0.
+fn _par_trace_sph(fp, fl): i64 {
+    var water: PvFluidConfig = PvFluidConfig_water_2d();
+    var side = _par_in(0);
+    var n = side * side;
+    var t = 0;
+    var v = 0;
+    var steps = 0;
+    if (_par_eq(fp, fl, "SphSolver::step") == 1 || _par_eq(fp, fl, "step") == 1) { steps = 1; }
+    if (steps == 1) {
+        if (_par_in(1) == 1) { water.dt = 0.0; }
+        var b1 = _par_tr_block(side);
+        if (_par_in(1) == 2) {
+            var p1: *PvFluidParticle = _pv_as_particles(b1);
+            p1.velocity.x = PV_F64_NAN;
+        }
+        if (_par_eq(fp, fl, "step") == 1) {
+            t, v = sph_step(_pv_as_particles(b1), n, &water, 0.001);
+        } else {
+            var s1: PvSphSolver = PvSphSolver_new();
+            t, v = s1.step(_pv_as_particles(b1), n, &water, 0.001);
+            PvSphSolver_drop(&s1);
+        }
+        fl_free(b1);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1 || _par_eq(fp, fl, "SphSolver::step_dfsph") == 1) {
+        var b2 = _par_tr_block(side);
+        var s2: PvSphSolver = PvSphSolver_new();
+        if (_par_eq(fp, fl, "SphSolver::step_pcisph") == 1) {
+            t, v = s2.step_pcisph(_pv_as_particles(b2), n, &water, 0.001, _par_in(1), 0.01);
+        } else {
+            t, v = s2.step_dfsph(_pv_as_particles(b2), n, &water, 0.001, _par_in(1), 0.01);
+        }
+        PvSphSolver_drop(&s2);
+        fl_free(b2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) {
+        var b3 = _par_tr_block(side);
+        var ps3: *PvFluidParticle = _pv_as_particles(b3);
+        var k3 = _par_in(2);
+        for (var a = 0; a < k3 && a < n; a = a + 1) {
+            var pa: *PvFluidParticle = ps3 + a;
+            pa.phase = _par_in(3);
+        }
+        if (_par_in(4) == 1) { ps3.velocity.x = PV_F64_NAN; }
+        var mp: PvMultiPhaseConfig = PvMultiPhaseConfig_single(1000.0, 2000.0, 0.001);
+        if (_par_in(1) == 2) {
+            var ph: PvPhaseProperties;
+            ph.rest_density = 1000.0;
+            ph.gas_constant = 2000.0;
+            ph.viscosity = 0.001;
+            var pushed = mp.push_phase(ph);
+        }
+        var s3: PvSphSolver = PvSphSolver_new();
+        t, v = s3.step_multiphase(ps3, n, &water, &mp);
+        PvSphSolver_drop(&s3);
+        PvMultiPhaseConfig_drop(&mp);
+        fl_free(b3);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "pressure_force") == 1 || _par_eq(fp, fl, "viscosity_force") == 1) {
+        var b4 = _par_tr_block(side);
+        if (_par_eq(fp, fl, "pressure_force") == 1) {
+            var f4: PvVec3 = pressure_force(_par_in(1), _pv_as_particles(b4), n, 0.05);
+        } else {
+            var g4: PvVec3 = viscosity_force(_par_in(1), _pv_as_particles(b4), n, 0.05, 0.001);
+        }
+        fl_free(b4);
+        return 1;
+    }
+    var lk = 0 - 1;
+    if (_par_eq(fp, fl, "update_viscoelastic") == 1) { lk = 0; }
+    if (_par_eq(fp, fl, "update_heat") == 1) { lk = 1; }
+    if (_par_eq(fp, fl, "apply_delta_sph") == 1) { lk = 2; }
+    if (_par_eq(fp, fl, "apply_implicit_viscosity") == 1) { lk = 3; }
+    if (_par_eq(fp, fl, "compute_gradient_corrections") == 1) { lk = 4; }
+    if (lk >= 0) {
+        var b5 = _par_tr_block(side);
+        var ps5: *PvFluidParticle = _pv_as_particles(b5);
+        var lw[32];
+        _par_tr_lists(ps5, n, 0.05, _par_in(1), &lw);
+        var o = load64(&lw);
+        var no = load64(&lw + 8);
+        var x = load64(&lw + 16);
+        var nx = load64(&lw + 24);
+        var zf: f64 = 1.0;
+        if (_par_in(2) == 1) { zf = 0.0; }
+        if (lk == 0) {
+            var ve: PvViscoelasticConfig = PvViscoelasticConfig_new(1000.0 * zf, 0.1);
+            var r0 = update_viscoelastic(ps5, n, o, no, x, nx, 0.05, &ve, 0.001);
+        } elif (lk == 1) {
+            var hc: PvHeatConfig = PvHeatConfig_new(0.1 * zf);
+            var r1 = update_heat(ps5, n, o, no, x, nx, 0.05, &hc, 0.001);
+        } elif (lk == 2) {
+            var r2 = apply_delta_sph(ps5, n, o, no, x, nx, 0.05, 10.0, 0.1 * zf, 0.001);
+        } elif (lk == 3) {
+            var r3 = apply_implicit_viscosity(ps5, n, o, no, x, nx, 0.05, 0.001 * zf, 0.001, 2);
+        } else {
+            var cp, cn = compute_gradient_corrections(ps5, n, o, no, x, nx, 0.05 * zf);
+            if (cp != 0) { fl_free(cp); }
+        }
+        fl_free(x);
+        fl_free(o);
+        fl_free(b5);
+        return 1;
+    }
+    var b6 = _par_tr_block(side);
+    var ps6: *PvFluidParticle = _pv_as_particles(b6);
+    var done = 1;
+    if (_par_eq(fp, fl, "update_phase_change") == 1) {
+        var pc: PvPhaseChangeConfig = PvPhaseChangeConfig_water_ice(0, 1);
+        update_phase_change(ps6, n, &pc, 0.001);
+    } elif (_par_eq(fp, fl, "update_combustion") == 1) {
+        var cc: PvCombustionConfig = PvCombustionConfig_default();
+        update_combustion(ps6, n, &cc, 0.001);
+    } elif (_par_eq(fp, fl, "update_reaction") == 1) {
+        var rc: PvCombustionConfig = PvCombustionConfig_default();
+        update_reaction(ps6, n, &rc, 0.001);
+    } elif (_par_eq(fp, fl, "generate_secondary_particles") == 1) {
+        var gp, gn = generate_secondary_particles(ps6, n, 0.0, 1.0);
+        if (gp != 0) { fl_free(gp); }
+    } elif (_par_eq(fp, fl, "apply_contact_angle") == 1) {
+        if (_par_in(1) == 0) { water.smoothing_radius = 0.0; }
+        apply_contact_angle(ps6, n, &water, 1.0, 0.07);
+    } elif (_par_eq(fp, fl, "sort_by_zorder") == 1) {
+        var zr = sort_by_zorder(ps6, n, _par_in(1));
+    } else {
+        done = 0;
+    }
+    fl_free(b6);
+    if (done == 1) { return 1; }
+    if (_par_eq(fp, fl, "split_particle") == 1 || _par_eq(fp, fl, "merge_particles") == 1) {
+        var b7 = _par_tr_block(2);
+        var ps7: *PvFluidParticle = _pv_as_particles(b7);
+        if (_par_eq(fp, fl, "split_particle") == 1) {
+            var sp, sn = split_particle(ps7, _par_in(0), 0.01);
+            if (sp != 0) { fl_free(sp); }
+        } else {
+            var mq: PvFluidParticle = merge_particles(ps7, ps7 + 1);
+        }
+        fl_free(b7);
+        return 1;
+    }
+    return 0;
+}
+
+# Runs trace scenario `fp` (its name after `trace:`): 1, 0 for one the port doesn't build, -1 for no memory.
+fn _par_trace_run(fp, fl): i64 {
+    var t = 0;
+    var v = 0;
+    var sw_case = _par_eq(fp, fl, "ShallowWater::step") + _par_eq(fp, fl, "ShallowWater::add_disturbance");
+    sw_case = sw_case + _par_eq(fp, fl, "update_sediment");
+    if (sw_case == 1) {
+        var sw: PvShallowWater;
+        t, v = PvShallowWater_new(_par_in(0), _par_in(1), 0.1, 1.0, &sw);
+        if (is_err_result(t) == 1) { return 1; }
+        if (_par_eq(fp, fl, "ShallowWater::step") == 1) {
+            var st, sv = sw.step(_par_in(2));
+        } elif (_par_eq(fp, fl, "update_sediment") == 1) {
+            var len = _par_in(2);
+            var c = _par_zeros(len);
+            var cfg: PvSedimentConfig = PvSedimentConfig_default();
+            update_sediment(&sw, c, len, &cfg, _par_in(3));
+            fl_free(c);
+        } else {
+            sw.add_disturbance(0.2, 0.2, _par_in(2), 0.1);
+        }
+        PvShallowWater_drop(&sw);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "VofField::advect") == 1) {
+        var vf: PvVofField;
+        t, v = PvVofField_new(_par_in(0), _par_in(1), 0.1, &vf);
+        if (is_err_result(t) == 1) { return 1; }
+        var vl = _par_in(3);
+        var z = _par_zeros(vl);
+        var at, av = vf.advect(z, vl, z, vl, _par_in(2));
+        fl_free(z);
+        PvVofField_drop(&vf);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "PhaseField::step") == 1) {
+        var pf: PvPhaseField;
+        t, v = PvPhaseField_new(_par_in(0), _par_in(1), 0.1, &pf);
+        if (is_err_result(t) == 1) { return 1; }
+        for (var k = 0; k < pf.phi.len; k = k + 1) { store64(pf.phi.data + k * 8, _par_in(3)); }
+        var pt, pv = pf.step(0, 0, 0, 0, _par_in(2));
+        PvPhaseField_drop(&pf);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "MpmSolver::step") == 1) {
+        var ms: PvMpmSolver;
+        t, v = PvMpmSolver_new(8, 8, 0.1, &ms);
+        if (is_err_result(t) == 1) { return 1; }
+        var n = _par_in(0);
+        var nm = _par_in(1);
+        var ps: *PvFluidParticle = _pv_as_particles(fl_alloc((n + 1) * sizeof(PvFluidParticle)));
+        var mp: *PvMpmParticle = _pv_as_mpm_particles(fl_alloc((nm + 1) * sizeof(PvMpmParticle)));
+        for (var a = 0; a < n; a = a + 1) {
+            var x: f64 = 0.3 + 0.05 * f64_from(a);
+            var q: PvFluidParticle = PvFluidParticle_new_2d(x, 0.4, 0.01);
+            var d: *PvFluidParticle = ps + a;
+            *d = q;
+        }
+        var law: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1000.0, 0.0);
+        for (var b = 0; b < nm; b = b + 1) {
+            var r: PvMpmParticle = PvMpmParticle_new(law, 0.0025);
+            var e: *PvMpmParticle = mp + b;
+            *e = r;
+        }
+        var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+        var mt, mv = ms.step(ps, n, mp, nm, g, _par_in(2));
+        fl_free(mp);
+        fl_free(ps);
+        PvMpmSolver_drop(&ms);
+        return 1;
+    }
+    if (_par_trace_coupling(fp, fl) == 1) { return 1; }
+    if (_par_trace_grid(fp, fl) == 1) { return 1; }
+    if (_par_trace_sph(fp, fl) == 1) { return 1; }
+    if (_par_eq(fp, fl, "ParticleArena::free") == 1) {
+        var ar: *PvParticleArena = PvParticleArena_new(_par_in(0));
+        var br: *PvParticleArena = PvParticleArena_new(1000);
+        if (ar == 0 || br == 0) { return 0 - 1; }
+        var issued = fl_alloc(64 * 24);
+        var ni = 0;
+        var h: PvArenaHandle;
+        for (var k2 = 1; k2 + 1 < _par_in_n; k2 = k2 + 2) {
+            var code = _par_in(k2);
+            var arg = _par_in(k2 + 1);
+            if (code == 0) {
+                if (ar.alloc(arg, &h) == 1 && ni < 64) {
+                    memcpy(issued + ni * 24, &h, 24);
+                    ni = ni + 1;
+                }
+            } elif (code == 1) {
+                if (ni > 0) {
+                    var hk: PvArenaHandle;
+                    memcpy(&hk, issued + (arg % ni) * 24, 24);
+                    ar.free(hk);
+                }
+            } elif (code == 2) {
+                var cc = ar.compact();
+            } else {
+                if (br.alloc(arg, &h) == 1) { ar.free(h); }
+            }
+        }
+        fl_free(issued);
+        PvParticleArena_drop(br);
+        PvParticleArena_drop(ar);
+        return 1;
+    }
+    return 0;
+}
+
+# The logging rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
+fn _par_logging(fp, fl): i64 {
+    if (fl > 6 && memeq(fp, "trace:", 6) == 1) {
+        _par_trace_begin();
+        var r = _par_trace_run(fp + 6, fl - 6);
+        _par_trace_end();
+        return r;
+    }
+    if (_par_eq(fp, fl, "init_with_level") == 1) {
+        var has = 0;
+        var env = "";
+        if (load64(_par_in_k) == 115) {
+            has = 1;
+            env = _par_in_cstr(0);
+            if (env == 0) { return 0 - 1; }
+        }
+        var dflt = _par_in_cstr(1);
+        if (dflt == 0) { return 0 - 1; }
+        var lv[64];
+        _pv_log_filter(env, strlen(env), has, dflt, strlen(dflt), &lv);
+        for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _par_got_i(load64(&lv + t * 8)); }
+        return 1;
+    }
+    return 0;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
     if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
+    if (_par_eq(mp, ml, "ai") == 1) { return _par_ai(fp, fl); }
+    if (_par_eq(mp, ml, "logging") == 1) { return _par_logging(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
     if (_par_eq(mp, ml, "compute") == 1) { return _par_compute(fp, fl); }
     if (_par_eq(mp, ml, "coupling") == 1) { return _par_coupling(fp, fl); }

@@ -505,13 +505,17 @@ impl PvMpmSolver {
     # Ok(0). Mirrors `MpmSolver::step`.
     #must_use
     fn step(self, ps: *PvFluidParticle, n, mpm: *PvMpmParticle, nm, gravity: PvVec3, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (n != nm) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var trace = _pv_span(_PV_LOG_MPM, "mpm::step", "n", n, 0, 0, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (n != nm) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         for (var c = 0; c < nm; c = c + 1) {
             var mc: *PvMpmParticle = mpm + c;
             var vt, vv = constitutive_model_validate(_pv_mpm_model(mc));
-            if (is_err_result(vt) == 1) { return Err(vv); }
-            if (_pv_is_finite(mc.volume_0) == 0 || mc.volume_0 <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+            if (is_err_result(vt) == 1) { _pv_span_end(trace); return Err(vv); }
+            if (_pv_is_finite(mc.volume_0) == 0 || mc.volume_0 <= 0.0) {
+                _pv_span_end(trace);
+                return Err(PV_ERR_INVALID_PARAMETER);
+            }
         }
         var nx = self.nx;
         var ny = self.ny;
@@ -749,6 +753,6 @@ impl PvMpmSolver {
             pr.velocity.x = vx2;
             pr.velocity.y = vy2;
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

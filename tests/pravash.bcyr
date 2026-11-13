@@ -2101,6 +2101,102 @@ fn bench_compute_a() {
     return 0;
 }
 
+# logging_b/* and ai_b/*: against scripts/probes/rust/src/bin/bench_logging_b.rs (bodies in its header). The `off`
+# rows run as a consumer that never turns tracing on does: no pravash init, sakshi at INFO (and at ERROR for the
+# warning, which INFO would print).
+
+# A sakshi hook that keeps nothing.
+fn _bench_null_hook(ts, level, category, msg, msg_len, sixth): i64 {
+    return 0;
+}
+
+# The logging and ai rows.
+fn bench_logging_b() {
+    var b = bench_new("logging_b/span_off");
+    bench_batch_start(b);
+    for (var k = 0; k < NS; k = k + 1) {
+        var t = _pv_span(_PV_LOG_SPH, "sph::step", "n", k, 0, 0, 0, 0);
+        _pv_span_end(t);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    var h = sakshi_set_emit_hook(&_bench_null_hook);
+    for (var tg = 0; tg < _PV_LOG_TARGETS; tg = tg + 1) { _pv_log_levels[tg] = _PV_LOG_TRACE; }
+    _pv_log_filtered = 1;
+    var l = sakshi_set_level(SK_TRACE);
+    b = bench_new("logging_b/span_on");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var t2 = _pv_span(_PV_LOG_SPH, "sph::step", "n", k, 0, 0, 0, 0);
+        _pv_span_end(t2);
+        g_sink = g_sink ^ t2;
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    var c = sakshi_clear_emit_hook();
+    _pv_log_filtered = 0;
+    var l2 = sakshi_set_level(SK_INFO);
+
+    # A warning a consumer has silenced (sakshi at ERROR; sakshi's default INFO would print it to stderr).
+    var l3 = sakshi_set_level(SK_ERROR);
+    b = bench_new("logging_b/warn_off");
+    bench_batch_start(b);
+    for (var k = 0; k < NS; k = k + 1) {
+        _pv_warn(_PV_LOG_SPH, "invalid neighbor lists ignored", "n", k, 0, 0, 0, 0);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    var l4 = sakshi_set_level(SK_INFO);
+
+    var env = "pravash::sph=trace,pravash=warn,info";
+    var en = strlen(env);
+    var lv[64];
+    b = bench_new("logging_b/filter_parse");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var r = _pv_log_filter(env, en, 1, "info", 4, &lv);
+        g_sink = g_sink ^ load64(&lv);
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+
+    var doc = "{\"endpoint\":\"https://daimon.example:8090/v1\",\"api_key\":\"sk-0123456789abcdef\"}";
+    var dn = strlen(doc);
+    var dc: PvDaimonConfig;
+    b = bench_new("ai_b/daimon_read");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var rt, rv = PvDaimonConfig_from_json(doc, dn, &dc);
+        g_sink = g_sink ^ dc.endpoint_len;
+        PvDaimonConfig_drop(&dc);
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    var ft, fv = PvDaimonConfig_from_json(doc, dn, &dc);
+    b = bench_new("ai_b/daimon_write");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var sb = str_builder_new();
+        var w = dc.to_json(sb);
+        g_sink = g_sink ^ w;
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    b = bench_new("ai_b/daimon_debug");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var sd = str_builder_new();
+        var d = dc.debug(sd, 0);
+        g_sink = g_sink ^ d;
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    PvDaimonConfig_drop(&dc);
+    return 0;
+}
+
 # Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
@@ -2133,6 +2229,7 @@ fn main(): i64 {
     bench_coupling_b();
     bench_mpm_c();
     bench_compute_a();
+    bench_logging_b();
     return 0;
 }
 

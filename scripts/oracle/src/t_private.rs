@@ -77,6 +77,18 @@ fn sources() -> Vec<Source> {
             file: "mpm.rs",
             excused: &[],
         },
+        Source {
+            file: "compute.rs",
+            excused: &[],
+        },
+        Source {
+            file: "logging.rs",
+            excused: &[],
+        },
+        Source {
+            file: "ai.rs",
+            excused: &[],
+        },
     ]
 }
 

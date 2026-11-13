@@ -1733,3 +1733,181 @@ fn PvShallowKernelParams_from_json(buf, len, out: *PvShallowKernelParams): Resul
     out.dry_threshold = e;
     return Ok(0);
 }
+
+# ── DaimonConfig, HooshConfig (M7 part b) ────────────────────────────────────────────
+# serde's derive for the two configs (src/ai.cyr): `{"endpoint":"…","api_key":"…"|null}` and `{"endpoint":"…"}`. A
+# missing or null `api_key` reads as None in the object form, as serde reads an Option; the sequence form needs every
+# element. Strings are UTF-8 with serde_json's escapes, which bayan decodes as serde_json does (a lone surrogate
+# either way is refused by both). Two serde_json refusals bayan passes through are checked on the text first (bayan
+# issue 2026-11-11-json-strings-accept-raw-control-bytes-and-invalid-utf8): a raw byte below 0x20 inside a string, and
+# bytes that are not UTF-8 (serde_json's `from_slice`; its `from_str` takes a `&str`, valid by type).
+
+# Appends the n bytes at p: 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_jw_n(sb, p, n): i64 {
+    if (n <= 0) { return 0; }
+    var t[16];
+    store64(&t, p);
+    store64(&t + 8, n);
+    if (str_builder_add_a(default_alloc(), sb, &t) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Appends the n bytes at p as serde_json writes a string: quoted; `"` and `\` escaped; \b \f \n \r \t named; the other
+# bytes below 0x20 as \u00xx, lowercase; every other byte as it is. 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_jw_str(sb, p, n): i64 {
+    var rc = _pv_jw(sb, "\"");
+    var run = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(p + i);
+        if (c == 34 || c == 92 || c < 32) {
+            rc = rc | _pv_jw_n(sb, p + run, i - run);
+            if (c == 34) {
+                rc = rc | _pv_jw(sb, "\\\"");
+            } elif (c == 92) {
+                rc = rc | _pv_jw(sb, "\\\\");
+            } elif (c == 8) {
+                rc = rc | _pv_jw(sb, "\\b");
+            } elif (c == 12) {
+                rc = rc | _pv_jw(sb, "\\f");
+            } elif (c == 10) {
+                rc = rc | _pv_jw(sb, "\\n");
+            } elif (c == 13) {
+                rc = rc | _pv_jw(sb, "\\r");
+            } elif (c == 9) {
+                rc = rc | _pv_jw(sb, "\\t");
+            } else {
+                var e[8];
+                store8(&e, 92);
+                store8(&e + 1, 117);
+                store8(&e + 2, 48);
+                store8(&e + 3, 48);
+                var hi = c >> 4;
+                var lo = c & 15;
+                store8(&e + 4, 48 + hi);
+                if (lo < 10) { store8(&e + 5, 48 + lo); } else { store8(&e + 5, 87 + lo); }
+                rc = rc | _pv_jw_n(sb, &e, 6);
+            }
+            run = i + 1;
+        }
+    }
+    rc = rc | _pv_jw_n(sb, p + run, n - run);
+    return rc | _pv_jw(sb, "\"");
+}
+
+# 1 when the n bytes at p are UTF-8 (strict: no overlong form, surrogate or code point past U+10FFFF) and no string
+# in them holds a raw byte below 0x20; else 0.
+#must_use
+fn _pv_jr_text_ok(p, n): i64 {
+    var i = 0;
+    var instr = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if (c >= 128) {
+            var cp, len = _pv_utf8_next(p + i, n - i);
+            if (cp < 0) { return 0; }
+            i = i + len;
+        } elif (instr == 1 && c < 32) {
+            return 0;
+        } elif (instr == 1 && c == 92) {
+            # An escape: its byte is the parser's to check (`\"` keeps the string open).
+            i = i + 2;
+        } else {
+            if (c == 34) { instr = 1 - instr; }
+            i = i + 1;
+        }
+    }
+    return 1;
+}
+
+# A JSON string node's bytes into *w (pointer) and *(w + 8) (length): 1, or 0 for anything else.
+fn _pv_jr_str(v, w): i64 {
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_STR) { return 0; }
+    var s = bayan_json_v_str(v);
+    store64(w, str_data(s));
+    store64(w + 8, str_len(s));
+    return 1;
+}
+
+impl PvDaimonConfig {
+    # Appends the config as serde_json writes a `DaimonConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "endpoint", 1);
+        rc = rc | _pv_jw_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_jw_key(sb, "api_key", 0);
+        if (self.api_key == 0) {
+            rc = rc | _pv_jw(sb, "null");
+        } else {
+            rc = rc | _pv_jw_str(sb, self.api_key, self.api_key_len);
+        }
+        return rc | _pv_jw(sb, "}");
+    }
+}
+
+# Reads a `DaimonConfig` document into *out, which then owns copies of its strings (release them with
+# PvDaimonConfig_drop; *out's old strings are not released). Ok(0); Err(PV_ERR_DESERIALIZE), or
+# Err(PV_ERR_OUT_OF_MEMORY) when a copy can't be allocated, with *out untouched.
+#must_use
+fn PvDaimonConfig_from_json(buf, len, out: *PvDaimonConfig): Result {
+    if (_pv_jr_text_ok(buf, len) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 2);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[32];
+    if (_pv_jr_str(_pv_jr_at(v, f, 0, "endpoint"), &w) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var k = _pv_jr_at(v, f, 1, "api_key");
+    var has = 0;
+    if (k != 0 && bayan_json_v_tag(k) != JTAG_NULL) {
+        if (_pv_jr_str(k, &w + 16) == 0) { return Err(PV_ERR_DESERIALIZE); }
+        has = 1;
+    }
+    var ed = _pv_ai_copy(load64(&w), load64(&w + 8));
+    if (ed == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var kd = 0;
+    var kl = 0;
+    if (has == 1) {
+        kl = load64(&w + 24);
+        kd = _pv_ai_copy(load64(&w + 16), kl);
+        if (kd == 0) {
+            fl_free(ed);
+            return Err(PV_ERR_OUT_OF_MEMORY);
+        }
+    }
+    out.endpoint = ed;
+    out.endpoint_len = load64(&w + 8);
+    out.api_key = kd;
+    out.api_key_len = kl;
+    out.owned = _PV_AI_OWN_ENDPOINT | (has * _PV_AI_OWN_KEY);
+    return Ok(0);
+}
+
+impl PvHooshConfig {
+    # Appends the config as serde_json writes a `HooshConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "endpoint", 1);
+        rc = rc | _pv_jw_str(sb, self.endpoint, self.endpoint_len);
+        return rc | _pv_jw(sb, "}");
+    }
+}
+
+# Reads a `HooshConfig` document into *out, as PvDaimonConfig_from_json does.
+#must_use
+fn PvHooshConfig_from_json(buf, len, out: *PvHooshConfig): Result {
+    if (_pv_jr_text_ok(buf, len) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 1);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[16];
+    if (_pv_jr_str(_pv_jr_at(v, f, 0, "endpoint"), &w) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var ed = _pv_ai_copy(load64(&w), load64(&w + 8));
+    if (ed == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    out.endpoint = ed;
+    out.endpoint_len = load64(&w + 8);
+    out.owned = _PV_AI_OWN_ENDPOINT;
+    return Ok(0);
+}

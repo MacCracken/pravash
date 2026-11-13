@@ -1,0 +1,222 @@
+# logging.tcyr — the ported Rust test of rust-old/src/logging.rs (M7 part b), then Cyrius-only groups: the span and
+# event texts through a sakshi hook, the level gates (pravash's filter, and sakshi's level before any init), a full
+# span stack, the directive parser's corners, and the Trace Event file (ledger L11): written, read back, checked and
+# removed, under build/ (the trace goes to the working directory, as Rust's does).
+
+include "tests/lib.cyr"
+
+# What the hook saw: the last event's level and text, and every span enter's text.
+var seen_level = 0 - 1;
+var seen_text: u8[512];
+var seen_len = 0;
+var seen_enters = 0;
+var seen_exits = 0;
+
+# The sakshi emit hook: counts span enters (level 10) and exits (11), and keeps the last text and level.
+fn hook(ts, level, category, msg, msg_len, sixth): i64 {
+    if (level == 10) { seen_enters = seen_enters + 1; }
+    if (level == 11) { seen_exits = seen_exits + 1; }
+    seen_level = level;
+    var n = msg_len;
+    if (n > 511) { n = 511; }
+    memcpy(&seen_text, msg, n);
+    seen_len = n;
+    return 0;
+}
+
+# 1 when the hook's last text is exactly the C string w.
+fn seen_is(w): i64 {
+    if (seen_len != strlen(w)) { return 0; }
+    return memeq(&seen_text, w, seen_len);
+}
+
+# Every target at level l through pravash's filter.
+fn all_levels(l) {
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = l; }
+    _pv_log_filtered = 1;
+    return 0;
+}
+
+# 1 when the n bytes at p contain the C string w.
+fn has(p, n, w): i64 {
+    var m = strlen(w);
+    for (var i = 0; i + m <= n; i = i + 1) {
+        if (memeq(p + i, w, m) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# Rust's `#[cfg(test)] mod tests`.
+fn test_rust() {
+    test_group("init_does_not_panic");
+    assert_eq(logging_init(), 1, "the first init installs");
+    assert_eq(logging_init(), 0, "a second changes nothing (Rust's try_init)");
+    assert_eq(logging_init_with_level("trace", 5), 0, "nor does init_with_level after it");
+    # Back to a consumer's view for the groups below: no pravash filter, sakshi to stderr at INFO.
+    _pv_log_filtered = 0;
+    var o = sakshi_set_output_fd(2);
+    var l = sakshi_set_level(SK_INFO);
+    return 0;
+}
+
+# The span and event texts through the hook, the level gates and a full 16-deep stack.
+fn test_spans() {
+    test_group("logging_spans");
+    var h = sakshi_set_emit_hook(&hook);
+    all_levels(_PV_LOG_TRACE);
+    var t0 = _pv_span(_PV_LOG_SPH, "sph::merge_particles", 0, 0, 0, 0, 0, 0);
+    assert(t0 == 1 && seen_level == 10 && seen_is("sph::merge_particles") == 1, "no fields: the bare name");
+    _pv_span_end(t0);
+    assert(seen_level == 11 && seen_is("sph::merge_particles") == 1, "the exit names the same span");
+    var t3 = _pv_span(_PV_LOG_GRID, "grid::diffuse", "nx", 8, "ny", 6, "iterations", 20);
+    assert(seen_is("grid::diffuse{nx=8 ny=6 iterations=20}") == 1, "three fields as the fmt layer renders them");
+    var t1 = _pv_span(_PV_LOG_GRID, "grid::project", 0, 0, 0, 0, 0, 0);
+    assert(sakshi_span_depth() == 2, "nested");
+    _pv_span_end(t1);
+    _pv_span_end(t3);
+    assert(sakshi_span_depth() == 0 && seen_enters == 3 && seen_exits == 3, "balanced");
+    var tn = _pv_span(_PV_LOG_MPM, "mpm::step", "n", 0 - 7, 0, 0, 0, 0);
+    assert(seen_is("mpm::step{n=-7}") == 1, "a negative value keeps its sign");
+    _pv_span_end(tn);
+    var long[160];
+    memset(&long, 97, 150);
+    store8(&long + 150, 0);
+    var tl = _pv_span(_PV_LOG_SPH, &long, "n", 1, 0, 0, 0, 0);
+    assert(tl == 1 && seen_len == 127, "a text past the slot is cut at 127 bytes");
+    _pv_span_end(tl);
+
+    test_group("logging_span_stack");
+    for (var k = 0; k < 16; k = k + 1) { var e = sakshi_span_enter("x", 1); }
+    var tf = _pv_span(_PV_LOG_SPH, "sph::step", "n", 1, 0, 0, 0, 0);
+    assert(tf == 0 && sakshi_span_depth() == 16, "a full stack: not entered, so nothing to exit");
+    _pv_span_end(tf);
+    assert_eq(sakshi_span_depth(), 16, "and nothing exited");
+    for (var k2 = 0; k2 < 16; k2 = k2 + 1) { var x = sakshi_span_exit(); }
+
+    test_group("logging_events");
+    _pv_warn(_PV_LOG_COUPLING, "particle_level_set: size mismatch ignored", "nx", 4, "ny", 3, "len", 11);
+    assert(seen_level == SK_WARN, "a WARN event");
+    assert(seen_is("pravash::coupling: particle_level_set: size mismatch ignored nx=4 ny=3 len=11") == 1,
+      "target, message, fields");
+    _pv_warn(_PV_LOG_COMMON, "plain", 0, 0, 0, 0, 0, 0);
+    assert(seen_is("pravash::common: plain") == 1, "no fields");
+
+    test_group("logging_levels");
+    all_levels(_PV_LOG_WARN);
+    seen_level = 0 - 1;
+    var tw = _pv_span(_PV_LOG_SPH, "sph::step", 0, 0, 0, 0, 0, 0);
+    assert(tw == 0 && seen_level == 0 - 1, "WARN enables no TRACE span");
+    _pv_warn(_PV_LOG_SPH, "w", 0, 0, 0, 0, 0, 0);
+    assert(seen_level == SK_WARN, "but the WARN event");
+    _pv_log_levels[_PV_LOG_SPH] = 0;
+    seen_level = 0 - 1;
+    _pv_warn(_PV_LOG_SPH, "w", 0, 0, 0, 0, 0, 0);
+    _pv_warn(_PV_LOG_GRID, "g", 0, 0, 0, 0, 0, 0);
+    assert(seen_level == SK_WARN && seen_is("pravash::grid: g") == 1, "per target: sph off, grid still on");
+    _pv_log_filtered = 0;
+    var l1 = sakshi_set_level(SK_ERROR);
+    seen_level = 0 - 1;
+    _pv_warn(_PV_LOG_SPH, "w", 0, 0, 0, 0, 0, 0);
+    assert(seen_level == 0 - 1, "before any init, sakshi's level decides: ERROR drops a WARN");
+    var l2 = sakshi_set_level(SK_TRACE);
+    var tt = _pv_span(_PV_LOG_SPH, "sph::step", 0, 0, 0, 0, 0, 0);
+    assert(tt == 1, "and TRACE enters spans");
+    _pv_span_end(tt);
+    var l3 = sakshi_set_level(SK_INFO);
+    var c = sakshi_clear_emit_hook();
+    return 0;
+}
+
+# The directive parser's corners: level names and numbers, targets and prefixes, the span and field forms, the
+# whitespace quirk, and the refusals.
+fn test_filter() {
+    test_group("logging_filter_parser");
+    assert(_pv_log_parse_level("+5", 2) == 5 && _pv_log_parse_level("005", 3) == 5, "+ and leading zeros");
+    assert(_pv_log_parse_level("6", 1) == 0 - 1 && _pv_log_parse_level("+", 1) == 0 - 1, "6 and a bare + refused");
+    assert(_pv_log_parse_level("", 0) == 1 && _pv_log_parse_level("OfF", 3) == 0, "\"\" is error; names in any case");
+    assert(_pv_log_parse_level("99999999999999999999", 20) == 0 - 1, "a huge number refused, no overflow");
+    var w[24];
+    assert(_pv_log_directive("pravash=", 8, &w) == 0 && load64(&w) == 5 && load64(&w + 16) == 7,
+      "`target=`: the target at trace");
+    assert(_pv_log_directive("  a=info", 8, &w) == 0 - 1, "the slicing quirk: `  a=info` reads `a=info` as a level");
+    assert(_pv_log_directive("[s]", 3, &w) == 1 && _pv_log_directive("t[{f}]=1", 8, &w) == 1, "span and field forms");
+    var e1 = _pv_log_directive("t[{}]", 5, &w);
+    var e2 = _pv_log_directive("t[x]y", 5, &w);
+    assert(e1 == 0 - 1 && e2 == 0 - 1, "and their errors");
+    var lv[64];
+    var env = "pravash::s=debug,pravash::sph=trace,pravash::sph=error";
+    _pv_log_filter(env, strlen(env), 1, "info", 4, &lv);
+    var lsph = load64(&lv + _PV_LOG_SPH * 8);
+    var lsw = load64(&lv + _PV_LOG_SHALLOW * 8);
+    assert(lsph == 1 && lsw == 4, "longest prefix; last equal wins");
+    assert(load64(&lv + _PV_LOG_GRID * 8) == 0, "no directive for grid: off");
+    _pv_log_filter("x!", 2, 1, "warn", 4, &lv);
+    assert(load64(&lv) == 0, "`x!` is a valid target: grid and the rest off, no fallback");
+    _pv_log_filter("pravash==", 9, 1, "warn", 4, &lv);
+    assert(load64(&lv) == 2, "`pravash==`: its level `=` doesn't parse, so the default");
+    return 0;
+}
+
+# The Trace Event file under build/: written, read back entry by entry, removed; empty after an earlier init.
+fn test_trace_file() {
+    test_group("logging_trace_file");
+    var m = sys_mkdir("build", 493);
+    assert_eq(sys_chdir("build"), 0, "in build/");
+    var g: PvFlushGuard;
+    _pv_log_init_done = 0;
+    assert_eq(logging_init_profiling(&g), 1, "the trace started");
+    assert(g.active == 1 && g.fd >= 0, "and its writer installed");
+    var sw: PvShallowWater;
+    var st, sv = PvShallowWater_new(3, 3, 0.1, 1.0, &sw);
+    var s2, v2 = sw.step(0.001);
+    PvShallowWater_drop(&sw);
+    _pv_warn(_PV_LOG_SPH, "phase index out of bounds, falling back to phase 0", "particles", 2, "available", 1, 0, 0);
+    g.flush();
+    PvFlushGuard_drop(&g);
+    assert(g.fd < 0 && g.active == 0, "closed");
+    var path = _pv_trace_path();
+    assert(strlen(path) > 11 && memeq(path, "trace-", 6) == 1, "trace-<µs>.json");
+    var buf = fl_alloc(65536);
+    var n = file_read_all(path, buf, 65535);
+    assert(n > 0, "read back");
+    var head = "[\n{\"args\":{\"name\":\"main\"},\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1},\n";
+    assert(memeq(buf, head, strlen(head)) == 1, "the main thread's name first");
+    var b1 = "{\"args\":{\"nx\":\"3\",\"ny\":\"3\"},\"cat\":\"pravash::shallow\",";
+    var b2 = "\"name\":\"shallow::step\",\"ph\":\"B\",\"pid\":1,\"tid\":1,\"ts\":";
+    assert(has(buf, n, b1) == 1 && has(buf, n, b2) == 1, "the step's B entry, its fields as string args");
+    assert(has(buf, n, "\"name\":\"shallow::step\",\"ph\":\"E\"") == 1, "and its E entry");
+    var i1 = "{\"args\":{\"message\":\"phase index out of bounds, falling back to phase 0\",";
+    var i2 = "\"particles\":\"2\",\"available\":\"1\"},\"cat\":\"pravash::sph\",";
+    var i3 = "\"name\":\"event pravash::sph\",\"ph\":\"i\",\"pid\":1,\"s\":\"t\",\"tid\":1,\"ts\":";
+    var ok_i = has(buf, n, i1) & has(buf, n, i2) & has(buf, n, i3);
+    assert(ok_i == 1, "the event: message and fields, scope t");
+    assert(n >= 2 && load8(buf + n - 2) == 10 && load8(buf + n - 1) == 93, "ends `\\n]`");
+    var del = sys_unlink(path);
+    var t0 = _pv_span(_PV_LOG_SHALLOW, "shallow::step", 0, 0, 0, 0, 0, 0);
+    assert(t0 == 0, "after the guard, pravash traces nothing");
+    assert_eq(logging_init(), 0, "and init_profiling counted as the init");
+    var g2: PvFlushGuard;
+    assert_eq(logging_init_profiling(&g2), 1, "a second trace file");
+    assert(g2.active == 0, "written empty: a subscriber was already set");
+    PvFlushGuard_drop(&g2);
+    var n2 = file_read_all(_pv_trace_path(), buf, 65535);
+    assert(n2 == 4 && memeq(buf, "[\n\n]", 4) == 1, "`[\\n\\n]`");
+    var del2 = sys_unlink(_pv_trace_path());
+    fl_free(buf);
+    var back = sys_chdir("..");
+    return 0;
+}
+
+# Runs the logging tests.
+fn main() {
+    alloc_init();
+    test_rust();
+    test_spans();
+    test_filter();
+    test_trace_file();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

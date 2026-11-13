@@ -228,6 +228,7 @@ impl PvShallowWater {
     # rises by amplitude·(1 − d/radius)². Nothing for radius ≤ 0. Mirrors `add_disturbance`.
     fn add_disturbance(self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
         if (radius <= 0.0) { return 0; }
+        var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::disturbance", 0, 0, 0, 0, 0, 0);
         var r2: f64 = radius * radius;
         var inv_radius: f64 = 1.0 / radius;
         var dx: f64 = self.dx;
@@ -246,7 +247,7 @@ impl PvShallowWater {
                 }
             }
         }
-        return 0;
+        _pv_span_end(trace); return 0;
     }
 
     # Σ max(η − z, 0)·dx² over every cell the two fields share, the boundary ring included (its cells are ghost
@@ -370,14 +371,18 @@ fn PvSedimentConfig_default(): PvSedimentConfig {
 # more than is suspended. Nothing happens for a non-finite or non-positive dt, a grid under 3 × 3, or a field or
 # concentration slice shorter than nx·ny. Mirrors `update_sediment` (Rust's `&mut [f64]` is the pointer and count).
 fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedimentConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::sediment", "nx", sw.nx, "ny", sw.ny, 0, 0);
     var nx = sw.nx;
     var ny = sw.ny;
-    if (nx < 3 || ny < 3) { return 0; }
-    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+    if (nx < 3 || ny < 3) { _pv_span_end(trace); return 0; }
+    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { _pv_span_end(trace); return 0; }
     var n = nx * ny;
-    if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
-    if (conc_len < n || sw.height.len < n || sw.ground.len < n || sw.vx.len < n || sw.vy.len < n) { return 0; }
-    if (sw.manning_n.len < n) { return 0; }
+    if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return 0; }
+    if (conc_len < n || sw.height.len < n || sw.ground.len < n || sw.vx.len < n || sw.vy.len < n) {
+        _pv_span_end(trace);
+        return 0;
+    }
+    if (sw.manning_n.len < n) { _pv_span_end(trace); return 0; }
     var g: f64 = sw.gravity;
     var rho_s: f64 = config.sediment_density;
     var rho_w: f64 = config.water_density;
@@ -428,7 +433,7 @@ fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedi
             store64(concentration + i * 8, _pv_bits(cn));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── the step (M2 part 2) ────────────────────────────────────────────────────────────
@@ -536,9 +541,10 @@ impl PvShallowWater {
     # PV_ERR_DIVERGED when a height or velocity comes out non-finite (the state then holds the step). Mirrors `step`.
     #must_use
     fn step(self, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::step", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var vt, vv = self._validate_state();
-        if (is_err_result(vt) == 1) { return Err(vv); }
+        if (is_err_result(vt) == 1) { _pv_span_end(trace); return Err(vv); }
         var size = vv;
         var nx = self.nx;
         var ny = self.ny;
@@ -556,7 +562,7 @@ impl PvShallowWater {
         ok = ok & self.scratch_vy.resize(size, zw);
         ok = ok & self.scratch_h.resize(size, zw);
         ok = ok & self.scratch_lap.resize(size, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
 
         var hp = self.height.data;
         var up = self.vx.data;
@@ -689,13 +695,13 @@ impl PvShallowWater {
             # 2a. The finite-volume update; 3a. dispersion on this step's velocity increment.
             self._riemann_update(dt);
             if (disp > 0.0) {
-                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+                if (self._apply_dispersion() == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
             }
         } else {
             # 2b. Dispersion first, so the filtered velocity drives the mass flux; 3b. continuity with
             #     face-averaged fluxes, walls (zero flux) on the boundary ring's faces.
             if (disp > 0.0) {
-                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+                if (self._apply_dispersion() == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
             }
             for (var y = 1; y < ny - 1; y = y + 1) {
                 for (var x = 1; x < nx - 1; x = x + 1) {
@@ -743,10 +749,10 @@ impl PvShallowWater {
             var b: f64 = load64(up + i * 8);
             var c: f64 = load64(vp + i * 8);
             if (_pv_is_finite(a) == 0 || _pv_is_finite(b) == 0 || _pv_is_finite(c) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 
     # The finite-volume update of (h, hu, hv) from the step's snapshot: well-balanced HLL fluxes on the four faces of

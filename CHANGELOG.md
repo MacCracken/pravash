@@ -3,6 +3,115 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **ai** (M7 part b): `src/ai.cyr`, the `ai.rs` surface. ADR 0002 #27.
+  - **`PvDaimonConfig` and `PvHooshConfig`** hold each string as bytes and a length, where a 0 API key is Rust's
+    `None`. Ownership bits say which strings the record copied.
+    - `_default()` points at static text and owns nothing.
+    - `set_endpoint` and `set_api_key` copy into the freelist and return 1, or 0 when the copy fails.
+    - `clear_api_key` and `_drop` release what the record owns.
+  - **`debug(sb, alternate)`** writes Rust's `{:?}` and `{:#?}` exactly, the API key as `Some("<redacted>")`.
+    `<str as Debug>`'s escapes come from a generated table, `src/str_debug_data.cyr`: 910 ranges read char by char
+    from rustc 1.99.1's core, Unicode 17.0.0 (`scripts/oracle/src/t_str_debug.rs`). Bytes that aren't UTF-8 are
+    written as U+FFFD.
+  - **The JSON codecs** live in `src/json.cyr`: serde_json's escaping on write, and serde's derive rules on read (a
+    missing or null API key is `None`). bayan accepts two things serde_json refuses: a raw control byte inside a
+    string, and bytes that aren't UTF-8. The port checks the text for both before the parse.
+- **logging** (M7 part b): `src/logging.cyr`, `logging.rs` and the crate's tracing on sakshi 2.5.10. ADR 0002 #28.
+  - **`logging_init`, `logging_init_with_level`, `logging_init_profiling`** are Rust's `init`, `init_with_level` and
+    `init_profiling`, renamed because the bundle shares one namespace. The first init wins and returns 1; later calls
+    return 0.
+    - Each of the 8 targets gets a level, decided as tracing-subscriber 0.3.23's `EnvFilter` decides a field-less
+      event outside a span.
+    - The filter transcribes EnvFilter's directive state machine, quirk included: it walks the trimmed directive but
+      slices the untrimmed one.
+    - `PRAVASH_LOG` parses strictly, the default leniently, as Rust does.
+  - **Every span and warning is ported.** Each of Rust's 60 `trace_span!` and 12 `warn!` has a counterpart at Rust's
+    point.
+    - A span, `_pv_span(target, name, fields…)`, enters the sakshi span `name{k=v …}` only when its target enables
+      TRACE.
+    - A warning, `_pv_warn`, is the sakshi WARN line `pravash::<module>: message k=v`.
+    - Every span closes explicitly before each return, inside a Rust block scope too. A `defer` cost the loops (see
+      Performance).
+  - **The trace file (stand-in, ledger L11).** sakshi has no Trace Event export, so `logging_init_profiling(guard)`
+    installs a sakshi emit hook. The hook writes tracing-chrome 0.7.2's `trace-<µs>.json` in the working directory.
+    `PvFlushGuard_drop` closes the file, clears the hook, turns every target off and restores sakshi's level. The
+    stand-in notes are appended to `sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md`.
+  - **Manifest:** `[deps] stdlib` adds `chrono`, which names the trace file, and `sakshi`. hisab 3.4.1, a test-scope
+    dependency, also declares a sakshi package, so `cyrius deps` warns that it refuses to overwrite the stdlib leaf.
+    The two copies are byte-identical. pravash's note is appended to
+    `hisab:docs/development/issues/2026-11-11-deps-sakshi-package-warns-every-consumer.md`.
+- **Parity:** two new golden modules, both class A, every row matching on the first replay.
+  - **`tests/golden/ai.tsv`** (seed 0x70_c0_0b) has 579 rows.
+    - Both defaults.
+    - 211 decodes: strings mixing every control character, Latin-1, combining marks, the format, separator,
+      private-use and unassigned classes and astral text. Also hand-written documents for each escape serde_json reads
+      or refuses, and for fields that are missing, null, duplicated, extra or the wrong type.
+    - serde_json's `to_string` and both Debug forms of every document that reads.
+  - **`tests/golden/logging.tsv`** has 251 rows.
+    - 99 filter rows: 63 `PRAVASH_LOG` values and unset, against 8 defaults.
+    - 152 trace rows over 37 traced calls. A capture subscriber on the oracle records the enters, exits and events.
+  - validate.py recomputes every `ai` row and every filter row. It checks the escape table against the stdlib's
+    Unicode 17.0.0 categories. For trace rows it checks the form: nesting, the declared fields and the targets.
+  - The instrumentation changed no other row's bits. The whole corpus replays, thread-count runs included: 17
+    modules, 57,674 ok; validate.py covers 58,405 rows with 0 failures.
+- **Tests:**
+  - `tests/ai.tcyr` (42 checks): both Rust tests, ownership, the escape table's edges, every malformed UTF-8 form and
+    the JSON text checks.
+  - `tests/logging.tcyr` (48 checks): Rust's `init_does_not_panic`, the span and event texts through a sakshi hook, the
+    level gates, a full 16-deep span stack, the parser's corners, and the trace file written under `build/`, read
+    back and removed.
+  - Surface parity: 461 items, 0 missing.
+- **Mutations of the port:** `ai` caught 14 of 16 on the first run, `logging` 15 of 19. The survivors were gaps:
+  - `ai`: the UTF-8 decoder's overlong and surrogate checks, which no Rust `&str` reaches. Cyrius-only tests close
+    them.
+  - `logging`: four scenarios were missing, now rows. They are a dynamic-only default, φ₀ between the clamp and the
+    divergence threshold, a phase equal to the phase count, and a diverging SPH step.
+  - validate.py: `ai` caught 6 of 7 and `logging` 2 of 4; the three that survive are equivalent.
+
+### Changed (Cyrius)
+- **Warnings print by default.** sakshi's default level is INFO, to stderr, so with no configuration pravash's
+  warnings print, where Rust with no subscriber prints nothing. Every library on sakshi behaves this way. A consumer
+  silences them with its own sakshi level (ADR 0002 #28).
+  The test suites that provoke warnings (parity and the common, coupling, grid and sph tests) set sakshi to ERROR,
+  as Rust's tests run with no subscriber. `tests/logging.tcyr` and the trace rows test the warnings themselves.
+- **Warnings earlier parts left out are now emitted** (ADR 0002 #14, #22, #23 amended):
+  - the phase field's divergence, once per step, with its cell count;
+  - the multiphase step's fallback for a phase past the phase count;
+  - the level set's size check;
+  - the SPH list functions' invalid neighbour lists.
+- **grid:** MacCormack's and BFECC's forward passes call a span-free `_pv_fg_advect_raw`, because Rust's run without
+  a span.
+- **Tooling:** `scripts/oracle/probe_tables.py` now accepts one resolver notice in its probe build: the sakshi leaf
+  warning that hisab's package causes. It matches the exact text, and every other error or warning line still
+  fails the probe.
+
+### Performance
+- **logging and ai** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M7 part b; pinned,
+  interleaved, against the Rust twin `bench_logging_b`):
+
+  | Bench | Rust | Cyrius | Cyrius / Rust |
+  |---|---|---|---|
+  | `span_off` | 1.56 ns | 12 ns | 7.7× |
+  | `span_on` (a hook that does nothing) | 17.3 ns | 285 ns | 16× |
+  | `warn_off` | 0.55 ns | 10 ns | 18× |
+  | `filter_parse` | 400 ns | 1.37 µs | 3.4× |
+  | `daimon_read` | 86 ns | 2.31 µs | 27× |
+  | `daimon_write` | 45 ns | 846 ns | 19× |
+  | `daimon_debug` | 208 ns | 0.88 µs | 4.2× |
+
+  - **The instrumentation is free on the steps it touched.** Pinned A/B against the uninstrumented code, best of two
+    interleaved rounds: the median step is 0.995× the old time and the worst 1.02×. The exception is
+    `sph_c/merge_particles`, which goes from 96 to 108 ns: a fixed 12 ns span check on a 100 ns function.
+  - **`defer` cost the loops.** The spans were first closed by a `defer`. That made `shallow_disturbance` 8–11%
+    slower, `shallow_step` about 4% and `flip_step/25` about 8%, and the cost grew with the work. Closing each span
+    explicitly before every return (195 returns over 50 functions) brought `add_disturbance` back to 0.998–1.014×. A
+    minimal repro showed no cost on a plain loop, so this isn't filed (port-parity §28).
+  - **The phase field's divergence count** first cost its step 6%. It now runs only past the clamp's ±1, at no cost
+    on the common path.
+  - **The Debug ASCII fast path:** printable ASCII other than `"` and `\` skips the decode and the table search.
+    `daimon_debug` went from 2.17 µs to 0.88 µs, with the same bytes.
+
+### Added (Cyrius)
 - **compute** (M7 part a): `src/compute.cyr` and `src/compute_ad.cyr`, the compute-backend surface of `compute.rs`.
   ADR 0002 #26.
   - **`PvPackedParticles`:** Rust's three `Vec<f32>` buffers are `PvF32Column`s, packed 4-byte singles a backend can

@@ -232,21 +232,36 @@ impl PvSphSolver {
     #must_use
     fn step_multiphase(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, phase_config: *PvMultiPhaseConfig):
     Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::step_multiphase", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
-        if (phase_config.phases.len / 3 == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
+        if (phase_config.phases.len / 3 == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
+        # One warning a step for the particles whose phase has no entry (they fall back to phase 0), as Rust's.
+        var nphases = phase_config.phases.len / 3;
+        var bad_phase = 0;
+        for (var bq = 0; bq < n; bq = bq + 1) {
+            var pb: *PvFluidParticle = ps + bq;
+            if (pb.phase >= nphases) { bad_phase = bad_phase + 1; }
+        }
+        if (bad_phase > 0) {
+            var msg = "phase index out of bounds, falling back to phase 0";
+            _pv_warn(_PV_LOG_SPH, msg, "particles", bad_phase, "available", nphases, 0, 0);
+        }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
@@ -254,6 +269,7 @@ impl PvSphSolver {
         var dens = self.densities.data;
 
         # The densities (serially, as Rust's), then each pressure by its phase's equation of state.
+        var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
         var dctx[40];
         _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
         _pv_sph_density_k(&dctx, 0, n);
@@ -270,7 +286,10 @@ impl PvSphSolver {
             *sq = *p;
         }
 
+        _pv_span_end(td);
+
         # The accelerations, from the snapshot (on the pool).
+        var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var it: f64 = phase_config.interface_tension;
@@ -298,11 +317,13 @@ impl PvSphSolver {
             var gy2: f64 = load64(acc + c * 24 + 8);
             var gz2: f64 = load64(acc + c * 24 + 16);
             if (_pv_is_finite(gx2) == 0 || _pv_is_finite(gy2) == 0 || _pv_is_finite(gz2) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(tf);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var w2: *PvFluidParticle = ps + c;
             w2.acceleration = PvVec3_new(gx2, gy2, gz2);
         }
+        _pv_span_end(tf);
 
         # Symplectic Euler, then the walls.
         var dt: f64 = config.dt;
@@ -319,6 +340,6 @@ impl PvSphSolver {
             pe.position.z = pe.position.z + (nvz * dt);
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

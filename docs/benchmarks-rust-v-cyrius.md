@@ -860,3 +860,62 @@ Hoisting the nine column pointers and writing through `*f32` / `load64` views:
 - **The autodiff gradient** reuses one tape, where Rust builds a tape and its two vectors per call.
 - **The parameter read** is bayan's tree build and the field lookups, as M1's JSON rows are (about 20×). The midpoint
   read adds 1.55 µs: the pre-order walk, the text scan and one bignum comparison (L15).
+
+## M7 part b: logging and ai (2026-11-12)
+
+Pinned to core 15, three interleaved runs (the medians below, ranges where they differ). Rust's criterion suite has no
+logging or ai group. The twin `scripts/probes/rust/src/bin/bench_logging_b.rs` and `tests/pravash.bcyr`'s
+`bench_logging_b` time the bodies its header lists:
+- a `sph::step` span with one field, entered and exited, with tracing off, and into a subscriber that enables
+  everything and does nothing. On the Cyrius side that is sakshi at TRACE with an emit hook that returns;
+- a warning a consumer has silenced. Rust has no subscriber; Cyrius sets sakshi to ERROR, because sakshi's default
+  INFO prints it;
+- the filter `pravash::sph=trace,pravash=warn,info`, parsed;
+- a `DaimonConfig`'s JSON read and write, and its `{:?}`.
+
+| Bench | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `logging_b/span_off` | 1.56–1.57 ns | 12 ns | 7.7× |
+| `logging_b/span_on` | 17.3–17.6 ns | 284–289 ns | 16× |
+| `logging_b/warn_off` | 0.55–0.75 ns | 10 ns | 18× |
+| `logging_b/filter_parse` | 390–411 ns | 1.35–1.41 µs | 3.4× |
+| `ai_b/daimon_read` | 85.8–86.3 ns | 2.29–2.32 µs | 27× |
+| `ai_b/daimon_write` | 45.2–46.8 ns | 843–857 ns | 19× |
+| `ai_b/daimon_debug` | 204–210 ns | 879–886 ns | 4.2× |
+
+**The instrumentation's cost on the steps** (pinned, interleaved A/B of the whole step suite, 69 rows, against the
+uninstrumented tree, best of two rounds each; every parity row unchanged):
+
+| Bench | Before | With `defer` | Explicit closes |
+|---|---|---|---|
+| `shallow_step/128x128` | 3.65–3.72 ms | 1.04× | 0.96× |
+| `shallow_disturbance/32x32` | 8.38–8.60 µs | 1.10× | 0.97× |
+| `shallow_disturbance/128x128` | 121.0–122.0 µs | 1.08× | 0.98× |
+| `flip_step/25_particles` | 18.3–18.9 µs | 1.08× | 0.99× |
+| `flip_step/225_particles` | 71.4–73.6 µs | 1.02× | 0.98× |
+| `phase_field_step/128x128` | 649–658 µs | 1.01× | 1.00× |
+| `solver_step/169_particles` | 236 µs | — | 1.02× |
+| `sph_c/merge_particles` | 93–96 ns | 1.16× | 1.13× |
+| all 69 rows, median | | | 0.995× |
+
+The "with `defer`" column is a run of 13 rows only, three rounds each.
+
+**Reading it.**
+- **A disabled span costs 12 ns**: two calls, the open's level check (sakshi's own level when no init ran) and
+  the close's test of its handle. Rust's `trace_span!` checks a callsite cache that is one static load when tracing
+  is off. On a step that is noise. On `merge_particles`, a 100 ns function, it is the 12 ns left after the `defer`
+  was removed.
+- **`defer` cost the loops, not the call.** With every span closed by a `defer`, `shallow_disturbance` was 8–11%
+  slower and `shallow_step` about 4%. The cost grew with the grid, which a fixed span check can't explain. Closing
+  each span explicitly before every return (195 over 50 functions) restored them. A minimal repro showed no cost on a
+  plain loop and about 2% on a loop calling an `#inline` helper. So it looks like a side effect of the frame layout,
+  and isn't filed until a repro shows it alone (port-parity §28).
+- **An enabled span** formats `name{k=v}` into its depth's slot and goes through sakshi's enter and exit, against
+  tracing's subscriber, which receives the fields unformatted. Tracing is off on the step path unless a consumer turns
+  it on.
+- **The filter parse** runs once per init.
+- **The `DaimonConfig` read** is bayan's tree build, the two text checks and two freelist copies. The other JSON rows
+  show the same ratio, about 25× (M1, M7 part a).
+- **The Debug ASCII fast path.** The first port decoded each code point and searched the escape table, which made
+  `daimon_debug` 2.15–2.17 µs. Printable ASCII other than `"` and `\` now skips both. It went to 879–886 ns, with the
+  same bytes: every ai row still matches and the 42 checks pass.

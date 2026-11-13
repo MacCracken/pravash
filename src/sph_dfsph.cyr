@@ -177,20 +177,24 @@ impl PvSphSolver {
     #must_use
     fn step_dfsph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
       max_error: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::dfsph", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.dfsph_alpha.resize(n, zw) & self.dfsph_kappa.resize(n, zw) & self.snapshot.resize(18 * n, 0);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
@@ -254,6 +258,7 @@ impl PvSphSolver {
         var done = 0;
         for (var it = 0; it < max_iterations; it = it + 1) {
             if (done == 0) {
+                var ti = _pv_span(_PV_LOG_SPH, "sph::dfsph_density", 0, 0, 0, 0, 0, 0);
                 var err_sum: f64 = 0.0;
                 for (var q = 0; q < n; q = q + 1) {
                     var pq: *PvFluidParticle = ps + q;
@@ -272,6 +277,7 @@ impl PvSphSolver {
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }
+                _pv_span_end(ti);
             }
         }
 
@@ -282,13 +288,14 @@ impl PvSphSolver {
             pe.position.y = pe.position.y + (pe.velocity.y * dt);
             pe.position.z = pe.position.z + (pe.velocity.z * dt);
         }
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_nb_build(g, ps, n, h) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         _pv_dfsph_density_alpha(self, ps, n, &kc);
 
         # The divergence solver.
         var done2 = 0;
         for (var it2 = 0; it2 < max_iterations; it2 = it2 + 1) {
             if (done2 == 0) {
+                var tj = _pv_span(_PV_LOG_SPH, "sph::dfsph_div", 0, 0, 0, 0, 0, 0);
                 var div_sum: f64 = 0.0;
                 for (var u = 0; u < n; u = u + 1) {
                     var ru: f64 = _pv_dfsph_density_rate(self, ps, &kc, u);
@@ -304,6 +311,7 @@ impl PvSphSolver {
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }
+                _pv_span_end(tj);
             }
         }
 
@@ -323,8 +331,8 @@ impl PvSphSolver {
                 bad = 1;
             }
         }
-        if (bad == 1) { return Err(PV_ERR_DIVERGED); }
+        if (bad == 1) { _pv_span_end(trace); return Err(PV_ERR_DIVERGED); }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

@@ -2134,3 +2134,94 @@ It covers 57,575 rows with 0 failures, in about 100 s.
   - the L15 pieces: the tie test at 1 + 2^-24, 2^-150, the overflow midpoint, f32::MAX and 1e39; the nudged rounding
     at both overflow edges; the decimal comparison (exponents, trailing zeros, the 800-digit sticky tail, the order
     bounds, the smallest subnormal); the integers; and the text locator over strings with escaped quotes.
+
+## 28. M7 part b: ai and logging (2026-11-12); M7 complete
+
+**`src/ai.cyr`** ports `ai.rs` (ADR 0002 #27): `PvDaimonConfig` and `PvHooshConfig`, each string as bytes and a length
+(a 0 key is None), with ownership bits, `_default()`, the setters and `_drop`, and `debug(sb, alternate)`, Rust's `{:?}`
+and `{:#?}`. `<str as Debug>`'s `\u{…}` set is `src/str_debug_data.cyr`, generated from rustc 1.99.1's core
+(`t_str_debug.rs`: every code point classified alone and after `a`, which agree everywhere; 910 ranges, Unicode
+17.0.0). Their JSON is in `src/json.cyr`. Two serde_json refusals that bayan passes through are checked on the text
+before the parse: a raw byte below 0x20 inside a string, and bytes that aren't UTF-8. bayan already refuses a lone
+surrogate either way, as serde_json does.
+
+**`src/logging.cyr`** ports `logging.rs` and carries the crate's tracing (ADR 0002 #28):
+- **Spans and events.** `_pv_span(target, name, fields…)` enters a sakshi span named `name{k=v …}` when its target
+  enables TRACE, and `_pv_span_end` exits it. `_pv_warn` emits the sakshi WARN line `pravash::<module>: message k=v`.
+  Every Rust `trace_span!` (60) and `warn!` (12) has its counterpart at Rust's point:
+  - spans in Rust block scopes close explicitly, before an error return inside the block too;
+  - the warnings earlier parts left out (phase field's divergence, the multiphase phase fallback, the level set's
+    size check, the list functions' invalid lists) are emitted;
+  - MacCormack's and BFECC's forward passes take a span-free `_pv_fg_advect_raw`, as Rust's run without one.
+- **The filter.** The per-target level the init sets is EnvFilter's for a field-less event outside a span. It is a
+  transcription of tracing-subscriber 0.3.23's directive state machine, with its quirk kept: it walks the trimmed
+  directive but slices the untrimmed one.
+- **The trace file** is tracing-chrome's shape through a sakshi hook (ledger L11).
+
+**A finding on the way: `defer` cost the loops.** The spans were first closed by a `defer` in each instrumented
+function. A pinned A/B against the uninstrumented code showed the median step unchanged, but `shallow_disturbance`
+8–11%, `shallow_step` about 4% and `flip_step/25` about 8% slower, growing with the work, which a fixed span cost can't
+explain. Closing the span explicitly instead restored `add_disturbance` (0.998–1.014× the old time, against
+1.08–1.11× with the `defer`). So every instrumented function now closes its span before each `return` (195 of them
+over 50 functions), with no `defer` left. A minimal repro showed no cost on a plain loop and about 2% on one calling
+an `#inline` helper, so it is likely a side effect of the frame layout and not filed. Separately, the phase field's
+divergence count first cost its step 6%; it now runs only past the clamp's ±1, at no cost on the common path.
+
+**The rows**, two new modules:
+- **`ai.tsv`** (seed 0x70_c0_0b): 579 rows, class A.
+  - Both defaults.
+  - 211 decodes: serde_json's text of configs whose strings mix printable ASCII, every control character, Latin-1,
+    combining marks, the format, separator, private-use and unassigned classes and astral text (16 picked strings, 40
+    seeded), and hand-written documents for each escape serde_json reads and each it refuses (a raw control
+    character, a lone surrogate either way, an unknown escape, a short `\u`), the sequence forms, and fields missing,
+    null, duplicated, extra and wrong-typed.
+  - For every document that reads, serde_json's `to_string` and both Debug forms.
+- **`logging.tsv`**: 251 rows, class A.
+  - 99 filter rows: 63 PRAVASH_LOG values (names in any case, 0–5 with `+` and leading zeros, targets and prefixes,
+    last-wins, empty pieces, the whitespace quirk, invalid, span and field forms) and unset, against 8 defaults
+    (lenient: an invalid directive dropped, `error` when none is left; a dynamic-only default leaves no fallback).
+  - 152 trace rows over 37 traced calls: each scenario run under a capture subscriber on the oracle (tracing-core's
+    `Subscriber`, recording enters, exits and events), from the arena's two warnings to the multigrid's nested
+    per-level sweeps and PCISPH's iteration spans, refusals and divergence included.
+
+**`validate.py`**:
+- recomputes every `ai` row (Python's json under serde's derive rules, serde_json's escaping, Rust's Debug);
+- checks the escape table against the stdlib's Unicode 17.0.0 categories, apart from Rust: all 956,567 code points
+  Rust's printable rule and Mn / Me decide are present, and the 65 others are Mc (61) and Lo (4), the Other_Grapheme_Extend
+  members the categories can't name;
+- recomputes every filter row through its own EnvFilter transcription;
+- checks every trace row's form (spans exited in nesting order, each name a pravash span with its declared fields,
+  each event a pravash warning under its target).
+
+It covers 58,405 rows with 0 failures.
+
+**Result:**
+- **The port.** Every `ai` row, every filter row and every trace row matched on the first replay. Adding the
+  instrumentation changed no other row's bits: the whole corpus replays, the thread-count runs included.
+- **The replay:** 17 modules, 0 failing | rows: 57,674 ok, 0 failed, 0 measured, 3 pending, 728 accepted (ADR 4: 131,
+  ADR 2: 597).
+- **Mutations of the port.** `ai`: 14 of 16 on the first run. The two survivors were the UTF-8 decoder's overlong and
+  surrogate checks, which no Rust `&str` can reach. Cyrius-only tests of every malformed form close them. `logging`:
+  15 of 19 on the first run. The four survivors were gaps in the scenarios, each closed by a row:
+  - a dynamic-only lenient default (no `error` fallback);
+  - φ₀ = 1.2, between a threshold of 1 and 1.5;
+  - a particle whose phase equals the phase count;
+  - a diverging SPH step, which shows a forces span left open on the divergence return.
+- **Mutations of the transcription.** `ai`: 6 of 7; dropping the missing-endpoint refusal is equivalent (a missing
+  endpoint is refused as not a string). `logging`: 2 of 4, the other two equivalent:
+  - LevelFilter's `""` is never reached through a directive;
+  - slicing the target from the trimmed string can't show: with leading whitespace the level slice always starts at
+    or before the `=`, so the directive fails either way.
+
+**Tests:**
+- `tests/ai.tcyr` (42 checks): both Rust tests, plus the layouts, ownership (the defaults own nothing; the setters
+  copy and release, by the freelist's LIFO reuse), the escape table's edges, every malformed UTF-8 form, both Debug
+  shapes, and the JSON text checks.
+- `tests/logging.tcyr` (48 checks): Rust's `init_does_not_panic`, plus the span and event texts through a sakshi
+  hook, the level gates (per target, and sakshi's level before any init), a full 16-deep stack, the parser's corners,
+  and the trace file: written under `build/`, read back, checked entry by entry, removed, and written empty when an
+  init came first.
+- **Quiet suites.** Once the warnings were emitted, sakshi's default printed 590 of them during `cyrius test`: the
+  refusal rows and tests provoke them on purpose. Rust's tests run with no subscriber and print none. So parity
+  and the common, coupling, grid and sph tests set sakshi to ERROR at their start. The trace rows set their own
+  level and restore it.

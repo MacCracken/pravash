@@ -488,6 +488,9 @@ fn test_serde() {
 # Runs the ported common tests.
 fn main() {
     alloc_init();
+    # Rust's tests run with no tracing subscriber, so the warnings the refusal tests provoke print nothing there;
+    # sakshi's default (INFO, to stderr) would print them. tests/logging.tcyr tests the warnings themselves.
+    var quiet = sakshi_set_level(SK_ERROR);
     test_materials();
     test_particles();
     test_configs();

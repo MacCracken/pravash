@@ -313,21 +313,25 @@ impl PvSphSolver {
     # aborts). Mirrors `step` (ADR 0002 #19).
     #must_use
     fn step(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::solver_step", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
         if (self.use_verlet != 0) { ok = ok & self.prev_accel.reserve(3 * n); }
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
@@ -335,6 +339,7 @@ impl PvSphSolver {
         var dens = self.densities.data;
 
         # The densities (on the pool), then the pressures.
+        var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
         var pool = _pv_sph_pool(self);
         var dctx[40];
         _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
@@ -351,7 +356,10 @@ impl PvSphSolver {
             *sq = *p;
         }
 
+        _pv_span_end(td);
+
         # The accelerations, from the snapshot, into the solver's buffer (on the pool).
+        var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var csf = 0;
@@ -374,11 +382,13 @@ impl PvSphSolver {
             var gy: f64 = load64(acc + c * 24 + 8);
             var gz: f64 = load64(acc + c * 24 + 16);
             if (_pv_is_finite(gx) == 0 || _pv_is_finite(gy) == 0 || _pv_is_finite(gz) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(tf);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var w: *PvFluidParticle = ps + c;
             w.acceleration = PvVec3_new(gx, gy, gz);
         }
+        _pv_span_end(tf);
 
         # Integrate.
         var dt: f64 = config.dt;
@@ -434,7 +444,7 @@ impl PvSphSolver {
             }
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 

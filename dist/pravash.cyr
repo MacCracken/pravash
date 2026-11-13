@@ -4,9 +4,13 @@
 # Do not edit -- rebuild with: cyrius distlib
 
 # Requires (compile-verified; the leaves of dist/pravash.deps):
+include "lib/syscalls.cyr"
+include "lib/sakshi.cyr"
 include "lib/thread.cyr"
 include "lib/string.cyr"
 include "lib/ganita.cyr"
+include "lib/io.cyr"
+include "lib/chrono.cyr"
 include "lib/freelist.cyr"
 include "lib/result.cyr"
 include "lib/fnptr.cyr"
@@ -4205,6 +4209,717 @@ fn _pv_fmod(x, y) {
     return sx | (mx >> (1 - ey));
 }
 
+# --- logging.cyr ---
+
+# logging.cyr — rust-old/src/logging.rs (M7 part b): pravash's tracing on sakshi, and the init helpers.
+#
+# Rust's pravash traces through `tracing`: a TRACE span on each operation (`sph::step{n=10}`) and a WARN event where an
+# input is ignored, under the targets `pravash::<module>`; `logging::init*` installs a subscriber. Here they go
+# through sakshi (ADR 0002 #28). A span is a sakshi span named as tracing's fmt layer renders one, `name{k=v k=v}`,
+# entered only when its target enables TRACE; an event is a sakshi WARN line, `pravash::<module>: <message> k=v`. A
+# consumer configures sakshi (its level, output, hook) and sees pravash's spans and events among its own: until
+# pravash's init runs, every target follows sakshi's level.
+#
+# `logging_init()` and `logging_init_with_level(level, len)` mirror `init` and `init_with_level`: the first call wins
+# (Rust's `try_init`), and sakshi then writes to stdout, as the fmt layer does. Each target's level is what
+# tracing-subscriber 0.3.23's `EnvFilter` decides: PRAVASH_LOG parsed strictly when it is set (set to "", it enables
+# nothing), and the default parsed leniently when it is unset or doesn't parse (an invalid directive dropped, error
+# when none is left). A directive is `target=level`, `target` or `level` (a name in any case, 0–5, or "" for error);
+# the longest target that prefixes a target's name decides, a directive without one last, and the last of two equal
+# ones wins. The parse is EnvFilter's state machine, quirks kept: it walks the trimmed directive but slices the
+# untrimmed one. Directives with a span name or fields (`[span]`, `{field}`) are checked as syntax and decide nothing:
+# sakshi has no span-scoped filter, and a field filter matches no field-less callsite (ADR 0002 #28).
+#
+# `logging_init_profiling(guard)` mirrors `init_profiling`: a chrome://tracing Trace Event file `trace-<unix µs>.json`
+# in the working directory, written through a sakshi hook until `PvFlushGuard_drop` (ledger L11).
+#
+# UPSTREAM(L11): sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md — replace the hook writer with
+#   sakshi's Trace Event exporter once it ships; parity: tests/logging.tcyr's trace-file group.
+#
+# Not thread-safe while tracing: sakshi has one span stack per process (its single-threaded contract). pravash's
+# worker pool enters no span and emits no event.
+
+# The targets, in name order: `pravash::<module>` for each module that traces.
+const _PV_LOG_COMMON = 0;
+const _PV_LOG_COUPLING = 1;
+const _PV_LOG_GRID = 2;
+const _PV_LOG_MPM = 3;
+const _PV_LOG_PHASE_FIELD = 4;
+const _PV_LOG_SHALLOW = 5;
+const _PV_LOG_SPH = 6;
+const _PV_LOG_VOF = 7;
+const _PV_LOG_TARGETS = 8;
+
+# The levels, as tracing's LevelFilter and sakshi number them: an event of level L is enabled under level M when
+# L ≤ M (OFF 0 enables nothing).
+const _PV_LOG_ERROR = 1;
+const _PV_LOG_WARN = 2;
+const _PV_LOG_TRACE = 5;
+
+# A target's name, or "" outside the list.
+#must_use
+fn _pv_log_target_name(t): i64 {
+    match t {
+        0 => { return "pravash::common"; }
+        1 => { return "pravash::coupling"; }
+        2 => { return "pravash::grid"; }
+        3 => { return "pravash::mpm"; }
+        4 => { return "pravash::phase_field"; }
+        5 => { return "pravash::shallow"; }
+        6 => { return "pravash::sph"; }
+        7 => { return "pravash::vof"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+# Each target's level once pravash's init has set them (`_pv_log_filtered` 1), else unused.
+var _pv_log_levels: i64[8];
+var _pv_log_filtered = 0;
+var _pv_log_init_done = 0;
+
+# The level target t enables: pravash's filter once its init ran, else sakshi's level.
+#must_use
+fn _pv_log_level(t): i64 {
+    if (_pv_log_filtered == 1) { return _pv_log_levels[t]; }
+    return sakshi_get_level();
+}
+
+# ── the filter ──────────────────────────────────────────────────────────────────────
+
+# 1 when byte c is ASCII whitespace (str::trim's, for the bytes an environment variable holds).
+#must_use
+fn _pv_log_ws(c): i64 {
+    if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
+    return 0;
+}
+
+# The level LevelFilter::from_str reads from the n bytes at p (an unsigned integer 0–5 with an optional `+`, a level
+# name in any case, or "" for error), or -1.
+#must_use
+fn _pv_log_parse_level(p, n): i64 {
+    if (n == 0) { return _PV_LOG_ERROR; }
+    var i = 0;
+    if (load8(p) == 43 && n > 1) { i = 1; }
+    var v = 0;
+    var digits = 1;
+    for (var k = i; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c < 48 || c > 57) {
+            digits = 0;
+        } elif (v < 100) {
+            v = v * 10 + (c - 48);
+        }
+    }
+    if (digits == 1) {
+        if (v <= 5) { return v; }
+        return 0 - 1;
+    }
+    if (n == 3 && _pv_log_ieq(p, "off", 3) == 1) { return 0; }
+    if (n == 5 && _pv_log_ieq(p, "error", 5) == 1) { return 1; }
+    if (n == 4 && _pv_log_ieq(p, "warn", 4) == 1) { return 2; }
+    if (n == 4 && _pv_log_ieq(p, "info", 4) == 1) { return 3; }
+    if (n == 5 && _pv_log_ieq(p, "debug", 5) == 1) { return 4; }
+    if (n == 5 && _pv_log_ieq(p, "trace", 5) == 1) { return 5; }
+    return 0 - 1;
+}
+
+# 1 when the n bytes at p equal the lowercase ASCII word w, ignoring case.
+#must_use
+fn _pv_log_ieq(p, w, n): i64 {
+    for (var k = 0; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != load8(w + k)) { return 0; }
+    }
+    return 1;
+}
+
+# 1 when byte c may start a directive's target or level (Rust's `-`, `:`, `_` or alphanumeric; a non-ASCII byte
+# counts as alphanumeric, as most such characters are).
+#must_use
+fn _pv_log_word_byte(c): i64 {
+    if (c == 45 || c == 58 || c == 95 || c >= 128) { return 1; }
+    if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return 1; }
+    return 0;
+}
+
+# One directive (the m bytes at s, untrimmed, holding no comma), as EnvFilter's Directive::parse reads it, into the
+# words at w: w[0] its level, w[1] its target's pointer (0 for none), w[2] the target's length. Returns 0 for a static
+# directive, 1 for one with a span name or fields (w unset), or -1 for one that doesn't parse.
+fn _pv_log_directive(s, m, w): i64 {
+    var a = 0;
+    while (a < m && _pv_log_ws(load8(s + a)) == 1) { a = a + 1; }
+    var b = m;
+    while (b > a && _pv_log_ws(load8(s + b - 1)) == 1) { b = b - 1; }
+    # The states (Rust's ParseState): 0 Start, 1 LevelOrTarget, 2 Span, 3 Field, 4 Fields, 5 Target, 6 Level.
+    var st = 0;
+    var mark = 0;
+    var dynamic = 0;
+    store64(w + 8, 0);
+    store64(w + 16, 0);
+    # The walk's index k counts the trimmed bytes; slices index the untrimmed ones (Rust's `from[start..i]`).
+    for (var k = 0; k < b - a; k = k + 1) {
+        var c = load8(s + a + k);
+        if (st == 0) {
+            if (c == 91) {
+                st = 2;
+                mark = k + 1;
+            } elif (_pv_log_word_byte(c) == 1) {
+                st = 1;
+                mark = k;
+            } else {
+                return 0 - 1;
+            }
+        } elif (st == 1) {
+            if (c == 61) {
+                store64(w + 8, s + mark);
+                store64(w + 16, k - mark);
+                st = 6;
+                mark = k + 1;
+            } elif (c == 91) {
+                store64(w + 8, s + mark);
+                store64(w + 16, k - mark);
+                st = 2;
+                mark = k + 1;
+            }
+        } elif (st == 2) {
+            if (c == 93) {
+                dynamic = 1;
+                st = 5;
+            } elif (c == 123) {
+                dynamic = 1;
+                st = 3;
+                mark = k + 1;
+            }
+        } elif (st == 3) {
+            if (c == 125) {
+                if (k == mark) { return 0 - 1; }
+                st = 4;
+            }
+        } elif (st == 4) {
+            if (c != 93) { return 0 - 1; }
+            st = 5;
+        } elif (st == 5) {
+            if (c != 61) { return 0 - 1; }
+            st = 6;
+            mark = k + 1;
+        }
+    }
+    if (st == 1) {
+        # `level` or `target`: a word that reads as a level is one, any other a target at trace.
+        var lv = _pv_log_parse_level(s + mark, m - mark);
+        if (lv >= 0) {
+            store64(w, lv);
+        } else {
+            store64(w, _PV_LOG_TRACE);
+            store64(w + 8, s + mark);
+            store64(w + 16, m - mark);
+        }
+    } elif (st == 6) {
+        var lv2 = _pv_log_parse_level(s + mark, m - mark);
+        if (m == mark) { lv2 = _PV_LOG_TRACE; }
+        if (lv2 < 0) { return 0 - 1; }
+        store64(w, lv2);
+    } elif (st == 5) {
+        store64(w, _PV_LOG_TRACE);
+    } elif (st == 0) {
+        # An all-whitespace directive: Rust's loop never runs and the Start state ends in error.
+        return 0 - 1;
+    } else {
+        return 0 - 1;
+    }
+    return dynamic;
+}
+
+# Applies the static directive at w to the per-target (rank, level) words at best (two per target): the directive
+# decides target t when its target prefixes t's name and is at least as long as the deciding one so far (a directive
+# without a target ranks -1, below any).
+fn _pv_log_apply(w, best) {
+    var tp = load64(w + 8);
+    var tn = load64(w + 16);
+    var rank = 0 - 1;
+    if (tp != 0) { rank = tn; }
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        var name = _pv_log_target_name(t);
+        var hit = 1;
+        if (tp != 0 && tn > 0) {
+            if (tn > strlen(name) || memeq(name, tp, tn) != 1) { hit = 0; }
+        }
+        if (hit == 1 && rank >= load64(best + t * 16)) {
+            store64(best + t * 16, rank);
+            store64(best + t * 16 + 8, load64(w));
+        }
+    }
+    return 0;
+}
+
+# The directives in the n bytes at p into the per-target levels at out (8 words): EnvFilter's `parse` (strict 1:
+# returns 0, out untouched, when one directive doesn't parse) or `parse_lossy` (0: skips it, and makes the filter
+# error when nothing is left). Returns 1 when out was set.
+fn _pv_log_parse(p, n, strict, out): i64 {
+    var best[128];
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        store64(&best + t * 16, 0 - 2);
+        store64(&best + t * 16 + 8, 0);
+    }
+    var any = 0;
+    var w[24];
+    var start = 0;
+    for (var i = 0; i <= n; i = i + 1) {
+        if (i == n || load8(p + i) == 44) {
+            if (i > start) {
+                var kind = _pv_log_directive(p + start, i - start, &w);
+                if (kind < 0 && strict == 1) { return 0; }
+                if (kind >= 0) { any = 1; }
+                if (kind == 0) { _pv_log_apply(&w, &best); }
+            }
+            start = i + 1;
+        }
+    }
+    if (any == 0 && strict == 0) {
+        # EnvFilter::new's default directive, `error` for every target.
+        store64(&w, _PV_LOG_ERROR);
+        store64(&w + 8, 0);
+        store64(&w + 16, 0);
+        _pv_log_apply(&w, &best);
+    }
+    for (var t2 = 0; t2 < _PV_LOG_TARGETS; t2 = t2 + 1) {
+        var lv = 0;
+        if (load64(&best + t2 * 16) > 0 - 2) { lv = load64(&best + t2 * 16 + 8); }
+        store64(out + t2 * 8, lv);
+    }
+    return 1;
+}
+
+# The level each target enables under `init_with_level`'s filter, into the 8 words at out: PRAVASH_LOG's n bytes at
+# env (has 0 when it is unset) when they parse, else the dn bytes of the default at dflt.
+fn _pv_log_filter(env, n, has, dflt, dn, out) {
+    if (has == 1 && _pv_log_parse(env, n, 1, out) == 1) { return 0; }
+    var r = _pv_log_parse(dflt, dn, 0, out);
+    return r - 1;
+}
+
+# ── init ────────────────────────────────────────────────────────────────────────────
+
+# `logging_init_with_level("info", 4)`. Mirrors `logging::init`.
+fn logging_init(): i64 {
+    return logging_init_with_level("info", 4);
+}
+
+# Sets each target's level from PRAVASH_LOG, or from the `len` bytes of the default directives at `level` (above), and
+# sends sakshi's text to stdout: 1, or 0 when an init already ran (nothing changes). Mirrors `logging::init_with_level`.
+fn logging_init_with_level(level, len): i64 {
+    if (_pv_log_init_done == 1) { return 0; }
+    _pv_log_init_done = 1;
+    var env = getenv("PRAVASH_LOG");
+    var has = 0;
+    var n = 0;
+    if (env != 0) {
+        has = 1;
+        n = strlen(env);
+    }
+    var lv[64];
+    _pv_log_filter(env, n, has, level, len, &lv);
+    var max = 0;
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        _pv_log_levels[t] = load64(&lv + t * 8);
+        if (load64(&lv + t * 8) > max) { max = load64(&lv + t * 8); }
+    }
+    _pv_log_filtered = 1;
+    # sakshi gates its lines by one level; pravash's per-target gate comes first.
+    sakshi_set_level(max);
+    sakshi_set_output_fd(1);
+    return 1;
+}
+
+# ── spans and events ────────────────────────────────────────────────────────────────
+
+# The span texts, one 128-byte slot per sakshi depth (sakshi keeps the name's pointer until the span exits), and each
+# slot's target; and the last event's text, target and parts, for the trace writer.
+var _pv_span_text: u8[2048];
+var _pv_span_tgt: i64[16];
+var _pv_event_text: u8[256];
+var _pv_event_tgt = 0;
+var _pv_event_msg_len = 0;
+
+# Appends the decimal of v at p + n (room checked against cap): the new length.
+fn _pv_log_put_int(p, n, cap, v): i64 {
+    var d[24];
+    var nd = 0;
+    var neg = 0;
+    var u = v;
+    if (v < 0) {
+        neg = 1;
+        u = 0 - v;
+    }
+    while (nd == 0 || u != 0) {
+        store8(&d + nd, 48 + (u % 10));
+        u = u / 10;
+        nd = nd + 1;
+    }
+    if (neg == 1 && n < cap) {
+        store8(p + n, 45);
+        n = n + 1;
+    }
+    for (var k = nd - 1; k >= 0; k = k - 1) {
+        if (n < cap) {
+            store8(p + n, load8(&d + k));
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# Appends the C string s at p + n (to cap): the new length.
+fn _pv_log_put(p, n, cap, s): i64 {
+    var m = strlen(s);
+    for (var k = 0; k < m; k = k + 1) {
+        if (n < cap) {
+            store8(p + n, load8(s + k));
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# Appends ` k=v` for each named field (a 0 name ends them) at p + n (to cap): the new length. `first` writes the first
+# without its space.
+fn _pv_log_put_fields(p, n, cap, first, k1, v1, k2, v2, k3, v3): i64 {
+    var sep = 1 - first;
+    if (k1 != 0) {
+        if (sep == 1) { n = _pv_log_put(p, n, cap, " "); }
+        n = _pv_log_put(p, n, cap, k1);
+        n = _pv_log_put(p, n, cap, "=");
+        n = _pv_log_put_int(p, n, cap, v1);
+        if (k2 != 0) {
+            n = _pv_log_put(p, n, cap, " ");
+            n = _pv_log_put(p, n, cap, k2);
+            n = _pv_log_put(p, n, cap, "=");
+            n = _pv_log_put_int(p, n, cap, v2);
+            if (k3 != 0) {
+                n = _pv_log_put(p, n, cap, " ");
+                n = _pv_log_put(p, n, cap, k3);
+                n = _pv_log_put(p, n, cap, "=");
+                n = _pv_log_put_int(p, n, cap, v3);
+            }
+        }
+    }
+    return n;
+}
+
+# Enters the TRACE span `name` of target t, with up to three integer fields (a 0 name ends them), when t enables
+# TRACE: 1, or 0 when it didn't (nothing happened). Every path out of the traced operation then calls
+# `_pv_span_end` with the result (a `defer`). Mirrors `trace_span!(name, k1 = v1, …).entered()`.
+fn _pv_span(t, name, k1, v1, k2, v2, k3, v3): i64 {
+    if (_pv_log_level(t) < _PV_LOG_TRACE) { return 0; }
+    var d = sakshi_span_depth();
+    if (d < 0 || d >= 16) { return 0; }
+    var slot = &_pv_span_text + d * 128;
+    var n = _pv_log_put(slot, 0, 127, name);
+    if (k1 != 0) {
+        n = _pv_log_put(slot, n, 127, "{");
+        n = _pv_log_put_fields(slot, n, 127, 1, k1, v1, k2, v2, k3, v3);
+        n = _pv_log_put(slot, n, 127, "}");
+    }
+    _pv_span_tgt[d] = t;
+    if (sakshi_span_enter(slot, n) != 0) { return 0; }
+    return 1;
+}
+
+# Exits the span `_pv_span` entered (on 1), or does nothing (on 0).
+fn _pv_span_end(on) {
+    if (on == 1) { var e = sakshi_span_exit(); }
+    return 0;
+}
+
+# Emits the WARN event `message k1=v1 …` (a 0 name ends the fields) of target t when t enables WARN, as the sakshi
+# line `pravash::<module>: message k1=v1 …`. Mirrors `tracing::warn!(k1, …, "message")`.
+fn _pv_warn(t, message, k1, v1, k2, v2, k3, v3) {
+    if (_pv_log_level(t) < _PV_LOG_WARN) { return 0; }
+    var p = &_pv_event_text;
+    var n = _pv_log_put(p, 0, 255, _pv_log_target_name(t));
+    n = _pv_log_put(p, n, 255, ": ");
+    var m0 = n;
+    n = _pv_log_put(p, n, 255, message);
+    _pv_event_msg_len = n - m0;
+    n = _pv_log_put_fields(p, n, 255, 0, k1, v1, k2, v2, k3, v3);
+    _pv_event_tgt = t;
+    sakshi_warn(p, n);
+    return 0;
+}
+
+# ── the Trace Event writer (ledger L11) ─────────────────────────────────────────────
+# tracing-chrome 0.7.2's file: `[`, entries joined by `,\n`, `\n]`; each entry serde_json's map, keys in order
+# (args, cat, name, ph, pid, s, tid, ts); a "M" thread_name entry for the main thread first; "B" / "E" for a span's
+# enter and exit with its fields as args (strings, the Debug of each value); "i" (scope "t") for an event, its
+# message and fields as args. ts is µs since the writer's first entry. tracing-chrome's `.file` / `.line` (the Rust
+# source location) have no Cyrius counterpart and are left out, as is an event's `event <file>:<line>` name: here
+# `event <target>` (ADR 0002 #28).
+
+# The guard `logging_init_profiling` fills: the file, and whether the writer is installed. Mirrors
+# `tracing_chrome::FlushGuard`.
+struct PvFlushGuard {
+    fd;
+    active;
+}
+
+var _pv_tr_fd = 0 - 1;
+var _pv_tr_prev_level = 0;
+var _pv_tr_path: u8[64];
+
+# The path of the last trace file logging_init_profiling created (a C string; "" before one).
+#must_use
+fn _pv_trace_path(): i64 {
+    return &_pv_tr_path;
+}
+var _pv_tr_buf: u8[8192];
+var _pv_tr_len = 0;
+var _pv_tr_count = 0;
+var _pv_tr_t0 = 0;
+
+# Writes the buffer out.
+fn _pv_tr_flush() {
+    if (_pv_tr_fd >= 0 && _pv_tr_len > 0) { var w = file_write(_pv_tr_fd, &_pv_tr_buf, _pv_tr_len); }
+    _pv_tr_len = 0;
+    return 0;
+}
+
+# Appends the n bytes at p to the file's buffer.
+fn _pv_tr_put_n(p, n) {
+    for (var k = 0; k < n; k = k + 1) {
+        if (_pv_tr_len >= 8192) { _pv_tr_flush(); }
+        store8(&_pv_tr_buf + _pv_tr_len, load8(p + k));
+        _pv_tr_len = _pv_tr_len + 1;
+    }
+    return 0;
+}
+
+# Appends the C string s.
+fn _pv_tr_put(s) {
+    _pv_tr_put_n(s, strlen(s));
+    return 0;
+}
+
+# Appends the n bytes at p as a JSON string (pravash's texts are plain ASCII; a quote, backslash or control byte is
+# escaped all the same).
+fn _pv_tr_str(p, n) {
+    _pv_tr_put("\"");
+    for (var k = 0; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c == 34 || c == 92) {
+            _pv_tr_put("\\");
+            _pv_tr_put_n(p + k, 1);
+        } elif (c < 32) {
+            _pv_tr_put(" ");
+        } else {
+            _pv_tr_put_n(p + k, 1);
+        }
+    }
+    _pv_tr_put("\"");
+    return 0;
+}
+
+# Appends the integer v.
+fn _pv_tr_int(v) {
+    var b[24];
+    var n = _pv_log_put_int(&b, 0, 24, v);
+    _pv_tr_put_n(&b, n);
+    return 0;
+}
+
+# Appends the args object of the fields in `name{k=v k=v}` or `k=v k=v` (the n bytes at p): `"args":{"k":"v",…},`,
+# or nothing when there are none.
+fn _pv_tr_args(p, n) {
+    if (n <= 0) { return 0; }
+    _pv_tr_put("\"args\":{");
+    var i = 0;
+    var first = 1;
+    while (i < n) {
+        var k0 = i;
+        while (i < n && load8(p + i) != 61) { i = i + 1; }
+        var kn = i - k0;
+        i = i + 1;
+        var v0 = i;
+        while (i < n && load8(p + i) != 32) { i = i + 1; }
+        if (first == 0) { _pv_tr_put(","); }
+        first = 0;
+        _pv_tr_str(p + k0, kn);
+        _pv_tr_put(":");
+        _pv_tr_str(p + v0, i - v0);
+        i = i + 1;
+    }
+    _pv_tr_put("},");
+    return 0;
+}
+
+# Starts an entry: the `,\n` between entries, and the main thread's name before the first.
+fn _pv_tr_entry(ts) {
+    if (_pv_tr_count == 0) {
+        _pv_tr_t0 = ts;
+        _pv_tr_put("{\"args\":{\"name\":\"main\"},\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1}");
+        _pv_tr_count = 1;
+    }
+    _pv_tr_put(",\n{");
+    _pv_tr_count = _pv_tr_count + 1;
+    return 0;
+}
+
+# Ends an entry with its phase, the pid and tid, and ts (µs since the first entry, with its ns as three decimals).
+fn _pv_tr_end(ph, scope, ts) {
+    _pv_tr_put("\"ph\":\"");
+    _pv_tr_put(ph);
+    _pv_tr_put("\",\"pid\":1,");
+    if (scope == 1) { _pv_tr_put("\"s\":\"t\","); }
+    _pv_tr_put("\"tid\":1,\"ts\":");
+    var d = ts - _pv_tr_t0;
+    if (d < 0) { d = 0; }
+    _pv_tr_int(d / 1000);
+    var f[8];
+    var r = d % 1000;
+    store8(&f, 46);
+    store8(&f + 1, 48 + r / 100);
+    store8(&f + 2, 48 + (r / 10) % 10);
+    store8(&f + 3, 48 + r % 10);
+    _pv_tr_put_n(&f, 4);
+    _pv_tr_put("}");
+    return 0;
+}
+
+# sakshi's emit hook while profiling: a span's enter / exit (level 10 / 11) and every event, as Trace Event entries.
+# A span pravash entered carries its target and fields; anyone else's has an empty category and no args. An event
+# pravash emitted carries its target, message and fields; anyone else's, its text as the message.
+fn _pv_tr_hook(ts, level, category, msg, msg_len, sixth): i64 {
+    if (_pv_tr_fd < 0) { return 0; }
+    if (level == 10 || level == 11) {
+        _pv_tr_entry(ts);
+        var own = 0;
+        if (msg >= &_pv_span_text && msg < &_pv_span_text + 2048) { own = 1; }
+        var nb = msg_len;
+        for (var k = 0; k < msg_len; k = k + 1) {
+            if (nb == msg_len && load8(msg + k) == 123) { nb = k; }
+        }
+        if (own == 1 && nb < msg_len) { _pv_tr_args(msg + nb + 1, msg_len - nb - 2); }
+        _pv_tr_put("\"cat\":");
+        if (own == 1) {
+            var slot = (msg - &_pv_span_text) / 128;
+            var tn = _pv_log_target_name(_pv_span_tgt[slot]);
+            _pv_tr_str(tn, strlen(tn));
+        } else {
+            _pv_tr_put("\"\"");
+        }
+        _pv_tr_put(",\"name\":");
+        _pv_tr_str(msg, nb);
+        _pv_tr_put(",");
+        if (level == 10) { _pv_tr_end("B", 0, ts); } else { _pv_tr_end("E", 0, ts); }
+        return 0;
+    }
+    _pv_tr_entry(ts);
+    if (msg == &_pv_event_text) {
+        var tname = _pv_log_target_name(_pv_event_tgt);
+        var tl = strlen(tname);
+        var m0 = msg + tl + 2;
+        _pv_tr_put("\"args\":{\"message\":");
+        _pv_tr_str(m0, _pv_event_msg_len);
+        var rest = msg_len - tl - 2 - _pv_event_msg_len;
+        if (rest > 1) {
+            _pv_tr_put(",");
+            # The fields after the message: ` k=v k=v` as "k":"v" pairs.
+            var fp = m0 + _pv_event_msg_len + 1;
+            var fl = rest - 1;
+            var i = 0;
+            var first = 1;
+            while (i < fl) {
+                var k0 = i;
+                while (i < fl && load8(fp + i) != 61) { i = i + 1; }
+                var kn = i - k0;
+                i = i + 1;
+                var v0 = i;
+                while (i < fl && load8(fp + i) != 32) { i = i + 1; }
+                if (first == 0) { _pv_tr_put(","); }
+                first = 0;
+                _pv_tr_str(fp + k0, kn);
+                _pv_tr_put(":");
+                _pv_tr_str(fp + v0, i - v0);
+                i = i + 1;
+            }
+        }
+        _pv_tr_put("},\"cat\":");
+        _pv_tr_str(tname, tl);
+        _pv_tr_put(",\"name\":");
+        var en[64];
+        var enn = _pv_log_put(&en, 0, 64, "event ");
+        enn = _pv_log_put(&en, enn, 64, tname);
+        _pv_tr_str(&en, enn);
+    } else {
+        _pv_tr_put("\"args\":{\"message\":");
+        _pv_tr_str(msg, msg_len);
+        _pv_tr_put("},\"cat\":\"\",\"name\":\"event\"");
+    }
+    _pv_tr_put(",");
+    _pv_tr_end("i", 1, ts);
+    return 0;
+}
+
+# Starts chrome://tracing output to `trace-<unix µs>.json` in the working directory and fills *guard: 1, or 0 when the
+# file can't be created. Every target then enables TRACE through sakshi's hook, which the writer takes over; when an
+# init already ran, the file is written empty instead (Rust's: its layer isn't registered when a subscriber is). The
+# trace is closed by PvFlushGuard_drop. Mirrors `logging::init_profiling`.
+#must_use
+fn logging_init_profiling(guard: *PvFlushGuard): i64 {
+    guard.fd = 0 - 1;
+    guard.active = 0;
+    var name[64];
+    var n = _pv_log_put(&name, 0, 63, "trace-");
+    n = _pv_log_put_int(&name, n, 63, clock_epoch_ns() / 1000);
+    n = _pv_log_put(&name, n, 63, ".json");
+    store8(&name + n, 0);
+    memcpy(&_pv_tr_path, &name, n + 1);
+    var fd = file_open(&name, O_WRONLY | O_CREAT | O_TRUNC, 420);
+    if (fd < 0) { return 0; }
+    guard.fd = fd;
+    _pv_tr_fd = fd;
+    _pv_tr_len = 0;
+    _pv_tr_count = 0;
+    _pv_tr_put("[\n");
+    if (_pv_log_init_done == 1) { return 1; }
+    _pv_log_init_done = 1;
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = _PV_LOG_TRACE; }
+    _pv_log_filtered = 1;
+    _pv_tr_prev_level = sakshi_get_level();
+    sakshi_set_level(SK_TRACE);
+    sakshi_set_emit_hook(&_pv_tr_hook);
+    guard.active = 1;
+    return 1;
+}
+
+impl PvFlushGuard {
+    # Writes out what the trace holds so far. Mirrors `FlushGuard::flush`.
+    fn flush(self) {
+        if (self.fd >= 0 && self.fd == _pv_tr_fd) { _pv_tr_flush(); }
+        return 0;
+    }
+}
+
+# Ends the trace: closes the entry list and the file, and removes the hook. pravash then traces nothing (every
+# target off) and sakshi has its level from before and writes to stderr: Rust's chrome layer stays installed and
+# writes nowhere, so nothing is printed either. Mirrors dropping the `FlushGuard`.
+fn PvFlushGuard_drop(guard: *PvFlushGuard) {
+    if (guard.fd < 0 || guard.fd != _pv_tr_fd) { return 0; }
+    if (guard.active == 1) {
+        var c = sakshi_clear_emit_hook();
+        for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = 0; }
+        var l = sakshi_set_level(_pv_tr_prev_level);
+    }
+    _pv_tr_put("\n]");
+    _pv_tr_flush();
+    var r = file_close(guard.fd);
+    _pv_tr_fd = 0 - 1;
+    guard.fd = 0 - 1;
+    guard.active = 0;
+    return 0;
+}
+
 # --- vec3.cyr ---
 
 # vec3.cyr — glam's `DVec3`, the operations pravash calls (port plan §7.2).
@@ -5088,10 +5803,15 @@ impl PvParticleArena {
 
     # Returns a block to the pool: inserted in start order, merged with an adjacent free block on either side,
     # and the watermark shrunk when the block ends there. A stale handle (from before a `compact`), an
-    # out-of-range one, or a block that overlaps a free one (a double free) is ignored. Mirrors `free`.
+    # out-of-range one, or a block that overlaps a free one (a double free) is ignored, with a WARN event naming the
+    # handle's start and length. Mirrors `free`.
     fn free(self, h: PvArenaHandle) {
         if (h.len == 0) { return 0; }
-        if (self._in_range(h) == 0) { return 0; }
+        if (self._in_range(h) == 0) {
+            var stale = "ParticleArena::free: stale or out-of-range handle ignored";
+            _pv_warn(_PV_LOG_COMMON, stale, "start", h.start, "len", h.len, 0, 0);
+            return 0;
+        }
         var end = h.start + h.len;
         # binary_search_by_key on start: the first entry whose start is not below h.start.
         var lo = 0;
@@ -5101,11 +5821,17 @@ impl PvParticleArena {
             if (self._fs(mid) < h.start) { lo = mid + 1; } else { hi = mid; }
         }
         var pos = lo;
+        var overlaps = 0;
         if (pos > 0) {
-            if (self._fs(pos - 1) + self._fl(pos - 1) > h.start) { return 0; }
+            if (self._fs(pos - 1) + self._fl(pos - 1) > h.start) { overlaps = 1; }
         }
         if (pos < self.free_count) {
-            if (self._fs(pos) < end) { return 0; }
+            if (self._fs(pos) < end) { overlaps = 1; }
+        }
+        if (overlaps == 1) {
+            var dbl = "ParticleArena::free: block already free (double free) ignored";
+            _pv_warn(_PV_LOG_COMMON, dbl, "start", h.start, "len", h.len, 0, 0);
+            return 0;
         }
         if (self._finsert(pos, h.start, h.len) == 0) { return 0; }
         if (pos + 1 < self.free_count) {
@@ -5715,6 +6441,7 @@ impl PvShallowWater {
     # rises by amplitude·(1 − d/radius)². Nothing for radius ≤ 0. Mirrors `add_disturbance`.
     fn add_disturbance(self, cx: f64, cy: f64, radius: f64, amplitude: f64) {
         if (radius <= 0.0) { return 0; }
+        var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::disturbance", 0, 0, 0, 0, 0, 0);
         var r2: f64 = radius * radius;
         var inv_radius: f64 = 1.0 / radius;
         var dx: f64 = self.dx;
@@ -5733,7 +6460,7 @@ impl PvShallowWater {
                 }
             }
         }
-        return 0;
+        _pv_span_end(trace); return 0;
     }
 
     # Σ max(η − z, 0)·dx² over every cell the two fields share, the boundary ring included (its cells are ghost
@@ -5857,14 +6584,18 @@ fn PvSedimentConfig_default(): PvSedimentConfig {
 # more than is suspended. Nothing happens for a non-finite or non-positive dt, a grid under 3 × 3, or a field or
 # concentration slice shorter than nx·ny. Mirrors `update_sediment` (Rust's `&mut [f64]` is the pointer and count).
 fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedimentConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::sediment", "nx", sw.nx, "ny", sw.ny, 0, 0);
     var nx = sw.nx;
     var ny = sw.ny;
-    if (nx < 3 || ny < 3) { return 0; }
-    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
+    if (nx < 3 || ny < 3) { _pv_span_end(trace); return 0; }
+    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { _pv_span_end(trace); return 0; }
     var n = nx * ny;
-    if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
-    if (conc_len < n || sw.height.len < n || sw.ground.len < n || sw.vx.len < n || sw.vy.len < n) { return 0; }
-    if (sw.manning_n.len < n) { return 0; }
+    if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return 0; }
+    if (conc_len < n || sw.height.len < n || sw.ground.len < n || sw.vx.len < n || sw.vy.len < n) {
+        _pv_span_end(trace);
+        return 0;
+    }
+    if (sw.manning_n.len < n) { _pv_span_end(trace); return 0; }
     var g: f64 = sw.gravity;
     var rho_s: f64 = config.sediment_density;
     var rho_w: f64 = config.water_density;
@@ -5915,7 +6646,7 @@ fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedi
             store64(concentration + i * 8, _pv_bits(cn));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── the step (M2 part 2) ────────────────────────────────────────────────────────────
@@ -6023,9 +6754,10 @@ impl PvShallowWater {
     # PV_ERR_DIVERGED when a height or velocity comes out non-finite (the state then holds the step). Mirrors `step`.
     #must_use
     fn step(self, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_SHALLOW, "shallow::step", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var vt, vv = self._validate_state();
-        if (is_err_result(vt) == 1) { return Err(vv); }
+        if (is_err_result(vt) == 1) { _pv_span_end(trace); return Err(vv); }
         var size = vv;
         var nx = self.nx;
         var ny = self.ny;
@@ -6043,7 +6775,7 @@ impl PvShallowWater {
         ok = ok & self.scratch_vy.resize(size, zw);
         ok = ok & self.scratch_h.resize(size, zw);
         ok = ok & self.scratch_lap.resize(size, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
 
         var hp = self.height.data;
         var up = self.vx.data;
@@ -6176,13 +6908,13 @@ impl PvShallowWater {
             # 2a. The finite-volume update; 3a. dispersion on this step's velocity increment.
             self._riemann_update(dt);
             if (disp > 0.0) {
-                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+                if (self._apply_dispersion() == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
             }
         } else {
             # 2b. Dispersion first, so the filtered velocity drives the mass flux; 3b. continuity with
             #     face-averaged fluxes, walls (zero flux) on the boundary ring's faces.
             if (disp > 0.0) {
-                if (self._apply_dispersion() == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+                if (self._apply_dispersion() == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
             }
             for (var y = 1; y < ny - 1; y = y + 1) {
                 for (var x = 1; x < nx - 1; x = x + 1) {
@@ -6230,10 +6962,10 @@ impl PvShallowWater {
             var b: f64 = load64(up + i * 8);
             var c: f64 = load64(vp + i * 8);
             if (_pv_is_finite(a) == 0 || _pv_is_finite(b) == 0 || _pv_is_finite(c) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 
     # The finite-volume update of (h, hu, hv) from the step's snapshot: well-balanced HLL fluxes on the four faces of
@@ -7238,12 +7970,20 @@ fn _pv_fg_advect_ctx(ctx, dst, src, vx, vy, nx, ny, k: f64) {
 # Semi-Lagrangian advection of src into dst on the interior: each cell traced back through (vx, vy) by
 # dt·inv_dx·v cells and sampled, the rows split across `pool` (0 runs them serially; src/par.cyr). Mirrors the
 # private `advect`, one of Rust's three `parallel` loops.
-fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
+fn _pv_fg_advect_raw(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
     var k: f64 = dt * inv_dx;
     var ctx[56];
     _pv_fg_advect_ctx(&ctx, dst, src, vx, vy, nx, ny, k);
     _pv_par_for(pool, 1, ny - 1, &_pv_fg_advect_k, &ctx);
     return 0;
+}
+
+# `_pv_fg_advect_raw` in the TRACE span `grid::advect{nx, ny}`: Rust's `advect` (MacCormack and BFECC take the raw
+# pass, as Rust's run their forward pass without the span).
+fn _pv_fg_advect(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::advect", "nx", nx, "ny", ny, 0, 0);
+    _pv_fg_advect_raw(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
+    _pv_span_end(trace); return 0;
 }
 
 # The bilinear sample at (fx, fy) with both axes wrapped: ((f % n) + n) % n, then the floor cell mod n and its
@@ -7312,11 +8052,12 @@ fn _pv_fg_advect_periodic_k(ctx, y0, y1) {
 # Semi-Lagrangian advection with periodic wrapping, over every cell (the ring included), the rows split across
 # `pool`. Mirrors the private `advect_periodic`, one of Rust's three `parallel` loops.
 fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::advect_periodic", "nx", nx, "ny", ny, 0, 0);
     var k: f64 = dt * inv_dx;
     var ctx[56];
     _pv_fg_advect_ctx(&ctx, dst, src, vx, vy, nx, ny, k);
     _pv_par_for(pool, 0, ny, &_pv_fg_advect_periodic_k, &ctx);
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # MacCormack advection of src into dst: the forward semi-Lagrangian step, the source's ring copied into it, the
@@ -7324,8 +8065,9 @@ fn _pv_fg_advect_periodic(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, pool) 
 # The forward step's rows split across `pool`, as Rust's `advect` call is; the rest is serial, as Rust's is. Mirrors
 # the private `advect_maccormack`.
 fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp, pool) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::advect_maccormack", "nx", nx, "ny", ny, 0, 0);
     var k: f64 = dt * inv_dx;
-    _pv_fg_advect(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
+    _pv_fg_advect_raw(dst, src, vx, vy, nx, ny, dt, inv_dx, pool);
     _pv_fg_copy_ring(dst, src, nx, ny);
     for (var y = 1; y < ny - 1; y = y + 1) {
         var yf: f64 = f64_from(y);
@@ -7360,7 +8102,7 @@ fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp
             store64(dst + j * 8, _pv_bits(c));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # BFECC advection of src into dst: forward into temp1 (the source's ring copied in), backward into temp2, the
@@ -7368,8 +8110,9 @@ fn _pv_fg_advect_maccormack(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp
 # of the backtraced point in src. The first forward step's rows split across `pool`, as Rust's `advect` call is;
 # the rest is serial, as Rust's is. Mirrors the private `advect_bfecc`.
 fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, temp2, pool) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::advect_bfecc", "nx", nx, "ny", ny, 0, 0);
     var k: f64 = dt * inv_dx;
-    _pv_fg_advect(temp1, src, vx, vy, nx, ny, dt, inv_dx, pool);
+    _pv_fg_advect_raw(temp1, src, vx, vy, nx, ny, dt, inv_dx, pool);
     _pv_fg_copy_ring(temp1, src, nx, ny);
     for (var y = 1; y < ny - 1; y = y + 1) {
         var yf: f64 = f64_from(y);
@@ -7411,7 +8154,7 @@ fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, te
             store64(dst + q * 8, _pv_bits(c));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── diffusion ───────────────────────────────────────────────────────────────────────
@@ -7420,10 +8163,11 @@ fn _pv_fg_advect_bfecc(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, temp1, te
 # field): `iterations` sweeps of field = (rhs + a·Σ neighbours)/(1 + 4a), a = (dt·diff_rate)/(dx·dx). 1, or 0 when
 # rhs can't grow (field unchanged). Mirrors the private `diffuse_with_buf`.
 fn _pv_fg_diffuse_buf(field, nx, ny, diff_rate: f64, dt: f64, dx: f64, iterations, rhs: *PvColumn): i64 {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::diffuse", "nx", nx, "ny", ny, "iterations", iterations);
     var a: f64 = (dt * diff_rate) / (dx * dx);
     var inv_denom: f64 = 1.0 / (1.0 + (4.0 * a));
     var n = nx * ny;
-    if (rhs.resize(n, 0) == 0) { return 0; }
+    if (rhs.resize(n, 0) == 0) { _pv_span_end(trace); return 0; }
     var rd = rhs.data;
     _pv_fg_copy(rd, field, n);
     for (var it = 0; it < iterations; it = it + 1) {
@@ -7441,7 +8185,7 @@ fn _pv_fg_diffuse_buf(field, nx, ny, diff_rate: f64, dt: f64, dx: f64, iteration
             }
         }
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # Diffuses `field` (`len` f64s, nx × ny) in place by Gauss–Seidel: the implicit (I − a·∇²)·x_new = x_old with
@@ -7449,13 +8193,15 @@ fn _pv_fg_diffuse_buf(field, nx, ny, diff_rate: f64, dt: f64, dx: f64, iteration
 # 0 with the field unchanged when nx or ny is below 3, nx·ny overflows or isn't `len` (Rust warns and returns), or
 # the right-hand side can't be allocated (Rust aborts). Mirrors `FluidGrid::diffuse`.
 fn PvFluidGrid_diffuse(field, len, nx, ny, diff_rate: f64, dt: f64, dx: f64, iterations): i64 {
-    if (nx < 3 || ny < 3) { return 0; }
-    if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return 0; }
-    if (nx * ny != len) { return 0; }
+    var trace = _pv_span(_PV_LOG_GRID, "grid::diffuse", "nx", nx, "ny", ny, 0, 0);
+    if (nx < 3 || ny < 3 || nx > 0x7FFFFFFFFFFFFFFF / ny || nx * ny != len) {
+        _pv_warn(_PV_LOG_GRID, "grid::diffuse: size mismatch ignored", "nx", nx, "ny", ny, "len", len);
+        _pv_span_end(trace); return 0;
+    }
     var rhs: PvColumn = PvColumn_new();
     var ok = _pv_fg_diffuse_buf(field, nx, ny, diff_rate, dt, dx, iterations, &rhs);
     rhs.drop();
-    return ok;
+    _pv_span_end(trace); return ok;
 }
 
 # ── pressure projection ─────────────────────────────────────────────────────────────
@@ -7463,6 +8209,7 @@ fn PvFluidGrid_diffuse(field, len, nx, ny, diff_rate: f64, dt: f64, dx: f64, ite
 # div = −((vx[i+1] − vx[i−1]) + (vy[i+nx] − vy[i−nx]))·scale on the interior. With scale dx/2 it is −dx²·∇·u, the
 # right-hand side of the unit-stencil Poisson system. Mirrors the private `divergence`.
 fn _pv_fg_divergence(div, vx, vy, nx, ny, scale: f64) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::divergence", "nx", nx, "ny", ny, 0, 0);
     for (var y = 1; y < ny - 1; y = y + 1) {
         for (var x = 1; x < nx - 1; x = x + 1) {
             var i = y * nx + x;
@@ -7476,12 +8223,13 @@ fn _pv_fg_divergence(div, vx, vy, nx, ny, scale: f64) {
             store64(div + i * 8, _pv_bits(d));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # `iterations` Gauss–Seidel sweeps of 4·p − Σ p = rhs on the interior, warm-started from p, the ring held. Mirrors the
 # private `pressure_solve` (always Ok).
 fn _pv_fg_pressure_gs(p, div, nx, ny, iterations) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::pressure_solve", "nx", nx, "ny", ny, "iterations", iterations);
     for (var it = 0; it < iterations; it = it + 1) {
         for (var y = 1; y < ny - 1; y = y + 1) {
             for (var x = 1; x < nx - 1; x = x + 1) {
@@ -7497,7 +8245,7 @@ fn _pv_fg_pressure_gs(p, div, nx, ny, iterations) {
             }
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # The DST plan of transform length n (≥ 1) in *tab: the n² sines of `_pv_dst_sines`, then the n eigenvalue terms
@@ -7532,18 +8280,19 @@ fn _pv_fg_dst_plan(n, tab: *PvColumn): i64 {
 #must_use
 fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn, tx: *PvColumn,
   ty: *PvColumn): Result {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::pressure_solve_dst", "nx", nx, "ny", ny, 0, 0);
     var inx = nx - 2;
     var iny = ny - 2;
-    if (inx <= 0 || iny <= 0) { return Ok(0); }
+    if (inx <= 0 || iny <= 0) { _pv_span_end(trace); return Ok(0); }
     var longest = inx;
     if (iny > longest) { longest = iny; }
-    if (ra.resize(inx * iny, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
-    if (rb.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
-    if (rc.resize(longest, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
-    if (_pv_fg_dst_plan(inx, tx) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (ra.resize(inx * iny, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (rb.resize(longest, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (rc.resize(longest, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (_pv_fg_dst_plan(inx, tx) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
     var py: *PvColumn = tx;
     if (iny != inx) {
-        if (_pv_fg_dst_plan(iny, ty) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_fg_dst_plan(iny, ty) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         py = ty;
     }
     var sx = tx.data;
@@ -7599,7 +8348,7 @@ fn _pv_fg_pressure_dst(p, plen, div, nx, ny, ra: *PvColumn, rb: *PvColumn, rc: *
     for (var oy = 0; oy < iny; oy = oy + 1) {
         _pv_fg_copy(p + ((oy + 1) * nx + 1) * 8, rhs + oy * inx * 8, inx);
     }
-    return Ok(0);
+    _pv_span_end(trace); return Ok(0);
 }
 
 # One multigrid V-cycle on 4p − Σp = rhs (nx × ny) at `depth`: below 7 cells a side (or at depth 10) 50 Gauss–Seidel
@@ -7716,12 +8465,16 @@ fn _pv_fg_mg_vcycle(p, rhs, nx, ny, nu, levels: *PvColumn, depth): i64 {
 # `pressure_solve_multigrid`.
 #must_use
 fn _pv_fg_pressure_mg(p, div, nx, ny, nu, cycles, levels: *PvColumn): Result {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::multigrid", "nx", nx, "ny", ny, "cycles", cycles);
     var c = cycles;
     if (c < 1) { c = 1; }
     for (var k = 0; k < c; k = k + 1) {
-        if (_pv_fg_mg_vcycle(p, div, nx, ny, nu, levels, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_fg_mg_vcycle(p, div, nx, ny, nu, levels, 0) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_OUT_OF_MEMORY);
+        }
     }
-    return Ok(0);
+    _pv_span_end(trace); return Ok(0);
 }
 
 # The unit-stencil operator of the pressure systems, for `_pv_cg`: out = 4v − (((v[i−1] + v[i+1]) + v[i−nx]) +
@@ -7753,6 +8506,7 @@ fn _pv_fg_stencil(ctx, v, out) {
 # Err(PV_ERR_OUT_OF_MEMORY) when the scratch can't grow. Mirrors the private `pressure_solve_cg`.
 #must_use
 fn _pv_fg_pressure_cg(p, div, nx, ny, iterations, ra: *PvColumn, rb: *PvColumn, rc: *PvColumn): Result {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::pressure_solve_cg", "nx", nx, "ny", ny, "iterations", iterations);
     var n = nx * ny;
     var ss: f64 = _pv_cg_dot(div, div, n);
     var b_norm: f64 = f64_sqrt(ss);
@@ -7760,20 +8514,21 @@ fn _pv_fg_pressure_cg(p, div, nx, ny, iterations, ra: *PvColumn, rb: *PvColumn, 
     var rel: f64 = 0x3EB0C6F7A0B5ED8D;  # 1e-6
     var t0: f64 = rel * b_norm;
     var tol: f64 = _pv_max(t0, lo);
-    if (n <= 0) { return Err(PV_ERR_DIVERGED); }
+    if (n <= 0) { _pv_span_end(trace); return Err(PV_ERR_DIVERGED); }
     if (ra.resize(n, 0) == 0 || rb.resize(n, 0) == 0 || rc.resize(n, 0) == 0) {
-        return Err(PV_ERR_OUT_OF_MEMORY);
+        _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY);
     }
     var ctx[16];
     store64(&ctx, nx);
     store64(&ctx + 8, ny);
     _pv_cg(&_pv_fg_stencil, &ctx, div, p, n, tol, iterations, ra.data, rb.data, rc.data);
-    return Ok(0);
+    _pv_span_end(trace); return Ok(0);
 }
 
 # u −= ∇p by central differences (scaled by inv_2dx) on the interior, the rows split across `pool`. Mirrors the
 # private `project_velocity`, one of Rust's three `parallel` loops.
 fn _pv_fg_project(vx, vy, p, nx, ny, inv_2dx: f64, pool) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::project", 0, 0, 0, 0, 0, 0);
     var ctx[48];
     store64(&ctx, vx);
     store64(&ctx + 8, vy);
@@ -7782,7 +8537,7 @@ fn _pv_fg_project(vx, vy, p, nx, ny, inv_2dx: f64, pool) {
     store64(&ctx + 32, ny);
     store64(&ctx + 40, _pv_bits(inv_2dx));
     _pv_par_for(pool, 1, ny - 1, &_pv_fg_project_k, &ctx);
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # The rows [y0, y1) of the projection (a `_pv_par_for` kernel): ctx holds vx, vy, p, nx, ny and the f64 inv_2dx.
@@ -7818,6 +8573,7 @@ fn _pv_fg_project_k(ctx, y0, y1) {
 # ε·dx·dt·(N × ω) with N = ∇|ω|/‖∇|ω|‖, skipped where |ω| or ‖∇|ω|‖ is below 1e-10. Mirrors the private
 # `apply_vorticity_confinement`.
 fn _pv_fg_vorticity(vx, vy, nx, ny, dx: f64, dt: f64, epsilon: f64, vort) {
+    var trace = _pv_span(_PV_LOG_GRID, "grid::vorticity_confinement", 0, 0, 0, 0, 0, 0);
     var inv_2dx: f64 = 0.5 / dx;
     for (var y = 1; y < ny - 1; y = y + 1) {
         for (var x = 1; x < nx - 1; x = x + 1) {
@@ -7864,7 +8620,7 @@ fn _pv_fg_vorticity(vx, vy, nx, ny, dx: f64, dt: f64, epsilon: f64, vort) {
             store64(vy + j * 8, _pv_bits(vn));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # Stores −x at word index d.
@@ -8127,38 +8883,48 @@ impl PvFluidGrid {
     # Mirrors `FluidGrid::step`.
     #must_use
     fn step(self, config: *PvGridConfig): Result {
+        var trace = _pv_span(_PV_LOG_GRID, "grid::step", "nx", self.nx, "ny", self.ny, 0, 0);
         var dt: f64 = config.dt;
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var visc: f64 = config.viscosity;
-        if (visc < 0.0 || _pv_is_finite(visc) == 0) { return Err(PV_ERR_INVALID_VISCOSITY); }
+        if (visc < 0.0 || _pv_is_finite(visc) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_VISCOSITY); }
         var cs: f64 = config.smagorinsky_cs;
-        if (_pv_is_finite(cs) == 0 || cs < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(cs) == 0 || cs < 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var eps: f64 = config.vorticity_confinement;
-        if (_pv_is_finite(eps) == 0 || eps < 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(eps) == 0 || eps < 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var alpha: f64 = config.buoyancy_alpha;
         var ambient: f64 = config.ambient_density;
-        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(ambient) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (config.pressure_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (config.diffusion_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(ambient) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
+        if (config.pressure_iterations == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
+        if (config.diffusion_iterations == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var bc = config.boundary;
-        if (bc < 0 || bc > PV_BOUNDARY_CONDITION_PERIODIC) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (bc < 0 || bc > PV_BOUNDARY_CONDITION_PERIODIC) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
         var nx = self.nx;
         var ny = self.ny;
-        if (nx < _PV_GRID_MIN_SIZE || ny < _PV_GRID_MIN_SIZE) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        var n = nx * ny;
-        if (self.vx.len != n || self.vy.len != n || self.pressure.len != n || self.density.len != n) {
+        if (nx < _PV_GRID_MIN_SIZE || ny < _PV_GRID_MIN_SIZE) {
+            _pv_span_end(trace);
             return Err(PV_ERR_INVALID_GRID_RESOLUTION);
         }
+        if (nx > 0x7FFFFFFFFFFFFFFF / ny) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        var n = nx * ny;
+        if (self.vx.len != n || self.vy.len != n || self.pressure.len != n || self.density.len != n) {
+            _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
         var dx: f64 = self.dx;
-        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var inv_dx: f64 = 1.0 / dx;
         var inv_2dx: f64 = 0.5 * inv_dx;
         var ok = self.scratch_a.resize(n, 0);
         ok = ok & self.scratch_b.resize(n, 0);
         ok = ok & self.scratch_c.resize(n, 0);
         ok = ok & self.diffuse_rhs.resize(n, 0);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var sa = self.scratch_a.data;
         var sb = self.scratch_b.data;
         var sc = self.scratch_c.data;
@@ -8182,7 +8948,10 @@ impl PvFluidGrid {
         _pv_fg_copy(vx, sa, n);
         _pv_fg_copy(vy, sb, n);
         _pv_fg_enforce(vx, vy, nx, ny, bc);
-        if (_pv_fg_any_bad(vx, n, 0) == 1 || _pv_fg_any_bad(vy, n, 0) == 1) { return Err(PV_ERR_DIVERGED); }
+        if (_pv_fg_any_bad(vx, n, 0) == 1 || _pv_fg_any_bad(vy, n, 0) == 1) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_DIVERGED);
+        }
 
         # 2. Diffuse the velocity, with the grid-averaged Smagorinsky viscosity ν_t = (Cs·dx)²·|S|.
         var eff: f64 = visc;
@@ -8220,10 +8989,10 @@ impl PvFluidGrid {
         if (eff > 0.0) {
             var dr: *PvColumn = _pv_fg_col(self, 7);
             if (_pv_fg_diffuse_buf(vx, nx, ny, eff, dt, dx, config.diffusion_iterations, dr) == 0) {
-                return Err(PV_ERR_OUT_OF_MEMORY);
+                _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY);
             }
             if (_pv_fg_diffuse_buf(vy, nx, ny, eff, dt, dx, config.diffusion_iterations, dr) == 0) {
-                return Err(PV_ERR_OUT_OF_MEMORY);
+                _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY);
             }
             _pv_fg_enforce(vx, vy, nx, ny, bc);
         }
@@ -8251,27 +9020,30 @@ impl PvFluidGrid {
         if (config.use_cg != 0) {
             var tc, vc = _pv_fg_pressure_cg(pd, sa, nx, ny, config.pressure_iterations, _pv_fg_col(self, 9),
               _pv_fg_col(self, 10), _pv_fg_col(self, 11));
-            if (is_err_result(tc) == 1) { return Err(vc); }
+            if (is_err_result(tc) == 1) { _pv_span_end(trace); return Err(vc); }
         } elif (config.use_multigrid != 0) {
             var cycles = (config.pressure_iterations + 9) / 10;
             var tm, vm = _pv_fg_pressure_mg(pd, sa, nx, ny, 4, cycles, _pv_fg_col(self, 8));
-            if (is_err_result(tm) == 1) { return Err(vm); }
+            if (is_err_result(tm) == 1) { _pv_span_end(trace); return Err(vm); }
         } elif (bc == PV_BOUNDARY_CONDITION_PERIODIC) {
             _pv_fg_pressure_gs(pd, sa, nx, ny, config.pressure_iterations);
         } else {
             var td, vd2 = _pv_fg_pressure_dst(pd, n, sa, nx, ny, _pv_fg_col(self, 9), _pv_fg_col(self, 10),
               _pv_fg_col(self, 11), _pv_fg_col(self, 12), _pv_fg_col(self, 13));
-            if (is_err_result(td) == 1) { return Err(vd2); }
+            if (is_err_result(td) == 1) { _pv_span_end(trace); return Err(vd2); }
         }
         _pv_fg_project(vx, vy, pd, nx, ny, inv_2dx, pool);
         _pv_fg_enforce(vx, vy, nx, ny, bc);
-        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
+        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_DIVERGED);
+        }
 
         # 5. Advect the density, then its zero-gradient ghosts (except on periodic walls).
         _pv_fg_advect_by(sa, rho, vx, vy, nx, ny, dt, inv_dx, config, sc, drhs, pool);
         _pv_fg_copy(rho, sa, n);
         if (bc != PV_BOUNDARY_CONDITION_PERIODIC) { _pv_fg_enforce_scalar(rho, nx, ny); }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -8284,11 +9056,16 @@ impl PvFluidGrid {
 # pressure loses ((σ·κ)·φ)/|g| where φ > 0. 1, or 0 with nothing changed when nx or ny is below 3, nx·ny overflows
 # or isn't both lengths, or dx isn't finite and > 0 (Rust warns and returns). Mirrors `apply_ghost_fluid`.
 fn apply_ghost_fluid(p, plen, ls, llen, nx, ny, dx: f64, surface_tension: f64): i64 {
-    if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
-    if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+    var trace = _pv_span(_PV_LOG_GRID, "grid::ghost_fluid", "nx", nx, "ny", ny, 0, 0);
+    var valid = 1;
+    if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3) || _pv_fg_mul_class(nx, ny) != 0) { valid = 0; }
     var n = nx * ny;
-    if (plen != n || llen != n) { return 0; }
-    if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return 0; }
+    if (valid == 1 && (plen != n || llen != n)) { valid = 0; }
+    if (_pv_is_finite(dx) == 0 || dx <= 0.0) { valid = 0; }
+    if (valid == 0) {
+        _pv_warn(_PV_LOG_GRID, "apply_ghost_fluid: invalid sizes or dx ignored", "nx", nx, "ny", ny, 0, 0);
+        _pv_span_end(trace); return 0;
+    }
     var inv_dx: f64 = 1.0 / dx;
     var inv_dx2: f64 = inv_dx * inv_dx;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -8326,7 +9103,7 @@ fn apply_ghost_fluid(p, plen, ls, llen, nx, ny, dx: f64, surface_tension: f64): 
             }
         }
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # --- mac_grid.cyr ---
@@ -8521,25 +9298,35 @@ impl PvMacGrid {
     # checked before anything changes; Rust aborts). Mirrors `MacGrid::step`.
     #must_use
     fn step(self, config: *PvGridConfig): Result {
+        var trace = _pv_span(_PV_LOG_GRID, "mac::step", "nx", self.nx, "ny", self.ny, 0, 0);
         var dt: f64 = config.dt;
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (config.pressure_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (config.pressure_iterations == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var alpha: f64 = config.buoyancy_alpha;
         var amb: f64 = config.ambient_density;
-        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(amb) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(amb) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
         var nx = self.nx;
         var ny = self.ny;
-        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
-        if (cn < 0) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        if (self.vx.len != vxn || self.vy.len != vyn || self.pressure.len != cn || self.density.len != cn) {
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) {
+            _pv_span_end(trace);
             return Err(PV_ERR_INVALID_GRID_RESOLUTION);
         }
+        var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
+        if (cn < 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (self.vx.len != vxn || self.vy.len != vyn || self.pressure.len != cn || self.density.len != cn) {
+            _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
         var dx: f64 = self.dx;
-        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var sdiv: *PvColumn = _pv_mac_col(self, 4);
         var sden: *PvColumn = _pv_mac_col(self, 5);
-        if (sdiv.resize(cn, 0) == 0 || sden.resize(cn, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (sdiv.resize(cn, 0) == 0 || sden.resize(cn, 0) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_OUT_OF_MEMORY);
+        }
         var inv_dx: f64 = 1.0 / dx;
         var u = self.vx.data;
         var v = self.vy.data;
@@ -8674,9 +9461,9 @@ impl PvMacGrid {
         _pv_col_swap(_pv_mac_col(self, 3), sden);
         if (_pv_fg_any_bad(u, vxn, 1) == 1 || _pv_fg_any_bad(v, vyn, 1) == 1
           || _pv_fg_any_bad(self.density.data, cn, 1) == 1) {
-            return Err(PV_ERR_DIVERGED);
+            _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -8809,15 +9596,20 @@ impl PvKEpsilon {
     # with nothing changed when nx or ny is below 3, nx·ny overflows, a length isn't nx·ny, dx or dt isn't finite
     # and > 0 (Rust warns and returns), or the scratch can't grow. Mirrors `KEpsilon::step`.
     fn step(self, vx, vx_len, vy, vy_len, nx, ny, dx: f64, dt: f64): i64 {
-        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
-        if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+        var trace = _pv_span(_PV_LOG_GRID, "grid::kepsilon", "nx", nx, "ny", ny, 0, 0);
+        var valid = 1;
+        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3) || _pv_fg_mul_class(nx, ny) != 0) { valid = 0; }
         var n = nx * ny;
-        if (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n) { return 0; }
-        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
+        if (valid == 1 && (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n)) { valid = 0; }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { valid = 0; }
+        if (valid == 0) {
+            _pv_warn(_PV_LOG_GRID, "KEpsilon::step: invalid sizes or parameters ignored", "nx", nx, "ny", ny, 0, 0);
+            _pv_span_end(trace); return 0;
+        }
         var inv_2dx: f64 = 0.5 / dx;
         var sk: *PvColumn = _pv_ke_col(self, 2);
         var se: *PvColumn = _pv_ke_col(self, 3);
-        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { return 0; }
+        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { _pv_span_end(trace); return 0; }
         var kc: *PvColumn = _pv_ke_col(self, 0);
         var ec: *PvColumn = _pv_ke_col(self, 1);
         _pv_col_swap(kc, sk);
@@ -8875,7 +9667,7 @@ impl PvKEpsilon {
                 store64(en + i * 8, _pv_bits(e2));
             }
         }
-        return 1;
+        _pv_span_end(trace); return 1;
     }
 }
 
@@ -9164,14 +9956,21 @@ impl PvVofField {
     # `VofField::advect`.
     #must_use
     fn advect(self, vx, vx_len, vy, vy_len, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_VOF, "vof::advect", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var nx = self.nx;
         var ny = self.ny;
-        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (_pv_fg_mul_class(nx, ny) != 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_fg_mul_class(nx, ny) != 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var n = nx * ny;
-        if (self.alpha.len != n || vx_len != n || vy_len != n) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
+        if (self.alpha.len != n || vx_len != n || vy_len != n) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
+        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_DIVERGED);
+        }
         var m: f64 = 0.0;
         for (var i = 0; i < n; i = i + 1) {
             var u: f64 = load64(vx + i * 8);
@@ -9191,9 +9990,9 @@ impl PvVofField {
         var sf: f64 = f64_from(substeps);
         var sub_dt: f64 = dt / sf;
         var sc: *PvColumn = _pv_vof_col(self, 1);
-        if (substeps > 0 && sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (substeps > 0 && sc.resize(n, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         for (var s = 0; s < substeps; s = s + 1) { _pv_vof_substep(self, vx, vy, sub_dt); }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -9350,23 +10149,24 @@ impl PvPhaseField {
     # neighbour. Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0),
     # PV_ERR_INVALID_GRID_RESOLUTION (φ not nx·ny long, nx or ny below 3, nx·ny overflowing, where Rust panics),
     # PV_ERR_INVALID_PARAMETER (a velocity that is neither both empty nor both nx·ny long), PV_ERR_OUT_OF_MEMORY (the
-    # scratch can't grow, checked before φ changes; Rust aborts). Rust's divergence warning (|φ| > 1.5) has no
-    # effect on the state and isn't kept. Mirrors `PhaseField::step`.
+    # scratch can't grow, checked before φ changes; Rust aborts). When any interior cell's new φ is beyond ±1.5 before
+    # its clamp, one WARN event per step counts them (`cells`). Mirrors `PhaseField::step`.
     #must_use
     fn step(self, vx, vx_len, vy, vy_len, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_PHASE_FIELD, "phase_field::step", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var nx = self.nx;
         var ny = self.ny;
         if (nx != 0 && ny != 0 && (nx < 0 || ny < 0 || nx > 0x7FFFFFFFFFFFFFFF / ny)) {
-            return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+            _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION);
         }
         var n = nx * ny;
-        if (self.phi.len != n || nx < 3 || ny < 3) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (self.phi.len != n || nx < 3 || ny < 3) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         var has_v = 1;
         if (vx_len == 0 && vy_len == 0) { has_v = 0; }
-        if (has_v == 1 && (vx_len != n || vy_len != n)) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (has_v == 1 && (vx_len != n || vy_len != n)) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var sc: *PvColumn = _pv_pf_col(self, 1);
-        if (sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (sc.resize(n, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var inv_dx: f64 = 1.0 / self.dx;
         var inv_dx2: f64 = inv_dx * inv_dx;
         var m: f64 = self.mobility;
@@ -9374,6 +10174,7 @@ impl PvPhaseField {
         var f = self.phi.data;
         var ph = sc.data;
         _pv_fg_copy(ph, f, n);
+        var diverging = 0;
         for (var y = 1; y < ny - 1; y = y + 1) {
             for (var x = 1; x < nx - 1; x = x + 1) {
                 var i = y * nx + x;
@@ -9404,10 +10205,23 @@ impl PvPhaseField {
                 # clamp(·, −1, 1) written out (a NaN stays NaN): as a `_pv_clamp` call it made the step 1.18–1.19×
                 # slower (pinned A/B, port-parity §13).
                 var c: f64 = cur + ((adv + react) * dt);
-                if (c < -1.0) { c = -1.0; }
-                if (c > 1.0) { c = 1.0; }
+                # |c| > 1.5 counts as diverging (a NaN doesn't, as Rust's `abs() > 1.5`), tested only past the clamp's
+                # ±1, so the common path pays nothing for it.
+                if (c < -1.0) {
+                    if (c < -1.5) { diverging = diverging + 1; }
+                    c = -1.0;
+                }
+                if (c > 1.0) {
+                    if (c > 1.5) { diverging = diverging + 1; }
+                    c = 1.0;
+                }
                 store64(f + i * 8, _pv_bits(c));
             }
+        }
+        # One warning per step (not per cell), as Rust's.
+        if (diverging > 0) {
+            var msg = "phase field divergence detected (|φ| > 1.5)";
+            _pv_warn(_PV_LOG_PHASE_FIELD, msg, "cells", diverging, 0, 0, 0, 0);
         }
         for (var gx = 0; gx < nx; gx = gx + 1) {
             store64(f + gx * 8, load64(f + (nx + gx) * 8));
@@ -9417,7 +10231,7 @@ impl PvPhaseField {
             store64(f + (gy * nx) * 8, load64(f + (gy * nx + 1) * 8));
             store64(f + (gy * nx + nx - 1) * 8, load64(f + (gy * nx + nx - 2) * 8));
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -10369,7 +11183,8 @@ fn _pv_zorder_cmp(ctx, a, b): i64 {
 # goes byte by byte). 1, or 0 with nothing changed for fewer than 2 particles or a cell size not finite and > 0 (Rust
 # returns), or when the scratch can't be allocated (Rust aborts). Mirrors `sort_by_zorder`.
 fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
-    if (n < 2 || _pv_is_positive(cell_size) == 0) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::sort_by_zorder", "n", n, 0, 0, 0, 0);
+    if (n < 2 || _pv_is_positive(cell_size) == 0) { _pv_span_end(trace); return 0; }
     var inv: f64 = 1.0 / cell_size;
     var mnx: f64 = PV_F64_MAX;
     var mny: f64 = PV_F64_MAX;
@@ -10380,7 +11195,7 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
     }
     # One block: the codes, the order, the sort's scratch.
     var keys = fl_alloc(n * 24);
-    if (keys == 0) { return 0; }
+    if (keys == 0) { _pv_span_end(trace); return 0; }
     var order = keys + n * 8;
     var tmp = keys + n * 16;
     for (var j = 0; j < n; j = j + 1) {
@@ -10414,7 +11229,7 @@ fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
         }
     }
     fl_free(keys);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # --- sph_fns.cyr ---
@@ -10480,9 +11295,10 @@ fn compute_density(idx, ps: *PvFluidParticle, n, h: f64): f64 {
 # (its [f64; 3] as a PvVec3, ADR 0002 #17).
 #must_use
 fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::pressure_force", "n", n, 0, 0, 0, 0);
     if (idx < 0 || idx >= n) {
         var nan: f64 = PV_F64_NAN;
-        return PvVec3_new(nan, nan, nan);
+        _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
@@ -10520,7 +11336,7 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
             }
         }
     }
-    return PvVec3_new(fx, fy, fz);
+    _pv_span_end(trace); return PvVec3_new(fx, fy, fz);
 }
 
 # The viscosity force on particle idx of the n at ps, by brute force: Σⱼ ((μ·mⱼ)·∇²W(r))/ρⱼ · (vⱼ − vᵢ), over j ≠ idx
@@ -10528,9 +11344,10 @@ fn pressure_force(idx, ps: *PvFluidParticle, n, h: f64): PvVec3 {
 # `viscosity_force`.
 #must_use
 fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::viscosity_force", "n", n, 0, 0, 0, 0);
     if (idx < 0 || idx >= n) {
         var nan: f64 = PV_F64_NAN;
-        return PvVec3_new(nan, nan, nan);
+        _pv_span_end(trace); return PvVec3_new(nan, nan, nan);
     }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
@@ -10568,7 +11385,7 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
             }
         }
     }
-    return PvVec3_new(fx, fy, fz);
+    _pv_span_end(trace); return PvVec3_new(fx, fy, fz);
 }
 
 # ── the free step ───────────────────────────────────────────────────────────────────
@@ -10586,13 +11403,14 @@ fn viscosity_force(idx, ps: *PvFluidParticle, n, h: f64, viscosity: f64): PvVec3
 # pressures set and the accelerations before it written, as Rust does. Mirrors `step` (ADR 0002 #17).
 #must_use
 fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::step", "n", n, 0, 0, 0, 0);
     var ct, cv = config.validate();
-    if (is_err_result(ct) == 1) { return Err(cv); }
-    if (n <= 0) { return Ok(0); }
+    if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+    if (n <= 0) { _pv_span_end(trace); return Ok(0); }
     var sz = sizeof(PvFluidParticle);
-    if (n > 9223372036854775807 / (sz + 8)) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (n > 9223372036854775807 / (sz + 8)) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
     var block = fl_alloc(n * (sz + 8));
-    if (block == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    if (block == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
     var dens = block;
     var snap: *PvFluidParticle = _pv_as_particles(block + n * 8);
     var h: f64 = config.smoothing_radius;
@@ -10600,6 +11418,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
     _pv_kc_init(&kc, h);
 
     # The densities, then the pressures.
+    var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
     for (var i = 0; i < n; i = i + 1) {
         var d: f64 = _pv_density_sum(ps + i, ps, n, &kc);
         store64(dens + i * 8, _pv_bits(d));
@@ -10615,7 +11434,10 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         *s = *p;
     }
 
+    _pv_span_end(td);
+
     # The accelerations, from the snapshot.
+    var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
     var h2: f64 = kc.h2;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var lo: f64 = _PV_SPH_MIN_DENSITY;
@@ -10664,11 +11486,13 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         }
         if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
             fl_free(block);
-            return Err(PV_ERR_DIVERGED);
+            _pv_span_end(tf);
+            _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
         }
         var out: *PvFluidParticle = ps + a;
         out.acceleration = PvVec3_new(ax, ay, az);
     }
+    _pv_span_end(tf);
     fl_free(block);
 
     # Symplectic Euler, then the walls.
@@ -10724,7 +11548,7 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
         w.position = PvVec3_new(wx, wy, wz);
         w.velocity = PvVec3_new(ux, uy, uz);
     }
-    return Ok(0);
+    _pv_span_end(trace); return Ok(0);
 }
 
 # ── splitting and merging ───────────────────────────────────────────────────────────
@@ -10735,15 +11559,16 @@ fn sph_step(ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Re
 # with `fl_free`; (0, 0) for n_children ≤ 0 or no memory (Rust aborts). Mirrors `split_particle` (ADR 0002 #9).
 #must_use
 fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
-    if (n_children <= 0) { return (0, 0); }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::split_particle", 0, 0, 0, 0, 0, 0);
+    if (n_children <= 0) { _pv_span_end(trace); return (0, 0); }
     var sz = sizeof(PvFluidParticle);
-    if (n_children > 9223372036854775807 / sz) { return (0, 0); }
+    if (n_children > 9223372036854775807 / sz) { _pv_span_end(trace); return (0, 0); }
     var buf = fl_alloc(n_children * sz);
-    if (buf == 0) { return (0, 0); }
+    if (buf == 0) { _pv_span_end(trace); return (0, 0); }
     var out: *PvFluidParticle = _pv_as_particles(buf);
     if (n_children == 1) {
         *out = *parent;
-        return (buf, 1);
+        _pv_span_end(trace); return (buf, 1);
     }
     var nf: f64 = f64_from(n_children);
     var child_mass: f64 = parent.mass / nf;
@@ -10760,7 +11585,7 @@ fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
         var y: f64 = ch.position.y + (offset * s);
         ch.position = PvVec3_new(x, y, ch.position.z);
     }
-    return (buf, n_children);
+    _pv_span_end(trace); return (buf, n_children);
 }
 
 # One particle from two, conserving mass and momentum: the mass a.m + b.m; position, velocity, density, pressure,
@@ -10768,6 +11593,7 @@ fn split_particle(parent: *PvFluidParticle, n_children, offset: f64) {
 # per component; no acceleration; a's phase and conformation. Mirrors `merge_particles`.
 #must_use
 fn merge_particles(a: *PvFluidParticle, b: *PvFluidParticle): PvFluidParticle {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::merge_particles", 0, 0, 0, 0, 0, 0);
     var ma: f64 = a.mass;
     var mb: f64 = b.mass;
     var total: f64 = ma + mb;
@@ -10793,7 +11619,7 @@ fn merge_particles(a: *PvFluidParticle, b: *PvFluidParticle): PvFluidParticle {
     p.mass = total;
     p.temperature = t;
     p.fuel = fu;
-    return p;
+    _pv_span_end(trace); return p;
 }
 
 # ── the particle block ──────────────────────────────────────────────────────────────
@@ -10846,9 +11672,19 @@ fn create_particle_block(ox: f64, oy: f64, sx: f64, sy: f64, spacing: f64, mass:
 # 1 when CSR lists fit n particles, as Rust's private `neighbor_lists_valid` checks: n + 1 offsets, never
 # decreasing, the last within the indices, and every index in [0, n). The lists are 8-byte words (Rust's `u32`
 # offsets and `usize` indices), so an offset outside [0, 2³²) or an index read as unsigned at n or more is invalid,
-# values Rust's types can't hold or that index past n. (Rust also logs a warning; logging arrives with M7.)
+# values Rust's types can't hold or that index past n. Invalid lists emit Rust's WARN event (its `n`, and the two
+# lists' lengths).
 #must_use
 fn _pv_lists_valid(offsets, n_off, indices, n_idx, n): i64 {
+    if (_pv_lists_ok(offsets, n_off, indices, n_idx, n) == 1) { return 1; }
+    _pv_warn(_PV_LOG_SPH, "invalid neighbor lists ignored (expected offsets.len() == n + 1, indices < n)", "n", n,
+      "offsets", n_off, "indices", n_idx);
+    return 0;
+}
+
+# The check itself, without the warning.
+#must_use
+fn _pv_lists_ok(offsets, n_off, indices, n_idx, n): i64 {
     if (n_off != n + 1 || n_idx < 0) { return 0; }
     var prev = load64(offsets);
     if (prev < 0) { return 0; }
@@ -10894,12 +11730,13 @@ fn PvViscoelasticConfig_new(elastic_modulus: f64, relaxation_time: f64): PvVisco
 #must_use
 fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, ve: *PvViscoelasticConfig,
   dt: f64): i64 {
-    if (n <= 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::viscoelastic", "n", n, 0, 0, 0, 0);
+    if (n <= 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
     var sz = sizeof(PvFluidParticle);
-    if (n > 9223372036854775807 / sz) { return 0; }
+    if (n > 9223372036854775807 / sz) { _pv_span_end(trace); return 0; }
     var buf = fl_alloc(n * sz);
-    if (buf == 0) { return 0; }
+    if (buf == 0) { _pv_span_end(trace); return 0; }
     var snap: *PvFluidParticle = _pv_as_particles(buf);
     for (var c = 0; c < n; c = c + 1) {
         var d: *PvFluidParticle = snap + c;
@@ -10986,7 +11823,7 @@ fn update_viscoelastic(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, 
         out.acceleration = PvVec3_new(ax, ay, out.acceleration.z);
     }
     fl_free(buf);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: heat conduction ─────────────────────────────────────────────────────────
@@ -11010,11 +11847,12 @@ fn PvHeatConfig_new(diffusivity: f64): PvHeatConfig {
 # Mirrors `update_heat` (ADR 0002 #18).
 #must_use
 fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, heat: *PvHeatConfig, dt: f64): i64 {
-    if (n <= 0 || _pv_is_positive(heat.diffusivity) == 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 8) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::heat", "n", n, 0, 0, 0, 0);
+    if (n <= 0 || _pv_is_positive(heat.diffusivity) == 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 8) { _pv_span_end(trace); return 0; }
     var snap = fl_alloc(n * 8);
-    if (snap == 0) { return 0; }
+    if (snap == 0) { _pv_span_end(trace); return 0; }
     for (var c = 0; c < n; c = c + 1) {
         var q: *PvFluidParticle = ps + c;
         store64(snap + c * 8, _pv_bits(q.temperature));
@@ -11053,7 +11891,7 @@ fn update_heat(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, 
         pi.temperature = pi.temperature + dtemp;
     }
     fl_free(snap);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: phase change ────────────────────────────────────────────────────────────
@@ -11096,6 +11934,7 @@ fn PvPhaseChangeConfig_water_ice(phase_ice, phase_water): PvPhaseChangeConfig {
 # flips the phase (fuel 0) and moves the temperature by what is left over c; energy back returns stored latent heat
 # first. dt is unused, as Rust's. Mirrors `update_phase_change`.
 fn update_phase_change(ps: *PvFluidParticle, n, config: *PvPhaseChangeConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::phase_change", "n", n, 0, 0, 0, 0);
     var t_trans: f64 = config.transition_temperature;
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var l_heat: f64 = _pv_max(config.latent_heat, tiny);
@@ -11149,7 +11988,7 @@ fn update_phase_change(ps: *PvFluidParticle, n, config: *PvPhaseChangeConfig, dt
             }
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: reactions and combustion ────────────────────────────────────────────────
@@ -11208,6 +12047,7 @@ impl PvReactionProvider for PvCombustionConfig {
 # Each of the n particles with fuel > 0 reacts through the provider: fuel = max(fuel − consumed, 0) (NaN-ignoring),
 # temperature += heat. Mirrors `update_reaction`.
 fn update_reaction(ps: *PvFluidParticle, n, provider: dyn PvReactionProvider, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::reaction", "n", n, 0, 0, 0, 0);
     for (var i = 0; i < n; i = i + 1) {
         var p: *PvFluidParticle = ps + i;
         if (p.fuel > 0.0) {
@@ -11218,13 +12058,14 @@ fn update_reaction(ps: *PvFluidParticle, n, provider: dyn PvReactionProvider, dt
             p.temperature = p.temperature + r.heat;
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # Combustion on each of the n particles above ignition with fuel > 0 (a NaN temperature does not burn here):
 # consumed = fuel − fuel/(1 + rate·dt), fuel = max(fuel − consumed, 0), temperature += heat_release·consumed.
 # Mirrors `update_combustion`.
 fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::combustion", "n", n, 0, 0, 0, 0);
     var t_ign: f64 = config.ignition_temperature;
     var rate: f64 = config.reaction_rate;
     var heat: f64 = config.heat_release;
@@ -11242,7 +12083,7 @@ fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f
             p.temperature = p.temperature + dtemp;
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: the contact angle ───────────────────────────────────────────────────────
@@ -11253,9 +12094,10 @@ fn update_combustion(ps: *PvFluidParticle, n, config: *PvCombustionConfig, dt: f
 # sum's |·|² < 1e-20. cos θ is correctly rounded (ADR 0004). Nothing for h not finite and > 0, or σ or θ not finite.
 # Mirrors `apply_contact_angle`.
 fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_angle: f64, surface_tension: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::contact_angle", "n", n, 0, 0, 0, 0);
     var h: f64 = config.smoothing_radius;
     if (_pv_is_positive(h) == 0 || _pv_is_finite(surface_tension) == 0 || _pv_is_finite(contact_angle) == 0) {
-        return 0;
+        _pv_span_end(trace); return 0;
     }
     var cos_theta: f64 = _pv_cos(contact_angle);
     var accel: f64 = (surface_tension * cos_theta) / h;
@@ -11296,7 +12138,7 @@ fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_
             p.acceleration = PvVec3_new(ax, ay, az);
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # ── part d: delta-SPH density diffusion ─────────────────────────────────────────────
@@ -11308,11 +12150,12 @@ fn apply_contact_angle(ps: *PvFluidParticle, n, config: *PvFluidConfig, contact_
 #must_use
 fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, speed_of_sound: f64, delta: f64,
   dt: f64): i64 {
-    if (n <= 0 || _pv_is_positive(delta) == 0) { return 1; }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 40) { return 0; }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::delta_sph", "n", n, 0, 0, 0, 0);
+    if (n <= 0 || _pv_is_positive(delta) == 0) { _pv_span_end(trace); return 1; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 40) { _pv_span_end(trace); return 0; }
     var snap = fl_alloc(n * 40);   # density, x, y, z, mass
-    if (snap == 0) { return 0; }
+    if (snap == 0) { _pv_span_end(trace); return 0; }
     for (var c = 0; c < n; c = c + 1) {
         var q: *PvFluidParticle = ps + c;
         var w = snap + c * 40;
@@ -11367,7 +12210,7 @@ fn apply_delta_sph(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f
         p.density = p.density + dd;
     }
     fl_free(snap);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: the MLS gradient corrections ────────────────────────────────────────────
@@ -11462,9 +12305,15 @@ fn _pv_invert_3x3(m, out): i64 {
 # (0, 0) for n ≤ 0 or no memory (Rust aborts). Mirrors `compute_gradient_corrections` (ADR 0002 #18).
 #must_use
 fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64) {
-    if (n <= 0 || n > 9223372036854775807 / 72) { return (0, 0); }
+    var trace = _pv_span(_PV_LOG_SPH, "sph::mls_correction", "n", n, 0, 0, 0, 0);
+    if (n == 0) {
+        # Rust checks the lists (and warns) for no particles too, unless h refuses first.
+        if (_pv_is_positive(h) == 1) { var lv = _pv_lists_valid(offsets, n_off, indices, n_idx, n); }
+        _pv_span_end(trace); return (0, 0);
+    }
+    if (n < 0 || n > 9223372036854775807 / 72) { _pv_span_end(trace); return (0, 0); }
     var out = fl_alloc(n * 72);
-    if (out == 0) { return (0, 0); }
+    if (out == 0) { _pv_span_end(trace); return (0, 0); }
     for (var c = 0; c < n; c = c + 1) {
         for (var e = 0; e < 9; e = e + 1) {
             var v: f64 = 0.0;
@@ -11472,7 +12321,10 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
             store64(out + (c * 9 + e) * 8, _pv_bits(v));
         }
     }
-    if (_pv_is_positive(h) == 0 || _pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return (out, n); }
+    if (_pv_is_positive(h) == 0 || _pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) {
+        _pv_span_end(trace);
+        return (out, n);
+    }
     var kc: PvKernelCoeffs;
     _pv_kc_init(&kc, h);
     var h2: f64 = kc.h2;
@@ -11542,7 +12394,7 @@ fn compute_gradient_corrections(ps: *PvFluidParticle, n, offsets, n_off, indices
             for (var t = 0; t < 9; t = t + 1) { store64(out + (i * 9 + t) * 8, load64(&tmp + t * 8)); }
         }
     }
-    return (out, n);
+    _pv_span_end(trace); return (out, n);
 }
 
 # L·∇W for the row-major 3×3 matrix at correction: each row ((r₀·x) + (r₁·y)) + (r₂·z). Mirrors
@@ -11574,13 +12426,14 @@ fn apply_gradient_correction(correction, gw: PvVec3): PvVec3 {
 #must_use
 fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_idx, h: f64, viscosity: f64, dt: f64,
   iterations): i64 {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::implicit_visc", "n", n, 0, 0, 0, 0);
     if (n <= 0 || _pv_is_positive(viscosity) == 0 || _pv_is_positive(h) == 0 || _pv_is_positive(dt) == 0) {
-        return 1;
+        _pv_span_end(trace); return 1;
     }
-    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { return 0; }
-    if (n > 9223372036854775807 / 24) { return 0; }
+    if (_pv_lists_valid(offsets, n_off, indices, n_idx, n) == 0) { _pv_span_end(trace); return 0; }
+    if (n > 9223372036854775807 / 24) { _pv_span_end(trace); return 0; }
     var v_old = fl_alloc(n * 24);
-    if (v_old == 0) { return 0; }
+    if (v_old == 0) { _pv_span_end(trace); return 0; }
     for (var c0 = 0; c0 < n; c0 = c0 + 1) {
         var q: *PvFluidParticle = ps + c0;
         store64(v_old + c0 * 24, _pv_bits(q.velocity.x));
@@ -11646,7 +12499,7 @@ fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_
         if (max_change < stop) { it = iterations; }
     }
     fl_free(v_old);
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # ── part d: secondary particles (foam, spray, bubbles) ──────────────────────────────
@@ -11680,8 +12533,9 @@ fn _pv_as_secondaries(p): *PvSecondaryParticle {
 # `generate_secondary_particles` (ADR 0002 #9).
 #must_use
 fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, max_lifetime: f64) {
+    var trace = _pv_span(_PV_LOG_SPH, "sph::secondary", "n", n, 0, 0, 0, 0);
     var sz = sizeof(PvSecondaryParticle);
-    if (n <= 0 || n > 9223372036854775807 / sz) { return (0, 0); }
+    if (n <= 0 || n > 9223372036854775807 / sz) { _pv_span_end(trace); return (0, 0); }
     var foam_thr: f64 = accel_threshold * 0.3;
     var count = 0;
     for (var i = 0; i < n; i = i + 1) {
@@ -11689,9 +12543,9 @@ fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, m
         var a: f64 = p.acceleration.length();
         if (a > accel_threshold || a > foam_thr) { count = count + 1; }
     }
-    if (count == 0) { return (0, 0); }
+    if (count == 0) { _pv_span_end(trace); return (0, 0); }
     var buf = fl_alloc(count * sz);
-    if (buf == 0) { return (0, 0); }
+    if (buf == 0) { _pv_span_end(trace); return (0, 0); }
     var k = 0;
     var half: f64 = max_lifetime * 0.5;
     for (var j = 0; j < n; j = j + 1) {
@@ -11721,7 +12575,7 @@ fn generate_secondary_particles(ps: *PvFluidParticle, n, accel_threshold: f64, m
             k = k + 1;
         }
     }
-    return (buf, count);
+    _pv_span_end(trace); return (buf, count);
 }
 
 # Advects and ages the n secondary particles at ss, then keeps those still alive (lifetime > 0; NaN is not) in their
@@ -12097,21 +12951,25 @@ impl PvSphSolver {
     # aborts). Mirrors `step` (ADR 0002 #19).
     #must_use
     fn step(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::solver_step", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
         if (self.use_verlet != 0) { ok = ok & self.prev_accel.reserve(3 * n); }
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
@@ -12119,6 +12977,7 @@ impl PvSphSolver {
         var dens = self.densities.data;
 
         # The densities (on the pool), then the pressures.
+        var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
         var pool = _pv_sph_pool(self);
         var dctx[40];
         _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
@@ -12135,7 +12994,10 @@ impl PvSphSolver {
             *sq = *p;
         }
 
+        _pv_span_end(td);
+
         # The accelerations, from the snapshot, into the solver's buffer (on the pool).
+        var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var csf = 0;
@@ -12158,11 +13020,13 @@ impl PvSphSolver {
             var gy: f64 = load64(acc + c * 24 + 8);
             var gz: f64 = load64(acc + c * 24 + 16);
             if (_pv_is_finite(gx) == 0 || _pv_is_finite(gy) == 0 || _pv_is_finite(gz) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(tf);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var w: *PvFluidParticle = ps + c;
             w.acceleration = PvVec3_new(gx, gy, gz);
         }
+        _pv_span_end(tf);
 
         # Integrate.
         var dt: f64 = config.dt;
@@ -12218,7 +13082,7 @@ impl PvSphSolver {
             }
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -12495,22 +13359,26 @@ impl PvSphSolver {
     #must_use
     fn step_pcisph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
       max_density_error: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::pcisph", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0);
         ok = ok & self.pcisph_accel.resize(3 * n, zw) & self.pcisph_pressures.resize(n, zw);
         ok = ok & self.pcisph_pred_pos.resize(3 * n, zw) & self.pcisph_pred_vel.resize(3 * n, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
@@ -12607,7 +13475,7 @@ impl PvSphSolver {
             ay = ay + ast.y;
             az = az + ast.z;
             if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             store64(npa + q * 24, _pv_bits(ax));
             store64(npa + q * 24 + 8, _pv_bits(ay));
@@ -12624,6 +13492,7 @@ impl PvSphSolver {
         if (iterations < 1) { iterations = 1; }
         var converged = 0;
         for (var it = 0; it < iterations; it = it + 1) {
+            var ti = _pv_span(_PV_LOG_SPH, "sph::pcisph_iter", "iter", it, 0, 0, 0, 0);
             _pv_pcisph_predict(self, n, &kc, dt);
             var max_error: f64 = 0.0;
             for (var c = 0; c < n; c = c + 1) {
@@ -12667,6 +13536,7 @@ impl PvSphSolver {
                     store64(pres + u * 8, _pv_bits(clamped));
                 }
             }
+            _pv_span_end(ti);
         }
         if (converged == 0) { _pv_pcisph_predict(self, n, &kc, dt); }
 
@@ -12677,7 +13547,7 @@ impl PvSphSolver {
             var my: f64 = load64(pos + m * 24 + 8);
             var mz: f64 = load64(pos + m * 24 + 16);
             if (_pv_is_finite(mx) == 0 || _pv_is_finite(my) == 0 || _pv_is_finite(mz) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var pm: *PvFluidParticle = ps + m;
             pm.velocity.x = load64(vel + m * 24);
@@ -12689,7 +13559,7 @@ impl PvSphSolver {
             pm.pressure = load64(pres + m * 8);
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -12874,20 +13744,24 @@ impl PvSphSolver {
     #must_use
     fn step_dfsph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
       max_error: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::dfsph", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.dfsph_alpha.resize(n, zw) & self.dfsph_kappa.resize(n, zw) & self.snapshot.resize(18 * n, 0);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
@@ -12951,6 +13825,7 @@ impl PvSphSolver {
         var done = 0;
         for (var it = 0; it < max_iterations; it = it + 1) {
             if (done == 0) {
+                var ti = _pv_span(_PV_LOG_SPH, "sph::dfsph_density", 0, 0, 0, 0, 0, 0);
                 var err_sum: f64 = 0.0;
                 for (var q = 0; q < n; q = q + 1) {
                     var pq: *PvFluidParticle = ps + q;
@@ -12969,6 +13844,7 @@ impl PvSphSolver {
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }
+                _pv_span_end(ti);
             }
         }
 
@@ -12979,13 +13855,14 @@ impl PvSphSolver {
             pe.position.y = pe.position.y + (pe.velocity.y * dt);
             pe.position.z = pe.position.z + (pe.velocity.z * dt);
         }
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_nb_build(g, ps, n, h) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         _pv_dfsph_density_alpha(self, ps, n, &kc);
 
         # The divergence solver.
         var done2 = 0;
         for (var it2 = 0; it2 < max_iterations; it2 = it2 + 1) {
             if (done2 == 0) {
+                var tj = _pv_span(_PV_LOG_SPH, "sph::dfsph_div", 0, 0, 0, 0, 0, 0);
                 var div_sum: f64 = 0.0;
                 for (var u = 0; u < n; u = u + 1) {
                     var ru: f64 = _pv_dfsph_density_rate(self, ps, &kc, u);
@@ -13001,6 +13878,7 @@ impl PvSphSolver {
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }
+                _pv_span_end(tj);
             }
         }
 
@@ -13020,9 +13898,9 @@ impl PvSphSolver {
                 bad = 1;
             }
         }
-        if (bad == 1) { return Err(PV_ERR_DIVERGED); }
+        if (bad == 1) { _pv_span_end(trace); return Err(PV_ERR_DIVERGED); }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -13262,21 +14140,36 @@ impl PvSphSolver {
     #must_use
     fn step_multiphase(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, phase_config: *PvMultiPhaseConfig):
     Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::step_multiphase", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
-        if (phase_config.phases.len / 3 == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
+        if (phase_config.phases.len / 3 == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
+        # One warning a step for the particles whose phase has no entry (they fall back to phase 0), as Rust's.
+        var nphases = phase_config.phases.len / 3;
+        var bad_phase = 0;
+        for (var bq = 0; bq < n; bq = bq + 1) {
+            var pb: *PvFluidParticle = ps + bq;
+            if (pb.phase >= nphases) { bad_phase = bad_phase + 1; }
+        }
+        if (bad_phase > 0) {
+            var msg = "phase index out of bounds, falling back to phase 0";
+            _pv_warn(_PV_LOG_SPH, msg, "particles", bad_phase, "available", nphases, 0, 0);
+        }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0) & self.accels.resize(3 * n, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var off = g.offsets.data;
@@ -13284,6 +14177,7 @@ impl PvSphSolver {
         var dens = self.densities.data;
 
         # The densities (serially, as Rust's), then each pressure by its phase's equation of state.
+        var td = _pv_span(_PV_LOG_SPH, "sph::density", "n", n, 0, 0, 0, 0);
         var dctx[40];
         _pv_sph_density_ctx(&dctx, ps, off, idx, dens, &kc);
         _pv_sph_density_k(&dctx, 0, n);
@@ -13300,7 +14194,10 @@ impl PvSphSolver {
             *sq = *p;
         }
 
+        _pv_span_end(td);
+
         # The accelerations, from the snapshot (on the pool).
+        var tf = _pv_span(_PV_LOG_SPH, "sph::forces", "n", n, 0, 0, 0, 0);
         var acc = self.accels.data;
         var st: f64 = self.surface_tension;
         var it: f64 = phase_config.interface_tension;
@@ -13328,11 +14225,13 @@ impl PvSphSolver {
             var gy2: f64 = load64(acc + c * 24 + 8);
             var gz2: f64 = load64(acc + c * 24 + 16);
             if (_pv_is_finite(gx2) == 0 || _pv_is_finite(gy2) == 0 || _pv_is_finite(gz2) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(tf);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var w2: *PvFluidParticle = ps + c;
             w2.acceleration = PvVec3_new(gx2, gy2, gz2);
         }
+        _pv_span_end(tf);
 
         # Symplectic Euler, then the walls.
         var dt: f64 = config.dt;
@@ -13349,7 +14248,7 @@ impl PvSphSolver {
             pe.position.z = pe.position.z + (nvz * dt);
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -13731,6 +14630,7 @@ impl PvRigidBody {
 # another writes). Mirrors `couple_sph_bodies`.
 fn couple_sph_bodies(ps: *PvFluidParticle, n, bodies: *PvRigidBody, nb, smoothing_radius: f64, stiffness: f64,
   damping: f64) {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::sph_bodies", "n_particles", n, "n_bodies", nb, 0, 0);
     var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
     var zero: f64 = 0.0;
     var nd: f64 = -damping;
@@ -13778,7 +14678,7 @@ fn couple_sph_bodies(ps: *PvFluidParticle, n, bodies: *PvRigidBody, nb, smoothin
         }
         bj.force = PvVec3_new(fx, fy, fz);
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # Integrates the nb bodies at bodies over dt: v += (F·(1/max(m, 1e-20)) + g)·dt, then x += v·dt. Mirrors
@@ -13876,6 +14776,7 @@ fn _pv_drag_mean(b: *PvRigidBody, sx: f64, sy: f64, sz: f64, count, fluid_densit
 #must_use
 fn drag_from_particles(body: *PvRigidBody, ps: *PvFluidParticle, n, fluid_density: f64, drag_coefficient: f64,
   sample_radius: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::drag_from_particles", 0, 0, 0, 0, 0, 0);
     var sx: f64 = 0.0;
     var sy: f64 = 0.0;
     var sz: f64 = 0.0;
@@ -13894,7 +14795,7 @@ fn drag_from_particles(body: *PvRigidBody, ps: *PvFluidParticle, n, fluid_densit
         }
     }
     var f: PvVec3 = _pv_drag_mean(body, sx, sy, sz, count, fluid_density, drag_coefficient);
-    return f;
+    _pv_span_end(trace); return f;
 }
 
 # The context of one indexed drag sum: the body's distance context, the particles and their count, the sample radius,
@@ -13948,6 +14849,7 @@ fn _pv_drag_visit(ctx, a, b): i64 {
 #must_use
 fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid: *PvNeighborGrid,
   fluid_density: f64, drag_coefficient: f64, sample_radius: f64): PvVec3 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::drag_from_particles_indexed", 0, 0, 0, 0, 0, 0);
     var inv: f64 = grid.inv_cell;
     var br: f64 = body_shape_bounding_radius(_pv_body_shape(body));
     var qr: f64 = sample_radius + br;
@@ -13984,7 +14886,7 @@ fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid
         _pv_nb_block(grid, &lo, &hi, &_pv_drag_visit, &d);
     }
     var f: PvVec3 = _pv_drag_mean(body, d.sx, d.sy, d.sz, d.count, fluid_density, drag_coefficient);
-    return f;
+    _pv_span_end(trace); return f;
 }
 
 # ── the particle level set ──────────────────────────────────────────────────────────
@@ -13994,9 +14896,16 @@ fn drag_from_particles_indexed(body: *PvRigidBody, ps: *PvFluidParticle, n, grid
 # outside the fluid, negative inside (a brute-force O(cells · n) search, as Rust's). 1, or 0 with nothing written
 # when nx·ny is not len or overflows, or nx or ny is negative (Rust warns and returns). Mirrors `particle_level_set`.
 fn particle_level_set(ls, len, nx, ny, dx: f64, ps: *PvFluidParticle, n, particle_radius: f64): i64 {
-    if (nx < 0 || ny < 0) { return 0; }
-    if (nx > 0 && ny > 9223372036854775807 / nx) { return 0; }
-    if (nx * ny != len) { return 0; }
+    var trace = _pv_span(_PV_LOG_COUPLING, "coupling::particle_level_set", "nx", nx, "ny", ny, "n", n);
+    # Rust's `nx.checked_mul(ny) != Some(level_set.len())`: an overflow, or any other length.
+    var bad = 0;
+    if (nx < 0 || ny < 0) { bad = 1; }
+    if (bad == 0 && nx > 0 && ny > 9223372036854775807 / nx) { bad = 1; }
+    if (bad == 0 && nx * ny != len) { bad = 1; }
+    if (bad == 1) {
+        _pv_warn(_PV_LOG_COUPLING, "particle_level_set: size mismatch ignored", "nx", nx, "ny", ny, "len", len);
+        _pv_span_end(trace); return 0;
+    }
     var fx: f64 = f64_from(nx);
     var fy: f64 = f64_from(ny);
     var far: f64 = (fx + fy) * dx;
@@ -14020,7 +14929,7 @@ fn particle_level_set(ls, len, nx, ny, dx: f64, ps: *PvFluidParticle, n, particl
             store64(ls + (y * nx + x) * 8, _pv_bits(min_dist));
         }
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 # --- flip.cyr ---
@@ -14152,6 +15061,7 @@ fn _pv_flip_apic_resize(s: *PvFlipSolver, n): i64 {
 # `use_apic` and it has one, else zero; then each node with a weight above 1e-20 is divided by it. Mirrors the private
 # `particles_to_grid`.
 fn _pv_flip_p2g(s: *PvFlipSolver, ps: *PvFluidParticle, n) {
+    var trace = _pv_span(_PV_LOG_COUPLING, "flip::p2g", "n", n, 0, 0, 0, 0);
     var nx = s.nx;
     var ny = s.ny;
     var dx: f64 = s.dx;
@@ -14243,7 +15153,7 @@ fn _pv_flip_p2g(s: *PvFlipSolver, ps: *PvFluidParticle, n) {
             store64(vy + i * 8, _pv_bits(qb));
         }
     }
-    return 0;
+    _pv_span_end(trace); return 0;
 }
 
 # The bilinear sample of the nx-wide field at f at the cell (x0, y0) and fractions (sx, sy) of a grid position:
@@ -14270,6 +15180,7 @@ fn _pv_flip_sample(f, nx, x0, y0, sx: f64, sy: f64): f64 {
 # change. 1, or 0 when the APIC column can't grow (nothing changed). Mirrors the private `grid_to_particles`.
 #must_use
 fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
+    var trace = _pv_span(_PV_LOG_COUPLING, "flip::g2p", "n", n, 0, 0, 0, 0);
     var nx = s.nx;
     var ny = s.ny;
     var dx: f64 = s.dx;
@@ -14278,7 +15189,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
     var vx = s.vx.data;
     var vy = s.vy.data;
     if (s.use_apic == 1) {
-        if (_pv_flip_apic_resize(s, n) == 0) { return 0; }
+        if (_pv_flip_apic_resize(s, n) == 0) { _pv_span_end(trace); return 0; }
         var ac = s.apic_c.data;
         for (var pi = 0; pi < n; pi = pi + 1) {
             var p: *PvFluidParticle = ps + pi;
@@ -14339,7 +15250,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
             store64(ac + pi * 32 + 16, _pv_bits(c10));
             store64(ac + pi * 32 + 24, _pv_bits(c11));
         }
-        return 1;
+        _pv_span_end(trace); return 1;
     }
     var flip: f64 = _pv_clamp(s.flip_ratio, 0.0, 1.0);
     var pic: f64 = one - flip;
@@ -14364,7 +15275,7 @@ fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
         pq.velocity.x = bx;
         pq.velocity.y = by;
     }
-    return 1;
+    _pv_span_end(trace); return 1;
 }
 
 impl PvFlipSolver {
@@ -14399,12 +15310,13 @@ impl PvFlipSolver {
     # Ok(0). Mirrors `FlipSolver::step`.
     #must_use
     fn step(self, ps: *PvFluidParticle, n, gravity: PvVec3, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (_pv_is_finite(self.flip_ratio) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var trace = _pv_span(_PV_LOG_COUPLING, "flip::step", "n", n, 0, 0, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (_pv_is_finite(self.flip_ratio) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var nx = self.nx;
         var ny = self.ny;
         if (self.use_apic == 1 && self.apic_c.len != 4 * n) {
-            if (_pv_flip_apic_resize(self, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+            if (_pv_flip_apic_resize(self, n) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         }
         _pv_flip_p2g(self, ps, n);
         var cells = nx * ny;
@@ -14497,9 +15409,9 @@ impl PvFlipSolver {
             var fy: f64 = load64(vy + q * 8);
             var zx: f64 = fx - fx;
             var zy: f64 = fy - fy;
-            if (!(zx == 0.0) || !(zy == 0.0)) { return Err(PV_ERR_DIVERGED); }
+            if (!(zx == 0.0) || !(zy == 0.0)) { _pv_span_end(trace); return Err(PV_ERR_DIVERGED); }
         }
-        if (_pv_flip_g2p(self, ps, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_flip_g2p(self, ps, n) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         # Advection, and the clamp to the grid.
         var nxf: f64 = f64_from(nx - 1);
         var nyf: f64 = f64_from(ny - 1);
@@ -14528,7 +15440,7 @@ impl PvFlipSolver {
                 p.velocity.y = 0.0;
             }
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -15041,13 +15953,17 @@ impl PvMpmSolver {
     # Ok(0). Mirrors `MpmSolver::step`.
     #must_use
     fn step(self, ps: *PvFluidParticle, n, mpm: *PvMpmParticle, nm, gravity: PvVec3, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (n != nm) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var trace = _pv_span(_PV_LOG_MPM, "mpm::step", "n", n, 0, 0, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (n != nm) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         for (var c = 0; c < nm; c = c + 1) {
             var mc: *PvMpmParticle = mpm + c;
             var vt, vv = constitutive_model_validate(_pv_mpm_model(mc));
-            if (is_err_result(vt) == 1) { return Err(vv); }
-            if (_pv_is_finite(mc.volume_0) == 0 || mc.volume_0 <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+            if (is_err_result(vt) == 1) { _pv_span_end(trace); return Err(vv); }
+            if (_pv_is_finite(mc.volume_0) == 0 || mc.volume_0 <= 0.0) {
+                _pv_span_end(trace);
+                return Err(PV_ERR_INVALID_PARAMETER);
+            }
         }
         var nx = self.nx;
         var ny = self.ny;
@@ -15285,7 +16201,7 @@ impl PvMpmSolver {
             pr.velocity.x = vx2;
             pr.velocity.y = vy2;
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }
 
@@ -15736,6 +16652,525 @@ fn PvKernelDerivatives_dtait_drho(density: f64, rest_density: f64, speed_of_soun
 fn PvKernelDerivatives_dwendland_c2_dr(r: f64, h: f64): f64 {
     var g: f64 = kernel_wendland_c2_grad(r, h);
     return g;
+}
+
+# --- str_debug_data.cyr ---
+
+# pravash — the code points Rust's str Debug escapes
+#
+# GENERATED by scripts/oracle from pravash 1.3.0 (rust-old/), hisab 1.4.0, glam 0.29.3. Do not edit.
+# Regenerate: cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml
+#
+# From rustc 1.99.1's core, Unicode 17.0.0, read char by char by t_str_debug.rs: the code points
+# `<str as Debug>` writes as \u{…} beside its named escapes (\0 \t \n \r \" \\), the grapheme
+# extenders and the chars core's is_printable rejects. Inclusive ranges [lo, hi] in code point order; the
+# surrogates, which no string holds, are folded in. src/ai.cyr searches it (_pv_str_debug_escapes).
+
+# The number of ranges.
+const _PV_STR_DEBUG_RANGES = 910;
+
+# The ranges, two words each: lo, hi.
+var _PV_STR_DEBUG_ESC: i64[1820] = {
+    0x1, 0x8, 0xB, 0xC, 0xE, 0x1F, 0x7F, 0xA0, 0xAD, 0xAD, 0x300, 0x36F,
+    0x378, 0x379, 0x380, 0x383, 0x38B, 0x38B, 0x38D, 0x38D, 0x3A2, 0x3A2, 0x483, 0x489,
+    0x530, 0x530, 0x557, 0x558, 0x58B, 0x58C, 0x590, 0x5BD, 0x5BF, 0x5BF, 0x5C1, 0x5C2,
+    0x5C4, 0x5C5, 0x5C7, 0x5CF, 0x5EB, 0x5EE, 0x5F5, 0x605, 0x610, 0x61A, 0x61C, 0x61C,
+    0x64B, 0x65F, 0x670, 0x670, 0x6D6, 0x6DD, 0x6DF, 0x6E4, 0x6E7, 0x6E8, 0x6EA, 0x6ED,
+    0x70E, 0x70F, 0x711, 0x711, 0x730, 0x74C, 0x7A6, 0x7B0, 0x7B2, 0x7BF, 0x7EB, 0x7F3,
+    0x7FB, 0x7FD, 0x816, 0x819, 0x81B, 0x823, 0x825, 0x827, 0x829, 0x82F, 0x83F, 0x83F,
+    0x859, 0x85D, 0x85F, 0x85F, 0x86B, 0x86F, 0x890, 0x89F, 0x8CA, 0x902, 0x93A, 0x93A,
+    0x93C, 0x93C, 0x941, 0x948, 0x94D, 0x94D, 0x951, 0x957, 0x962, 0x963, 0x981, 0x981,
+    0x984, 0x984, 0x98D, 0x98E, 0x991, 0x992, 0x9A9, 0x9A9, 0x9B1, 0x9B1, 0x9B3, 0x9B5,
+    0x9BA, 0x9BC, 0x9BE, 0x9BE, 0x9C1, 0x9C6, 0x9C9, 0x9CA, 0x9CD, 0x9CD, 0x9CF, 0x9DB,
+    0x9DE, 0x9DE, 0x9E2, 0x9E5, 0x9FE, 0xA02, 0xA04, 0xA04, 0xA0B, 0xA0E, 0xA11, 0xA12,
+    0xA29, 0xA29, 0xA31, 0xA31, 0xA34, 0xA34, 0xA37, 0xA37, 0xA3A, 0xA3D, 0xA41, 0xA58,
+    0xA5D, 0xA5D, 0xA5F, 0xA65, 0xA70, 0xA71, 0xA75, 0xA75, 0xA77, 0xA82, 0xA84, 0xA84,
+    0xA8E, 0xA8E, 0xA92, 0xA92, 0xAA9, 0xAA9, 0xAB1, 0xAB1, 0xAB4, 0xAB4, 0xABA, 0xABC,
+    0xAC1, 0xAC8, 0xACA, 0xACA, 0xACD, 0xACF, 0xAD1, 0xADF, 0xAE2, 0xAE5, 0xAF2, 0xAF8,
+    0xAFA, 0xB01, 0xB04, 0xB04, 0xB0D, 0xB0E, 0xB11, 0xB12, 0xB29, 0xB29, 0xB31, 0xB31,
+    0xB34, 0xB34, 0xB3A, 0xB3C, 0xB3E, 0xB3F, 0xB41, 0xB46, 0xB49, 0xB4A, 0xB4D, 0xB5B,
+    0xB5E, 0xB5E, 0xB62, 0xB65, 0xB78, 0xB82, 0xB84, 0xB84, 0xB8B, 0xB8D, 0xB91, 0xB91,
+    0xB96, 0xB98, 0xB9B, 0xB9B, 0xB9D, 0xB9D, 0xBA0, 0xBA2, 0xBA5, 0xBA7, 0xBAB, 0xBAD,
+    0xBBA, 0xBBE, 0xBC0, 0xBC0, 0xBC3, 0xBC5, 0xBC9, 0xBC9, 0xBCD, 0xBCF, 0xBD1, 0xBE5,
+    0xBFB, 0xC00, 0xC04, 0xC04, 0xC0D, 0xC0D, 0xC11, 0xC11, 0xC29, 0xC29, 0xC3A, 0xC3C,
+    0xC3E, 0xC40, 0xC45, 0xC57, 0xC5B, 0xC5B, 0xC5E, 0xC5F, 0xC62, 0xC65, 0xC70, 0xC76,
+    0xC81, 0xC81, 0xC8D, 0xC8D, 0xC91, 0xC91, 0xCA9, 0xCA9, 0xCB4, 0xCB4, 0xCBA, 0xCBC,
+    0xCBF, 0xCC0, 0xCC2, 0xCC2, 0xCC5, 0xCDB, 0xCDF, 0xCDF, 0xCE2, 0xCE5, 0xCF0, 0xCF0,
+    0xCF4, 0xD01, 0xD0D, 0xD0D, 0xD11, 0xD11, 0xD3B, 0xD3C, 0xD3E, 0xD3E, 0xD41, 0xD45,
+    0xD49, 0xD49, 0xD4D, 0xD4D, 0xD50, 0xD53, 0xD57, 0xD57, 0xD62, 0xD65, 0xD80, 0xD81,
+    0xD84, 0xD84, 0xD97, 0xD99, 0xDB2, 0xDB2, 0xDBC, 0xDBC, 0xDBE, 0xDBF, 0xDC7, 0xDCF,
+    0xDD2, 0xDD7, 0xDDF, 0xDE5, 0xDF0, 0xDF1, 0xDF5, 0xE00, 0xE31, 0xE31, 0xE34, 0xE3E,
+    0xE47, 0xE4E, 0xE5C, 0xE80, 0xE83, 0xE83, 0xE85, 0xE85, 0xE8B, 0xE8B, 0xEA4, 0xEA4,
+    0xEA6, 0xEA6, 0xEB1, 0xEB1, 0xEB4, 0xEBC, 0xEBE, 0xEBF, 0xEC5, 0xEC5, 0xEC7, 0xECF,
+    0xEDA, 0xEDB, 0xEE0, 0xEFF, 0xF18, 0xF19, 0xF35, 0xF35, 0xF37, 0xF37, 0xF39, 0xF39,
+    0xF48, 0xF48, 0xF6D, 0xF7E, 0xF80, 0xF84, 0xF86, 0xF87, 0xF8D, 0xFBD, 0xFC6, 0xFC6,
+    0xFCD, 0xFCD, 0xFDB, 0xFFF, 0x102D, 0x1030, 0x1032, 0x1037, 0x1039, 0x103A, 0x103D, 0x103E,
+    0x1058, 0x1059, 0x105E, 0x1060, 0x1071, 0x1074, 0x1082, 0x1082, 0x1085, 0x1086, 0x108D, 0x108D,
+    0x109D, 0x109D, 0x10C6, 0x10C6, 0x10C8, 0x10CC, 0x10CE, 0x10CF, 0x115F, 0x1160, 0x1249, 0x1249,
+    0x124E, 0x124F, 0x1257, 0x1257, 0x1259, 0x1259, 0x125E, 0x125F, 0x1289, 0x1289, 0x128E, 0x128F,
+    0x12B1, 0x12B1, 0x12B6, 0x12B7, 0x12BF, 0x12BF, 0x12C1, 0x12C1, 0x12C6, 0x12C7, 0x12D7, 0x12D7,
+    0x1311, 0x1311, 0x1316, 0x1317, 0x135B, 0x135F, 0x137D, 0x137F, 0x139A, 0x139F, 0x13F6, 0x13F7,
+    0x13FE, 0x13FF, 0x1680, 0x1680, 0x169D, 0x169F, 0x16F9, 0x16FF, 0x1712, 0x171E, 0x1732, 0x1734,
+    0x1737, 0x173F, 0x1752, 0x175F, 0x176D, 0x176D, 0x1771, 0x177F, 0x17B4, 0x17B5, 0x17B7, 0x17BD,
+    0x17C6, 0x17C6, 0x17C9, 0x17D3, 0x17DD, 0x17DF, 0x17EA, 0x17EF, 0x17FA, 0x17FF, 0x180B, 0x180F,
+    0x181A, 0x181F, 0x1879, 0x187F, 0x1885, 0x1886, 0x18A9, 0x18A9, 0x18AB, 0x18AF, 0x18F6, 0x18FF,
+    0x191F, 0x1922, 0x1927, 0x1928, 0x192C, 0x192F, 0x1932, 0x1932, 0x1939, 0x193F, 0x1941, 0x1943,
+    0x196E, 0x196F, 0x1975, 0x197F, 0x19AC, 0x19AF, 0x19CA, 0x19CF, 0x19DB, 0x19DD, 0x1A17, 0x1A18,
+    0x1A1B, 0x1A1D, 0x1A56, 0x1A56, 0x1A58, 0x1A60, 0x1A62, 0x1A62, 0x1A65, 0x1A6C, 0x1A73, 0x1A7F,
+    0x1A8A, 0x1A8F, 0x1A9A, 0x1A9F, 0x1AAE, 0x1B03, 0x1B34, 0x1B3D, 0x1B42, 0x1B44, 0x1B4D, 0x1B4D,
+    0x1B6B, 0x1B73, 0x1B80, 0x1B81, 0x1BA2, 0x1BA5, 0x1BA8, 0x1BAD, 0x1BE6, 0x1BE6, 0x1BE8, 0x1BE9,
+    0x1BED, 0x1BED, 0x1BEF, 0x1BFB, 0x1C2C, 0x1C33, 0x1C36, 0x1C3A, 0x1C4A, 0x1C4C, 0x1C8B, 0x1C8F,
+    0x1CBB, 0x1CBC, 0x1CC8, 0x1CD2, 0x1CD4, 0x1CE0, 0x1CE2, 0x1CE8, 0x1CED, 0x1CED, 0x1CF4, 0x1CF4,
+    0x1CF8, 0x1CF9, 0x1CFB, 0x1CFF, 0x1DC0, 0x1DFF, 0x1F16, 0x1F17, 0x1F1E, 0x1F1F, 0x1F46, 0x1F47,
+    0x1F4E, 0x1F4F, 0x1F58, 0x1F58, 0x1F5A, 0x1F5A, 0x1F5C, 0x1F5C, 0x1F5E, 0x1F5E, 0x1F7E, 0x1F7F,
+    0x1FB5, 0x1FB5, 0x1FC5, 0x1FC5, 0x1FD4, 0x1FD5, 0x1FDC, 0x1FDC, 0x1FF0, 0x1FF1, 0x1FF5, 0x1FF5,
+    0x1FFF, 0x200F, 0x2028, 0x202F, 0x205F, 0x206F, 0x2072, 0x2073, 0x208F, 0x208F, 0x209D, 0x209F,
+    0x20C2, 0x20FF, 0x218C, 0x218F, 0x242A, 0x243F, 0x244B, 0x245F, 0x2B74, 0x2B75, 0x2CEF, 0x2CF1,
+    0x2CF4, 0x2CF8, 0x2D26, 0x2D26, 0x2D28, 0x2D2C, 0x2D2E, 0x2D2F, 0x2D68, 0x2D6E, 0x2D71, 0x2D7F,
+    0x2D97, 0x2D9F, 0x2DA7, 0x2DA7, 0x2DAF, 0x2DAF, 0x2DB7, 0x2DB7, 0x2DBF, 0x2DBF, 0x2DC7, 0x2DC7,
+    0x2DCF, 0x2DCF, 0x2DD7, 0x2DD7, 0x2DDF, 0x2DFF, 0x2E5E, 0x2E7F, 0x2E9A, 0x2E9A, 0x2EF4, 0x2EFF,
+    0x2FD6, 0x2FEF, 0x3000, 0x3000, 0x302A, 0x302F, 0x3040, 0x3040, 0x3097, 0x309A, 0x3100, 0x3104,
+    0x3130, 0x3130, 0x3164, 0x3164, 0x318F, 0x318F, 0x31E6, 0x31EE, 0x321F, 0x321F, 0xA48D, 0xA48F,
+    0xA4C7, 0xA4CF, 0xA62C, 0xA63F, 0xA66F, 0xA672, 0xA674, 0xA67D, 0xA69E, 0xA69F, 0xA6F0, 0xA6F1,
+    0xA6F8, 0xA6FF, 0xA7DD, 0xA7F0, 0xA802, 0xA802, 0xA806, 0xA806, 0xA80B, 0xA80B, 0xA825, 0xA826,
+    0xA82C, 0xA82F, 0xA83A, 0xA83F, 0xA878, 0xA87F, 0xA8C4, 0xA8CD, 0xA8DA, 0xA8F1, 0xA8FF, 0xA8FF,
+    0xA926, 0xA92D, 0xA947, 0xA951, 0xA953, 0xA95E, 0xA97D, 0xA982, 0xA9B3, 0xA9B3, 0xA9B6, 0xA9B9,
+    0xA9BC, 0xA9BD, 0xA9C0, 0xA9C0, 0xA9CE, 0xA9CE, 0xA9DA, 0xA9DD, 0xA9E5, 0xA9E5, 0xA9FF, 0xA9FF,
+    0xAA29, 0xAA2E, 0xAA31, 0xAA32, 0xAA35, 0xAA3F, 0xAA43, 0xAA43, 0xAA4C, 0xAA4C, 0xAA4E, 0xAA4F,
+    0xAA5A, 0xAA5B, 0xAA7C, 0xAA7C, 0xAAB0, 0xAAB0, 0xAAB2, 0xAAB4, 0xAAB7, 0xAAB8, 0xAABE, 0xAABF,
+    0xAAC1, 0xAAC1, 0xAAC3, 0xAADA, 0xAAEC, 0xAAED, 0xAAF6, 0xAB00, 0xAB07, 0xAB08, 0xAB0F, 0xAB10,
+    0xAB17, 0xAB1F, 0xAB27, 0xAB27, 0xAB2F, 0xAB2F, 0xAB6C, 0xAB6F, 0xABE5, 0xABE5, 0xABE8, 0xABE8,
+    0xABED, 0xABEF, 0xABFA, 0xABFF, 0xD7A4, 0xD7AF, 0xD7C7, 0xD7CA, 0xD7FC, 0xF8FF, 0xFA6E, 0xFA6F,
+    0xFADA, 0xFAFF, 0xFB07, 0xFB12, 0xFB18, 0xFB1C, 0xFB1E, 0xFB1E, 0xFB37, 0xFB37, 0xFB3D, 0xFB3D,
+    0xFB3F, 0xFB3F, 0xFB42, 0xFB42, 0xFB45, 0xFB45, 0xFDD0, 0xFDEF, 0xFE00, 0xFE0F, 0xFE1A, 0xFE2F,
+    0xFE53, 0xFE53, 0xFE67, 0xFE67, 0xFE6C, 0xFE6F, 0xFE75, 0xFE75, 0xFEFD, 0xFF00, 0xFFA0, 0xFFA0,
+    0xFFBF, 0xFFC1, 0xFFC8, 0xFFC9, 0xFFD0, 0xFFD1, 0xFFD8, 0xFFD9, 0xFFDD, 0xFFDF, 0xFFE7, 0xFFE7,
+    0xFFEF, 0xFFFB, 0xFFFE, 0xFFFF, 0x1000C, 0x1000C, 0x10027, 0x10027, 0x1003B, 0x1003B, 0x1003E, 0x1003E,
+    0x1004E, 0x1004F, 0x1005E, 0x1007F, 0x100FB, 0x100FF, 0x10103, 0x10106, 0x10134, 0x10136, 0x1018F, 0x1018F,
+    0x1019D, 0x1019F, 0x101A1, 0x101CF, 0x101FD, 0x1027F, 0x1029D, 0x1029F, 0x102D1, 0x102E0, 0x102FC, 0x102FF,
+    0x10324, 0x1032C, 0x1034B, 0x1034F, 0x10376, 0x1037F, 0x1039E, 0x1039E, 0x103C4, 0x103C7, 0x103D6, 0x103FF,
+    0x1049E, 0x1049F, 0x104AA, 0x104AF, 0x104D4, 0x104D7, 0x104FC, 0x104FF, 0x10528, 0x1052F, 0x10564, 0x1056E,
+    0x1057B, 0x1057B, 0x1058B, 0x1058B, 0x10593, 0x10593, 0x10596, 0x10596, 0x105A2, 0x105A2, 0x105B2, 0x105B2,
+    0x105BA, 0x105BA, 0x105BD, 0x105BF, 0x105F4, 0x105FF, 0x10737, 0x1073F, 0x10756, 0x1075F, 0x10768, 0x1077F,
+    0x10786, 0x10786, 0x107B1, 0x107B1, 0x107BB, 0x107FF, 0x10806, 0x10807, 0x10809, 0x10809, 0x10836, 0x10836,
+    0x10839, 0x1083B, 0x1083D, 0x1083E, 0x10856, 0x10856, 0x1089F, 0x108A6, 0x108B0, 0x108DF, 0x108F3, 0x108F3,
+    0x108F6, 0x108FA, 0x1091C, 0x1091E, 0x1093A, 0x1093E, 0x1095A, 0x1097F, 0x109B8, 0x109BB, 0x109D0, 0x109D1,
+    0x10A01, 0x10A0F, 0x10A14, 0x10A14, 0x10A18, 0x10A18, 0x10A36, 0x10A3F, 0x10A49, 0x10A4F, 0x10A59, 0x10A5F,
+    0x10AA0, 0x10ABF, 0x10AE5, 0x10AEA, 0x10AF7, 0x10AFF, 0x10B36, 0x10B38, 0x10B56, 0x10B57, 0x10B73, 0x10B77,
+    0x10B92, 0x10B98, 0x10B9D, 0x10BA8, 0x10BB0, 0x10BFF, 0x10C49, 0x10C7F, 0x10CB3, 0x10CBF, 0x10CF3, 0x10CF9,
+    0x10D24, 0x10D2F, 0x10D3A, 0x10D3F, 0x10D66, 0x10D6D, 0x10D86, 0x10D8D, 0x10D90, 0x10E5F, 0x10E7F, 0x10E7F,
+    0x10EAA, 0x10EAC, 0x10EAE, 0x10EAF, 0x10EB2, 0x10EC1, 0x10EC8, 0x10ECF, 0x10ED9, 0x10EFF, 0x10F28, 0x10F2F,
+    0x10F46, 0x10F50, 0x10F5A, 0x10F6F, 0x10F82, 0x10F85, 0x10F8A, 0x10FAF, 0x10FCC, 0x10FDF, 0x10FF7, 0x10FFF,
+    0x11001, 0x11001, 0x11038, 0x11046, 0x1104E, 0x11051, 0x11070, 0x11070, 0x11073, 0x11074, 0x11076, 0x11081,
+    0x110B3, 0x110B6, 0x110B9, 0x110BA, 0x110BD, 0x110BD, 0x110C2, 0x110CF, 0x110E9, 0x110EF, 0x110FA, 0x11102,
+    0x11127, 0x1112B, 0x1112D, 0x11135, 0x11148, 0x1114F, 0x11173, 0x11173, 0x11177, 0x11181, 0x111B6, 0x111BE,
+    0x111C0, 0x111C0, 0x111C9, 0x111CC, 0x111CF, 0x111CF, 0x111E0, 0x111E0, 0x111F5, 0x111FF, 0x11212, 0x11212,
+    0x1122F, 0x11231, 0x11234, 0x11237, 0x1123E, 0x1123E, 0x11241, 0x1127F, 0x11287, 0x11287, 0x11289, 0x11289,
+    0x1128E, 0x1128E, 0x1129E, 0x1129E, 0x112AA, 0x112AF, 0x112DF, 0x112DF, 0x112E3, 0x112EF, 0x112FA, 0x11301,
+    0x11304, 0x11304, 0x1130D, 0x1130E, 0x11311, 0x11312, 0x11329, 0x11329, 0x11331, 0x11331, 0x11334, 0x11334,
+    0x1133A, 0x1133C, 0x1133E, 0x1133E, 0x11340, 0x11340, 0x11345, 0x11346, 0x11349, 0x1134A, 0x1134D, 0x1134F,
+    0x11351, 0x1135C, 0x11364, 0x1137F, 0x1138A, 0x1138A, 0x1138C, 0x1138D, 0x1138F, 0x1138F, 0x113B6, 0x113B6,
+    0x113B8, 0x113B8, 0x113BB, 0x113C9, 0x113CB, 0x113CB, 0x113CE, 0x113D0, 0x113D2, 0x113D2, 0x113D6, 0x113D6,
+    0x113D9, 0x113FF, 0x11438, 0x1143F, 0x11442, 0x11444, 0x11446, 0x11446, 0x1145C, 0x1145C, 0x1145E, 0x1145E,
+    0x11462, 0x1147F, 0x114B0, 0x114B0, 0x114B3, 0x114B8, 0x114BA, 0x114BA, 0x114BD, 0x114BD, 0x114BF, 0x114C0,
+    0x114C2, 0x114C3, 0x114C8, 0x114CF, 0x114DA, 0x1157F, 0x115AF, 0x115AF, 0x115B2, 0x115B7, 0x115BC, 0x115BD,
+    0x115BF, 0x115C0, 0x115DC, 0x115FF, 0x11633, 0x1163A, 0x1163D, 0x1163D, 0x1163F, 0x11640, 0x11645, 0x1164F,
+    0x1165A, 0x1165F, 0x1166D, 0x1167F, 0x116AB, 0x116AB, 0x116AD, 0x116AD, 0x116B0, 0x116B7, 0x116BA, 0x116BF,
+    0x116CA, 0x116CF, 0x116E4, 0x116FF, 0x1171B, 0x1171D, 0x1171F, 0x1171F, 0x11722, 0x11725, 0x11727, 0x1172F,
+    0x11747, 0x117FF, 0x1182F, 0x11837, 0x11839, 0x1183A, 0x1183C, 0x1189F, 0x118F3, 0x118FE, 0x11907, 0x11908,
+    0x1190A, 0x1190B, 0x11914, 0x11914, 0x11917, 0x11917, 0x11930, 0x11930, 0x11936, 0x11936, 0x11939, 0x1193E,
+    0x11943, 0x11943, 0x11947, 0x1194F, 0x1195A, 0x1199F, 0x119A8, 0x119A9, 0x119D4, 0x119DB, 0x119E0, 0x119E0,
+    0x119E5, 0x119FF, 0x11A01, 0x11A0A, 0x11A33, 0x11A38, 0x11A3B, 0x11A3E, 0x11A47, 0x11A4F, 0x11A51, 0x11A56,
+    0x11A59, 0x11A5B, 0x11A8A, 0x11A96, 0x11A98, 0x11A99, 0x11AA3, 0x11AAF, 0x11AF9, 0x11AFF, 0x11B0A, 0x11B60,
+    0x11B62, 0x11B64, 0x11B66, 0x11B66, 0x11B68, 0x11BBF, 0x11BE2, 0x11BEF, 0x11BFA, 0x11BFF, 0x11C09, 0x11C09,
+    0x11C30, 0x11C3D, 0x11C3F, 0x11C3F, 0x11C46, 0x11C4F, 0x11C6D, 0x11C6F, 0x11C90, 0x11CA8, 0x11CAA, 0x11CB0,
+    0x11CB2, 0x11CB3, 0x11CB5, 0x11CFF, 0x11D07, 0x11D07, 0x11D0A, 0x11D0A, 0x11D31, 0x11D45, 0x11D47, 0x11D4F,
+    0x11D5A, 0x11D5F, 0x11D66, 0x11D66, 0x11D69, 0x11D69, 0x11D8F, 0x11D92, 0x11D95, 0x11D95, 0x11D97, 0x11D97,
+    0x11D99, 0x11D9F, 0x11DAA, 0x11DAF, 0x11DDC, 0x11DDF, 0x11DEA, 0x11EDF, 0x11EF3, 0x11EF4, 0x11EF9, 0x11F01,
+    0x11F11, 0x11F11, 0x11F36, 0x11F3D, 0x11F40, 0x11F42, 0x11F5A, 0x11FAF, 0x11FB1, 0x11FBF, 0x11FF2, 0x11FFE,
+    0x1239A, 0x123FF, 0x1246F, 0x1246F, 0x12475, 0x1247F, 0x12544, 0x12F8F, 0x12FF3, 0x12FFF, 0x13430, 0x13440,
+    0x13447, 0x1345F, 0x143FB, 0x143FF, 0x14647, 0x160FF, 0x1611E, 0x16129, 0x1612D, 0x1612F, 0x1613A, 0x167FF,
+    0x16A39, 0x16A3F, 0x16A5F, 0x16A5F, 0x16A6A, 0x16A6D, 0x16ABF, 0x16ABF, 0x16ACA, 0x16ACF, 0x16AEE, 0x16AF4,
+    0x16AF6, 0x16AFF, 0x16B30, 0x16B36, 0x16B46, 0x16B4F, 0x16B5A, 0x16B5A, 0x16B62, 0x16B62, 0x16B78, 0x16B7C,
+    0x16B90, 0x16D3F, 0x16D7A, 0x16E3F, 0x16E9B, 0x16E9F, 0x16EB9, 0x16EBA, 0x16ED4, 0x16EFF, 0x16F4B, 0x16F4F,
+    0x16F88, 0x16F92, 0x16FA0, 0x16FDF, 0x16FE4, 0x16FF1, 0x16FF7, 0x16FFF, 0x18CD6, 0x18CFE, 0x18D1F, 0x18D7F,
+    0x18DF3, 0x1AFEF, 0x1AFF4, 0x1AFF4, 0x1AFFC, 0x1AFFC, 0x1AFFF, 0x1AFFF, 0x1B123, 0x1B131, 0x1B133, 0x1B14F,
+    0x1B153, 0x1B154, 0x1B156, 0x1B163, 0x1B168, 0x1B16F, 0x1B2FC, 0x1BBFF, 0x1BC6B, 0x1BC6F, 0x1BC7D, 0x1BC7F,
+    0x1BC89, 0x1BC8F, 0x1BC9A, 0x1BC9B, 0x1BC9D, 0x1BC9E, 0x1BCA0, 0x1CBFF, 0x1CCFD, 0x1CCFF, 0x1CEB4, 0x1CEB9,
+    0x1CED1, 0x1CEDF, 0x1CEF1, 0x1CF4F, 0x1CFC4, 0x1CFFF, 0x1D0F6, 0x1D0FF, 0x1D127, 0x1D128, 0x1D165, 0x1D169,
+    0x1D16D, 0x1D182, 0x1D185, 0x1D18B, 0x1D1AA, 0x1D1AD, 0x1D1EB, 0x1D1FF, 0x1D242, 0x1D244, 0x1D246, 0x1D2BF,
+    0x1D2D4, 0x1D2DF, 0x1D2F4, 0x1D2FF, 0x1D357, 0x1D35F, 0x1D379, 0x1D3FF, 0x1D455, 0x1D455, 0x1D49D, 0x1D49D,
+    0x1D4A0, 0x1D4A1, 0x1D4A3, 0x1D4A4, 0x1D4A7, 0x1D4A8, 0x1D4AD, 0x1D4AD, 0x1D4BA, 0x1D4BA, 0x1D4BC, 0x1D4BC,
+    0x1D4C4, 0x1D4C4, 0x1D506, 0x1D506, 0x1D50B, 0x1D50C, 0x1D515, 0x1D515, 0x1D51D, 0x1D51D, 0x1D53A, 0x1D53A,
+    0x1D53F, 0x1D53F, 0x1D545, 0x1D545, 0x1D547, 0x1D549, 0x1D551, 0x1D551, 0x1D6A6, 0x1D6A7, 0x1D7CC, 0x1D7CD,
+    0x1DA00, 0x1DA36, 0x1DA3B, 0x1DA6C, 0x1DA75, 0x1DA75, 0x1DA84, 0x1DA84, 0x1DA8C, 0x1DEFF, 0x1DF1F, 0x1DF24,
+    0x1DF2B, 0x1E02F, 0x1E06E, 0x1E0FF, 0x1E12D, 0x1E136, 0x1E13E, 0x1E13F, 0x1E14A, 0x1E14D, 0x1E150, 0x1E28F,
+    0x1E2AE, 0x1E2BF, 0x1E2EC, 0x1E2EF, 0x1E2FA, 0x1E2FE, 0x1E300, 0x1E4CF, 0x1E4EC, 0x1E4EF, 0x1E4FA, 0x1E5CF,
+    0x1E5EE, 0x1E5EF, 0x1E5FB, 0x1E5FE, 0x1E600, 0x1E6BF, 0x1E6DF, 0x1E6DF, 0x1E6E3, 0x1E6E3, 0x1E6E6, 0x1E6E6,
+    0x1E6EE, 0x1E6EF, 0x1E6F5, 0x1E6FD, 0x1E700, 0x1E7DF, 0x1E7E7, 0x1E7E7, 0x1E7EC, 0x1E7EC, 0x1E7EF, 0x1E7EF,
+    0x1E7FF, 0x1E7FF, 0x1E8C5, 0x1E8C6, 0x1E8D0, 0x1E8FF, 0x1E944, 0x1E94A, 0x1E94C, 0x1E94F, 0x1E95A, 0x1E95D,
+    0x1E960, 0x1EC70, 0x1ECB5, 0x1ED00, 0x1ED3E, 0x1EDFF, 0x1EE04, 0x1EE04, 0x1EE20, 0x1EE20, 0x1EE23, 0x1EE23,
+    0x1EE25, 0x1EE26, 0x1EE28, 0x1EE28, 0x1EE33, 0x1EE33, 0x1EE38, 0x1EE38, 0x1EE3A, 0x1EE3A, 0x1EE3C, 0x1EE41,
+    0x1EE43, 0x1EE46, 0x1EE48, 0x1EE48, 0x1EE4A, 0x1EE4A, 0x1EE4C, 0x1EE4C, 0x1EE50, 0x1EE50, 0x1EE53, 0x1EE53,
+    0x1EE55, 0x1EE56, 0x1EE58, 0x1EE58, 0x1EE5A, 0x1EE5A, 0x1EE5C, 0x1EE5C, 0x1EE5E, 0x1EE5E, 0x1EE60, 0x1EE60,
+    0x1EE63, 0x1EE63, 0x1EE65, 0x1EE66, 0x1EE6B, 0x1EE6B, 0x1EE73, 0x1EE73, 0x1EE78, 0x1EE78, 0x1EE7D, 0x1EE7D,
+    0x1EE7F, 0x1EE7F, 0x1EE8A, 0x1EE8A, 0x1EE9C, 0x1EEA0, 0x1EEA4, 0x1EEA4, 0x1EEAA, 0x1EEAA, 0x1EEBC, 0x1EEEF,
+    0x1EEF2, 0x1EFFF, 0x1F02C, 0x1F02F, 0x1F094, 0x1F09F, 0x1F0AF, 0x1F0B0, 0x1F0C0, 0x1F0C0, 0x1F0D0, 0x1F0D0,
+    0x1F0F6, 0x1F0FF, 0x1F1AE, 0x1F1E5, 0x1F203, 0x1F20F, 0x1F23C, 0x1F23F, 0x1F249, 0x1F24F, 0x1F252, 0x1F25F,
+    0x1F266, 0x1F2FF, 0x1F6D9, 0x1F6DB, 0x1F6ED, 0x1F6EF, 0x1F6FD, 0x1F6FF, 0x1F7DA, 0x1F7DF, 0x1F7EC, 0x1F7EF,
+    0x1F7F1, 0x1F7FF, 0x1F80C, 0x1F80F, 0x1F848, 0x1F84F, 0x1F85A, 0x1F85F, 0x1F888, 0x1F88F, 0x1F8AE, 0x1F8AF,
+    0x1F8BC, 0x1F8BF, 0x1F8C2, 0x1F8CF, 0x1F8D9, 0x1F8FF, 0x1FA58, 0x1FA5F, 0x1FA6E, 0x1FA6F, 0x1FA7D, 0x1FA7F,
+    0x1FA8B, 0x1FA8D, 0x1FAC7, 0x1FAC7, 0x1FAC9, 0x1FACC, 0x1FADD, 0x1FADE, 0x1FAEB, 0x1FAEE, 0x1FAF9, 0x1FAFF,
+    0x1FB93, 0x1FB93, 0x1FBFB, 0x1FFFF, 0x2A6E0, 0x2A6FF, 0x2B81E, 0x2B81F, 0x2CEAE, 0x2CEAF, 0x2EBE1, 0x2EBEF,
+    0x2EE5E, 0x2F7FF, 0x2FA1E, 0x2FFFF, 0x3134B, 0x3134F, 0x3347A, 0x10FFFF,
+};
+
+# --- ai.cyr ---
+
+# ai.cyr — rust-old/src/ai.rs (M7 part b): the daimon and hoosh service configs, their defaults, and Rust's `Debug` for
+# each, which never prints the daimon key. Their JSON is in src/json.cyr.
+#
+# A config holds its strings as bytes and a length: `endpoint`, and the daimon config's `api_key`, where a 0 pointer is
+# Rust's None and any other pointer Some (Some("") included). Rust's `String`s own their bytes. Here `owned` says which
+# of a config's strings are its own freelist copies (bit 0 the endpoint, bit 1 the key), which `_drop` releases: a
+# default config points at static text and owns nothing, one read from JSON owns its strings, and the setters copy.
+# Rust's `#[non_exhaustive]` stops a consumer building one with a struct literal, so it starts from a default or a
+# document and sets fields; here that is the setters (ADR 0002 #27).
+#
+# `debug(sb, alternate)` is Rust's `{:?}` (alternate 0) and `{:#?}` (1): the derived `Debug` for `HooshConfig` and the
+# hand-written one for `DaimonConfig`, whose key prints as `Some("<redacted>")`. Strings print as `<str as Debug>`
+# does: the named escapes \0 \t \n \r \" \\, `\u{…}` for the code points src/str_debug_data.cyr lists (generated from
+# rustc's core), the rest as they are. A byte that is no part of valid UTF-8 (Rust's strings can't hold one) prints as
+# U+FFFD.
+
+# The `owned` bits.
+const _PV_AI_OWN_ENDPOINT = 1;
+const _PV_AI_OWN_KEY = 2;
+
+# A daimon service's config: its endpoint, and its API key (0 for none). Mirrors `DaimonConfig`.
+struct PvDaimonConfig {
+    endpoint;
+    endpoint_len;
+    api_key;
+    api_key_len;
+    owned;
+}
+
+# A hoosh service's config: its endpoint. Mirrors `HooshConfig`.
+struct PvHooshConfig {
+    endpoint;
+    endpoint_len;
+    owned;
+}
+
+# The daimon default: endpoint http://localhost:8090, no key, nothing owned. Mirrors `DaimonConfig::default`.
+#must_use
+fn PvDaimonConfig_default(): PvDaimonConfig {
+    var c: PvDaimonConfig;
+    c.endpoint = "http://localhost:8090";
+    c.endpoint_len = 21;
+    c.api_key = 0;
+    c.api_key_len = 0;
+    c.owned = 0;
+    return c;
+}
+
+# The hoosh default: endpoint http://localhost:8088, nothing owned. Mirrors `HooshConfig::default`.
+#must_use
+fn PvHooshConfig_default(): PvHooshConfig {
+    var c: PvHooshConfig;
+    c.endpoint = "http://localhost:8088";
+    c.endpoint_len = 21;
+    c.owned = 0;
+    return c;
+}
+
+# A freelist copy of the n bytes at p, NUL-terminated (so Some("") is a nonzero pointer), or 0 for no memory.
+#must_use
+fn _pv_ai_copy(p, n): i64 {
+    if (n < 0) { return 0; }
+    var d = fl_alloc(n + 1);
+    if (d == 0) { return 0; }
+    if (n > 0) { memcpy(d, p, n); }
+    store8(d + n, 0);
+    return d;
+}
+
+# Releases the strings a daimon config owns; it is then the empty config (endpoint "" at a static, no key). Mirrors
+# dropping the `DaimonConfig`.
+fn PvDaimonConfig_drop(c: *PvDaimonConfig) {
+    if ((c.owned & _PV_AI_OWN_ENDPOINT) != 0 && c.endpoint != 0) { fl_free(c.endpoint); }
+    if ((c.owned & _PV_AI_OWN_KEY) != 0 && c.api_key != 0) { fl_free(c.api_key); }
+    c.endpoint = "";
+    c.endpoint_len = 0;
+    c.api_key = 0;
+    c.api_key_len = 0;
+    c.owned = 0;
+    return 0;
+}
+
+# Releases the endpoint a hoosh config owns, as PvDaimonConfig_drop. Mirrors dropping the `HooshConfig`.
+fn PvHooshConfig_drop(c: *PvHooshConfig) {
+    if ((c.owned & _PV_AI_OWN_ENDPOINT) != 0 && c.endpoint != 0) { fl_free(c.endpoint); }
+    c.endpoint = "";
+    c.endpoint_len = 0;
+    c.owned = 0;
+    return 0;
+}
+
+impl PvDaimonConfig {
+    # Sets the endpoint to a copy of the n bytes at p: 1, or 0 when the copy can't be allocated (unchanged). Rust's
+    # `c.endpoint = String::from(..)`.
+    #must_use
+    fn set_endpoint(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_ENDPOINT) != 0 && self.endpoint != 0) { fl_free(self.endpoint); }
+        self.endpoint = d;
+        self.endpoint_len = n;
+        self.owned = self.owned | _PV_AI_OWN_ENDPOINT;
+        return 1;
+    }
+
+    # Sets the key to a copy of the n bytes at p (Some, even for n = 0): 1, or 0 when the copy can't be allocated
+    # (unchanged). Rust's `c.api_key = Some(..)`.
+    #must_use
+    fn set_api_key(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        self.api_key = d;
+        self.api_key_len = n;
+        self.owned = self.owned | _PV_AI_OWN_KEY;
+        return 1;
+    }
+
+    # Removes the key. Rust's `c.api_key = None`.
+    fn clear_api_key(self) {
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        self.api_key = 0;
+        self.api_key_len = 0;
+        self.owned = self.owned & _PV_AI_OWN_ENDPOINT;
+        return 0;
+    }
+
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1) of the config: the endpoint, and `Some("<redacted>")` or
+    # `None` for the key, whose bytes are never read. 0, or -1 when the builder can't grow. Mirrors the hand-written
+    # `impl Debug for DaimonConfig`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dbg_open(sb, "DaimonConfig", alternate);
+        rc = rc | _pv_dbg_field(sb, "endpoint", alternate, 1);
+        rc = rc | _pv_debug_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_field(sb, "api_key", alternate, 0);
+        if (self.api_key == 0) {
+            rc = rc | _pv_jw(sb, "None");
+        } elif (alternate == 0) {
+            rc = rc | _pv_jw(sb, "Some(\"<redacted>\")");
+        } else {
+            rc = rc | _pv_jw(sb, "Some(\n        \"<redacted>\",\n    )");
+        }
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_close(sb, alternate);
+        return rc;
+    }
+}
+
+impl PvHooshConfig {
+    # Sets the endpoint to a copy of the n bytes at p: 1, or 0 when the copy can't be allocated (unchanged).
+    #must_use
+    fn set_endpoint(self, p, n): i64 {
+        var d = _pv_ai_copy(p, n);
+        if (d == 0) { return 0; }
+        if ((self.owned & _PV_AI_OWN_ENDPOINT) != 0 && self.endpoint != 0) { fl_free(self.endpoint); }
+        self.endpoint = d;
+        self.endpoint_len = n;
+        self.owned = _PV_AI_OWN_ENDPOINT;
+        return 1;
+    }
+
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1) of the config. 0, or -1 when the builder can't grow. Mirrors
+    # the derived `Debug` for `HooshConfig`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dbg_open(sb, "HooshConfig", alternate);
+        rc = rc | _pv_dbg_field(sb, "endpoint", alternate, 1);
+        rc = rc | _pv_debug_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_dbg_field_end(sb, alternate);
+        rc = rc | _pv_dbg_close(sb, alternate);
+        return rc;
+    }
+}
+
+# ── Rust's Debug ────────────────────────────────────────────────────────────────────
+# `debug_struct`'s two shapes: `Name { a: x, b: y }`, and the alternate `Name {\n    a: x,\n    b: y,\n}` (a field's
+# value never holds a raw newline here, so PadAdapter's indentation has nothing to add inside one).
+
+# Appends `Name {` (alternate: `Name {\n`). 0, or -1.
+#must_use
+fn _pv_dbg_open(sb, name, alternate): i64 {
+    var rc = _pv_jw(sb, name);
+    if (alternate == 0) { return rc | _pv_jw(sb, " {"); }
+    return rc | _pv_jw(sb, " {\n");
+}
+
+# Appends a field's name: ` a: ` (`, b: ` after the first; alternate `    a: `). 0, or -1.
+#must_use
+fn _pv_dbg_field(sb, name, alternate, first): i64 {
+    var rc = 0;
+    if (alternate == 1) {
+        rc = _pv_jw(sb, "    ");
+    } elif (first == 1) {
+        rc = _pv_jw(sb, " ");
+    } else {
+        rc = _pv_jw(sb, ", ");
+    }
+    rc = rc | _pv_jw(sb, name);
+    return rc | _pv_jw(sb, ": ");
+}
+
+# Ends a field (alternate: `,\n`). 0, or -1.
+#must_use
+fn _pv_dbg_field_end(sb, alternate): i64 {
+    if (alternate == 0) { return 0; }
+    return _pv_jw(sb, ",\n");
+}
+
+# Appends ` }` (alternate: `}`). 0, or -1.
+#must_use
+fn _pv_dbg_close(sb, alternate): i64 {
+    if (alternate == 0) { return _pv_jw(sb, " }"); }
+    return _pv_jw(sb, "}");
+}
+
+# 1 when `<str as Debug>` writes code point u as `\u{…}` (src/str_debug_data.cyr, by binary search), else 0.
+#must_use
+fn _pv_str_debug_escapes(u): i64 {
+    var lo = 0;
+    var hi = _PV_STR_DEBUG_RANGES - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) / 2;
+        var a = _PV_STR_DEBUG_ESC[2 * mid];
+        var b = _PV_STR_DEBUG_ESC[2 * mid + 1];
+        if (u < a) {
+            hi = mid - 1;
+        } elif (u > b) {
+            lo = mid + 1;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# The code point of the UTF-8 sequence at p (n bytes left, n ≥ 1) and its length: (cp, len), or (-1, 1) when the byte
+# at p starts no valid sequence (an overlong form, a surrogate, past U+10FFFF, a stray continuation, a truncation).
+fn _pv_utf8_next(p, n) {
+    var b0 = load8(p);
+    if (b0 < 128) { return (b0, 1); }
+    var len = 0;
+    var cp = 0;
+    var min = 0;
+    if (b0 >= 194 && b0 <= 223) {
+        len = 2;
+        cp = b0 & 31;
+        min = 128;
+    } elif (b0 >= 224 && b0 <= 239) {
+        len = 3;
+        cp = b0 & 15;
+        min = 2048;
+    } elif (b0 >= 240 && b0 <= 244) {
+        len = 4;
+        cp = b0 & 7;
+        min = 65536;
+    } else {
+        return (0 - 1, 1);
+    }
+    if (n < len) { return (0 - 1, 1); }
+    for (var k = 1; k < len; k = k + 1) {
+        var b = load8(p + k);
+        if ((b & 192) != 128) { return (0 - 1, 1); }
+        cp = (cp << 6) | (b & 63);
+    }
+    if (cp < min || cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return (0 - 1, 1); }
+    return (cp, len);
+}
+
+# Appends the n bytes at p as `<str as Debug>` writes a string, quotes included. 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_debug_str(sb, p, n): i64 {
+    var rc = _pv_jw(sb, "\"");
+    var i = 0;
+    var run = 0;
+    while (i < n) {
+        # Printable ASCII other than `"` and `\` prints as it is (the table holds none of 0x20–0x7E): no decode, no
+        # search.
+        var b0 = load8(p + i);
+        if (b0 >= 32 && b0 <= 126 && b0 != 34 && b0 != 92) {
+            i = i + 1;
+            continue;
+        }
+        var cp, len = _pv_utf8_next(p + i, n - i);
+        var esc = 0;
+        if (cp < 0 || cp == 34 || cp == 92 || cp == 0 || cp == 9 || cp == 10 || cp == 13) {
+            esc = 1;
+        } elif (_pv_str_debug_escapes(cp) == 1) {
+            esc = 1;
+        }
+        if (esc == 0) {
+            i = i + len;
+        } else {
+            # The plain run before it, then the escape.
+            rc = rc | _pv_jw_n(sb, p + run, i - run);
+            if (cp < 0) {
+                var rep[8];
+                store8(&rep, 239);
+                store8(&rep + 1, 191);
+                store8(&rep + 2, 189);
+                rc = rc | _pv_jw_n(sb, &rep, 3);
+            } elif (cp == 34) {
+                rc = rc | _pv_jw(sb, "\\\"");
+            } elif (cp == 92) {
+                rc = rc | _pv_jw(sb, "\\\\");
+            } elif (cp == 0) {
+                rc = rc | _pv_jw(sb, "\\0");
+            } elif (cp == 9) {
+                rc = rc | _pv_jw(sb, "\\t");
+            } elif (cp == 10) {
+                rc = rc | _pv_jw(sb, "\\n");
+            } elif (cp == 13) {
+                rc = rc | _pv_jw(sb, "\\r");
+            } else {
+                rc = rc | _pv_debug_u(sb, cp);
+            }
+            i = i + len;
+            run = i;
+        }
+    }
+    rc = rc | _pv_jw_n(sb, p + run, n - run);
+    return rc | _pv_jw(sb, "\"");
+}
+
+# Appends `\u{…}` for code point cp: lowercase hex, no leading zeros. 0, or -1.
+#must_use
+fn _pv_debug_u(sb, cp): i64 {
+    var buf[16];
+    var d[8];
+    var nd = 0;
+    var v = cp;
+    while (nd == 0 || v != 0) {
+        var h = v & 15;
+        if (h < 10) { store8(&d + nd, 48 + h); } else { store8(&d + nd, 87 + h); }
+        nd = nd + 1;
+        v = v >> 4;
+    }
+    store8(&buf, 92);
+    store8(&buf + 1, 117);
+    store8(&buf + 2, 123);
+    for (var k = 0; k < nd; k = k + 1) { store8(&buf + 3 + k, load8(&d + nd - 1 - k)); }
+    store8(&buf + 3 + nd, 125);
+    return _pv_jw_n(sb, &buf, 4 + nd);
 }
 
 # --- json.cyr ---
@@ -17473,5 +18908,183 @@ fn PvShallowKernelParams_from_json(buf, len, out: *PvShallowKernelParams): Resul
     out.gravity = c;
     out.damping = d;
     out.dry_threshold = e;
+    return Ok(0);
+}
+
+# ── DaimonConfig, HooshConfig (M7 part b) ────────────────────────────────────────────
+# serde's derive for the two configs (src/ai.cyr): `{"endpoint":"…","api_key":"…"|null}` and `{"endpoint":"…"}`. A
+# missing or null `api_key` reads as None in the object form, as serde reads an Option; the sequence form needs every
+# element. Strings are UTF-8 with serde_json's escapes, which bayan decodes as serde_json does (a lone surrogate
+# either way is refused by both). Two serde_json refusals bayan passes through are checked on the text first (bayan
+# issue 2026-11-11-json-strings-accept-raw-control-bytes-and-invalid-utf8): a raw byte below 0x20 inside a string, and
+# bytes that are not UTF-8 (serde_json's `from_slice`; its `from_str` takes a `&str`, valid by type).
+
+# Appends the n bytes at p: 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_jw_n(sb, p, n): i64 {
+    if (n <= 0) { return 0; }
+    var t[16];
+    store64(&t, p);
+    store64(&t + 8, n);
+    if (str_builder_add_a(default_alloc(), sb, &t) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Appends the n bytes at p as serde_json writes a string: quoted; `"` and `\` escaped; \b \f \n \r \t named; the other
+# bytes below 0x20 as \u00xx, lowercase; every other byte as it is. 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_jw_str(sb, p, n): i64 {
+    var rc = _pv_jw(sb, "\"");
+    var run = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(p + i);
+        if (c == 34 || c == 92 || c < 32) {
+            rc = rc | _pv_jw_n(sb, p + run, i - run);
+            if (c == 34) {
+                rc = rc | _pv_jw(sb, "\\\"");
+            } elif (c == 92) {
+                rc = rc | _pv_jw(sb, "\\\\");
+            } elif (c == 8) {
+                rc = rc | _pv_jw(sb, "\\b");
+            } elif (c == 12) {
+                rc = rc | _pv_jw(sb, "\\f");
+            } elif (c == 10) {
+                rc = rc | _pv_jw(sb, "\\n");
+            } elif (c == 13) {
+                rc = rc | _pv_jw(sb, "\\r");
+            } elif (c == 9) {
+                rc = rc | _pv_jw(sb, "\\t");
+            } else {
+                var e[8];
+                store8(&e, 92);
+                store8(&e + 1, 117);
+                store8(&e + 2, 48);
+                store8(&e + 3, 48);
+                var hi = c >> 4;
+                var lo = c & 15;
+                store8(&e + 4, 48 + hi);
+                if (lo < 10) { store8(&e + 5, 48 + lo); } else { store8(&e + 5, 87 + lo); }
+                rc = rc | _pv_jw_n(sb, &e, 6);
+            }
+            run = i + 1;
+        }
+    }
+    rc = rc | _pv_jw_n(sb, p + run, n - run);
+    return rc | _pv_jw(sb, "\"");
+}
+
+# 1 when the n bytes at p are UTF-8 (strict: no overlong form, surrogate or code point past U+10FFFF) and no string
+# in them holds a raw byte below 0x20; else 0.
+#must_use
+fn _pv_jr_text_ok(p, n): i64 {
+    var i = 0;
+    var instr = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if (c >= 128) {
+            var cp, len = _pv_utf8_next(p + i, n - i);
+            if (cp < 0) { return 0; }
+            i = i + len;
+        } elif (instr == 1 && c < 32) {
+            return 0;
+        } elif (instr == 1 && c == 92) {
+            # An escape: its byte is the parser's to check (`\"` keeps the string open).
+            i = i + 2;
+        } else {
+            if (c == 34) { instr = 1 - instr; }
+            i = i + 1;
+        }
+    }
+    return 1;
+}
+
+# A JSON string node's bytes into *w (pointer) and *(w + 8) (length): 1, or 0 for anything else.
+fn _pv_jr_str(v, w): i64 {
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_STR) { return 0; }
+    var s = bayan_json_v_str(v);
+    store64(w, str_data(s));
+    store64(w + 8, str_len(s));
+    return 1;
+}
+
+impl PvDaimonConfig {
+    # Appends the config as serde_json writes a `DaimonConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "endpoint", 1);
+        rc = rc | _pv_jw_str(sb, self.endpoint, self.endpoint_len);
+        rc = rc | _pv_jw_key(sb, "api_key", 0);
+        if (self.api_key == 0) {
+            rc = rc | _pv_jw(sb, "null");
+        } else {
+            rc = rc | _pv_jw_str(sb, self.api_key, self.api_key_len);
+        }
+        return rc | _pv_jw(sb, "}");
+    }
+}
+
+# Reads a `DaimonConfig` document into *out, which then owns copies of its strings (release them with
+# PvDaimonConfig_drop; *out's old strings are not released). Ok(0); Err(PV_ERR_DESERIALIZE), or
+# Err(PV_ERR_OUT_OF_MEMORY) when a copy can't be allocated, with *out untouched.
+#must_use
+fn PvDaimonConfig_from_json(buf, len, out: *PvDaimonConfig): Result {
+    if (_pv_jr_text_ok(buf, len) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 2);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[32];
+    if (_pv_jr_str(_pv_jr_at(v, f, 0, "endpoint"), &w) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var k = _pv_jr_at(v, f, 1, "api_key");
+    var has = 0;
+    if (k != 0 && bayan_json_v_tag(k) != JTAG_NULL) {
+        if (_pv_jr_str(k, &w + 16) == 0) { return Err(PV_ERR_DESERIALIZE); }
+        has = 1;
+    }
+    var ed = _pv_ai_copy(load64(&w), load64(&w + 8));
+    if (ed == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var kd = 0;
+    var kl = 0;
+    if (has == 1) {
+        kl = load64(&w + 24);
+        kd = _pv_ai_copy(load64(&w + 16), kl);
+        if (kd == 0) {
+            fl_free(ed);
+            return Err(PV_ERR_OUT_OF_MEMORY);
+        }
+    }
+    out.endpoint = ed;
+    out.endpoint_len = load64(&w + 8);
+    out.api_key = kd;
+    out.api_key_len = kl;
+    out.owned = _PV_AI_OWN_ENDPOINT | (has * _PV_AI_OWN_KEY);
+    return Ok(0);
+}
+
+impl PvHooshConfig {
+    # Appends the config as serde_json writes a `HooshConfig`: 0, or -1 when the builder can't grow.
+    #must_use
+    fn to_json(self, sb): i64 {
+        var rc = _pv_jw(sb, "{");
+        rc = rc | _pv_jw_key(sb, "endpoint", 1);
+        rc = rc | _pv_jw_str(sb, self.endpoint, self.endpoint_len);
+        return rc | _pv_jw(sb, "}");
+    }
+}
+
+# Reads a `HooshConfig` document into *out, as PvDaimonConfig_from_json does.
+#must_use
+fn PvHooshConfig_from_json(buf, len, out: *PvHooshConfig): Result {
+    if (_pv_jr_text_ok(buf, len) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var v = _pv_jr_parse(buf, len);
+    var f = _pv_jr_form(v, 1);
+    if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var w[16];
+    if (_pv_jr_str(_pv_jr_at(v, f, 0, "endpoint"), &w) == 0) { return Err(PV_ERR_DESERIALIZE); }
+    var ed = _pv_ai_copy(load64(&w), load64(&w + 8));
+    if (ed == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    out.endpoint = ed;
+    out.endpoint_len = load64(&w + 8);
+    out.owned = _PV_AI_OWN_ENDPOINT;
     return Ok(0);
 }

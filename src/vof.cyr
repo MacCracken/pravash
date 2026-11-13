@@ -281,14 +281,21 @@ impl PvVofField {
     # `VofField::advect`.
     #must_use
     fn advect(self, vx, vx_len, vy, vy_len, dt: f64): Result {
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        var trace = _pv_span(_PV_LOG_VOF, "vof::advect", "nx", self.nx, "ny", self.ny, 0, 0);
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         var nx = self.nx;
         var ny = self.ny;
-        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (_pv_fg_mul_class(nx, ny) != 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_fg_mul_class(nx, ny) != 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var n = nx * ny;
-        if (self.alpha.len != n || vx_len != n || vy_len != n) { return Err(PV_ERR_INVALID_PARAMETER); }
-        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) { return Err(PV_ERR_DIVERGED); }
+        if (self.alpha.len != n || vx_len != n || vy_len != n) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
+        if (_pv_fg_any_bad(vx, n, 1) == 1 || _pv_fg_any_bad(vy, n, 1) == 1) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_DIVERGED);
+        }
         var m: f64 = 0.0;
         for (var i = 0; i < n; i = i + 1) {
             var u: f64 = load64(vx + i * 8);
@@ -308,8 +315,8 @@ impl PvVofField {
         var sf: f64 = f64_from(substeps);
         var sub_dt: f64 = dt / sf;
         var sc: *PvColumn = _pv_vof_col(self, 1);
-        if (substeps > 0 && sc.resize(n, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (substeps > 0 && sc.resize(n, 0) == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         for (var s = 0; s < substeps; s = s + 1) { _pv_vof_substep(self, vx, vy, sub_dt); }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

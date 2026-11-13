@@ -32,10 +32,8 @@ from pathlib import Path
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
 MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph",
-           "coupling", "mpm", "compute"]
-PENDING_MODULES = {
-    "logging": "M7", "ai": "M7",
-}
+           "coupling", "mpm", "compute", "ai", "logging"]
+PENDING_MODULES = {}
 DEFERRED_MODULES = {}
 NOT_APPLICABLE_MODULES = {
     "lib": "crate root: module list and re-exports",
@@ -52,6 +50,10 @@ FN_RENAMES = {
     # sph's free `step`: one namespace serves pravash and its consumers, and a bare `step` is the likeliest to
     # collide (ADR 0002 #17).
     "step": "sph_step",
+    # logging's free functions: bare `init` names collide first of all (ADR 0002 #28).
+    "init": "logging_init",
+    "init_with_level": "logging_init_with_level",
+    "init_profiling": "logging_init_profiling",
 }
 # Rust field -> the Cyrius fields that carry it.
 FIELD_RENAMES = {
@@ -69,6 +71,8 @@ EXCEPTIONS = {
     "error::type Result": "the stdlib's value-form Result, whose Err payload is a PV_ERR_* code (ADR 0002 #1)",
     "coupling::AddedMassCoefficient": "a unit struct that only holds the added-mass coefficients: "
                                       "PV_ADDED_MASS_COEFFICIENT_* (src/constants.cyr)",
+    "ai::impl Debug for DaimonConfig": "Rust's Debug is the method `debug(sb, alternate)`, `{:?}` and `{:#?}` (the "
+                                       "derived Debug of HooshConfig too; ADR 0002 #27)",
     "compute::KernelDerivatives": "a unit struct that only namespaces its associated functions: "
                                   "PvKernelDerivatives_* (src/compute.cyr; autodiff_gradient in src/compute_ad.cyr, "
                                   "outside the bundle, ADR 0002 #26)",

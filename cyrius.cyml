@@ -22,11 +22,16 @@ dce = true
 #   atomic / thread — the worker pool for the runtime thread count (ADR 0002 #4)
 #   bayan    — #derive(Serialize) / #derive(Deserialize) JSON (ADR 0002 #6)
 # hisab's own bundle needs math, alloc, vec, ganita, result, str and fmt (hisab dist/hisab.deps).
-# sakshi (tracing → sakshi spans) arrives through hisab's own dependency in test compiles; it moves here
-# when the first library module logs, or with hisab's move to production scope.
+#   chrono   — the wall clock that names the Trace Event file (logging_init_profiling)
+#   sakshi   — tracing: every module's spans and warnings, and the init helpers (src/logging.cyr, ADR 0002 #28);
+#              here since M7 part b, when the first library module logged (it came only through hisab's test
+#              compiles before)
+# ⚠ hisab 3.4.1 (test scope) also declares a [deps.sakshi] package, so `cyrius deps` warns "refusing to overwrite
+# stdlib leaf 'sakshi'": the stdlib copy wins, and the two are byte-identical at sakshi 2.5.10. Only hisab can retire
+# it (hisab:docs/development/issues/2026-11-11-deps-sakshi-package-warns-every-consumer.md, pravash's note added).
 [deps]
 stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
-    "tagged", "result", "freelist", "fnptr", "atomic", "thread", "bayan"]
+    "tagged", "result", "freelist", "fnptr", "atomic", "thread", "bayan", "chrono", "sakshi"]
 
 # hisab 3.4.1, pinned by tag. `scope = "test"`: the bundle calls no hisab. Its returned values
 # allocate unscoped while cyrius S1 / hisab H9 are open, so the step path uses stand-ins (ADR 0003), and a
@@ -62,6 +67,7 @@ modules = [
     "src/crlog_data.cyr",
     "src/crlog.cyr",
     "src/mathx.cyr",
+    "src/logging.cyr",
     "src/vec3.cyr",
     "src/column.cyr",
     "src/common.cyr",
@@ -87,5 +93,7 @@ modules = [
     "src/flip.cyr",
     "src/mpm.cyr",
     "src/compute.cyr",
+    "src/str_debug_data.cyr",
+    "src/ai.cyr",
     "src/json.cyr",
 ]

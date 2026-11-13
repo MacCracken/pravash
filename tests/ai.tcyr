@@ -1,0 +1,232 @@
+# ai.tcyr — the ported Rust tests of rust-old/src/ai.rs (M7 part b): both, in Rust's order. Cyrius-only groups follow:
+# the layouts, ownership (the defaults own nothing; the setters copy and release; drop), the escape table's edges, a
+# byte that is no part of valid UTF-8, the alternate Debug, and the JSON text checks.
+
+include "tests/lib.cyr"
+
+# The text of a builder.
+fn sb_text(sb) {
+    var s = str_builder_build(sb);
+    return (str_data(s), str_len(s));
+}
+
+# 1 when the n bytes at p contain the C string w.
+fn has(p, n, w): i64 {
+    var m = strlen(w);
+    for (var i = 0; i + m <= n; i = i + 1) {
+        if (memeq(p + i, w, m) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# 1 when the n bytes at p are exactly the C string w.
+fn is(p, n, w): i64 {
+    if (n != strlen(w)) { return 0; }
+    if (n == 0) { return 1; }
+    return memeq(p, w, n);
+}
+
+# Rust's `#[cfg(test)] mod tests`, in order.
+fn test_rust() {
+    test_group("test_defaults");
+    var d: PvDaimonConfig = PvDaimonConfig_default();
+    assert(is(d.endpoint, d.endpoint_len, "http://localhost:8090") == 1, "the daimon endpoint");
+
+    test_group("test_debug_redacts_api_key");
+    var c: PvDaimonConfig = PvDaimonConfig_default();
+    assert_eq(c.set_api_key("secret-token", 12), 1, "the key set");
+    var sb = str_builder_new();
+    assert_eq(c.debug(sb, 0), 0, "printed");
+    var p, n = sb_text(sb);
+    assert(has(p, n, "secret-token") == 0, "the key never printed");
+    assert(has(p, n, "<redacted>") == 1, "<redacted> instead");
+    PvDaimonConfig_drop(&c);
+    return 0;
+}
+
+# Cyrius-only groups.
+fn test_cyrius() {
+    test_group("ai_layouts");
+    assert(sizeof(PvDaimonConfig) == 40 && sizeof(PvHooshConfig) == 24, "the two configs");
+    var h: PvHooshConfig = PvHooshConfig_default();
+    assert(is(h.endpoint, h.endpoint_len, "http://localhost:8088") == 1 && h.owned == 0, "the hoosh default");
+
+    test_group("ai_ownership");
+    var d: PvDaimonConfig = PvDaimonConfig_default();
+    assert(d.owned == 0 && d.api_key == 0, "a default owns nothing and has no key");
+    PvDaimonConfig_drop(&d);
+    assert(d.endpoint_len == 0 && d.api_key == 0, "dropping a default frees nothing and empties it");
+    d = PvDaimonConfig_default();
+    assert_eq(d.set_endpoint("https://x", 9), 1, "an endpoint copied");
+    assert_eq(d.set_api_key("", 0), 1, "an empty key copied");
+    assert(d.api_key != 0 && d.api_key_len == 0 && d.owned == 3, "Some(\"\") is a nonzero pointer; both owned");
+    var first = d.endpoint;
+    assert_eq(d.set_endpoint("https://y", 9), 1, "replaced");
+    assert(is(d.endpoint, d.endpoint_len, "https://y") == 1, "the new endpoint");
+    # The freelist is LIFO per size class: a released block is the next one of its size handed out.
+    var again = fl_alloc(10);
+    assert(again == first, "the replaced endpoint's copy was released");
+    fl_free(again);
+    var key = d.api_key;
+    d.clear_api_key();
+    assert(d.api_key == 0 && d.owned == 1, "None again");
+    var k1 = fl_alloc(1);
+    assert(k1 == key, "the key's copy released");
+    fl_free(k1);
+    var ep = d.endpoint;
+    PvDaimonConfig_drop(&d);
+    var e1 = fl_alloc(10);
+    assert(e1 == ep && d.owned == 0, "drop releases the endpoint");
+    fl_free(e1);
+    var doc = "{\"endpoint\":\"e\",\"api_key\":\"k\"}";
+    var t, v = PvDaimonConfig_from_json(doc, strlen(doc), &d);
+    assert(is_err_result(t) == 0 && d.owned == 3, "a decoded config owns both strings");
+    var ke = d.api_key;
+    PvDaimonConfig_drop(&d);
+    var k2 = fl_alloc(2);
+    assert(k2 == ke, "and drop releases them");
+    fl_free(k2);
+    assert_eq(h.set_endpoint("z", 1), 1, "a hoosh endpoint copied");
+    var he = h.endpoint;
+    PvHooshConfig_drop(&h);
+    var h2 = fl_alloc(2);
+    assert(h2 == he, "and released");
+    fl_free(h2);
+
+    test_group("ai_debug_escapes");
+    assert(_pv_str_debug_escapes(0) == 0 && _pv_str_debug_escapes(1) == 1, "\\0 is named, U+0001 escaped");
+    assert(_pv_str_debug_escapes(32) == 0 && _pv_str_debug_escapes(127) == 1 && _pv_str_debug_escapes(160) == 1,
+      "the space prints; DEL and NBSP escape");
+    assert(_pv_str_debug_escapes(768) == 1 && _pv_str_debug_escapes(233) == 0, "a combining mark escapes; é prints");
+    assert(_pv_str_debug_escapes(1114111) == 1 && _pv_str_debug_escapes(128512) == 0, "U+10FFFF escapes; 😀 prints");
+    var sb = str_builder_new();
+    var raw[8];
+    store8(&raw, 97);
+    store8(&raw + 1, 255);
+    store8(&raw + 2, 98);
+    store8(&raw + 3, 226);
+    store8(&raw + 4, 130);
+    assert_eq(_pv_debug_str(sb, &raw, 5), 0, "printed");
+    var p, n = sb_text(sb);
+    var want[16];
+    store8(&want, 34);
+    store8(&want + 1, 97);
+    store8(&want + 2, 239);
+    store8(&want + 3, 191);
+    store8(&want + 4, 189);
+    store8(&want + 5, 98);
+    store8(&want + 6, 239);
+    store8(&want + 7, 191);
+    store8(&want + 8, 189);
+    store8(&want + 9, 239);
+    store8(&want + 10, 191);
+    store8(&want + 11, 189);
+    store8(&want + 12, 34);
+    assert(n == 13 && memeq(p, &want, 13) == 1, "each byte of no valid sequence prints as U+FFFD");
+    var sb2 = str_builder_new();
+    assert_eq(_pv_debug_u(sb2, 0), 0, "printed");
+    var q, m = sb_text(sb2);
+    assert(is(q, m, "\\u{0}") == 1, "\\u{0}: at least one digit");
+
+    # Each malformed sequence: overlong (C0 80, E0 80 80, F0 80 80 80), an encoded surrogate (ED A0 80), past
+    # U+10FFFF (F4 90 80 80), truncated (E2 82). Every byte of one starts no valid sequence.
+    var bad_seqs[64];
+    var lens[64];
+    store8(&bad_seqs, 192);
+    store8(&bad_seqs + 1, 128);
+    store64(&lens, 2);
+    store8(&bad_seqs + 8, 224);
+    store8(&bad_seqs + 9, 128);
+    store8(&bad_seqs + 10, 128);
+    store64(&lens + 8, 3);
+    store8(&bad_seqs + 16, 240);
+    store8(&bad_seqs + 17, 128);
+    store8(&bad_seqs + 18, 128);
+    store8(&bad_seqs + 19, 128);
+    store64(&lens + 16, 4);
+    store8(&bad_seqs + 24, 237);
+    store8(&bad_seqs + 25, 160);
+    store8(&bad_seqs + 26, 128);
+    store64(&lens + 24, 3);
+    store8(&bad_seqs + 32, 244);
+    store8(&bad_seqs + 33, 144);
+    store8(&bad_seqs + 34, 128);
+    store8(&bad_seqs + 35, 128);
+    store64(&lens + 32, 4);
+    store8(&bad_seqs + 40, 226);
+    store8(&bad_seqs + 41, 130);
+    store64(&lens + 40, 2);
+    var all_rep = 1;
+    var all_refused = 1;
+    var probe: PvDaimonConfig = PvDaimonConfig_default();
+    for (var s = 0; s < 6; s = s + 1) {
+        var bp = &bad_seqs + s * 8;
+        var bl = load64(&lens + s * 8);
+        var cp0, l0 = _pv_utf8_next(bp, bl);
+        if (cp0 >= 0 || l0 != 1) { all_rep = 0; }
+        var sbx = str_builder_new();
+        if (_pv_debug_str(sbx, bp, bl) != 0) { all_rep = 0; }
+        var xp, xn = sb_text(sbx);
+        if (xn != 2 + 3 * bl) { all_rep = 0; }
+        var dj[32];
+        memcpy(&dj, "{\"endpoint\":\"", 13);
+        memcpy(&dj + 13, bp, bl);
+        memcpy(&dj + 13 + bl, "\"}", 2);
+        var tj, vj = PvDaimonConfig_from_json(&dj, 15 + bl, &probe);
+        if (is_err_result(tj) == 0) { all_refused = 0; }
+    }
+    assert(all_rep == 1, "overlong, surrogate, past-U+10FFFF and truncated sequences: U+FFFD per byte");
+    assert(all_refused == 1, "and a document holding one is refused");
+
+    test_group("ai_debug_alternate");
+    var hd: PvHooshConfig = PvHooshConfig_default();
+    var sb3 = str_builder_new();
+    assert_eq(hd.debug(sb3, 1), 0, "printed");
+    var r, rn = sb_text(sb3);
+    assert(is(r, rn, "HooshConfig {\n    endpoint: \"http://localhost:8088\",\n}") == 1, "the derived {:#?}");
+    var dk: PvDaimonConfig = PvDaimonConfig_default();
+    assert_eq(dk.set_api_key("k", 1), 1, "a key");
+    var sb4 = str_builder_new();
+    assert_eq(dk.debug(sb4, 1), 0, "printed");
+    var s4, n4 = sb_text(sb4);
+    assert(has(s4, n4, "    api_key: Some(\n        \"<redacted>\",\n    ),\n}") == 1, "Some nests one level deeper");
+    PvDaimonConfig_drop(&dk);
+
+    test_group("ai_json_text_checks");
+    var bad: PvDaimonConfig = PvDaimonConfig_default();
+    var raw2[32];
+    var src = "{\"endpoint\":\"a\"}";
+    memcpy(&raw2, src, 16);
+    store8(&raw2 + 13, 9);
+    var t1, v1 = PvDaimonConfig_from_json(&raw2, 16, &bad);
+    assert(is_err_result(t1) == 1 && v1 == PV_ERR_DESERIALIZE, "a raw tab inside a string is refused");
+    store8(&raw2 + 13, 255);
+    var t2, v2 = PvDaimonConfig_from_json(&raw2, 16, &bad);
+    assert(is_err_result(t2) == 1, "a byte that is not UTF-8 is refused");
+    store8(&raw2 + 13, 127);
+    var t3, v3 = PvDaimonConfig_from_json(&raw2, 16, &bad);
+    assert(is_err_result(t3) == 0 && load8(bad.endpoint) == 127, "a raw DEL is read");
+    PvDaimonConfig_drop(&bad);
+    var ws = " {\t\"endpoint\"\n:\r\"a\" } ";
+    var t4, v4 = PvDaimonConfig_from_json(ws, strlen(ws), &bad);
+    assert(is_err_result(t4) == 0, "tabs and newlines between tokens are whitespace");
+    PvDaimonConfig_drop(&bad);
+    var esc = "{\"endpoint\":\"\\\"\\t\"}";
+    var t5, v5 = PvDaimonConfig_from_json(esc, strlen(esc), &bad);
+    var ok5 = is_err_result(t5) == 0 && bad.endpoint_len == 2;
+    assert(ok5 && load8(bad.endpoint + 1) == 9, "an escaped quote keeps the string open");
+    PvDaimonConfig_drop(&bad);
+    return 0;
+}
+
+# Runs the ported ai tests.
+fn main() {
+    alloc_init();
+    test_rust();
+    test_cyrius();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

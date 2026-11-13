@@ -24,13 +24,14 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M4 SPH foundations | ✅ **done 2026-11-12.** Part d: the physics extensions in `src/sph_fns.cyr` (the list functions, phase change, the `dyn PvReactionProvider`, the contact angle, the secondary particles), 318 rows, 1 against the corrected oracle; L7's 3×3 inverse a transcription of hisab 1.4.0's `matrix_inverse` (ganita's `mat_inv` differs on 12 of 60 rows); 11 Rust tests; ADR 0002 #18. Part c: `src/sph_fns.cyr`, the brute-force density and forces, the free step (`sph_step`, ADR 0002 #17), the particle block, split and merge; 198 rows (5 split rows against the corrected oracle); 10 Rust tests and the 4 free-function SPH integration tests. A cyrius miscompile (`s.f = g(t.e)`, open upstream) caught by the merge rows and worked around. Part b ✅ 2026-11-12: `src/neighbor.cyr`, the neighbour grid on bit-faithful f32 keys (L4) and `sort_by_zorder` on a stable merge sort (L9); 50 rows bit-exact (30 neighbour lists, including the D3 probe drift at large offsets and a kept grid; 20 z-order), and the 2,460 cell-key rows pending since M0; ADR 0002 #16. Part a ✅ 2026-11-12: `src/sph_kernels.cyr` (the seven kernels, `PvKernelCoeffs`, the linear and Tait equations of state, the non-Newtonian models, the batch and whole-system helpers); private constants generated (`src/constants_private.cyr`, `t_private.rs`); a new golden module `sph.tsv`, 804 rows bit-exact on the first replay, 16 of them against the corrected oracle `sph.cr.tsv`; 22 Rust tests |
 | M5 SPH solvers | ✅ **done 2026-11-12.** Part e: the solver's thread count (`set_threads`; Rust's three `parallel` loops on the pool, every step row at 2, 3, 4 and 8 threads giving the serial bits; ADR 0002 #4) and the D3 switch to f64 neighbour keys (hisab 3.4.1's cell, integer neighbour cells; 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription; ADR 0002 #2). Part d ✅ 2026-11-12: `src/sph_multiphase.cyr`, the multiphase step with `PvPhaseProperties` and `PvMultiPhaseConfig`; 26 rows, the first 25 bit-exact on the first replay and the 26th closing the mutation tests' one gap; the last 5 Rust tests of `sph.rs`; ADR 0002 #22. Part c ✅ 2026-11-12: `src/sph_dfsph.cyr`, the DFSPH step; 35 rows, bit-exact on the first replay; 6 Rust tests; ADR 0002 #21. Part b ✅ 2026-11-12: `src/sph_pcisph.cyr`, the PCISPH step; 37 rows, bit-exact on the first replay; 4 Rust tests; ADR 0002 #20. Part a ✅ 2026-11-12: `src/sph.cyr`, `PvSphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension, the f32 lists of M4 part b) and `adaptive_dt`; 66 rows, every one bit-exact on the first replay; 19 Rust tests and 5 integration tests; ADR 0002 #19. |
 | M6 Coupling and MPM | ✅ **done 2026-11-12.** Part a ✅ 2026-11-12: `src/coupling.cyr`, the rigid bodies (`PvBodyShape` / `PvShape`, `PvRigidBody`, the two-way coupling, integration with and without added mass, both drags, the particle level set; JSON for `BodyShape` and `RigidBody`). `drag_from_particles_indexed` takes the caller's cells-only `PvNeighborGrid` (`PvNeighborGrid_build`, f64 keys; ADR 0002 #23). A new golden module, `coupling.tsv`: 4,798 rows, every one bit-exact on the first replay but an indexed drag at 10⁶, which `coupling.d3.tsv` maps (ADR 2); 22 of the 33 Rust tests. Part b ✅ 2026-11-12: `src/flip.cyr`, the `FlipSolver` (P2G, the projection, FLIP/PIC and APIC G2P, the APIC resize; ADR 0002 #24): 245 rows, every one bit-exact on the first replay, among them 210 class S trajectories and scenarios; all 33 Rust tests of `coupling.rs` and all 33 integration tests. Part c ✅ 2026-11-12: `src/mpm.cyr` (`PvConstitutiveModel` / `PvConstitutiveLaw` and its JSON, `PvMat2`, `PvMpmParticle`, `PvMpmSolver`; the 2 × 2 SVD and Drucker–Prager on the correctly rounded primitives; ADR 0002 #25): a new golden module, `mpm.tsv`, 1,336 rows, 1,319 bit-exact against the oracle and 17 against the corrected oracle `mpm.cr.tsv` where glibc misrounds; all 13 Rust tests |
-| M7 Compute, logging and ai | in progress. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
-| M8 | not started |
+| M7 Compute, logging and ai | ✅ **done 2026-11-12.** Part b ✅ 2026-11-12: `src/ai.cyr` (`PvDaimonConfig`, `PvHooshConfig`: the defaults, the setters with their ownership bits, JSON, Rust's `{:?}` and `{:#?}` with the key redacted, `<str as Debug>`'s escapes from `src/str_debug_data.cyr`, generated from rustc 1.99.1's core; ADR 0002 #27) and `src/logging.cyr` (the three inits, the PRAVASH_LOG filter as tracing-subscriber's EnvFilter decides it, and the Trace Event file through a sakshi hook, ledger L11; ADR 0002 #28), with every one of Rust's 60 spans and 12 warnings at its point in every module. Two new golden modules, `ai.tsv` 579 rows and `logging.tsv` 251 (99 filter rows, 152 trace rows over 37 calls), all matching on the first replay; the instrumentation changed no other row; all 3 Rust tests. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
+| M8 Release 2.0.0 | next |
 
 ## Toolchain
 
 - **Cyrius pin**: 6.7.18 (`cyrius.cyml` `[package].cyrius`)
-- **hisab**: 3.4.1 (Cyrius), commit `d6703c5`, `scope = "test"`: the bundle calls none, and its one caller, `src/compute_ad.cyr`, stays outside `[lib]` (ADR 0002 #26); sakshi 2.5.10 through it
+- **hisab**: 3.4.1 (Cyrius), commit `d6703c5`, `scope = "test"`: the bundle calls none, and its one caller, `src/compute_ad.cyr`, stays outside `[lib]` (ADR 0002 #26). It also declares a sakshi package, so `cyrius deps` warns that it refuses to overwrite the stdlib leaf; the two copies are byte-identical
+- **sakshi**: 2.5.10, a stdlib leaf since M7 part b (pravash's tracing)
 - **ganita**: 1.2.15, bundled in the 6.7.18 stdlib
 - **Rust oracle**: rustc 1.99.1, hisab 1.4.0, glam 0.29.3 (`rust-old/Cargo.lock`), glibc 2.44
 
@@ -40,13 +41,13 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   hooks. Frozen; never edited.
 - **Cyrius**: `[lib]` = `src/error.cyr`, `src/constants.cyr` (generated), `src/crmath_data.cyr` (generated),
   `src/constants_private.cyr` (generated), `src/crmath.cyr`, `src/crlog_data.cyr` (generated), `src/crlog.cyr`,
-  `src/mathx.cyr`, `src/vec3.cyr`,
+  `src/mathx.cyr`, `src/logging.cyr`, `src/vec3.cyr`,
   `src/column.cyr`, `src/common.cyr`, `src/buoyancy.cyr`, `src/vortex.cyr`, `src/bridge.cyr`, `src/shallow.cyr`,
   `src/par.cyr`,
   `src/grid_solve.cyr`, `src/grid.cyr`, `src/mac_grid.cyr`, `src/k_epsilon.cyr`, `src/vof.cyr`, `src/phase_field.cyr`,
   `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr`, `src/sph.cyr`, `src/sph_pcisph.cyr`,
-  `src/sph_dfsph.cyr`, `src/sph_multiphase.cyr`, `src/coupling.cyr`, `src/flip.cyr`, `src/mpm.cyr`, `src/compute.cyr`
-  and `src/json.cyr`, bundled as `dist/pravash.cyr`; `src/compute_ad.cyr` outside the bundle (a consumer includes it
+  `src/sph_dfsph.cyr`, `src/sph_multiphase.cyr`, `src/coupling.cyr`, `src/flip.cyr`, `src/mpm.cyr`, `src/compute.cyr`,
+  `src/str_debug_data.cyr` (generated), `src/ai.cyr` and `src/json.cyr`, bundled as `dist/pravash.cyr`; `src/compute_ad.cyr` outside the bundle (a consumer includes it
   and declares hisab); the scaffold's `src/main.cyr` stub.
 
 ## Tests
@@ -54,7 +55,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
 - **Cyrius**:
-  - `tests/parity.tcyr` replays the corpus: 15 modules, 0 failing; 56,844 ok, 728 accepted (ADR 4: 131 against the
+  - `tests/parity.tcyr` replays the corpus: 17 modules, 0 failing; 57,674 ok, 728 accepted (ADR 4: 131 against the
     corrected oracle, ADR 2: 597 against the f64-key oracle), 0 failed, 0 measured, 3 pending (three JSON rows on
     bayan's policies). Every `FluidGrid::step` row (376) and every `SphSolver` step row (147) also runs at 2, 3, 4
     and 8 threads, 0 differing from one. Bits are identical on x86_64 ELF, x86_64 PE and aarch64.
@@ -79,18 +80,22 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
     - `tests/compute.tcyr`: all 11 of `compute.rs`, and seven Cyrius-only groups (the layouts, f32 rounding, the op
       names, a backend through `dyn`, autodiff against analytical gradients and on a growing tape, finite differences,
       the L15 f32 reads): 83 checks;
+    - `tests/ai.tcyr`: both of `ai.rs`, and Cyrius-only groups (the layouts, ownership, the escape table's edges,
+      every malformed UTF-8 form, both Debug shapes, the JSON text checks): 42 checks;
+    - `tests/logging.tcyr`: the 1 of `logging.rs`, and Cyrius-only groups (the span and event texts through a sakshi
+      hook, the level gates, a full 16-deep stack, the parser's corners, the trace file): 48 checks;
     - `tests/integration.tcyr`: all 33 of `rust-old/tests/integration.rs` (79 checks).
   - `scripts/surface_parity.py`: error, common, buoyancy, vortex, bridge, shallow, grid, vof, phase_field, sph,
-    coupling, mpm and compute, 450 items ok (0 pending), 0 missing.
+    coupling, mpm, compute, ai and logging, 461 items ok (0 pending), 0 missing.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
-- **Golden corpus** (`tests/golden/`): bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), grid 1,120 (511 class
-  S step rows), json 302, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
+- **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), grid 1,120 (511 class
+  S step rows), json 302, logging 251, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
   224 (63 class S) and vortex 2,293 rows, and the corrected oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv`
   3, `bridge.cr.tsv` 26, `grid.cr.tsv` 20, `sph.cr.tsv` 22 and `mpm.cr.tsv` 17 rows; and the f64-key oracle (ADR 0002 #2):
   `math.d3.tsv` 558, `sph.d3.tsv` 38 and `coupling.d3.tsv` 1 rows.
-  `validate.py` recomputes all 57,575 rows, every solver step by transcription, and the list-dependent rows again on
+  `validate.py` recomputes all 58,405 rows, every solver step by transcription, and the list-dependent rows again on
   f64 keys: 0 failures (in about 100 s);
-  `probe_tables.py` 35 of 35.
+  `probe_tables.py` 41 of 41.
 - **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)): the
   10 primitives against Rust's glibc, on shared seeded arguments. The correctly rounded functions run 58 ns (ln) to
   1.41 µs (atan2, whose mean comes from a rare slow path), 11–103× glibc. The `common` bodies run 4–13× Rust 1.3.0
@@ -120,7 +125,11 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   column 6.8×, the sand column 45× (about 22 correctly rounded calls a particle, L1). M7 part a, against a twin:
   packing 1,000 particles 5.2× (37 of its 52.6 µs the freelist's three large-block cycles), the unpacks 18×, the
   closed-form derivatives 8× and `dtait_drho` 50× (the correctly rounded pow), the autodiff gradient 4.1×, and an
-  `SphKernelParams` read 25× serde_json (28× with an f32 midpoint, the L15 text path).
+  `SphKernelParams` read 25× serde_json (28× with an f32 midpoint, the L15 text path). M7 part b, against a twin: a
+  disabled span 12 ns (Rust 1.56 ns), an enabled one 285 ns (17.3), a silenced warning 10 ns, the filter parse 3.4×,
+  the `DaimonConfig` read 27×, write 19× and Debug 4.2×; the instrumentation leaves the median step at 0.995× the
+  uninstrumented time (worst 1.02×; `merge_particles` +12 ns). A `defer` closing each span had cost the loops 8–11%,
+  so every span closes explicitly.
 
 ## Upstream requests and stand-ins
 
@@ -135,11 +144,12 @@ stand-ins so far:
 - L7: `_pv_invert_3x3` in `src/sph_fns.cyr` (the MLS 3×3 inverse);
 - L5 and L6: `src/grid_solve.cyr` (the CG and the DST / IDST);
 - L10: `src/json.cyr`;
+- L11: `src/logging.cyr`'s Trace Event writer (a sakshi emit hook);
 - L15: `_pv_jr_f32` in `src/json.cyr` (the f32 reads: RN32 of the f64, the decimal compared exactly at a midpoint);
 - L13: `src/column.cyr`;
 - L14: `_pv_fmod` in `src/mathx.cyr`.
 
-Each is marked. `scripts/upstream_ledger.py --check`: 16 notes, 0 failures.
+Each is marked. `scripts/upstream_ledger.py --check`: 17 notes, 0 failures.
 
 Filed 2026-11-11:
 - **hisab:** `2026-11-11-spatial-hash-per-step-rebuild-allocates.md`, `2026-11-11-no-matrix-free-linear-cg.md`,
@@ -149,6 +159,8 @@ Filed 2026-11-11:
   `2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md`,
   `2026-11-11-struct-values-and-f64v4-lanes-cost-in-pair-loops.md`;
 - **sakshi:** `2026-11-11-no-chrome-trace-export.md`;
+- **M7 part b:** pravash's stand-in notes appended to sakshi `2026-11-11-no-chrome-trace-export.md` (L11), and its
+  note appended to hisab `2026-11-11-deps-sakshi-package-warns-every-consumer.md` (the deps warning);
 - **M7 part a:** cyrius `2026-11-12-no-f32-decimal-parse.md` and bayan
   `2026-11-12-json-tree-number-keeps-no-source-text.md` (L15, each with a repro), and pravash's packing numbers
   appended to cyrius `2026-11-11-freelist-maps-every-block-over-4k.md`;
@@ -183,12 +195,13 @@ Filed 2026-11-11:
 
 Direct (declared in `cyrius.cyml`):
 
-- stdlib: syscalls, string, alloc, str, fmt, io, vec, math, ganita, tagged, result, freelist, fnptr, atomic, thread, bayan
-- hisab 3.4.1 (test scope), which brings sakshi 2.5.10
+- stdlib: syscalls, string, alloc, str, fmt, io, vec, math, ganita, tagged, result, freelist, fnptr, atomic, thread, bayan,
+  chrono, sakshi
+- hisab 3.4.1 (test scope), which also declares sakshi 2.5.10
 - test stdlib (`[test] stdlib`, test / bench / fuzz builds only): assert, bench, overflow, simd
 - local tools only (not the library, not CI): MPFR 4.x (`libmpfr.so.6`) for `scripts/oracle/validate.py`
-- the generator (`scripts/oracle/`): the oracle by path, hisab 1.4.0, serde 1.0.229 and serde_json 1.0.154
-  (`float_roundtrip`), at the oracle's own versions
+- the generator (`scripts/oracle/`): the oracle by path, hisab 1.4.0, serde 1.0.229, serde_json 1.0.154
+  (`float_roundtrip`), tracing 0.1.44 and tracing-subscriber 0.3.23, at the oracle's own versions
 
 ## Consumers
 
@@ -201,5 +214,11 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M7 part b: logging (`logging.rs`: the sakshi init, and the chrome://tracing writer of ledger L11) and ai (`ai.rs`:
-`DaimonConfig`, `HooshConfig`, their defaults, JSON and the redacting debug print).
+M8, release 2.0.0 (the port plan's M8 row). It covers four things:
+- the Rust-test ledger, which accounts for each of the 351 unit, 33 integration and 7 ignored doc tests;
+- the full surface-parity diff;
+- the 23 Rust benchmarks in both columns, with thread-count rows;
+- the README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' examples compiled and run,
+  and VERSION 2.0.0.
+
+The release gate is the full corpus green on x86_64 ELF, x86_64 PE and aarch64.

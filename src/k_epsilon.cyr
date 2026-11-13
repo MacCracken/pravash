@@ -125,15 +125,20 @@ impl PvKEpsilon {
     # with nothing changed when nx or ny is below 3, nx·ny overflows, a length isn't nx·ny, dx or dt isn't finite
     # and > 0 (Rust warns and returns), or the scratch can't grow. Mirrors `KEpsilon::step`.
     fn step(self, vx, vx_len, vy, vy_len, nx, ny, dx: f64, dt: f64): i64 {
-        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3)) { return 0; }
-        if (_pv_fg_mul_class(nx, ny) != 0) { return 0; }
+        var trace = _pv_span(_PV_LOG_GRID, "grid::kepsilon", "nx", nx, "ny", ny, 0, 0);
+        var valid = 1;
+        if ((nx >= 0 && nx < 3) || (ny >= 0 && ny < 3) || _pv_fg_mul_class(nx, ny) != 0) { valid = 0; }
         var n = nx * ny;
-        if (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n) { return 0; }
-        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { return 0; }
+        if (valid == 1 && (vx_len != n || vy_len != n || self.k.len != n || self.epsilon.len != n)) { valid = 0; }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0 || _pv_is_finite(dt) == 0 || dt <= 0.0) { valid = 0; }
+        if (valid == 0) {
+            _pv_warn(_PV_LOG_GRID, "KEpsilon::step: invalid sizes or parameters ignored", "nx", nx, "ny", ny, 0, 0);
+            _pv_span_end(trace); return 0;
+        }
         var inv_2dx: f64 = 0.5 / dx;
         var sk: *PvColumn = _pv_ke_col(self, 2);
         var se: *PvColumn = _pv_ke_col(self, 3);
-        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { return 0; }
+        if (sk.resize(n, 0) == 0 || se.resize(n, 0) == 0) { _pv_span_end(trace); return 0; }
         var kc: *PvColumn = _pv_ke_col(self, 0);
         var ec: *PvColumn = _pv_ke_col(self, 1);
         _pv_col_swap(kc, sk);
@@ -191,6 +196,6 @@ impl PvKEpsilon {
                 store64(en + i * 8, _pv_bits(e2));
             }
         }
-        return 1;
+        _pv_span_end(trace); return 1;
     }
 }

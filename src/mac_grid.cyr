@@ -188,25 +188,35 @@ impl PvMacGrid {
     # checked before anything changes; Rust aborts). Mirrors `MacGrid::step`.
     #must_use
     fn step(self, config: *PvGridConfig): Result {
+        var trace = _pv_span(_PV_LOG_GRID, "mac::step", "nx", self.nx, "ny", self.ny, 0, 0);
         var dt: f64 = config.dt;
-        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
-        if (config.pressure_iterations == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (config.pressure_iterations == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var alpha: f64 = config.buoyancy_alpha;
         var amb: f64 = config.ambient_density;
-        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(amb) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(alpha) == 0 || _pv_is_finite(amb) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_INVALID_PARAMETER);
+        }
         var nx = self.nx;
         var ny = self.ny;
-        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
-        if (cn < 0) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
-        if (self.vx.len != vxn || self.vy.len != vyn || self.pressure.len != cn || self.density.len != cn) {
+        if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) {
+            _pv_span_end(trace);
             return Err(PV_ERR_INVALID_GRID_RESOLUTION);
         }
+        var cn, vxn, vyn = _pv_mac_sizes(nx, ny);
+        if (cn < 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+        if (self.vx.len != vxn || self.vy.len != vyn || self.pressure.len != cn || self.density.len != cn) {
+            _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION);
+        }
         var dx: f64 = self.dx;
-        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        if (_pv_is_finite(dx) == 0 || dx <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var sdiv: *PvColumn = _pv_mac_col(self, 4);
         var sden: *PvColumn = _pv_mac_col(self, 5);
-        if (sdiv.resize(cn, 0) == 0 || sden.resize(cn, 0) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (sdiv.resize(cn, 0) == 0 || sden.resize(cn, 0) == 0) {
+            _pv_span_end(trace);
+            return Err(PV_ERR_OUT_OF_MEMORY);
+        }
         var inv_dx: f64 = 1.0 / dx;
         var u = self.vx.data;
         var v = self.vy.data;
@@ -341,8 +351,8 @@ impl PvMacGrid {
         _pv_col_swap(_pv_mac_col(self, 3), sden);
         if (_pv_fg_any_bad(u, vxn, 1) == 1 || _pv_fg_any_bad(v, vyn, 1) == 1
           || _pv_fg_any_bad(self.density.data, cn, 1) == 1) {
-            return Err(PV_ERR_DIVERGED);
+            _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
         }
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

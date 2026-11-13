@@ -25,6 +25,11 @@ hisab = { version = "=1.4.0", default-features = false }
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 # serde, for the `DeserializeOwned` bound of the JSON rows: the oracle's own version.
 serde = "=1.0.229"
+# tracing and tracing-subscriber for the logging rows (logging.tsv): the oracle's own versions. A capture subscriber
+# records the spans and events each traced call emits, and `EnvFilter` decides the `PRAVASH_LOG` rows, as the oracle's
+# `logging::init_with_level` builds it. Only `env-filter` (its `registry` and `std`): no fmt layer, nothing printed.
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["env-filter", "std", "registry"] }
 
 # The generator runs twice (port plan §4 step 5): the serial build writes the corpus, and the
 # `parallel` build may only `--check` it, so every row must come out the same with rayon on

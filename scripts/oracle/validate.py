@@ -5471,6 +5471,402 @@ def check_compute(rows):
     return counts
 
 
+# ── ai (M7 part b) ──────────────────────────────────────────────────────────────────────────
+# The two configs under serde's derive (Python's json reads the documents; its strict mode refuses raw control
+# characters, and a lone surrogate, which it passes through, is refused here as serde_json refuses it), serde_json's
+# string escaping, and Rust's Debug: `debug_struct`'s two shapes and `<str as Debug>`, whose \u{…} set is
+# src/str_debug_data.cyr. `check_str_debug` checks that table against the stdlib's Unicode 17.0.0 categories
+# (lib/unicode/_categories_data.cyr), apart from Rust: every code point Rust's printable.py rule escapes (Zl, Zp, Cc,
+# Cf, Cs, Co, Cn, Zs but the space) and every Mn and Me (Grapheme_Extend's bulk) must be in it, and what else it holds
+# must be Mc or Lo (Other_Grapheme_Extend, which the categories can't name).
+
+GC_NAMES = "Lu Ll Lt Lm Lo Mn Mc Me Nd Nl No Pc Pd Ps Pe Pi Pf Po Sm Sc Sk So Zs Zl Zp Cc Cf Cs Co Cn".split()
+STR_DEBUG = []
+
+
+def load_str_debug(root):
+    """src/str_debug_data.cyr's ranges, sorted [(lo, hi)]."""
+    text = (root / "src" / "str_debug_data.cyr").read_text()
+    body = text[text.index("{") + 1:text.rindex("}")]
+    nums = [int(x, 16) for x in re.findall(r"0x[0-9A-F]+", body)]
+    count = int(re.search(r"const _PV_STR_DEBUG_RANGES = (\d+);", text).group(1))
+    if len(nums) != 2 * count:
+        fail(f"str_debug_data.cyr: {len(nums)} words for {count} ranges")
+    STR_DEBUG[:] = [(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
+
+
+def str_debug_escapes(u):
+    lo, hi = 0, len(STR_DEBUG) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        a, b = STR_DEBUG[mid]
+        if u < a:
+            hi = mid - 1
+        elif u > b:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
+def check_str_debug(root):
+    text = (root / "lib" / "unicode" / "_categories_data.cyr").read_text()
+    pieces = dict((int(k), v) for k, v in re.findall(r'var _UNICODE_CAT_PIECE_(\d+) = "([0-9a-f]+)"', text))
+    data = "".join(pieces[k] for k in sorted(pieces))
+    want, other, extra = set(), {}, {}
+    for i in range(0, len(data), 14):
+        a, b, c = int(data[i:i + 6], 16), int(data[i + 6:i + 12], 16), GC_NAMES[int(data[i + 12:i + 14], 16)]
+        for u in range(a, b + 1):
+            if c in ("Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn", "Mn", "Me") or (c == "Zs" and u != 0x20):
+                want.add(u)
+            else:
+                other[u] = c
+    want -= {0x0, 0x9, 0xA, 0xD}
+    have = set()
+    for a, b in STR_DEBUG:
+        have.update(range(a, b + 1))
+    missing = want - have
+    for u in have - want:
+        extra[other.get(u, "??")] = extra.get(other.get(u, "??"), 0) + 1
+    if missing:
+        fail(f"str_debug_data.cyr: {len(missing)} code points Rust's rule escapes are missing, first U+{min(missing):04X}")
+    if set(extra) - {"Mc", "Lo"}:
+        fail(f"str_debug_data.cyr: escapes code points of categories {sorted(set(extra) - {'Mc', 'Lo'})}")
+    if not missing and not set(extra) - {"Mc", "Lo"}:
+        print(f"str_debug_data.cyr: {len(want)} code points by the printable rule and Mn / Me, all present; "
+              f"{sum(extra.values())} more ({', '.join(f'{k} {v}' for k, v in sorted(extra.items()))}: "
+              f"Other_Grapheme_Extend)")
+
+
+def unpct_utf8(s):
+    """An `s:` token's text decoded as UTF-8 bytes (unpct maps each byte to a char, for ASCII documents)."""
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        if s[i] == "%" and re.fullmatch(r"[0-9A-F]{2}", s[i + 1:i + 3]):
+            out.append(int(s[i + 1:i + 3], 16))
+            i += 3
+        else:
+            out += s[i].encode("utf-8")
+            i += 1
+    return out.decode("utf-8")
+
+
+def ai_s(x):
+    """A string as its golden `s:` token."""
+    return "s:" + "".join(chr(b) if 0x21 <= b <= 0x7E and b != 0x25 else f"%{b:02X}" for b in x.encode("utf-8"))
+
+
+def ai_string(v):
+    if not isinstance(v, str) or any(0xD800 <= ord(ch) <= 0xDFFF for ch in v):
+        raise JsonRefused("not a string")
+    return v
+
+
+def ai_read(func, doc):
+    """(endpoint, key or None) as serde reads func's config from doc (a hoosh config's key is None)."""
+    v = j_load(doc)
+    daimon = func.startswith("DaimonConfig")
+    names = ["endpoint", "api_key"] if daimon else ["endpoint"]
+    if isinstance(v, list):
+        f = j_arr(v, len(names))
+    elif isinstance(v, tuple) and v[0] == "obj":
+        f = []
+        for name in names:
+            hits = [val for key, val in v[1] if key == name]
+            if len(hits) > 1 or (not hits and name == "endpoint"):
+                raise JsonRefused("missing or duplicated field")
+            f.append(hits[0] if hits else None)
+    else:
+        raise JsonRefused("not a struct")
+    e = ai_string(f[0])
+    k = None if not daimon or f[1] is None else ai_string(f[1])
+    return e, k
+
+
+def serde_str(s):
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif o < 0x20:
+            out.append({8: "\\b", 12: "\\f", 10: "\\n", 13: "\\r", 9: "\\t"}.get(o, "\\u%04x" % o))
+        else:
+            out.append(ch)
+    return "".join(out) + '"'
+
+
+def rust_debug_str(s):
+    out = ['"']
+    named = {'"': '\\"', "\\": "\\\\", "\0": "\\0", "\t": "\\t", "\n": "\\n", "\r": "\\r"}
+    for ch in s:
+        if ch in named:
+            out.append(named[ch])
+        elif str_debug_escapes(ord(ch)):
+            out.append("\\u{%x}" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out) + '"'
+
+
+def ai_debug(func, e, k, alternate):
+    name = "DaimonConfig" if func.startswith("DaimonConfig") else "HooshConfig"
+    fields = [("endpoint", rust_debug_str(e))]
+    if name == "DaimonConfig":
+        fields.append(("api_key", "None" if k is None else
+                       ('Some(\n        "<redacted>",\n    )' if alternate else 'Some("<redacted>")')))
+    if alternate:
+        return name + " {\n" + "".join(f"    {n}: {v},\n" for n, v in fields) + "}"
+    return name + " { " + ", ".join(f"{n}: {v}" for n, v in fields) + " }"
+
+
+def ai_want(func, ins):
+    if func == "DaimonConfig::default":
+        return [ai_s("http://localhost:8090"), "n:"]
+    if func == "HooshConfig::default":
+        return [ai_s("http://localhost:8088")]
+    try:
+        e, k = ai_read(func, unpct_utf8(ins[0][2:]))
+    except JsonRefused:
+        return ["E:Deserialize"]
+    daimon = func.startswith("DaimonConfig")
+    if func.endswith("::from_json"):
+        return [ai_s(e)] + ([ai_s(k) if k is not None else "n:"] if daimon else [])
+    if func.endswith("::to_json"):
+        text = '{"endpoint":' + serde_str(e)
+        if daimon:
+            text += ',"api_key":' + ("null" if k is None else serde_str(k))
+        return [ai_s(text + "}")]
+    if func.endswith("::debug"):
+        return [ai_s(ai_debug(func, e, k, False)), ai_s(ai_debug(func, e, k, True))]
+    return None
+
+
+def check_ai(root, rows):
+    load_str_debug(root)
+    check_str_debug(root)
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        want = ai_want(func, ins)
+        if want is None:
+            fail(f"{where}: no check for {func}")
+        elif want != outs:
+            fail(f"{where}: {func} recorded {outs!r}, recomputed {want!r}")
+    return counts
+
+
+# ── logging (M7 part b) ─────────────────────────────────────────────────────────────────────
+# The `init_with_level` rows: tracing-subscriber 0.3.23's EnvFilter, transcribed apart from the port. `parse` splits
+# on commas and drops empty pieces; `Directive::parse` walks the trimmed piece with its state machine but slices the
+# untrimmed one; a directive with a span name or fields decides nothing for a field-less event outside a span;
+# `LevelFilter::from_str` takes a usize 0–5 (Rust's parse: an optional `+`), "" (error) or a name in any case. The
+# statics match by target prefix, the longest first, the last of equal ones winning; none means off; `EnvFilter::new`
+# (the fallback) ignores invalid directives and adds `error` when no directive is left. The trace rows are checked
+# for form: every span entered is exited in nesting order, each name is one of pravash's spans with the fields its
+# `trace_span!` declares, and each event is one of its warnings, under its module's target, with its fields.
+
+LOG_TARGETS = ["pravash::common", "pravash::coupling", "pravash::grid", "pravash::mpm", "pravash::phase_field",
+               "pravash::shallow", "pravash::sph", "pravash::vof"]
+
+
+def lf_level(s):
+    if re.fullmatch(r"\+?[0-9]+", s) and s != "+":
+        v = int(s)
+        return v if v <= 5 else None
+    if s == "":
+        return 1
+    return {"off": 0, "error": 1, "warn": 2, "info": 3, "debug": 4, "trace": 5}.get(s.lower())
+
+
+def lf_directive(frm):
+    """(dynamic, target, level), or None when it doesn't parse."""
+    tr = frm.strip()
+    level, target, dynamic = 5, None, False
+    state, mark = "start", 0
+    for k, c in enumerate(tr):
+        if state == "start":
+            if c == "[":
+                state, mark = "span", k + 1
+            elif c in "-:_" or c.isalnum():
+                state, mark = "lot", k
+            else:
+                return None
+        elif state == "lot":
+            if c == "=":
+                target, state, mark = frm[mark:k], "level", k + 1
+            elif c == "[":
+                target, state, mark = frm[mark:k], "span", k + 1
+        elif state == "span":
+            if c == "]":
+                dynamic, state = True, "target"
+            elif c == "{":
+                dynamic, state, mark = True, "field", k + 1
+        elif state == "field":
+            if c == "}":
+                if frm[mark:k] == "":
+                    return None
+                state = "fields"
+        elif state == "fields":
+            if c != "]":
+                return None
+            state = "target"
+        elif state == "target":
+            if c != "=":
+                return None
+            state, mark = "level", k + 1
+        elif state == "level":
+            pass
+    if state == "lot":
+        lv = lf_level(frm[mark:])
+        if lv is not None:
+            level, target = lv, None
+        else:
+            level, target = 5, frm[mark:]
+    elif state == "level":
+        rest = frm[mark:]
+        lv = 5 if rest == "" else lf_level(rest)
+        if lv is None:
+            return None
+        level = lv
+    elif state != "target":
+        return None
+    return dynamic, target, level
+
+
+def lf_parse(dirs, strict):
+    """The eight targets' levels, or None for a strict parse that fails."""
+    statics, any_dir = [], False
+    if not (strict and dirs == ""):
+        for piece in dirs.split(","):
+            if piece == "":
+                continue
+            d = lf_directive(piece)
+            if d is None:
+                if strict:
+                    return None
+                continue
+            any_dir = True
+            if not d[0]:
+                statics.append(d)
+    if not any_dir and not strict:
+        statics.append((False, None, 1))
+    out = []
+    for name in LOG_TARGETS:
+        best_rank, best = -2, 0
+        for _, target, level in statics:
+            if target is not None and not name.startswith(target):
+                continue
+            rank = -1 if target is None else len(target)
+            if rank >= best_rank:
+                best_rank, best = rank, level
+        out.append(best if best_rank > -2 else 0)
+    return out
+
+
+# Each span pravash's tracing names, with the fields its `trace_span!` declares, and each warning's text, target and
+# fields.
+LOG_SPANS = {
+    "shallow::step": "nx ny", "shallow::disturbance": "", "shallow::sediment": "nx ny", "vof::advect": "nx ny",
+    "phase_field::step": "nx ny", "mpm::step": "n", "coupling::sph_bodies": "n_particles n_bodies",
+    "coupling::drag_from_particles": "", "coupling::drag_from_particles_indexed": "",
+    "coupling::particle_level_set": "nx ny n", "flip::p2g": "n", "flip::g2p": "n", "flip::step": "n",
+    "grid::advect": "nx ny", "grid::advect_periodic": "nx ny", "grid::advect_maccormack": "nx ny",
+    "grid::advect_bfecc": "nx ny", "grid::diffuse": "nx ny|nx ny iterations", "grid::divergence": "nx ny",
+    "grid::pressure_solve": "nx ny iterations", "grid::pressure_solve_dst": "nx ny", "grid::multigrid": "nx ny cycles",
+    "grid::pressure_solve_cg": "nx ny iterations", "grid::project": "", "grid::vorticity_confinement": "",
+    "grid::step": "nx ny", "grid::kepsilon": "nx ny", "grid::ghost_fluid": "nx ny", "mac::step": "nx ny",
+    "sph::viscoelastic": "n", "sph::heat": "n", "sph::phase_change": "n", "sph::reaction": "n", "sph::combustion": "n",
+    "sph::contact_angle": "n", "sph::delta_sph": "n", "sph::pressure_force": "n", "sph::viscosity_force": "n",
+    "sph::solver_step": "n", "sph::build_neighbors": "n", "sph::density": "n", "sph::forces": "n", "sph::pcisph": "n",
+    "sph::pcisph_iter": "iter", "sph::dfsph": "n", "sph::dfsph_density": "", "sph::dfsph_div": "",
+    "sph::step_multiphase": "n", "sph::step": "n", "sph::mls_correction": "n", "sph::implicit_visc": "n",
+    "sph::split_particle": "", "sph::merge_particles": "", "sph::sort_by_zorder": "n", "sph::secondary": "n",
+}
+LOG_WARNINGS = {
+    "ParticleArena::free: stale or out-of-range handle ignored": ("pravash::common", "start len"),
+    "ParticleArena::free: block already free (double free) ignored": ("pravash::common", "start len"),
+    "phase field divergence detected (|φ| > 1.5)": ("pravash::phase_field", "cells"),
+    "particle_level_set: size mismatch ignored": ("pravash::coupling", "nx ny len"),
+    "grid::diffuse: size mismatch ignored": ("pravash::grid", "nx ny len"),
+    "KEpsilon::step: invalid sizes or parameters ignored": ("pravash::grid", "nx ny"),
+    "apply_ghost_fluid: invalid sizes or dx ignored": ("pravash::grid", "nx ny"),
+    "invalid neighbor lists ignored (expected offsets.len() == n + 1, indices < n)": ("pravash::sph",
+                                                                                     "n offsets indices"),
+    "phase index out of bounds, falling back to phase 0": ("pravash::sph", "particles available"),
+}
+
+
+def lf_fields(text):
+    """The keys of `k=v k=v` (integer values), or None when the text isn't that."""
+    if text == "":
+        return ""
+    keys = []
+    for part in text.split(" "):
+        m = re.fullmatch(r"([a-z_]+)=(-?[0-9]+)", part)
+        if not m:
+            return None
+        keys.append(m.group(1))
+    return " ".join(keys)
+
+
+def lf_trace_problem(tokens):
+    """What's malformed in a trace row's tokens, or None."""
+    stack = []
+    for tok in tokens:
+        if not tok.startswith("s:"):
+            return f"not a text token: {tok}"
+        x = unpct_utf8(tok[2:])
+        if x.startswith(">"):
+            m = re.fullmatch(r">([a-z0-9_:]+)(?:\{(.*)\})?", x)
+            if not m or m.group(1) not in LOG_SPANS:
+                return f"unknown span {x!r}"
+            keys = lf_fields(m.group(2) or "")
+            if keys is None or keys not in LOG_SPANS[m.group(1)].split("|"):
+                return f"span {m.group(1)} with fields {m.group(2)!r}"
+            stack.append(m.group(1))
+        elif x.startswith("<"):
+            if not stack or stack[-1] != x[1:]:
+                return f"exit {x[1:]} out of order"
+            stack.pop()
+        else:
+            m = re.fullmatch(r"WARN (pravash::[a-z_]+): (.*)", x)
+            if not m:
+                return f"unknown event {x!r}"
+            hit = None
+            for msg, (target, keys) in LOG_WARNINGS.items():
+                if m.group(2) == msg or m.group(2).startswith(msg + " "):
+                    hit = (msg, target, keys)
+            if hit is None or hit[1] != m.group(1) or lf_fields(m.group(2)[len(hit[0]):].strip()) != hit[2]:
+                return f"event {x!r}"
+    if stack:
+        return f"span {stack[-1]} never exited"
+    return None
+
+
+def check_logging(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        if func == "init_with_level":
+            env = None if ins[0] == "n:" else unpct(ins[0][2:])
+            default = unpct(ins[1][2:])
+            want = (lf_parse(env, True) if env is not None else None) or lf_parse(default, False)
+            got = [tok_val(t) for t in outs]
+            if got != want:
+                fail(f"{where}: init_with_level({env!r}, {default!r}) recorded {got}, recomputed {want}")
+        elif func.startswith("trace:"):
+            problem = lf_trace_problem(outs)
+            if problem:
+                fail(f"{where}: {func}: {problem}")
+        else:
+            fail(f"{where}: no check for {func}")
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -5842,6 +6238,14 @@ def main():
             print(f"mpm: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "mpm", path, rows)
             MPM_CACHE.clear()
+        elif path.stem == "ai":
+            counts = check_ai(root, rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"ai: {len(rows)} rows recomputed ({summary})")
+        elif path.stem == "logging":
+            counts = check_logging(rows)
+            summary = ", ".join(f"{k.replace('trace:', '')} {v}" for k, v in sorted(counts.items()))
+            print(f"logging: {len(rows)} rows checked ({summary})")
         elif path.stem == "compute":
             counts = check_compute(rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

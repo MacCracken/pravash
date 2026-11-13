@@ -168,22 +168,26 @@ impl PvSphSolver {
     #must_use
     fn step_pcisph(self, ps: *PvFluidParticle, n, config: *PvFluidConfig, viscosity: f64, max_iterations,
       max_density_error: f64): Result {
+        var trace = _pv_span(_PV_LOG_SPH, "sph::pcisph", "n", n, 0, 0, 0, 0);
         var ct, cv = config.validate();
-        if (is_err_result(ct) == 1) { return Err(cv); }
-        if (n <= 0) { return Ok(0); }
+        if (is_err_result(ct) == 1) { _pv_span_end(trace); return Err(cv); }
+        if (n <= 0) { _pv_span_end(trace); return Ok(0); }
         var h: f64 = config.smoothing_radius;
         var h32: f32 = f32_from(h);
         var hw: f64 = f32_to(h32);
-        if (_pv_is_positive(hw) == 0) { return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
-        if (n > 9223372036854775807 / 144) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (_pv_is_positive(hw) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_SMOOTHING_RADIUS); }
+        if (n > 9223372036854775807 / 144) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var zero: f64 = 0.0;
         var zw = _pv_bits(zero);
         var ok = self.densities.resize(n, zw) & self.snapshot.resize(18 * n, 0);
         ok = ok & self.pcisph_accel.resize(3 * n, zw) & self.pcisph_pressures.resize(n, zw);
         ok = ok & self.pcisph_pred_pos.resize(3 * n, zw) & self.pcisph_pred_vel.resize(3 * n, zw);
-        if (ok == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var g: *PvNeighborGrid = _pv_sph_grid(self);
-        if (_pv_nb_build(g, ps, n, h) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        var tb = _pv_span(_PV_LOG_SPH, "sph::build_neighbors", "n", n, 0, 0, 0, 0);
+        var built = _pv_nb_build(g, ps, n, h);
+        _pv_span_end(tb);
+        if (built == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
         var kc: PvKernelCoeffs;
         _pv_kc_init(&kc, h);
         var h2: f64 = kc.h2;
@@ -280,7 +284,7 @@ impl PvSphSolver {
             ay = ay + ast.y;
             az = az + ast.z;
             if (_pv_is_finite(ax) == 0 || _pv_is_finite(ay) == 0 || _pv_is_finite(az) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             store64(npa + q * 24, _pv_bits(ax));
             store64(npa + q * 24 + 8, _pv_bits(ay));
@@ -297,6 +301,7 @@ impl PvSphSolver {
         if (iterations < 1) { iterations = 1; }
         var converged = 0;
         for (var it = 0; it < iterations; it = it + 1) {
+            var ti = _pv_span(_PV_LOG_SPH, "sph::pcisph_iter", "iter", it, 0, 0, 0, 0);
             _pv_pcisph_predict(self, n, &kc, dt);
             var max_error: f64 = 0.0;
             for (var c = 0; c < n; c = c + 1) {
@@ -340,6 +345,7 @@ impl PvSphSolver {
                     store64(pres + u * 8, _pv_bits(clamped));
                 }
             }
+            _pv_span_end(ti);
         }
         if (converged == 0) { _pv_pcisph_predict(self, n, &kc, dt); }
 
@@ -350,7 +356,7 @@ impl PvSphSolver {
             var my: f64 = load64(pos + m * 24 + 8);
             var mz: f64 = load64(pos + m * 24 + 16);
             if (_pv_is_finite(mx) == 0 || _pv_is_finite(my) == 0 || _pv_is_finite(mz) == 0) {
-                return Err(PV_ERR_DIVERGED);
+                _pv_span_end(trace); return Err(PV_ERR_DIVERGED);
             }
             var pm: *PvFluidParticle = ps + m;
             pm.velocity.x = load64(vel + m * 24);
@@ -362,6 +368,6 @@ impl PvSphSolver {
             pm.pressure = load64(pres + m * 8);
         }
         _pv_sph_walls(ps, n, config);
-        return Ok(0);
+        _pv_span_end(trace); return Ok(0);
     }
 }

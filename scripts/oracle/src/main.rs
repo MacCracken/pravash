@@ -27,6 +27,7 @@
 mod cyr;
 mod glibc;
 mod grids;
+mod m_ai;
 mod m_bridge;
 mod m_buoyancy;
 mod m_common;
@@ -36,6 +37,7 @@ mod m_coupling;
 mod m_grid;
 mod m_grid_c;
 mod m_json;
+mod m_logging;
 mod m_math;
 mod m_mpm;
 mod m_phase_field;
@@ -45,6 +47,7 @@ mod m_vof;
 mod m_vortex;
 mod t_constants;
 mod t_private;
+mod t_str_debug;
 mod tsv;
 
 use std::collections::BTreeSet;
@@ -58,6 +61,7 @@ const PARALLEL: bool = cfg!(feature = "parallel");
 /// Every golden emitter, in file-name order.
 fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
     Ok(vec![
+        m_ai::emit(),
         m_bridge::emit(),
         m_buoyancy::emit(),
         m_common::emit(),
@@ -66,6 +70,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_coupling::emit(),
         m_grid::emit(),
         m_json::emit(),
+        m_logging::emit(),
         m_math::emit(),
         m_mpm::emit(),
         m_phase_field::emit(),
@@ -81,6 +86,7 @@ fn cyrius_outputs(root: &Path, prov: &str) -> Result<Vec<Output>, String> {
     let files = vec![
         ("src/constants.cyr", t_constants::emit(root, prov)?),
         ("src/constants_private.cyr", t_private::emit(root, prov)?),
+        ("src/str_debug_data.cyr", t_str_debug::emit(prov)?),
         ("tests/constants_rows.cyr", t_constants::emit_rows(prov)),
     ];
     Ok(files

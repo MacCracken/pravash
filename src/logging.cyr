@@ -1,0 +1,708 @@
+# logging.cyr — rust-old/src/logging.rs (M7 part b): pravash's tracing on sakshi, and the init helpers.
+#
+# Rust's pravash traces through `tracing`: a TRACE span on each operation (`sph::step{n=10}`) and a WARN event where an
+# input is ignored, under the targets `pravash::<module>`; `logging::init*` installs a subscriber. Here they go
+# through sakshi (ADR 0002 #28). A span is a sakshi span named as tracing's fmt layer renders one, `name{k=v k=v}`,
+# entered only when its target enables TRACE; an event is a sakshi WARN line, `pravash::<module>: <message> k=v`. A
+# consumer configures sakshi (its level, output, hook) and sees pravash's spans and events among its own: until
+# pravash's init runs, every target follows sakshi's level.
+#
+# `logging_init()` and `logging_init_with_level(level, len)` mirror `init` and `init_with_level`: the first call wins
+# (Rust's `try_init`), and sakshi then writes to stdout, as the fmt layer does. Each target's level is what
+# tracing-subscriber 0.3.23's `EnvFilter` decides: PRAVASH_LOG parsed strictly when it is set (set to "", it enables
+# nothing), and the default parsed leniently when it is unset or doesn't parse (an invalid directive dropped, error
+# when none is left). A directive is `target=level`, `target` or `level` (a name in any case, 0–5, or "" for error);
+# the longest target that prefixes a target's name decides, a directive without one last, and the last of two equal
+# ones wins. The parse is EnvFilter's state machine, quirks kept: it walks the trimmed directive but slices the
+# untrimmed one. Directives with a span name or fields (`[span]`, `{field}`) are checked as syntax and decide nothing:
+# sakshi has no span-scoped filter, and a field filter matches no field-less callsite (ADR 0002 #28).
+#
+# `logging_init_profiling(guard)` mirrors `init_profiling`: a chrome://tracing Trace Event file `trace-<unix µs>.json`
+# in the working directory, written through a sakshi hook until `PvFlushGuard_drop` (ledger L11).
+#
+# UPSTREAM(L11): sakshi:docs/development/issues/2026-11-11-no-chrome-trace-export.md — replace the hook writer with
+#   sakshi's Trace Event exporter once it ships; parity: tests/logging.tcyr's trace-file group.
+#
+# Not thread-safe while tracing: sakshi has one span stack per process (its single-threaded contract). pravash's
+# worker pool enters no span and emits no event.
+
+# The targets, in name order: `pravash::<module>` for each module that traces.
+const _PV_LOG_COMMON = 0;
+const _PV_LOG_COUPLING = 1;
+const _PV_LOG_GRID = 2;
+const _PV_LOG_MPM = 3;
+const _PV_LOG_PHASE_FIELD = 4;
+const _PV_LOG_SHALLOW = 5;
+const _PV_LOG_SPH = 6;
+const _PV_LOG_VOF = 7;
+const _PV_LOG_TARGETS = 8;
+
+# The levels, as tracing's LevelFilter and sakshi number them: an event of level L is enabled under level M when
+# L ≤ M (OFF 0 enables nothing).
+const _PV_LOG_ERROR = 1;
+const _PV_LOG_WARN = 2;
+const _PV_LOG_TRACE = 5;
+
+# A target's name, or "" outside the list.
+#must_use
+fn _pv_log_target_name(t): i64 {
+    match t {
+        0 => { return "pravash::common"; }
+        1 => { return "pravash::coupling"; }
+        2 => { return "pravash::grid"; }
+        3 => { return "pravash::mpm"; }
+        4 => { return "pravash::phase_field"; }
+        5 => { return "pravash::shallow"; }
+        6 => { return "pravash::sph"; }
+        7 => { return "pravash::vof"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+# Each target's level once pravash's init has set them (`_pv_log_filtered` 1), else unused.
+var _pv_log_levels: i64[8];
+var _pv_log_filtered = 0;
+var _pv_log_init_done = 0;
+
+# The level target t enables: pravash's filter once its init ran, else sakshi's level.
+#must_use
+fn _pv_log_level(t): i64 {
+    if (_pv_log_filtered == 1) { return _pv_log_levels[t]; }
+    return sakshi_get_level();
+}
+
+# ── the filter ──────────────────────────────────────────────────────────────────────
+
+# 1 when byte c is ASCII whitespace (str::trim's, for the bytes an environment variable holds).
+#must_use
+fn _pv_log_ws(c): i64 {
+    if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
+    return 0;
+}
+
+# The level LevelFilter::from_str reads from the n bytes at p (an unsigned integer 0–5 with an optional `+`, a level
+# name in any case, or "" for error), or -1.
+#must_use
+fn _pv_log_parse_level(p, n): i64 {
+    if (n == 0) { return _PV_LOG_ERROR; }
+    var i = 0;
+    if (load8(p) == 43 && n > 1) { i = 1; }
+    var v = 0;
+    var digits = 1;
+    for (var k = i; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c < 48 || c > 57) {
+            digits = 0;
+        } elif (v < 100) {
+            v = v * 10 + (c - 48);
+        }
+    }
+    if (digits == 1) {
+        if (v <= 5) { return v; }
+        return 0 - 1;
+    }
+    if (n == 3 && _pv_log_ieq(p, "off", 3) == 1) { return 0; }
+    if (n == 5 && _pv_log_ieq(p, "error", 5) == 1) { return 1; }
+    if (n == 4 && _pv_log_ieq(p, "warn", 4) == 1) { return 2; }
+    if (n == 4 && _pv_log_ieq(p, "info", 4) == 1) { return 3; }
+    if (n == 5 && _pv_log_ieq(p, "debug", 5) == 1) { return 4; }
+    if (n == 5 && _pv_log_ieq(p, "trace", 5) == 1) { return 5; }
+    return 0 - 1;
+}
+
+# 1 when the n bytes at p equal the lowercase ASCII word w, ignoring case.
+#must_use
+fn _pv_log_ieq(p, w, n): i64 {
+    for (var k = 0; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != load8(w + k)) { return 0; }
+    }
+    return 1;
+}
+
+# 1 when byte c may start a directive's target or level (Rust's `-`, `:`, `_` or alphanumeric; a non-ASCII byte
+# counts as alphanumeric, as most such characters are).
+#must_use
+fn _pv_log_word_byte(c): i64 {
+    if (c == 45 || c == 58 || c == 95 || c >= 128) { return 1; }
+    if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return 1; }
+    return 0;
+}
+
+# One directive (the m bytes at s, untrimmed, holding no comma), as EnvFilter's Directive::parse reads it, into the
+# words at w: w[0] its level, w[1] its target's pointer (0 for none), w[2] the target's length. Returns 0 for a static
+# directive, 1 for one with a span name or fields (w unset), or -1 for one that doesn't parse.
+fn _pv_log_directive(s, m, w): i64 {
+    var a = 0;
+    while (a < m && _pv_log_ws(load8(s + a)) == 1) { a = a + 1; }
+    var b = m;
+    while (b > a && _pv_log_ws(load8(s + b - 1)) == 1) { b = b - 1; }
+    # The states (Rust's ParseState): 0 Start, 1 LevelOrTarget, 2 Span, 3 Field, 4 Fields, 5 Target, 6 Level.
+    var st = 0;
+    var mark = 0;
+    var dynamic = 0;
+    store64(w + 8, 0);
+    store64(w + 16, 0);
+    # The walk's index k counts the trimmed bytes; slices index the untrimmed ones (Rust's `from[start..i]`).
+    for (var k = 0; k < b - a; k = k + 1) {
+        var c = load8(s + a + k);
+        if (st == 0) {
+            if (c == 91) {
+                st = 2;
+                mark = k + 1;
+            } elif (_pv_log_word_byte(c) == 1) {
+                st = 1;
+                mark = k;
+            } else {
+                return 0 - 1;
+            }
+        } elif (st == 1) {
+            if (c == 61) {
+                store64(w + 8, s + mark);
+                store64(w + 16, k - mark);
+                st = 6;
+                mark = k + 1;
+            } elif (c == 91) {
+                store64(w + 8, s + mark);
+                store64(w + 16, k - mark);
+                st = 2;
+                mark = k + 1;
+            }
+        } elif (st == 2) {
+            if (c == 93) {
+                dynamic = 1;
+                st = 5;
+            } elif (c == 123) {
+                dynamic = 1;
+                st = 3;
+                mark = k + 1;
+            }
+        } elif (st == 3) {
+            if (c == 125) {
+                if (k == mark) { return 0 - 1; }
+                st = 4;
+            }
+        } elif (st == 4) {
+            if (c != 93) { return 0 - 1; }
+            st = 5;
+        } elif (st == 5) {
+            if (c != 61) { return 0 - 1; }
+            st = 6;
+            mark = k + 1;
+        }
+    }
+    if (st == 1) {
+        # `level` or `target`: a word that reads as a level is one, any other a target at trace.
+        var lv = _pv_log_parse_level(s + mark, m - mark);
+        if (lv >= 0) {
+            store64(w, lv);
+        } else {
+            store64(w, _PV_LOG_TRACE);
+            store64(w + 8, s + mark);
+            store64(w + 16, m - mark);
+        }
+    } elif (st == 6) {
+        var lv2 = _pv_log_parse_level(s + mark, m - mark);
+        if (m == mark) { lv2 = _PV_LOG_TRACE; }
+        if (lv2 < 0) { return 0 - 1; }
+        store64(w, lv2);
+    } elif (st == 5) {
+        store64(w, _PV_LOG_TRACE);
+    } elif (st == 0) {
+        # An all-whitespace directive: Rust's loop never runs and the Start state ends in error.
+        return 0 - 1;
+    } else {
+        return 0 - 1;
+    }
+    return dynamic;
+}
+
+# Applies the static directive at w to the per-target (rank, level) words at best (two per target): the directive
+# decides target t when its target prefixes t's name and is at least as long as the deciding one so far (a directive
+# without a target ranks -1, below any).
+fn _pv_log_apply(w, best) {
+    var tp = load64(w + 8);
+    var tn = load64(w + 16);
+    var rank = 0 - 1;
+    if (tp != 0) { rank = tn; }
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        var name = _pv_log_target_name(t);
+        var hit = 1;
+        if (tp != 0 && tn > 0) {
+            if (tn > strlen(name) || memeq(name, tp, tn) != 1) { hit = 0; }
+        }
+        if (hit == 1 && rank >= load64(best + t * 16)) {
+            store64(best + t * 16, rank);
+            store64(best + t * 16 + 8, load64(w));
+        }
+    }
+    return 0;
+}
+
+# The directives in the n bytes at p into the per-target levels at out (8 words): EnvFilter's `parse` (strict 1:
+# returns 0, out untouched, when one directive doesn't parse) or `parse_lossy` (0: skips it, and makes the filter
+# error when nothing is left). Returns 1 when out was set.
+fn _pv_log_parse(p, n, strict, out): i64 {
+    var best[128];
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        store64(&best + t * 16, 0 - 2);
+        store64(&best + t * 16 + 8, 0);
+    }
+    var any = 0;
+    var w[24];
+    var start = 0;
+    for (var i = 0; i <= n; i = i + 1) {
+        if (i == n || load8(p + i) == 44) {
+            if (i > start) {
+                var kind = _pv_log_directive(p + start, i - start, &w);
+                if (kind < 0 && strict == 1) { return 0; }
+                if (kind >= 0) { any = 1; }
+                if (kind == 0) { _pv_log_apply(&w, &best); }
+            }
+            start = i + 1;
+        }
+    }
+    if (any == 0 && strict == 0) {
+        # EnvFilter::new's default directive, `error` for every target.
+        store64(&w, _PV_LOG_ERROR);
+        store64(&w + 8, 0);
+        store64(&w + 16, 0);
+        _pv_log_apply(&w, &best);
+    }
+    for (var t2 = 0; t2 < _PV_LOG_TARGETS; t2 = t2 + 1) {
+        var lv = 0;
+        if (load64(&best + t2 * 16) > 0 - 2) { lv = load64(&best + t2 * 16 + 8); }
+        store64(out + t2 * 8, lv);
+    }
+    return 1;
+}
+
+# The level each target enables under `init_with_level`'s filter, into the 8 words at out: PRAVASH_LOG's n bytes at
+# env (has 0 when it is unset) when they parse, else the dn bytes of the default at dflt.
+fn _pv_log_filter(env, n, has, dflt, dn, out) {
+    if (has == 1 && _pv_log_parse(env, n, 1, out) == 1) { return 0; }
+    var r = _pv_log_parse(dflt, dn, 0, out);
+    return r - 1;
+}
+
+# ── init ────────────────────────────────────────────────────────────────────────────
+
+# `logging_init_with_level("info", 4)`. Mirrors `logging::init`.
+fn logging_init(): i64 {
+    return logging_init_with_level("info", 4);
+}
+
+# Sets each target's level from PRAVASH_LOG, or from the `len` bytes of the default directives at `level` (above), and
+# sends sakshi's text to stdout: 1, or 0 when an init already ran (nothing changes). Mirrors `logging::init_with_level`.
+fn logging_init_with_level(level, len): i64 {
+    if (_pv_log_init_done == 1) { return 0; }
+    _pv_log_init_done = 1;
+    var env = getenv("PRAVASH_LOG");
+    var has = 0;
+    var n = 0;
+    if (env != 0) {
+        has = 1;
+        n = strlen(env);
+    }
+    var lv[64];
+    _pv_log_filter(env, n, has, level, len, &lv);
+    var max = 0;
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+        _pv_log_levels[t] = load64(&lv + t * 8);
+        if (load64(&lv + t * 8) > max) { max = load64(&lv + t * 8); }
+    }
+    _pv_log_filtered = 1;
+    # sakshi gates its lines by one level; pravash's per-target gate comes first.
+    sakshi_set_level(max);
+    sakshi_set_output_fd(1);
+    return 1;
+}
+
+# ── spans and events ────────────────────────────────────────────────────────────────
+
+# The span texts, one 128-byte slot per sakshi depth (sakshi keeps the name's pointer until the span exits), and each
+# slot's target; and the last event's text, target and parts, for the trace writer.
+var _pv_span_text: u8[2048];
+var _pv_span_tgt: i64[16];
+var _pv_event_text: u8[256];
+var _pv_event_tgt = 0;
+var _pv_event_msg_len = 0;
+
+# Appends the decimal of v at p + n (room checked against cap): the new length.
+fn _pv_log_put_int(p, n, cap, v): i64 {
+    var d[24];
+    var nd = 0;
+    var neg = 0;
+    var u = v;
+    if (v < 0) {
+        neg = 1;
+        u = 0 - v;
+    }
+    while (nd == 0 || u != 0) {
+        store8(&d + nd, 48 + (u % 10));
+        u = u / 10;
+        nd = nd + 1;
+    }
+    if (neg == 1 && n < cap) {
+        store8(p + n, 45);
+        n = n + 1;
+    }
+    for (var k = nd - 1; k >= 0; k = k - 1) {
+        if (n < cap) {
+            store8(p + n, load8(&d + k));
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# Appends the C string s at p + n (to cap): the new length.
+fn _pv_log_put(p, n, cap, s): i64 {
+    var m = strlen(s);
+    for (var k = 0; k < m; k = k + 1) {
+        if (n < cap) {
+            store8(p + n, load8(s + k));
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# Appends ` k=v` for each named field (a 0 name ends them) at p + n (to cap): the new length. `first` writes the first
+# without its space.
+fn _pv_log_put_fields(p, n, cap, first, k1, v1, k2, v2, k3, v3): i64 {
+    var sep = 1 - first;
+    if (k1 != 0) {
+        if (sep == 1) { n = _pv_log_put(p, n, cap, " "); }
+        n = _pv_log_put(p, n, cap, k1);
+        n = _pv_log_put(p, n, cap, "=");
+        n = _pv_log_put_int(p, n, cap, v1);
+        if (k2 != 0) {
+            n = _pv_log_put(p, n, cap, " ");
+            n = _pv_log_put(p, n, cap, k2);
+            n = _pv_log_put(p, n, cap, "=");
+            n = _pv_log_put_int(p, n, cap, v2);
+            if (k3 != 0) {
+                n = _pv_log_put(p, n, cap, " ");
+                n = _pv_log_put(p, n, cap, k3);
+                n = _pv_log_put(p, n, cap, "=");
+                n = _pv_log_put_int(p, n, cap, v3);
+            }
+        }
+    }
+    return n;
+}
+
+# Enters the TRACE span `name` of target t, with up to three integer fields (a 0 name ends them), when t enables
+# TRACE: 1, or 0 when it didn't (nothing happened). Every path out of the traced operation then calls
+# `_pv_span_end` with the result (a `defer`). Mirrors `trace_span!(name, k1 = v1, …).entered()`.
+fn _pv_span(t, name, k1, v1, k2, v2, k3, v3): i64 {
+    if (_pv_log_level(t) < _PV_LOG_TRACE) { return 0; }
+    var d = sakshi_span_depth();
+    if (d < 0 || d >= 16) { return 0; }
+    var slot = &_pv_span_text + d * 128;
+    var n = _pv_log_put(slot, 0, 127, name);
+    if (k1 != 0) {
+        n = _pv_log_put(slot, n, 127, "{");
+        n = _pv_log_put_fields(slot, n, 127, 1, k1, v1, k2, v2, k3, v3);
+        n = _pv_log_put(slot, n, 127, "}");
+    }
+    _pv_span_tgt[d] = t;
+    if (sakshi_span_enter(slot, n) != 0) { return 0; }
+    return 1;
+}
+
+# Exits the span `_pv_span` entered (on 1), or does nothing (on 0).
+fn _pv_span_end(on) {
+    if (on == 1) { var e = sakshi_span_exit(); }
+    return 0;
+}
+
+# Emits the WARN event `message k1=v1 …` (a 0 name ends the fields) of target t when t enables WARN, as the sakshi
+# line `pravash::<module>: message k1=v1 …`. Mirrors `tracing::warn!(k1, …, "message")`.
+fn _pv_warn(t, message, k1, v1, k2, v2, k3, v3) {
+    if (_pv_log_level(t) < _PV_LOG_WARN) { return 0; }
+    var p = &_pv_event_text;
+    var n = _pv_log_put(p, 0, 255, _pv_log_target_name(t));
+    n = _pv_log_put(p, n, 255, ": ");
+    var m0 = n;
+    n = _pv_log_put(p, n, 255, message);
+    _pv_event_msg_len = n - m0;
+    n = _pv_log_put_fields(p, n, 255, 0, k1, v1, k2, v2, k3, v3);
+    _pv_event_tgt = t;
+    sakshi_warn(p, n);
+    return 0;
+}
+
+# ── the Trace Event writer (ledger L11) ─────────────────────────────────────────────
+# tracing-chrome 0.7.2's file: `[`, entries joined by `,\n`, `\n]`; each entry serde_json's map, keys in order
+# (args, cat, name, ph, pid, s, tid, ts); a "M" thread_name entry for the main thread first; "B" / "E" for a span's
+# enter and exit with its fields as args (strings, the Debug of each value); "i" (scope "t") for an event, its
+# message and fields as args. ts is µs since the writer's first entry. tracing-chrome's `.file` / `.line` (the Rust
+# source location) have no Cyrius counterpart and are left out, as is an event's `event <file>:<line>` name: here
+# `event <target>` (ADR 0002 #28).
+
+# The guard `logging_init_profiling` fills: the file, and whether the writer is installed. Mirrors
+# `tracing_chrome::FlushGuard`.
+struct PvFlushGuard {
+    fd;
+    active;
+}
+
+var _pv_tr_fd = 0 - 1;
+var _pv_tr_prev_level = 0;
+var _pv_tr_path: u8[64];
+
+# The path of the last trace file logging_init_profiling created (a C string; "" before one).
+#must_use
+fn _pv_trace_path(): i64 {
+    return &_pv_tr_path;
+}
+var _pv_tr_buf: u8[8192];
+var _pv_tr_len = 0;
+var _pv_tr_count = 0;
+var _pv_tr_t0 = 0;
+
+# Writes the buffer out.
+fn _pv_tr_flush() {
+    if (_pv_tr_fd >= 0 && _pv_tr_len > 0) { var w = file_write(_pv_tr_fd, &_pv_tr_buf, _pv_tr_len); }
+    _pv_tr_len = 0;
+    return 0;
+}
+
+# Appends the n bytes at p to the file's buffer.
+fn _pv_tr_put_n(p, n) {
+    for (var k = 0; k < n; k = k + 1) {
+        if (_pv_tr_len >= 8192) { _pv_tr_flush(); }
+        store8(&_pv_tr_buf + _pv_tr_len, load8(p + k));
+        _pv_tr_len = _pv_tr_len + 1;
+    }
+    return 0;
+}
+
+# Appends the C string s.
+fn _pv_tr_put(s) {
+    _pv_tr_put_n(s, strlen(s));
+    return 0;
+}
+
+# Appends the n bytes at p as a JSON string (pravash's texts are plain ASCII; a quote, backslash or control byte is
+# escaped all the same).
+fn _pv_tr_str(p, n) {
+    _pv_tr_put("\"");
+    for (var k = 0; k < n; k = k + 1) {
+        var c = load8(p + k);
+        if (c == 34 || c == 92) {
+            _pv_tr_put("\\");
+            _pv_tr_put_n(p + k, 1);
+        } elif (c < 32) {
+            _pv_tr_put(" ");
+        } else {
+            _pv_tr_put_n(p + k, 1);
+        }
+    }
+    _pv_tr_put("\"");
+    return 0;
+}
+
+# Appends the integer v.
+fn _pv_tr_int(v) {
+    var b[24];
+    var n = _pv_log_put_int(&b, 0, 24, v);
+    _pv_tr_put_n(&b, n);
+    return 0;
+}
+
+# Appends the args object of the fields in `name{k=v k=v}` or `k=v k=v` (the n bytes at p): `"args":{"k":"v",…},`,
+# or nothing when there are none.
+fn _pv_tr_args(p, n) {
+    if (n <= 0) { return 0; }
+    _pv_tr_put("\"args\":{");
+    var i = 0;
+    var first = 1;
+    while (i < n) {
+        var k0 = i;
+        while (i < n && load8(p + i) != 61) { i = i + 1; }
+        var kn = i - k0;
+        i = i + 1;
+        var v0 = i;
+        while (i < n && load8(p + i) != 32) { i = i + 1; }
+        if (first == 0) { _pv_tr_put(","); }
+        first = 0;
+        _pv_tr_str(p + k0, kn);
+        _pv_tr_put(":");
+        _pv_tr_str(p + v0, i - v0);
+        i = i + 1;
+    }
+    _pv_tr_put("},");
+    return 0;
+}
+
+# Starts an entry: the `,\n` between entries, and the main thread's name before the first.
+fn _pv_tr_entry(ts) {
+    if (_pv_tr_count == 0) {
+        _pv_tr_t0 = ts;
+        _pv_tr_put("{\"args\":{\"name\":\"main\"},\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1}");
+        _pv_tr_count = 1;
+    }
+    _pv_tr_put(",\n{");
+    _pv_tr_count = _pv_tr_count + 1;
+    return 0;
+}
+
+# Ends an entry with its phase, the pid and tid, and ts (µs since the first entry, with its ns as three decimals).
+fn _pv_tr_end(ph, scope, ts) {
+    _pv_tr_put("\"ph\":\"");
+    _pv_tr_put(ph);
+    _pv_tr_put("\",\"pid\":1,");
+    if (scope == 1) { _pv_tr_put("\"s\":\"t\","); }
+    _pv_tr_put("\"tid\":1,\"ts\":");
+    var d = ts - _pv_tr_t0;
+    if (d < 0) { d = 0; }
+    _pv_tr_int(d / 1000);
+    var f[8];
+    var r = d % 1000;
+    store8(&f, 46);
+    store8(&f + 1, 48 + r / 100);
+    store8(&f + 2, 48 + (r / 10) % 10);
+    store8(&f + 3, 48 + r % 10);
+    _pv_tr_put_n(&f, 4);
+    _pv_tr_put("}");
+    return 0;
+}
+
+# sakshi's emit hook while profiling: a span's enter / exit (level 10 / 11) and every event, as Trace Event entries.
+# A span pravash entered carries its target and fields; anyone else's has an empty category and no args. An event
+# pravash emitted carries its target, message and fields; anyone else's, its text as the message.
+fn _pv_tr_hook(ts, level, category, msg, msg_len, sixth): i64 {
+    if (_pv_tr_fd < 0) { return 0; }
+    if (level == 10 || level == 11) {
+        _pv_tr_entry(ts);
+        var own = 0;
+        if (msg >= &_pv_span_text && msg < &_pv_span_text + 2048) { own = 1; }
+        var nb = msg_len;
+        for (var k = 0; k < msg_len; k = k + 1) {
+            if (nb == msg_len && load8(msg + k) == 123) { nb = k; }
+        }
+        if (own == 1 && nb < msg_len) { _pv_tr_args(msg + nb + 1, msg_len - nb - 2); }
+        _pv_tr_put("\"cat\":");
+        if (own == 1) {
+            var slot = (msg - &_pv_span_text) / 128;
+            var tn = _pv_log_target_name(_pv_span_tgt[slot]);
+            _pv_tr_str(tn, strlen(tn));
+        } else {
+            _pv_tr_put("\"\"");
+        }
+        _pv_tr_put(",\"name\":");
+        _pv_tr_str(msg, nb);
+        _pv_tr_put(",");
+        if (level == 10) { _pv_tr_end("B", 0, ts); } else { _pv_tr_end("E", 0, ts); }
+        return 0;
+    }
+    _pv_tr_entry(ts);
+    if (msg == &_pv_event_text) {
+        var tname = _pv_log_target_name(_pv_event_tgt);
+        var tl = strlen(tname);
+        var m0 = msg + tl + 2;
+        _pv_tr_put("\"args\":{\"message\":");
+        _pv_tr_str(m0, _pv_event_msg_len);
+        var rest = msg_len - tl - 2 - _pv_event_msg_len;
+        if (rest > 1) {
+            _pv_tr_put(",");
+            # The fields after the message: ` k=v k=v` as "k":"v" pairs.
+            var fp = m0 + _pv_event_msg_len + 1;
+            var fl = rest - 1;
+            var i = 0;
+            var first = 1;
+            while (i < fl) {
+                var k0 = i;
+                while (i < fl && load8(fp + i) != 61) { i = i + 1; }
+                var kn = i - k0;
+                i = i + 1;
+                var v0 = i;
+                while (i < fl && load8(fp + i) != 32) { i = i + 1; }
+                if (first == 0) { _pv_tr_put(","); }
+                first = 0;
+                _pv_tr_str(fp + k0, kn);
+                _pv_tr_put(":");
+                _pv_tr_str(fp + v0, i - v0);
+                i = i + 1;
+            }
+        }
+        _pv_tr_put("},\"cat\":");
+        _pv_tr_str(tname, tl);
+        _pv_tr_put(",\"name\":");
+        var en[64];
+        var enn = _pv_log_put(&en, 0, 64, "event ");
+        enn = _pv_log_put(&en, enn, 64, tname);
+        _pv_tr_str(&en, enn);
+    } else {
+        _pv_tr_put("\"args\":{\"message\":");
+        _pv_tr_str(msg, msg_len);
+        _pv_tr_put("},\"cat\":\"\",\"name\":\"event\"");
+    }
+    _pv_tr_put(",");
+    _pv_tr_end("i", 1, ts);
+    return 0;
+}
+
+# Starts chrome://tracing output to `trace-<unix µs>.json` in the working directory and fills *guard: 1, or 0 when the
+# file can't be created. Every target then enables TRACE through sakshi's hook, which the writer takes over; when an
+# init already ran, the file is written empty instead (Rust's: its layer isn't registered when a subscriber is). The
+# trace is closed by PvFlushGuard_drop. Mirrors `logging::init_profiling`.
+#must_use
+fn logging_init_profiling(guard: *PvFlushGuard): i64 {
+    guard.fd = 0 - 1;
+    guard.active = 0;
+    var name[64];
+    var n = _pv_log_put(&name, 0, 63, "trace-");
+    n = _pv_log_put_int(&name, n, 63, clock_epoch_ns() / 1000);
+    n = _pv_log_put(&name, n, 63, ".json");
+    store8(&name + n, 0);
+    memcpy(&_pv_tr_path, &name, n + 1);
+    var fd = file_open(&name, O_WRONLY | O_CREAT | O_TRUNC, 420);
+    if (fd < 0) { return 0; }
+    guard.fd = fd;
+    _pv_tr_fd = fd;
+    _pv_tr_len = 0;
+    _pv_tr_count = 0;
+    _pv_tr_put("[\n");
+    if (_pv_log_init_done == 1) { return 1; }
+    _pv_log_init_done = 1;
+    for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = _PV_LOG_TRACE; }
+    _pv_log_filtered = 1;
+    _pv_tr_prev_level = sakshi_get_level();
+    sakshi_set_level(SK_TRACE);
+    sakshi_set_emit_hook(&_pv_tr_hook);
+    guard.active = 1;
+    return 1;
+}
+
+impl PvFlushGuard {
+    # Writes out what the trace holds so far. Mirrors `FlushGuard::flush`.
+    fn flush(self) {
+        if (self.fd >= 0 && self.fd == _pv_tr_fd) { _pv_tr_flush(); }
+        return 0;
+    }
+}
+
+# Ends the trace: closes the entry list and the file, and removes the hook. pravash then traces nothing (every
+# target off) and sakshi has its level from before and writes to stderr: Rust's chrome layer stays installed and
+# writes nowhere, so nothing is printed either. Mirrors dropping the `FlushGuard`.
+fn PvFlushGuard_drop(guard: *PvFlushGuard) {
+    if (guard.fd < 0 || guard.fd != _pv_tr_fd) { return 0; }
+    if (guard.active == 1) {
+        var c = sakshi_clear_emit_hook();
+        for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) { _pv_log_levels[t] = 0; }
+        var l = sakshi_set_level(_pv_tr_prev_level);
+    }
+    _pv_tr_put("\n]");
+    _pv_tr_flush();
+    var r = file_close(guard.fd);
+    _pv_tr_fd = 0 - 1;
+    guard.fd = 0 - 1;
+    guard.active = 0;
+    return 0;
+}
