@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **`scripts/bench_record.py`** (M8 part b) writes the release record's two tables from saved runs. It fails when a
+  criterion row or a thread row is missing from any run.
+
+### Performance
+- **The 2.0.0 benchmark record** (M8 part b,
+  [`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md)): every row of Rust 1.3.0's criterion suite
+  beside the port's bench of the same name, 21 groups and 57 rows. Three interleaved rounds were pinned to core 15,
+  and `scripts/bench_record.py` writes the table from the saved runs.
+  - **Overall:** the port runs at a median of 4.4× Rust's time (geometric mean 3.9×), from 0.76× to 37×.
+  - **Level with Rust or faster (10 rows):**
+    - the SPH solver's WCSPH and PCISPH steps up to 64 particles (0.76–1.02×): Rust rebuilds its hash every step,
+      while the port's f64 cell grid reuses solver-owned storage;
+    - the DST grid step at 30 × 30 and 63 × 63 (0.82–1.0×): the port keeps its transform plans.
+  - **2.4–9.8×, the bulk:** per-element loops that rustc inlines and vectorises.
+  - **16×:** `grid_max_speed`.
+  - **26–37×:** `create_particle_block`, which pays the freelist's map per block over 4 KB (filed at M1).
+  - **No Cyrius row has slowed beyond noise** since its milestone's record. The SPH solver rows are 1.3–1.75× faster
+    than at M5 parts a and b.
+  - **Thread counts** (cores 8–15, T = 1 → 8):
+    - the 625-particle SPH step runs 2.24× faster at 8 threads (Rust's rayon build: 1.05×), and the 2,500-particle
+      step 3.16× (Rust 1.95×);
+    - the grid steps gain 1.03–1.14× on both sides, because their Gauss–Seidel solves stay serial to keep the bits;
+    - Rust's rayon build is slower than its serial build on the 15 × 15 grids, even at one thread.
+
+### Added (Cyrius)
 - **The Rust-test ledger** (M8 part a): `scripts/rust_test_ledger.py` writes
   [`docs/development/rust-test-ledger.md`](docs/development/rust-test-ledger.md), and its `--check` runs in CI. Every
   test of the frozen 1.3.0 crate is ported to a Cyrius test group of the same name, or recorded with its reason.

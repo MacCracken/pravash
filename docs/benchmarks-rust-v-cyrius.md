@@ -5,7 +5,9 @@ Each row times one benchmark body twice:
 - **Cyrius:** `tests/pravash.bcyr`, run by `cyrius bench`.
 
 Port milestones append rows as their modules land. Numbers are host-specific, so compare within a column set,
-never across hosts.
+never across hosts. The 2.0.0 release record comes first, with every row of Rust's criterion suite in both columns
+and the thread counts, from one session. The milestone sections after it keep each part's twins, A/B runs and
+findings.
 
 Speed is measured, not gated (CLAUDE.md, port plan §0). These are first numbers on a young language with no speed
 work yet. They are recorded so the compiler, ganita and hisab can see where pravash's workload spends its time. A
@@ -20,6 +22,153 @@ slow row is a finding to file, with its numbers, not a reason to change the port
   and subtracts it from every sample: 1.22 µs per read on this host, while its clocksource is HPET.
 - **Rust timing:** `Instant` around 1,000,000 calls, the median of 7 runs, with `black_box` on each argument and a
   folded result.
+
+## 2.0.0: the release record (M8 part b, 2026-11-12)
+
+Every row of Rust 1.3.0's criterion suite beside the port's bench of the same name: the 21 groups of
+`rust-old/benches/benchmarks.rs`, 57 rows. The method:
+- **Interleaved rounds.** Three rounds, each a full criterion run followed by a full `cyrius bench`, pinned to
+  core 15, on the tree as M8 part a left it.
+- **Rust:** criterion's defaults, `--features "sph grid shallow coupling" --bench benchmarks -- --noplot`. Each
+  Rust value is criterion's point estimate.
+- **Cyrius:** each value is the bench's mean.
+
+`scripts/bench_record.py` writes the table from the six saved outputs. A range is the three rounds; the ratio is of
+the medians.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `sph_kernels/poly6` | 1.90–1.97 ns | 18.0–20.0 ns | 9.29× |
+| `sph_kernels/spiky_grad` | 1.49–1.58 ns | 15.0–16.0 ns | 9.75× |
+| `sph_kernels/viscosity_laplacian` | 1.39–1.46 ns | 13.0–14.0 ns | 9.01× |
+| `sph_density/100_particles` | 85.2–90.8 ns | 813–885 ns | 9.55× |
+| `sph_density/500_particles` | 590–634 ns | 4.17–4.60 µs | 7.11× |
+| `sph_density/1000_particles` | 1.16–1.21 µs | 8.11–8.73 µs | 7.02× |
+| `sph_step/9_particles` | 374–377 ns | 2.95–3.25 µs | 7.89× |
+| `sph_step/25_particles` | 1.56–1.60 µs | 14.6–15.8 µs | 9.33× |
+| `sph_step/64_particles` | 10.5–10.8 µs | 88.7–95.0 µs | 8.47× |
+| `sph_pressure_force/625_particles` | 763–781 ns | 5.89–6.23 µs | 7.80× |
+| `sph_viscosity_force/625_particles` | 728–770 ns | 6.13–6.71 µs | 8.28× |
+| `solver_step/9_particles` | 7.03–7.16 µs | 5.49–5.91 µs | 0.78× |
+| `solver_step/25_particles` | 20.0–21.2 µs | 15.7–16.9 µs | 0.78× |
+| `solver_step/64_particles` | 52.8–54.8 µs | 54.3–58.0 µs | 1.01× |
+| `solver_step/169_particles` | 155–166 µs | 234–248 µs | 1.47× |
+| `solver_step/256_particles` | 251–253 µs | 461–496 µs | 1.85× |
+| `solver_step_st/25_particles` | 20.4–21.5 µs | 15.1–16.8 µs | 0.76× |
+| `solver_step_st/64_particles` | 53.8–55.9 µs | 52.6–58.5 µs | 1.02× |
+| `solver_step_st/169_particles` | 158–168 µs | 243–269 µs | 1.58× |
+| `pcisph_step/9_particles` | 7.23–7.65 µs | 6.32–6.72 µs | 0.87× |
+| `pcisph_step/25_particles` | 21.0–21.7 µs | 17.8–20.0 µs | 0.86× |
+| `pcisph_step/64_particles` | 54.7–58.5 µs | 70.4–84.9 µs | 1.30× |
+| `grid_diffuse/32x32` | 87.7–89.3 µs | 297–322 µs | 3.55× |
+| `grid_diffuse/64x64` | 450–468 µs | 1.21–1.31 ms | 2.76× |
+| `grid_diffuse/128x128` | 2.00–2.10 ms | 4.79–5.20 ms | 2.41× |
+| `grid_max_speed/32x32` | 348–379 ns | 5.55–6.04 µs | 15.8× |
+| `grid_max_speed/64x64` | 1.42–1.51 µs | 22.7–24.1 µs | 15.8× |
+| `grid_max_speed/128x128` | 5.66–5.75 µs | 90.3–97.4 µs | 16.0× |
+| `grid_step/15x15` | 124–135 µs | 720–787 µs | 5.84× |
+| `grid_step/30x30` | 1.05–1.14 ms | 1.05–1.17 ms | 1.00× |
+| `grid_step/63x63` | 10.1–10.3 ms | 8.32–9.30 ms | 0.82× |
+| `grid_step_maccormack/15x15` | 134–136 µs | 772–856 µs | 5.75× |
+| `grid_step_maccormack/30x30` | 1.08–1.13 ms | 1.28–1.46 ms | 1.16× |
+| `grid_step_maccormack/63x63` | 10.3–10.8 ms | 9.46–10.6 ms | 0.92× |
+| `grid_step_periodic/15x15` | 71.6–73.3 µs | 263–290 µs | 3.67× |
+| `grid_step_periodic/30x30` | 370–390 µs | 1.20–1.31 ms | 3.22× |
+| `grid_step_periodic/63x63` | 2.06–2.14 ms | 5.44–5.97 ms | 2.61× |
+| `shallow_step/32x32`¹ | 27.9–28.5 µs | 202–445 µs | 7.30× |
+| `shallow_step/64x64`¹ | 122–128 µs | 848 µs–1.91 ms | 7.09× |
+| `shallow_step/128x128`¹ | 502–514 µs | 3.50–16.3 ms | 7.14× |
+| `shallow_volume/32x32` | 778–788 ns | 4.59–6.00 µs | 6.05× |
+| `shallow_volume/64x64` | 3.14–3.30 µs | 19.9–22.8 µs | 6.43× |
+| `shallow_volume/128x128` | 12.4–12.8 µs | 78.2–84.9 µs | 6.41× |
+| `shallow_disturbance/32x32` | 4.57–5.16 µs | 7.98–8.67 µs | 1.63× |
+| `shallow_disturbance/64x64` | 17.5–21.8 µs | 30.1–33.3 µs | 1.46× |
+| `shallow_disturbance/128x128` | 73.3–84.5 µs | 115–125 µs | 1.45× |
+| `create_particle_block/100_particles` | 370–376 ns | 13.4–14.4 µs | 36.7× |
+| `create_particle_block/500_particles` | 1.86–1.91 µs | 49.0–52.7 µs | 26.7× |
+| `create_particle_block/1000_particles` | 3.44–3.63 µs | 90.8–98.0 µs | 25.8× |
+| `coupling_sph_bodies/625_particles` | 14.8–15.8 µs | 98.5–103 µs | 6.32× |
+| `particle_level_set/32x32_100_particles` | 229–239 µs | 1.00–1.05 ms | 4.38× |
+| `particle_level_set/64x64_529_particles` | 4.77–5.04 ms | 20.8–21.7 ms | 4.31× |
+| `particle_level_set/32x32_1024_particles` | 2.30–2.44 ms | 10.0–10.5 ms | 4.31× |
+| `drag_from_particles/625_particles` | 1.44–1.52 µs | 12.0–12.5 µs | 8.17× |
+| `flip_step/25_particles` | 3.90–4.18 µs | 18.4–18.7 µs | 4.56× |
+| `flip_step/100_particles` | 8.82–9.60 µs | 38.4–39.1 µs | 4.26× |
+| `flip_step/225_particles` | 18.4–18.9 µs | 71.4–73.2 µs | 3.90× |
+
+57 rows over 3 Rust and 3 Cyrius runs. Cyrius / Rust: median 4.38×, geometric mean 3.92×, from 0.76× to 36.7×.
+
+¹ **The `shallow_step` ranges.** Round 3's Cyrius run of `shallow_step` was 2.1–4.5× its other two rounds, while
+every other row of all three rounds stayed within 25 % of its median. That run overlapped other projects' jobs on
+this shared host: a bench, two compiles and a long verifier, on other cores, sharing the memory system. The medians
+and ratios are unaffected, matching M2's record (7.2×).
+
+**Reading it.** The rows fall into five bands:
+- **Faster than Rust, or level with it (10 rows).**
+  - *The SPH solver's steps up to 64 particles* (`solver_step`, `solver_step_st`, `pcisph_step`: 0.76–1.02×).
+    Rust's solver rebuilds hisab's `HashMap` hash and allocates its lists every step (4.1 MB per 1,000-particle
+    step, probe 9). The port's f64 integer-cell grid (L4, M5 part e) reuses storage the solver owns. Past 64
+    particles the per-pair sums take over, and the ratio climbs to 1.3–1.85×.
+  - *The DST grid step at 30 × 30 and 63 × 63, and its MacCormack form at 63 × 63* (0.82–1.0×). Rust calls `sin`
+    per element on every line. The port keeps each transform length's plan (L6, M3 part b).
+
+  At 15 × 15 the same steps are 5.8×. Rust's bench builds a fresh grid every step, so each step builds its plans,
+  and 25 of their sines take the correctly rounded slow path (L1).
+- **1.2–2×:** the solver steps past 64 particles, `grid_step_maccormack/30x30`, and the shallow-water disturbance
+  (1.45–1.63×).
+- **2.4–9.8×, the bulk.** Per-element loops: the grid's diffuse and periodic steps (2.4–3.7×), FLIP (3.9–4.6×), the
+  level set (4.3–4.4×), the shallow-water step and volume (6.0–7.3×), the body coupling and drag (6.3×, 8.2×), the
+  SPH free functions (7.0–9.6×) and the kernels (9.0–9.8×). rustc inlines these loops' helpers and vectorises the
+  sums. Cyrius calls the helpers; `#inline` declines small numeric functions (filed at M2) and nothing vectorises.
+- **16×:** `grid_max_speed`, a square-root-and-max reduction that Rust vectorises (M3 part a).
+- **26–37×:** `create_particle_block`. Even the 100-particle block is 14 KB, and the freelist maps and unmaps every
+  block over 4 KB (`cyrius:docs/development/issues/2026-11-11-freelist-maps-every-block-over-4k.md`, M1 part 3).
+  The loop itself is a template copy per particle (M4 part c).
+
+**Against each milestone's own record**, no Cyrius row has slowed beyond noise. The solver and PCISPH rows are
+1.3–1.75× faster than at M5 parts a and b (`solver_step/9_particles` 9.95–10.1 → 5.49–5.91 µs), the f64 grid of
+part e. Rust's own numbers move by up to 20 % between sessions on this host (`flip_step/25_particles` 4.65 µs at M6
+part b, 3.90–4.18 µs here), so a ratio can move that much with no change on the Cyrius side.
+
+**Thread counts.** Two rounds on cores 8–15, after the serial rounds. Each round runs Rust at each T, then one
+`cyrius bench`:
+- **Rust, grid:** criterion's `grid_step` groups, built with `parallel`, at `RAYON_NUM_THREADS=T`;
+- **Rust, SPH:** the `bench_sph_m5e` twin, built with `parallel`;
+- **Cyrius:** the suite's `*_t<T>` rows, a solver at T threads, timed after a first step that starts its pool.
+
+`scripts/bench_record.py --threads` writes the table. The speed-up is T = 1's median over T = 8's.
+
+| Bench | | T = 1 | T = 2 | T = 4 | T = 8 | Speed-up at 8 |
+|---|---|---|---|---|---|---|
+| `grid_step/63x63` (DST) | Rust | 10.5–11.1 ms | 10.5–10.8 ms | 10.3 ms | 10.4–10.5 ms | 1.03× |
+|  | Cyrius | 5.78–5.79 ms | 5.74–5.78 ms | 5.70–5.76 ms | 5.55–5.56 ms | 1.04× |
+| `grid_step_periodic/63x63` | Rust | 2.13–2.41 ms | 2.03–2.06 ms | 2.00–2.01 ms | 2.02–2.09 ms | 1.10× |
+|  | Cyrius | 5.77–5.78 ms | 5.69–5.78 ms | 5.37–5.42 ms | 5.32–5.35 ms | 1.08× |
+| `grid_step_periodic/255x255` (Cyrius only) | Cyrius | 93.1–93.5 ms | 85.0–85.6 ms | 83.4–83.6 ms | 81.7–81.9 ms | 1.14× |
+| `sph_m5e/step_625` | Rust | 885–896 µs | 773–801 µs | 727–742 µs | 753–948 µs | 1.05× |
+|  | Cyrius | 2.40–2.43 ms | 1.59–1.68 ms | 1.23–1.29 ms | 1.08 ms | 2.24× |
+| `sph_m5e/multiphase_625` | Rust | 876–906 µs | 765–805 µs | 754–766 µs | 750–854 µs | 1.11× |
+|  | Cyrius | 2.62–2.64 ms | 1.95–2.05 ms | 1.56–1.68 ms | 1.46 ms | 1.80× |
+| `sph_m5e/step_2500` | Rust | 6.88–7.61 ms | 4.78 ms | 4.00–4.01 ms | 3.43–3.99 ms | 1.95× |
+|  | Cyrius | 32.1–32.2 ms | 18.1–18.6 ms | 12.0–12.2 ms | 10.1–10.2 ms | 3.16× |
+
+- **Compare the speed-ups.** Rust's criterion steps a fresh clone of the starting grid every iteration. The Cyrius
+  rows step one kept grid, and the kept grid also keeps its DST plans, so the Cyrius DST row is 5.8 ms here against
+  8.3–9.3 ms in the criterion shape above. The SPH rows have the same shape on both sides.
+- **The grid steps scale on neither side** (1.03–1.14× at 8). Both parallelise the same three loops: the two
+  advections and the projection. The serial Gauss–Seidel solves are most of the step, and parallelising them would
+  change their order of operations, so no thread count could keep the bits (M3 part e).
+- **The SPH steps scale on the port where Rust's rayon build barely does.** At T = 8 the 625-particle step is 2.24×
+  faster than at T = 1, against Rust's 1.05×. Multiphase gains 1.80× against 1.11×, and the 2,500-particle step
+  3.16× against 1.95×. At 8 threads the 625-particle step costs 1.1–1.4× Rust's, against 2.7× at one.
+- **Rust's rayon build costs on small grids.** Even at one thread it is slower than its serial build:
+  - `grid_step/15x15`: 172–177 µs against 124–135 µs;
+  - `grid_step_periodic/15x15`: 107–117 µs against 71.6–73.3 µs;
+  - `grid_step_periodic/30x30`: 437–468 µs against 370–390 µs.
+
+  The port's thread count is a runtime choice, so T = 1 is its serial step.
+- **Every count gives the serial bits.** The parity replay runs every `FluidGrid::step` row and every `SphSolver`
+  step row at 2, 3, 4 and 8 threads (M3 part e, M5 part e).
 
 ## M1a part 2: the correctly rounded primitives (2026-11-11, ADR 0004)
 

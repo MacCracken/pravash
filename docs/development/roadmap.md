@@ -93,7 +93,8 @@
 - [x] M8 part a: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI). All 405 Rust tests are
   accounted for: 391 ported to same-named groups, including Rust's 7 `ignore`d doc examples written against the
   API and run, and 14 n/a (the oracle hooks' own tests)
-- [ ] M8 part b: the benchmark record: Rust's 21 criterion groups (57 rows) in both columns, plus thread-count rows
+- [x] M8 part b: the benchmark record: Rust's 21 criterion groups (57 rows) in both columns, plus thread-count rows
+  (median 4.4× Rust's time, 0.76× to 37×; the SPH step 2.2–3.2× faster at 8 threads)
 - [ ] M8 part c: the full surface-parity diff, the README, the migration guide, the CHANGELOG's Breaking section,
   and the docs' examples compiled and run
 - [ ] M8 part d: VERSION 2.0.0 and the release gate on three targets; the 1.3.x deprecation notice (the

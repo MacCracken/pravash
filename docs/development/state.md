@@ -25,7 +25,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M5 SPH solvers | ✅ **done 2026-11-12.** Part e: the solver's thread count (`set_threads`; Rust's three `parallel` loops on the pool, every step row at 2, 3, 4 and 8 threads giving the serial bits; ADR 0002 #4) and the D3 switch to f64 neighbour keys (hisab 3.4.1's cell, integer neighbour cells; 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription; ADR 0002 #2). Part d ✅ 2026-11-12: `src/sph_multiphase.cyr`, the multiphase step with `PvPhaseProperties` and `PvMultiPhaseConfig`; 26 rows, the first 25 bit-exact on the first replay and the 26th closing the mutation tests' one gap; the last 5 Rust tests of `sph.rs`; ADR 0002 #22. Part c ✅ 2026-11-12: `src/sph_dfsph.cyr`, the DFSPH step; 35 rows, bit-exact on the first replay; 6 Rust tests; ADR 0002 #21. Part b ✅ 2026-11-12: `src/sph_pcisph.cyr`, the PCISPH step; 37 rows, bit-exact on the first replay; 4 Rust tests; ADR 0002 #20. Part a ✅ 2026-11-12: `src/sph.cyr`, `PvSphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension, the f32 lists of M4 part b) and `adaptive_dt`; 66 rows, every one bit-exact on the first replay; 19 Rust tests and 5 integration tests; ADR 0002 #19. |
 | M6 Coupling and MPM | ✅ **done 2026-11-12.** Part a ✅ 2026-11-12: `src/coupling.cyr`, the rigid bodies (`PvBodyShape` / `PvShape`, `PvRigidBody`, the two-way coupling, integration with and without added mass, both drags, the particle level set; JSON for `BodyShape` and `RigidBody`). `drag_from_particles_indexed` takes the caller's cells-only `PvNeighborGrid` (`PvNeighborGrid_build`, f64 keys; ADR 0002 #23). A new golden module, `coupling.tsv`: 4,798 rows, every one bit-exact on the first replay but an indexed drag at 10⁶, which `coupling.d3.tsv` maps (ADR 2); 22 of the 33 Rust tests. Part b ✅ 2026-11-12: `src/flip.cyr`, the `FlipSolver` (P2G, the projection, FLIP/PIC and APIC G2P, the APIC resize; ADR 0002 #24): 245 rows, every one bit-exact on the first replay, among them 210 class S trajectories and scenarios; all 33 Rust tests of `coupling.rs` and all 33 integration tests. Part c ✅ 2026-11-12: `src/mpm.cyr` (`PvConstitutiveModel` / `PvConstitutiveLaw` and its JSON, `PvMat2`, `PvMpmParticle`, `PvMpmSolver`; the 2 × 2 SVD and Drucker–Prager on the correctly rounded primitives; ADR 0002 #25): a new golden module, `mpm.tsv`, 1,336 rows, 1,319 bit-exact against the oracle and 17 against the corrected oracle `mpm.cr.tsv` where glibc misrounds; all 13 Rust tests |
 | M7 Compute, logging and ai | ✅ **done 2026-11-12.** Part b ✅ 2026-11-12: `src/ai.cyr` (`PvDaimonConfig`, `PvHooshConfig`: the defaults, the setters with their ownership bits, JSON, Rust's `{:?}` and `{:#?}` with the key redacted, `<str as Debug>`'s escapes from `src/str_debug_data.cyr`, generated from rustc 1.99.1's core; ADR 0002 #27) and `src/logging.cyr` (the three inits, the PRAVASH_LOG filter as tracing-subscriber's EnvFilter decides it, and the Trace Event file through a sakshi hook, ledger L11; ADR 0002 #28), with every one of Rust's 60 spans and 12 warnings at its point in every module. Two new golden modules, `ai.tsv` 579 rows and `logging.tsv` 251 (99 filter rows, 152 trace rows over 37 calls), all matching on the first replay; the instrumentation changed no other row; all 3 Rust tests. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
-| M8 Release 2.0.0 | in progress. Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
+| M8 Release 2.0.0 | in progress. Part b ✅ 2026-11-12: the release benchmark record (`scripts/bench_record.py`): all 57 rows of Rust's 21 criterion groups in both columns, three pinned interleaved rounds (median 4.4× Rust's time, 0.76× to 37×), and the thread-count rows (the SPH step 2.2–3.2× faster at 8 threads, Rust's rayon 1.05–1.95×). Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
 
 ## Toolchain
 
@@ -100,7 +100,15 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   `validate.py` recomputes all 58,405 rows, every solver step by transcription, and the list-dependent rows again on
   f64 keys: 0 failures (in about 100 s);
   `probe_tables.py` 41 of 41.
-- **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)): the
+- **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)).
+  - **The 2.0.0 record** (M8 part b, written by `scripts/bench_record.py`): all 57 rows of Rust's 21 criterion
+    groups, three pinned interleaved rounds. The port runs at a median of 4.4× Rust's time (geometric mean 3.9×),
+    from 0.76× to 37×:
+    - level or faster: the SPH solver steps up to 64 particles and the DST steps at 30 and 63 cells a side;
+    - 26–37×: `create_particle_block`, which pays the freelist's large-block maps.
+  - **Thread counts:** the SPH step gains 2.2–3.2× at 8 threads (Rust's rayon 1.05–1.95×); the grid steps gain
+    1.03–1.14× on both sides.
+  - **By milestone** (the per-part twins): the
   10 primitives against Rust's glibc, on shared seeded arguments. The correctly rounded functions run 58 ns (ln) to
   1.41 µs (atan2, whose mean comes from a rare slow path), 11–103× glibc. The `common` bodies run 4–13× Rust 1.3.0
   for validation, energy and the SoA / arena (36 µs to 206 µs per 1,000 particles), and 86× for building one
@@ -218,8 +226,11 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M8 part b: the benchmark record. All 21 of Rust's criterion groups (57 rows) get both columns in
-[`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md), plus the thread-count rows. After it:
-- part c: the full surface-parity diff, the README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section,
-  and the docs' examples compiled and run;
-- part d: VERSION 2.0.0 and the release gate (the full corpus green on x86_64 ELF, x86_64 PE and aarch64).
+M8 part c, the docs:
+- the full surface-parity diff;
+- the README;
+- `docs/guides/migration-2.0.md`;
+- the CHANGELOG's Breaking section;
+- the docs' examples compiled and run.
+
+Then part d: VERSION 2.0.0 and the release gate (the full corpus green on x86_64 ELF, x86_64 PE and aarch64).
