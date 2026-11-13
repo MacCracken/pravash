@@ -1,0 +1,71 @@
+# compute_ad.cyr — `KernelDerivatives::autodiff_gradient` of rust-old/src/compute.rs (M7 part a), on hisab's
+# reverse-mode tape (`ad_tape_*`, `ad_*`).
+#
+# Outside the `[lib]` bundle (ADR 0002 #26): it is pravash's one call into hisab, which stays a test-scope dependency,
+# so `dist/pravash.cyr` names no hisab symbol. A consumer that wants it includes this file after the bundle and declares
+# hisab itself, as itihas ships its optional MCP surface. Its rows are class D (port plan §5, set by probe 8,
+# port-parity §4.8): hisab 3.4.1's reverse sweep accumulates in another order from 1.4.0's (within 3 ulp).
+#
+# One tape is kept for the process and grown when a function fills it (hisab's tapes are never freed: its allocator
+# only bumps), so a call allocates only its result once the tape is large enough. Not thread-safe, as the JSON
+# decoder's arena isn't.
+
+var _pv_ad_tape = 0;
+var _pv_ad_cap = 0;
+
+# The largest tape a gradient may grow to, in nodes: 2^24 (640 MB of hisab's 40-byte nodes).
+const _PV_AD_MAX_CAP = 16777216;
+
+# The gradient ∂f/∂xᵢ of f at the n inputs at x (f64 words), by hisab's reverse-mode tape: `f(tape, vars, n)` records
+# the function on the tape from its n input variables (`ad_var` indices, a word each at `vars`) with hisab's `ad_*`
+# operations, and returns its output's index. A function that fills the tape (an index that isn't `ad_ok`) is run
+# again on one twice the size; f must be a pure function of its inputs, as Rust's `Fn` is. Returns (pointer, n), a
+# freelist buffer of the n gradient components the caller frees, or (0, 0) for n ≤ 0, for a root that is not a node
+# even on the largest tape, a refused sweep, or no memory. Mirrors `KernelDerivatives::autodiff_gradient`.
+#must_use
+fn PvKernelDerivatives_autodiff_gradient(f, x, n) {
+    if (n <= 0) { return (0, 0); }
+    var vars = fl_alloc(n * 8);
+    if (vars == 0) { return (0, 0); }
+    var cap = 64;
+    while (cap < 4 * n) { cap = cap * 2; }
+    var done = 0;
+    var root = 0 - 1;
+    while (done == 0) {
+        if (cap > _PV_AD_MAX_CAP) {
+            fl_free(vars);
+            return (0, 0);
+        }
+        if (_pv_ad_tape == 0 || _pv_ad_cap < cap) {
+            var t0 = ad_tape_new(cap);
+            if (t0 == 0) {
+                fl_free(vars);
+                return (0, 0);
+            }
+            _pv_ad_tape = t0;
+            _pv_ad_cap = cap;
+        }
+        var t = _pv_ad_tape;
+        ad_tape_reset(t);
+        for (var i = 0; i < n; i = i + 1) { store64(vars + i * 8, ad_var(t, load64(x + i * 8))); }
+        root = fncall3(f, t, vars, n);
+        if (ad_ok(t, root) == 1 && ad_tape_len(t) < _pv_ad_cap) {
+            done = 1;
+        } else {
+            cap = _pv_ad_cap * 2;
+        }
+    }
+    var gt, gv = ad_grad(_pv_ad_tape, root);
+    if (is_err_result(gt) == 1) {
+        fl_free(vars);
+        return (0, 0);
+    }
+    var out = fl_alloc(n * 8);
+    if (out == 0) {
+        fl_free(vars);
+        return (0, 0);
+    }
+    for (var k = 0; k < n; k = k + 1) { store64(out + k * 8, ad_grad_of(_pv_ad_tape, load64(vars + k * 8))); }
+    fl_free(vars);
+    return (out, n);
+}

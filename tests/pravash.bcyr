@@ -7,6 +7,7 @@
 #   taskset -c 15 cyrius bench tests/pravash.bcyr
 
 include "tests/lib.cyr"
+include "src/compute_ad.cyr"
 
 var NS = 1000000;
 var g_sink = 0;
@@ -1950,6 +1951,156 @@ fn bench_mpm_c() {
     return 0;
 }
 
+# compute_a/*: against scripts/probes/rust/src/bin/bench_compute_a.rs (bodies in its header): the packing of 1,000
+# particles, the closed-form derivatives, the autodiff gradient of the poly6 kernel, and an `SphKernelParams` read.
+
+# m_compute.rs's catalogue function 2 (the poly6 kernel of r = x0 at h = x1) on hisab's tape.
+fn _bench_ad2(t, v, n): i64 {
+    var h2 = ad_mul(t, load64(v + 8), load64(v + 8));
+    var r2 = ad_mul(t, load64(v), load64(v));
+    var d = ad_sub(t, h2, r2);
+    var d2 = ad_mul(t, d, d);
+    var d3 = ad_mul(t, d2, d);
+    var h3 = ad_mul(t, h2, load64(v + 8));
+    var h6 = ad_mul(t, h3, h3);
+    var h9 = ad_mul(t, h6, h3);
+    var sf: f64 = 64.0;
+    var den: f64 = sf * PV_F64_PI;
+    var kv: f64 = 315.0 / den;
+    var k = ad_const(t, kv);
+    var c = ad_div(t, k, h9);
+    return ad_mul(t, c, d3);
+}
+
+# The compute rows.
+fn bench_compute_a() {
+    var buf = fl_alloc(1000 * sizeof(PvFluidParticle));
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var x: f64 = f64_from(i % 10) * 0.01;
+        var y: f64 = f64_from((i / 10) % 10) * 0.01;
+        var z: f64 = f64_from(i / 100) * 0.01;
+        var q: PvFluidParticle = PvFluidParticle_new(PvVec3_new(x, y, z), 0.001);
+        q.velocity = PvVec3_new(0.1, -0.2, 0.3);
+        var rho: f64 = 1000.0 + f64_from(i);
+        var pr: f64 = 0.5 * f64_from(i);
+        q.density = rho;
+        q.pressure = pr;
+        var d: *PvFluidParticle = ps + i;
+        *d = q;
+    }
+    var soa: PvParticleSoa;
+    var ok = PvParticleSoa_from_aos(&soa, ps, 1000);
+    var pk: PvPackedParticles;
+    var b = bench_new("compute_a/from_soa_1000");
+    bench_batch_start(b);
+    for (var k = 0; k < 2000; k = k + 1) {
+        var r = PvPackedParticles_from_soa(&soa, &pk);
+        g_sink = g_sink ^ pk.count ^ r;
+        PvPackedParticles_drop(&pk);
+    }
+    bench_batch_stop(b, 2000);
+    bench_report(b);
+
+    var r0 = PvPackedParticles_from_soa(&soa, &pk);
+    var dst: PvParticleSoa;
+    var ok2 = PvParticleSoa_from_aos(&dst, ps, 1000);
+    b = bench_new("compute_a/unpack_1000");
+    bench_batch_start(b);
+    for (var k = 0; k < 2000; k = k + 1) {
+        pk.unpack_density_pressure(&dst);
+        pk.unpack_velocity(&dst);
+        pk.unpack_positions(&dst);
+        g_sink = g_sink ^ dst.density.get(7);
+    }
+    bench_batch_stop(b, 2000);
+    bench_report(b);
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&dst);
+    PvParticleSoa_drop(&soa);
+    fl_free(buf);
+    g_sink = g_sink ^ ok ^ ok2 ^ r0;
+
+    b = bench_new("compute_a/dpoly6_dr2");
+    bench_batch_start(b);
+    for (var k = 0; k < NS; k = k + 1) {
+        var r2: f64 = f64_from(k % 1024) * 0.000001;
+        var w: f64 = PvKernelDerivatives_dpoly6_dr2(r2, 0.04);
+        g_sink = g_sink ^ _pv_bits(w);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("compute_a/dtait_drho");
+    bench_batch_start(b);
+    for (var k = 0; k < NS; k = k + 1) {
+        var dk: f64 = f64_from(k % 1024) / 50.0;
+        var rho2: f64 = 990.0 + dk;
+        var w2: f64 = PvKernelDerivatives_dtait_drho(rho2, 1000.0, 1480.0, 7.0);
+        g_sink = g_sink ^ _pv_bits(w2);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    b = bench_new("compute_a/dwendland_c2_dr");
+    bench_batch_start(b);
+    for (var k = 0; k < NS; k = k + 1) {
+        var rr: f64 = f64_from(k % 1024) * 0.0001;
+        var w3: f64 = PvKernelDerivatives_dwendland_c2_dr(rr, 0.05);
+        g_sink = g_sink ^ _pv_bits(w3);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+
+    var xs[16];
+    var a0: f64 = 0.02;
+    var a1: f64 = 0.06;
+    store64(&xs, _pv_bits(a0));
+    store64(&xs + 8, _pv_bits(a1));
+    b = bench_new("compute_a/autodiff_poly6");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var gp, gn = PvKernelDerivatives_autodiff_gradient(&_bench_ad2, &xs, 2);
+        g_sink = g_sink ^ load64(gp) ^ gn;
+        fl_free(gp);
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+
+    # serde_json's document for the parameters, and the same with dt on an f32 midpoint.
+    var sbd = str_builder_new();
+    str_builder_add_cstr(sbd, "{\"smoothing_radius\":0.05,\"rest_density\":1000.0,\"gas_constant\":2000.0,");
+    str_builder_add_cstr(sbd, "\"viscosity\":0.001,\"gravity\":[0.0,-9.81,0.0],\"dt\":0.001,\"particle_count\":1000}");
+    var docs = str_builder_build(sbd);
+    var sbt = str_builder_new();
+    str_builder_add_cstr(sbt, "{\"smoothing_radius\":0.05,\"rest_density\":1000.0,\"gas_constant\":2000.0,");
+    str_builder_add_cstr(sbt, "\"viscosity\":0.001,\"gravity\":[0.0,-9.81,0.0],\"dt\":1.0000000596046448,");
+    str_builder_add_cstr(sbt, "\"particle_count\":1000}");
+    var ties = str_builder_build(sbt);
+    var doc = str_data(docs);
+    var tie = str_data(ties);
+    var sp: PvSphKernelParams;
+    var dl = str_len(docs);
+    b = bench_new("compute_a/sph_params_read");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var t1, v1 = PvSphKernelParams_from_json(doc, dl, &sp);
+        g_sink = g_sink ^ t1 ^ sp.particle_count;
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    var tl = str_len(ties);
+    b = bench_new("compute_a/sph_params_read_tie");
+    bench_batch_start(b);
+    for (var k = 0; k < 200000; k = k + 1) {
+        var t2, v2 = PvSphKernelParams_from_json(tie, tl, &sp);
+        g_sink = g_sink ^ t2 ^ sp.particle_count;
+    }
+    bench_batch_stop(b, 200000);
+    bench_report(b);
+    return 0;
+}
+
 # Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
@@ -1981,6 +2132,7 @@ fn main(): i64 {
     bench_coupling_a();
     bench_coupling_b();
     bench_mpm_c();
+    bench_compute_a();
     return 0;
 }
 

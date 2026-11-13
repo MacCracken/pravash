@@ -2020,3 +2020,117 @@ Surface parity: 401 items ok, 0 pending, 0 missing. With it every module of M6 i
 
 The sand column's ratio is the correctly rounded primitives' cost, about 22 calls a particle (L1). The numbers are
 appended to ganita's request.
+
+## 27. M7 part a: compute (2026-11-12)
+
+**`src/compute.cyr`** ports `compute.rs` (ADR 0002 #26):
+- **The buffers.** Rust's `Vec<f32>`s are `PvF32Column`s (`data`, `len`, `cap`; 4 bytes an element): a store through
+  the `*f32` view rounds as `as f32` does, and a read widens exactly as `f64::from`.
+- **The packing.** `PvPackedParticles_from_soa` packs `consistent_len` particles as [x, y, z, mass],
+  [vx, vy, vz, +0] and [density, pressure]. The three unpacks write at most `count`, bounded by the buffer's whole
+  chunks and every column they write, as Rust's `take(n)` over zipped iterators is.
+- **The records.** The three kernel-parameter structs keep Rust's field order; `gravity` is three f32 fields.
+- **The rest.** `PvComputeOp` and the two backend traits, which return status words. The four closed-form
+  derivatives. `dtait_drho` on the correctly rounded pow (ADR 0004).
+
+**`src/compute_ad.cyr`** holds `PvKernelDerivatives_autodiff_gradient`, on hisab 3.4.1's tape:
+- **Outside the bundle.** hisab stays test-scope, so `dist/pravash.cyr` names no hisab symbol; the file follows
+  itihas's `src/mcp.cyr`.
+- **Not an optional dep.** `[features]` gates only the root manifest's own optional deps; a consumer can't select a
+  dependency's feature.
+- **Not a profile.** A `[lib.autodiff]` profile was tried. distlib can't verify it against a test-scope hisab, and
+  reports the seven `ad_*` names as consumer-supplied.
+- **The tape.** It keeps one tape, grown to twice its size when a function fills it (a root that isn't `ad_ok`, or a
+  full tape), up to 2^24 nodes.
+
+**The f32 reads (ledger L15).** serde_json 1.0.154 with `float_roundtrip` reads an f32 field by rounding the decimal
+to f32 once (`f64_from_parts` with `single_precision`), and refuses one that rounds to ±∞. Integers go through
+`u64 as f32` / `i64 as f32`.
+- **The first replay** failed 3 of the 95 then-recorded decoder rows, all on this:
+  - `1e300` and `-1e39`, which serde_json refuses and f32 of the f64 makes ±∞;
+  - `3.4028235677973366e38`, whose f64 is the overflow midpoint 2^128 − 2^103, so f32 of it ties to +∞. serde_json
+    reads f32::MAX.
+- **The rule.** Every f32 midpoint is an f64, so a decimal and its nearest f64 never lie on opposite sides of one.
+  RN32(RN64(x)) is therefore RN32(x) except where RN64(x) is a midpoint.
+- **The stand-in.** `_pv_jr_f32` takes RN32 of bayan's f64 and tests for that case (`_pv_f32_is_tie`). There it
+  compares the decimal with the midpoint exactly (`_pv_dec_cmp`):
+  - a 32-bit-limb bignum, 170 limbs;
+  - 800 kept digits and a sticky flag (an f64 has at most 767 significant digits);
+  - orders past 10^±400 decided without the bignum.
+
+  It then nudges the f32 one step toward the decimal's side (`_pv_f32_round`).
+- **The text.** bayan's tree keeps no number text. `_pv_jr_num_text` finds the node's position among the tree's
+  numbers in pre-order, and scans the document for that number token, skipping strings and their escapes.
+- **Integers** round once from the i64, compared exactly at a midpoint.
+
+**The rows** (`m_compute.rs`, seed 0x70_c0_0a, a new module): 1,228.
+- **`PackedParticles::from_soa`** (10) and the three **unpacks** (12 each), class A: the empty SoA; 1–13 particles
+  with magnitudes to 10^±40 (past f32's range both ways), the specials (±0, the smallest subnormal, f64::MAX, ±∞,
+  NaN), 16777217 (a tie) and 1e-46; and mismatched columns. The unpacks run on written
+  buffers, short buffers, a count above them, an extra pair, and short SoA columns.
+- **The defaults** (3) and **the decoders** (71 + 15 + 13), class A:
+  - serde_json's documents, the seq form, missing, extra and wrong-typed fields, the u32 bounds;
+  - 38 f32 corner decimals in `dt`: midpoints written exactly (1 + 2^-24, 1 + 3·2^-24, 2^-150, 3·2^-150, the overflow
+    threshold, 33554450 and 33554470 with their trailing zeros), the shortest f64 digits beside them, integer
+    mantissas with exponents, integers past 2^53 next to a midpoint, 900-digit tails and 60 leading zeros;
+  - three documents that place midpoints after a string holding digits and an escaped quote, an unknown field's
+    numbers, the gravity array, and the seq form.
+- **`dpoly6_dr2`** and **`dwendland_c2_dr`** (340 each, class B) and **`deos_drho`** (11, A): log-spread radii and
+  smoothing lengths, both sides of the support, the specials.
+- **`dtait_drho`** (245, class C): densities about ρ₀, γ from 0 to 7, the floored ρ₀, the specials. validate.py's MPFR
+  pass changes none of them (glibc's pow is correctly rounded on all 245), so there is no `compute.cr.tsv`; the port
+  matches every row bit for bit.
+- **`autodiff_gradient`** (144, class D): six catalogue functions, 24 seeded inputs each. They are listed in
+  `m_compute.rs`; the sixth, x0^1.5 · x1, gives a pow node an upstream gradient that isn't 1.
+
+`validate.py` transcribes the module:
+- the packing through ctypes' f32;
+- serde's f32 and u32 reads in exact rationals (`f32_nearest`), with serde_json's integer paths (`-0` is −0.0; a
+  negative below i64::MIN goes through `-(u as f64)`);
+- the derivatives;
+- hisab 1.4.0's tape and sweep, op for op, on glibc's functions.
+
+It covers 57,575 rows with 0 failures, in about 100 s.
+
+**Result:**
+- **The port.** Every row matches but the autodiff's, which are class D:
+  - 310 gradient components agree bit for bit, 34 differ by 1 ulp, 9 by 2, 6 by 3–16 and 1 by 19.
+  - All four past 3 ulp are function 2's ∂/∂h, the poly6 kernel, which has no transcendentals. Its h-gradient sums
+    terms of opposite sign along three paths (h², h³, h⁹), so the cancellation magnifies the difference between the
+    tapes' accumulation orders: 3.4.1's sweep against 1.4.0's.
+  - Probe 8's "within 3 ulp" (§4.8) was measured on functions without such a cancellation. The relative errors stay
+    below 5e-15, well inside class D's 1e-12.
+- **The replay:** 15 modules, 0 failing | rows: 56,844 ok, 0 failed, 0 measured, 3 pending, 728 accepted (ADR 4: 131,
+  ADR 2: 597).
+- **Mutations of the port.** 26 of 30 fail rows or tests on the first run, among them every mutation of the L15
+  pieces but one. Of the four survivors:
+  - `compute_op_name`'s strings were unchecked: a test now checks each;
+  - no midpoint ended in a zero, so the bignum's 10^e on the decimal side was never applied. 33554450.0 survived by
+    chance (its even neighbour is below, where the mutant's "below" also lands); 33554470.0, whose even neighbour is
+    above, fails the mutant;
+  - a dpoly6 regrouping, (−3·(c·d))·d, moves 22 rows by 1 ulp and 1 by 2: inside class B, visible only in the
+    histogram;
+  - the tape growing by 64 nodes instead of doubling changes no result.
+
+  Two more survive parity and fail `tests/compute.tcyr` alone: the subnormal exponent q = −1075, which no f32
+  midpoint reaches; and an unreset tape.
+- **Mutations of the transcription.** 10 of 13 caught on the first run:
+  - pow's `(g·n)·x^(n−1)` regrouped survived, because the catalogue's only pow (function 3) had an upstream
+    gradient of 1. The sixth function closes it (9 rows fail);
+  - 315/(64π) regrouped as (315/64)/π is equivalent: both round to the same double;
+  - dropping the negative-u64 integer path leaves every row passing: the path takes an integer below i64::MIN, which
+    bayan refuses (S3, ADR 0002 row 10), so the corpus can't hold one.
+
+**Tests** (`tests/compute.tcyr`, 83 checks):
+- all 11 Rust tests in Rust's order;
+- seven Cyrius-only groups:
+  - the layouts (80 / 36 / 28 bytes);
+  - f32 rounding to nearest even, −0 kept, the padding +0;
+  - the op names;
+  - a `MockBackend` through `dyn PvComputeBackend`;
+  - autodiff against analytical gradients, on a 1,000-op function that grows the tape, and 50 calls taking no
+    heap;
+  - the derivatives against central differences (class R);
+  - the L15 pieces: the tie test at 1 + 2^-24, 2^-150, the overflow midpoint, f32::MAX and 1e39; the nudged rounding
+    at both overflow edges; the decimal comparison (exponents, trailing zeros, the 800-digit sticky tail, the order
+    bounds, the smallest subnormal); the integers; and the text locator over strings with escaped quotes.

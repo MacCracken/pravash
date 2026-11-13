@@ -23,7 +23,7 @@ use crate::grids::{Rng, specials};
 use crate::m_common::{config, material, particle};
 use crate::tsv::{Class, Module, Tok, e, f, i, s};
 
-fn soa_toks(soa: &ParticleSoa) -> Vec<Tok> {
+pub fn soa_toks(soa: &ParticleSoa) -> Vec<Tok> {
     let mut out = Vec::new();
     let cols: [&Vec<f64>; 17] = [
         &soa.pos_x,

@@ -1,0 +1,446 @@
+# compute.cyr — the compute-backend surface of rust-old/src/compute.rs (M7 part a): f32 particle buffers packed from
+# the SoA for a GPU upload and unpacked back, the kernel parameter records a backend reads, the operations and the two
+# backend traits (implemented by a consumer; pravash's solvers never dispatch to one), and the analytical kernel
+# derivatives.
+#
+# Rust's `Vec<f32>` buffers are `PvF32Column`s: packed 4-byte singles a backend can upload as they are. A value is
+# rounded to f32 when it is stored (Rust's `as f32`) and widened exactly when it is read back (`f64::from`). Rust's
+# `[f32; 3]` gravity is three f32 fields. The traits return a status word where Rust returns `Result`, since a call
+# through a `dyn` returns one value: PV_ERR_NONE (0) for Ok, or a PV_ERR_* code (ADR 0002 #26).
+#
+# `KernelDerivatives::autodiff_gradient` is in src/compute_ad.cyr, outside the `[lib]` bundle: it is the one function
+# that calls hisab, which stays a test-scope dependency, so only a consumer that includes that file and declares hisab
+# pulls it in.
+
+# ── f32 buffers ─────────────────────────────────────────────────────────────────────
+
+# A typed view of a word (an f32 buffer's address).
+#must_use
+fn _pv_as_f32s(p): *f32 {
+    return p;
+}
+
+# A growable buffer of packed f32 values: the storage (4 bytes an element), the length and the capacity, in
+# elements. Rust's `Vec<f32>`. Starts empty; released by `drop`.
+struct PvF32Column {
+    data;
+    len;
+    cap;
+}
+
+impl PvF32Column {
+    # Room for at least n elements: 1, or 0 when the memory isn't there (unchanged).
+    #must_use
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var d = fl_alloc(n * 4);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 4); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = n;
+        return 1;
+    }
+
+    # Appends x rounded to f32 (Rust's `x as f32`), into reserved room: the caller has reserved it.
+    fn push_rounded(self, x: f64) {
+        var b: *f32 = _pv_as_f32s(self.data);
+        b[self.len] = x;
+        self.len = self.len + 1;
+        return 0;
+    }
+
+    # Element i widened to f64 (exact), unchecked. Mirrors `f64::from(v[i])`.
+    #must_use
+    fn at(self, i): f64 {
+        var b: *f32 = _pv_as_f32s(self.data);
+        var v: f32 = b[i];
+        var w: f64 = f32_to(v);
+        return w;
+    }
+
+    # Sets element i to x rounded to f32: 1, or 0 out of range (nothing written). Mirrors `v[i] = x as f32`.
+    fn set(self, i, x: f64): i64 {
+        if (i < 0 || i >= self.len) { return 0; }
+        var b: *f32 = _pv_as_f32s(self.data);
+        b[i] = x;
+        return 1;
+    }
+
+    # Shortens the buffer to n elements (no effect when it is not longer). Mirrors `Vec::truncate`.
+    fn truncate(self, n) {
+        if (n >= 0 && n < self.len) { self.len = n; }
+        return 0;
+    }
+
+    # Releases the storage; the buffer is empty and usable again. Mirrors dropping the `Vec`.
+    fn drop(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# ── PackedParticles ─────────────────────────────────────────────────────────────────
+
+# Particles packed into f32 buffers for a GPU upload: the count, then [x, y, z, mass] and [vx, vy, vz, 0] per
+# particle (4 singles each, 16-byte aligned) and [density, pressure] per particle. Mirrors `PackedParticles`.
+struct PvPackedParticles {
+    count;
+    position_mass: PvF32Column;
+    velocity: PvF32Column;
+    density_pressure: PvF32Column;
+}
+
+# A typed view of a word (a buffer's address in a packed record).
+#must_use
+fn _pv_as_f32_column(p): *PvF32Column {
+    return p;
+}
+
+# Buffer k of a packed record (0 position_mass, 1 velocity, 2 density_pressure), by its byte offset
+# (tests/compute.tcyr pins the layout, 80 bytes).
+#must_use
+fn _pv_packed_col(p, k): *PvF32Column {
+    return _pv_as_f32_column(_pv_addr(p) + 8 + k * 24);
+}
+
+# Releases the three buffers; the record is empty after (count 0). Mirrors dropping the `PackedParticles`.
+fn PvPackedParticles_drop(p: *PvPackedParticles) {
+    for (var k = 0; k < 3; k = k + 1) {
+        var c: *PvF32Column = _pv_packed_col(p, k);
+        c.drop();
+    }
+    p.count = 0;
+    return 0;
+}
+
+# Packs the SoA's complete particles (`consistent_len`, at most u32::MAX) into *out, each value rounded to f32:
+# [x, y, z, mass], [vx, vy, vz, 0] and [density, pressure] per particle. 1, or 0 when the buffers can't be allocated
+# (Rust aborts); *out then holds no storage. Mirrors `PackedParticles::from_soa`.
+#must_use
+fn PvPackedParticles_from_soa(soa: *PvParticleSoa, out: *PvPackedParticles): i64 {
+    for (var k = 0; k < 3; k = k + 1) {
+        var z: *PvF32Column = _pv_packed_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
+    out.count = 0;
+    var n = soa.consistent_len();
+    if (n > 4294967295) { n = 4294967295; }
+    var pm: *PvF32Column = _pv_packed_col(out, 0);
+    var vl: *PvF32Column = _pv_packed_col(out, 1);
+    var dp: *PvF32Column = _pv_packed_col(out, 2);
+    var ok = pm.reserve(4 * n) & vl.reserve(4 * n) & dp.reserve(2 * n);
+    if (ok == 0) {
+        PvPackedParticles_drop(out);
+        return 0;
+    }
+    # The SoA's columns by index: 0–2 position, 3–5 velocity, 9 density, 10 pressure, 11 mass; every one holds at
+    # least n slots (n is the consistent length), so the loop reads them unchecked and writes the reserved room.
+    var c0: *PvColumn = _pv_soa_col(soa, 0);
+    var c1: *PvColumn = _pv_soa_col(soa, 1);
+    var c2: *PvColumn = _pv_soa_col(soa, 2);
+    var c3: *PvColumn = _pv_soa_col(soa, 3);
+    var c4: *PvColumn = _pv_soa_col(soa, 4);
+    var c5: *PvColumn = _pv_soa_col(soa, 5);
+    var c9: *PvColumn = _pv_soa_col(soa, 9);
+    var c10: *PvColumn = _pv_soa_col(soa, 10);
+    var c11: *PvColumn = _pv_soa_col(soa, 11);
+    var d0 = c0.data;
+    var d1 = c1.data;
+    var d2 = c2.data;
+    var d3 = c3.data;
+    var d4 = c4.data;
+    var d5 = c5.data;
+    var d9 = c9.data;
+    var d10 = c10.data;
+    var d11 = c11.data;
+    var fp: *f32 = _pv_as_f32s(pm.data);
+    var fv: *f32 = _pv_as_f32s(vl.data);
+    var fd: *f32 = _pv_as_f32s(dp.data);
+    var zero: f64 = 0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var o = i * 8;
+        var q = i * 4;
+        var x: f64 = load64(d0 + o);
+        var y: f64 = load64(d1 + o);
+        var z: f64 = load64(d2 + o);
+        var m: f64 = load64(d11 + o);
+        fp[q] = x;
+        fp[q + 1] = y;
+        fp[q + 2] = z;
+        fp[q + 3] = m;
+        var vx: f64 = load64(d3 + o);
+        var vy: f64 = load64(d4 + o);
+        var vz: f64 = load64(d5 + o);
+        fv[q] = vx;
+        fv[q + 1] = vy;
+        fv[q + 2] = vz;
+        fv[q + 3] = zero;
+        var rho: f64 = load64(d9 + o);
+        var pr: f64 = load64(d10 + o);
+        fd[2 * i] = rho;
+        fd[2 * i + 1] = pr;
+    }
+    pm.len = 4 * n;
+    vl.len = 4 * n;
+    dp.len = 2 * n;
+    out.count = n;
+    return 1;
+}
+
+# Writes up to m particles of buffer b (`per` values each) back into the SoA columns k0, k0 + 1 (and k0 + 2 when
+# `cols` is 3), widened: m is count, b's complete chunks and the columns' lengths, whichever is least (Rust's `take(n)`
+# over zipped iterators).
+fn _pv_unpack(count, b: *PvF32Column, per, soa: *PvParticleSoa, k0, cols) {
+    var m = count;
+    var chunks = b.len / per;
+    if (chunks < m) { m = chunks; }
+    for (var k = 0; k < cols; k = k + 1) {
+        var c: *PvColumn = _pv_soa_col(soa, k0 + k);
+        if (c.len < m) { m = c.len; }
+    }
+    # Column by column: each slot below m is written once, so the order changes nothing.
+    var src: *f32 = _pv_as_f32s(b.data);
+    for (var k2 = 0; k2 < cols; k2 = k2 + 1) {
+        var d: *PvColumn = _pv_soa_col(soa, k0 + k2);
+        var dd = d.data;
+        for (var i = 0; i < m; i = i + 1) {
+            var v: f32 = src[per * i + k2];
+            var w: f64 = f32_to(v);
+            store64(dd + i * 8, _pv_bits(w));
+        }
+    }
+    return 0;
+}
+
+impl PvPackedParticles {
+    # Writes each particle's [density, pressure] back into the SoA, widened: at most `count`, bounded by the buffer's
+    # complete pairs and the two columns' lengths. Mirrors `PackedParticles::unpack_density_pressure`.
+    fn unpack_density_pressure(self, soa: *PvParticleSoa) {
+        _pv_unpack(self.count, _pv_packed_col(self, 2), 2, soa, 9, 2);
+        return 0;
+    }
+
+    # Writes each particle's [vx, vy, vz] back into the SoA, widened, bounded as above by the buffer's complete
+    # quadruples and the three columns. Mirrors `PackedParticles::unpack_velocity`.
+    fn unpack_velocity(self, soa: *PvParticleSoa) {
+        _pv_unpack(self.count, _pv_packed_col(self, 1), 4, soa, 3, 3);
+        return 0;
+    }
+
+    # Writes each particle's [x, y, z] back into the SoA, widened, bounded as above. Mirrors
+    # `PackedParticles::unpack_positions`.
+    fn unpack_positions(self, soa: *PvParticleSoa) {
+        _pv_unpack(self.count, _pv_packed_col(self, 0), 4, soa, 0, 3);
+        return 0;
+    }
+}
+
+# ── kernel parameters ───────────────────────────────────────────────────────────────
+
+# The parameters of an SPH density or force kernel, in f32 (a backend's uniform buffer). Rust's `gravity: [f32; 3]` is
+# the three fields gravity_x, gravity_y, gravity_z. Mirrors `SphKernelParams`.
+struct PvSphKernelParams {
+    smoothing_radius: f32;
+    rest_density: f32;
+    gas_constant: f32;
+    viscosity: f32;
+    gravity_x: f32;
+    gravity_y: f32;
+    gravity_z: f32;
+    dt: f32;
+    particle_count: u32;
+}
+
+# Every field 0. Mirrors `SphKernelParams::default`.
+#must_use
+fn PvSphKernelParams_default(): PvSphKernelParams {
+    var p: PvSphKernelParams;
+    var z: f32 = f32_from(0.0);
+    p.smoothing_radius = z;
+    p.rest_density = z;
+    p.gas_constant = z;
+    p.viscosity = z;
+    p.gravity_x = z;
+    p.gravity_y = z;
+    p.gravity_z = z;
+    p.dt = z;
+    p.particle_count = 0;
+    return p;
+}
+
+# The parameters of a grid Navier–Stokes step, in f32 and u32. Mirrors `GridKernelParams`.
+struct PvGridKernelParams {
+    nx: u32;
+    ny: u32;
+    dx: f32;
+    dt: f32;
+    viscosity: f32;
+    buoyancy_alpha: f32;
+    ambient_density: f32;
+}
+
+# Every field 0. Mirrors `GridKernelParams::default`.
+#must_use
+fn PvGridKernelParams_default(): PvGridKernelParams {
+    var p: PvGridKernelParams;
+    var z: f32 = f32_from(0.0);
+    p.nx = 0;
+    p.ny = 0;
+    p.dx = z;
+    p.dt = z;
+    p.viscosity = z;
+    p.buoyancy_alpha = z;
+    p.ambient_density = z;
+    return p;
+}
+
+# The parameters of a shallow-water step, in f32 and u32. Mirrors `ShallowKernelParams`.
+struct PvShallowKernelParams {
+    nx: u32;
+    ny: u32;
+    dx: f32;
+    dt: f32;
+    gravity: f32;
+    damping: f32;
+    dry_threshold: f32;
+}
+
+# Every field 0. Mirrors `ShallowKernelParams::default`.
+#must_use
+fn PvShallowKernelParams_default(): PvShallowKernelParams {
+    var p: PvShallowKernelParams;
+    var z: f32 = f32_from(0.0);
+    p.nx = 0;
+    p.ny = 0;
+    p.dx = z;
+    p.dt = z;
+    p.gravity = z;
+    p.damping = z;
+    p.dry_threshold = z;
+    return p;
+}
+
+# ── the backends ────────────────────────────────────────────────────────────────────
+
+# The operation a backend is asked to perform: explicit, append-only values (Rust's `#[non_exhaustive]` enum in
+# declaration order). Mirrors `ComputeOp`.
+enum PvComputeOp {
+    PV_COMPUTE_OP_SPH_DENSITY = 0;
+    PV_COMPUTE_OP_SPH_STEP = 1;
+    PV_COMPUTE_OP_GRID_ADVECT = 2;
+    PV_COMPUTE_OP_SHALLOW_STEP = 3;
+}
+
+# The Rust variant name of an operation (`"SphDensity"`), or "Unknown".
+#must_use
+fn compute_op_name(k): i64 {
+    match k {
+        PV_COMPUTE_OP_SPH_DENSITY => { return "SphDensity"; }
+        PV_COMPUTE_OP_SPH_STEP => { return "SphStep"; }
+        PV_COMPUTE_OP_GRID_ADVECT => { return "GridAdvect"; }
+        PV_COMPUTE_OP_SHALLOW_STEP => { return "ShallowStep"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# A backend that accelerates simulation kernels on packed buffers (a GPU, a cluster): the consumer implements it and
+# calls it; pravash's CPU solvers never dispatch to one. Each method returns PV_ERR_NONE (0) for Ok or a PV_ERR_* code
+# (Rust's `Result<()>`). The slices are (pointer, count) of f32 elements. Mirrors the trait `ComputeBackend`.
+trait PvComputeBackend {
+    # 1 when the backend implements `op` (a `PvComputeOp`). Mirrors `ComputeBackend::supports`.
+    fn supports(self, op): i64;
+
+    # SPH densities: updates `particles.density_pressure`. Mirrors `ComputeBackend::sph_density`.
+    fn sph_density(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64;
+
+    # A whole SPH step (density, forces, integration): updates every particle buffer. Mirrors
+    # `ComputeBackend::sph_step`.
+    fn sph_step(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64;
+
+    # Grid advection: reads src (and the velocities), writes dst, n elements each. Mirrors
+    # `ComputeBackend::grid_advect`.
+    fn grid_advect(self, dst, src, vx, vy, n, params: *PvGridKernelParams): i64;
+
+    # A shallow-water step: updates height, vx and vy in place over ground, n elements each. Mirrors
+    # `ComputeBackend::shallow_step`.
+    fn shallow_step(self, height, vx, vy, ground, n, params: *PvShallowKernelParams): i64;
+}
+
+# A neural operator's correction: the deltas to add to the velocities (in their layout) and to the pressures, as f32
+# buffers the corrector fills. Mirrors `NeuralCorrection`.
+struct PvNeuralCorrection {
+    velocity_delta: PvF32Column;
+    pressure_delta: PvF32Column;
+}
+
+# Releases both buffers. Mirrors dropping the `NeuralCorrection`.
+fn PvNeuralCorrection_drop(c: *PvNeuralCorrection) {
+    for (var k = 0; k < 2; k = k + 1) {
+        var b: *PvF32Column = _pv_as_f32_column(_pv_addr(c) + k * 24);
+        b.drop();
+    }
+    return 0;
+}
+
+# A learned corrector: takes a coarse state's velocities and pressures (f32 slices) and fills *out with the
+# correction toward the fine result. Returns PV_ERR_NONE (0) for Ok or a PV_ERR_* code (Rust's
+# `Result<NeuralCorrection>`). Mirrors the trait `NeuralCorrector`.
+trait PvNeuralCorrector {
+    # The correction for this state. Mirrors `NeuralCorrector::correct`.
+    fn correct(self, velocities, nv, pressures, np, params: *PvGridKernelParams, out: *PvNeuralCorrection): i64;
+}
+
+# ── kernel derivatives ──────────────────────────────────────────────────────────────
+
+# d(poly6)/d(r²) = −3c·(h² − r²)², c = 315/((64π)·h⁹) with h⁹ = (h³·h³)·h³; 0 for h ≤ 0 or r² > h² (a NaN h computes
+# on, as Rust's tests let it). Mirrors `KernelDerivatives::dpoly6_dr2`.
+#must_use
+fn PvKernelDerivatives_dpoly6_dr2(r2: f64, h: f64): f64 {
+    var h2: f64 = h * h;
+    var zero: f64 = 0.0;
+    if (h <= 0.0 || r2 > h2) { return zero; }
+    var h3: f64 = h2 * h;
+    var h9: f64 = (h3 * h3) * h3;
+    var sf: f64 = 64.0;
+    var den: f64 = (sf * PV_F64_PI) * h9;
+    var num: f64 = 315.0;
+    var c: f64 = num / den;
+    var diff: f64 = h2 - r2;
+    var m3: f64 = -3.0;
+    var r: f64 = ((m3 * c) * diff) * diff;
+    return r;
+}
+
+# d(P)/dρ of the linear equation of state: the gas constant k. Mirrors `KernelDerivatives::deos_drho`.
+#must_use
+fn PvKernelDerivatives_deos_drho(gas_constant: f64): f64 {
+    return gas_constant;
+}
+
+# d(Tait)/dρ = (c·c)·(ρ/ρ₀)^(γ − 1), ρ₀ floored at 1e-10 (NaN-ignoring); powf correctly rounded. Mirrors
+# `KernelDerivatives::dtait_drho`.
+#must_use
+fn PvKernelDerivatives_dtait_drho(density: f64, rest_density: f64, speed_of_sound: f64, gamma: f64): f64 {
+    var floor10: f64 = 0x3DDB7CDFD9D7BDBB;   # 1e-10
+    var rho0: f64 = _pv_max(rest_density, floor10);
+    var q: f64 = density / rho0;
+    var e: f64 = gamma - 1.0;
+    var pw: f64 = _pv_powf(q, e);
+    var c2: f64 = speed_of_sound * speed_of_sound;
+    var r: f64 = c2 * pw;
+    return r;
+}
+
+# d(Wendland C2)/dr: `kernel_wendland_c2_grad`. Mirrors `KernelDerivatives::dwendland_c2_dr`.
+#must_use
+fn PvKernelDerivatives_dwendland_c2_dr(r: f64, h: f64): f64 {
+    var g: f64 = kernel_wendland_c2_grad(r, h);
+    return g;
+}

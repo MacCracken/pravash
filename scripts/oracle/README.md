@@ -166,6 +166,10 @@ oracle:
   from MPFR for the corrected oracle, `mpm.cr.tsv`: the stress and step rows whose outputs change when every call is
   correctly rounded, each with the first misrounded calls in its note. The step trajectories are cached across their
   frames, per source of transcendentals;
+- it recomputes every `compute` row (M7 part a): the f32 packing and unpacks (ctypes' f32), the kernel-parameter
+  decoders under serde_json's f32 and u32 reads (each decimal rounded to f32 once, in exact rationals, refused when that
+  is ±∞), the closed-form derivatives, and hisab 1.4.0's reverse-mode tape op for op on glibc's functions. The Tait
+  derivative's pow comes from MPFR for the corrected oracle too, and changes no row, so there is no `compute.cr.tsv`;
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what

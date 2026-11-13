@@ -30,6 +30,7 @@ mod grids;
 mod m_bridge;
 mod m_buoyancy;
 mod m_common;
+mod m_compute;
 mod m_constants;
 mod m_coupling;
 mod m_grid;
@@ -60,6 +61,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_bridge::emit(),
         m_buoyancy::emit(),
         m_common::emit(),
+        m_compute::emit(),
         m_constants::emit(root)?,
         m_coupling::emit(),
         m_grid::emit(),

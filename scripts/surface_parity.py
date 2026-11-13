@@ -32,9 +32,9 @@ from pathlib import Path
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
 MODULES = ["error", "common", "buoyancy", "vortex", "bridge", "shallow", "grid", "vof", "phase_field", "sph",
-           "coupling", "mpm"]
+           "coupling", "mpm", "compute"]
 PENDING_MODULES = {
-    "compute": "M7", "logging": "M7", "ai": "M7",
+    "logging": "M7", "ai": "M7",
 }
 DEFERRED_MODULES = {}
 NOT_APPLICABLE_MODULES = {
@@ -54,7 +54,10 @@ FN_RENAMES = {
     "step": "sph_step",
 }
 # Rust field -> the Cyrius fields that carry it.
-FIELD_RENAMES = {}
+FIELD_RENAMES = {
+    # `[f32; 3]`: a tuple element can't be an f32 and a struct holds no array, so three fields (ADR 0002 #26).
+    ("SphKernelParams", "gravity"): ["gravity_x", "gravity_y", "gravity_z"],
+}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {}
@@ -66,6 +69,9 @@ EXCEPTIONS = {
     "error::type Result": "the stdlib's value-form Result, whose Err payload is a PV_ERR_* code (ADR 0002 #1)",
     "coupling::AddedMassCoefficient": "a unit struct that only holds the added-mass coefficients: "
                                       "PV_ADDED_MASS_COEFFICIENT_* (src/constants.cyr)",
+    "compute::KernelDerivatives": "a unit struct that only namespaces its associated functions: "
+                                  "PvKernelDerivatives_* (src/compute.cyr; autodiff_gradient in src/compute_ad.cyr, "
+                                  "outside the bundle, ADR 0002 #26)",
 }
 
 

@@ -3,6 +3,85 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **compute** (M7 part a): `src/compute.cyr` and `src/compute_ad.cyr`, the compute-backend surface of `compute.rs`.
+  ADR 0002 #26.
+  - **`PvPackedParticles`:** Rust's three `Vec<f32>` buffers are `PvF32Column`s, packed 4-byte singles a backend can
+    upload as they are. `PvPackedParticles_from_soa(soa, out)` returns 0 where Rust aborts, and
+    `PvPackedParticles_drop` releases it. The three unpacks write at most `count`, bounded by the buffer's whole chunks
+    and the columns, as Rust's zipped iterators do.
+  - **The parameter records** `PvSphKernelParams` (gravity as `gravity_x`, `gravity_y`, `gravity_z`),
+    `PvGridKernelParams` and `PvShallowKernelParams` have `_default`s and JSON codecs in `src/json.cyr`.
+  - **`PvComputeOp`** (append-only, with `compute_op_name`) and the traits **`PvComputeBackend`** and
+    **`PvNeuralCorrector`**, which return a status word where Rust returns `Result`, since a `dyn` call returns one
+    value. `PvNeuralCorrection` holds two `PvF32Column`s.
+  - **`KernelDerivatives`:** `PvKernelDerivatives_dpoly6_dr2`, `_deos_drho`, `_dtait_drho` (on the correctly rounded
+    pow) and `_dwendland_c2_dr`.
+  - **`PvKernelDerivatives_autodiff_gradient(f, x, n)`** records `f` on hisab 3.4.1's tape. It keeps one tape for the
+    process, grown when a function fills it. It lives in `src/compute_ad.cyr`, outside the bundle, as itihas keeps its
+    MCP surface: hisab stays test-scope, so `dist/pravash.cyr` names no hisab symbol. A consumer that wants it includes
+    the file and declares hisab. A `[lib.autodiff]` profile was tried; distlib can't verify it against a test-scope
+    hisab.
+  - **f32 JSON reads, a stand-in (ledger L15).** serde_json's `float_roundtrip` rounds a decimal to f32 once and
+    refuses one that rounds to ±∞; f32 of bayan's f64 rounds twice. The two differ only where the f64 is exactly an f32
+    midpoint. There `_pv_jr_f32` compares the document's own decimal with the midpoint exactly: a 32-bit-limb bignum,
+    the text found by the number's document-order position. Integers round once from the i64. Requests filed:
+    `cyrius:docs/development/issues/2026-11-12-no-f32-decimal-parse.md` (an f32 parse) and
+    `bayan:docs/development/issues/2026-11-12-json-tree-number-keeps-no-source-text.md` (a number node's span).
+  - **Parity:** a new golden module, `tests/golden/compute.tsv` (seed 0x70_c0_0a): 1,228 rows, every one matching.
+    - Class A: 46 packing rows, 3 defaults, 99 decoder rows and 11 `deos_drho`. 44 of the decoder rows aim at the f32
+      read:
+      - 38 corner decimals: midpoints written exactly, their shortest f64 digits, 2^-150 and 3·2^-150, the overflow
+        threshold, integers past 2^53 next to a midpoint, and digit runs past 800;
+      - 3 documents that put midpoints after strings, unknown fields and arrays;
+      - 3 in the grid and shallow-water records.
+    - Class B: 340 `dpoly6_dr2` and 340 `dwendland_c2_dr` rows.
+    - Class C: 245 `dtait_drho` rows at bound 0. glibc's pow is correctly rounded on every row, so there is no
+      `compute.cr.tsv`.
+    - Class D: 144 `autodiff_gradient` rows over six catalogue functions, up to 19 ulp: hisab 3.4.1's tape on ganita
+      against 1.4.0's on glibc.
+    - validate.py transcribes the packing, serde's f32 and u32 reads (exact rationals), the derivatives and hisab
+      1.4.0's tape.
+  - **Tests:** all 11 Rust tests of `compute.rs`, plus Cyrius-only groups: `tests/compute.tcyr`, 83 checks.
+    - the layouts and f32 rounding;
+    - the op names;
+    - a backend implemented and called through `dyn`;
+    - autodiff against analytical gradients and on a tape it has to grow;
+    - finite differences;
+    - the L15 stand-in's pieces.
+  - **Mutations:** 26 of 30 port mutations fail rows or tests on the first run. Two gaps, closed:
+    - `compute_op_name`'s strings were unchecked (now tested);
+    - no midpoint ended in a zero, so a missing 10^e on the decimal survived. Rows at 33554450 and 33554470 close it.
+
+    Two survivors are expected: a dpoly6 regrouping moves 23 rows by 1–2 ulp, inside class B, and shows only in the
+    histogram; a tape growth step of +64 changes no result. validate.py: 10 of 13 caught on the first run. Pow's
+    `(g·n)·x^(n−1)` order was unseen, because the catalogue's only pow had an upstream gradient of 1; a sixth
+    function, x0^1.5 · x1, closes it. Of the other two, one is equivalent: 315/(64π) and (315/64)/π round alike. The
+    other can't be reached: the negative-u64 integer path is one bayan refuses (S3).
+
+### Performance
+- **compute** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M7 part a; pinned, interleaved,
+  against the Rust twin `bench_compute_a`):
+
+  | Bench | Rust | Cyrius | Cyrius / Rust |
+  |---|---|---|---|
+  | `from_soa_1000` | 10.2 µs | 52.6 µs | 5.2× |
+  | `unpack_1000` (all three) | 1.39 µs | 24.5 µs | 18× |
+  | `dpoly6_dr2` | 2.3 ns | 19 ns | 8.2× |
+  | `dtait_drho` | 16.0 ns | 795 ns | 50× |
+  | `dwendland_c2_dr` | 3.6 ns | 29 ns | 8.0× |
+  | `autodiff_poly6` | 252 ns | 1.03 µs | 4.1× |
+  | `sph_params_read` | 231 ns | 5.89 µs | 25× |
+  | `sph_params_read_tie` | 261 ns | 7.44 µs | 28× |
+
+  - **The packing loops** first looked each column up and called a method per value. Hoisted into typed views, with
+    the same bits: `from_soa` went from 192.4 to 52.6 µs (3.7×) and the unpacks from 179.0 to 24.5 µs (7.3×), pinned
+    A/B.
+  - 37 µs of `from_soa` is its three `fl_alloc` / `fl_free` cycles of 8–16 KB (the freelist issue; pravash's numbers
+    appended).
+  - `dtait_drho` is the correctly rounded pow (ledger L1).
+  - The midpoint read costs 1.55 µs more than a plain one.
+
+### Added (Cyrius)
 - **mpm** (M6 part c): `src/mpm.cyr`, the material point method of `mpm.rs`. M6 is complete. ADR 0002 #25.
   - **`ConstitutiveModel`** is the kind enum `PvConstitutiveModel` and the payload struct `PvConstitutiveLaw`
     (`_fluid`, `_neo_hookean`, `_drucker_prager`), with `constitutive_model_validate`. Its JSON codec is in

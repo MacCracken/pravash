@@ -11,7 +11,11 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M6 complete** (2026-11-12); M7 (compute, logging and ai) is next. Part c ported MPM (`src/mpm.cyr`):
+> ⏳ **Status: M7 part a done** (2026-11-12); part b (logging and ai) is next. Part a ported `compute.rs`
+> (`src/compute.cyr`, and `src/compute_ad.cyr` outside the bundle, hisab staying test-scope): 1,228 rows in a new golden
+> module, matching on the first replay but three f32 reads, which the L15 stand-in fixed (an f32 read as serde_json's
+> `float_roundtrip`: rounded once from the decimal) (ADR 0002 #26, port-parity §27). M6 is complete (2026-11-12).
+> Part c ported MPM (`src/mpm.cyr`):
 > 1,336 rows in a new golden module, 1,319 bit-exact against the oracle and 17 against the corrected oracle
 > `mpm.cr.tsv`, where glibc misrounds a hypot, atan2, sin, cos, ln or exp (ADR 0002 #25, port-parity §26). Part b
 > ported the `FlipSolver` (`src/flip.cyr`), 245 rows, every one bit-exact on the
@@ -237,7 +241,7 @@ functions, so six things change.
 | M5 | `parallel` in `sph.rs` (`par_iter_mut`, 2 `into_par_iter` maps) | — | — | — | `src/par.cyr` | `thread.cyr` |
 | M6 | `coupling.rs` | 590 | 19 | 33 | `src/coupling.cyr` (the rigid bodies), `src/flip.cyr` (the `FlipSolver`) | the M4 neighbour hash |
 | M6 | `mpm.rs` | 424 | 6 | 13 | `src/mpm.cyr` | — |
-| M7 | `compute.rs` | 201 | 9 | 11 | `src/compute.cyr` | hisab `ad_tape_*` for `autodiff_gradient` (not per-step) |
+| M7 | `compute.rs` | 201 | 9 | 11 | `src/compute.cyr` (`autodiff_gradient` in `src/compute_ad.cyr`, outside `[lib]`) | hisab `ad_tape_*` for `autodiff_gradient` (not per-step), test-scope: a consumer of the gradient declares hisab (ADR 0002 #26) |
 | M7 | `logging.rs` | 20 | 3 | 1 | `src/logging.cyr` | sakshi |
 | M7 | `ai.rs` (`DaimonConfig`, `HooshConfig`) | 35 | — | 2 | `src/ai.cyr` | bayan (JSON) |
 
@@ -810,6 +814,7 @@ in `src/` has a row below, and that every open row has at least one note. It run
 | L12 | closed | (none needed) an 8-byte-chunk record copy for particles, had M1's benchmarks shown `memcpy` dominating. Closed at M1 part 3: struct assignment `*dst = *src` copies a 144-byte record word-wise in 11.7 ns, against `memcpy`'s 245 ns, and every particle move is an assignment (benchmarks-rust-v-cyrius, M1 part 3) | `memcpy` copies a byte at a time | the open `cyrius:docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` (pravash's numbers added 2026-11-11) | stdlib `memcpy`, where raw bytes are copied | none |
 | L13 | open | `src/column.cyr`: a growable column of 8-byte slots on the freelist (push doubling and freeing the outgrown buffer, `drop`, NaN / 0 on a bad index), what `ParticleSoa`'s `Vec<f64>` / `Vec<u8>` fields become | `vec_push_a` never frees the outgrown buffer, even through a freeing Allocator, there is no `vec_free`, and `vec_get` / `vec_set` abort on a bad index | `cyrius:docs/development/issues/2026-11-11-vec-keeps-outgrown-buffer-and-aborts.md` | the stdlib `vec` with a freeing grow, `vec_free_a` and non-aborting access | the ParticleSoa rows of `tests/golden/common.tsv` (class A) |
 | L14 | open | `src/mathx.cyr`: `_pv_fmod`, the exact fmod (C's, which Rust's `%` on f64 lowers to) in integer bit operations, transcribed from hisab 3.4.1's `f64_fmod`. The periodic grid sampler needs it (M3) | ganita and the stdlib's math have no fmod; hisab's exact one is test-scope here, as a production hisab would reach every consumer's compile (the `[deps.hisab]` note in `cyrius.cyml`) | `ganita:docs/development/issues/2026-11-11-no-fmod.md` | ganita's fmod | the `f64::rem` rows of `tests/golden/math.tsv` (class A) and the periodic `FluidGrid::step` rows of `tests/golden/grid.tsv` (class S) |
+| L15 | open | `src/json.cyr` `_pv_jr_f32`: an f32 field read as serde_json's `float_roundtrip` reads one (M7 part a), the decimal rounded to f32 once and refused when that is ±∞. It takes RN32 of bayan's correctly rounded f64, and where that f64 is exactly an f32 midpoint (the only place a double rounding can differ) compares the document's decimal with it exactly: a 32-bit-limb bignum over 800 kept digits, the text found by the number's document-order position (`_pv_jr_num_text`). An integer rounds once from the i64 | the stdlib parses decimals to f64 only, and `f32_from(f64_from(n))` rounds twice past 2^53; bayan's tree keeps no number text (a float node holds its f64 alone) | `cyrius:docs/development/issues/2026-11-12-no-f32-decimal-parse.md`; `bayan:docs/development/issues/2026-11-12-json-tree-number-keeps-no-source-text.md` | the stdlib's f32 parse over the node's span | the kernel-parameter `from_json` rows of `tests/golden/compute.tsv` (class A) |
 
 **Also filed at M0, outside the ledger:** pravash's case on the `cyrius port` clobber issue. A project whose
 `.gitignore` ignores `Cargo.lock` ends up with a frozen oracle that has no lockfile.
@@ -980,5 +985,7 @@ port-parity §25 (part b): `src/flip.cyr`; ADR 0002 #24 (the solver-owned column
 port-parity §24 (part a): `src/coupling.cyr`; ADR 0002 #23 (the payload enum `PvShape`, the cells-only grid for the hash, the level set's return); the mutation tests found two gaps (the walk past the block in z, a level set longer than nx·ny), closed by rows drawing no random numbers.
 
 **Next:** M7, compute, logging and ai |
-| M7 Compute, logging and ai | — | — | — | — | |
+| M7 Compute, logging and ai | part a ✅ 2026-11-12 | compute 1,228 (seed 0x70_c0_0a). Part a: 46 packing rows (empty, 1–13 particles with the specials, mismatched columns; the unpacks on written, short and over-counted buffers and short columns); 3 defaults; 99 documents, 44 of them f32 corner cases (midpoints written exactly, their shortest f64 digits, 2^-150 and 3·2^-150, the overflow threshold, integers past 2^53, digit runs past 800, midpoints after strings, unknown fields and arrays); 340 `dpoly6_dr2` and 340 `dwendland_c2_dr` (class B); 11 `deos_drho`; 245 `dtait_drho` (class C, glibc's pow correctly rounded on every one); 144 `autodiff_gradient` over six catalogue functions (class D, up to 19 ulp). All matching on the first replay but 3 f32 reads (an overflow serde_json refuses, a midpoint), which the L15 stand-in fixed | all 11 Rust tests of `compute.rs`; the layouts, f32 rounding, the op names, a backend through `dyn`, autodiff against analytical gradients and on a growing tape, finite differences, the L15 reads | a twin: packing 1,000 particles 5.2× (3.7× faster after the loops were hoisted; 37 µs of 52.6 the freelist's large-block cycles), the unpacks 18× (7.3× faster), the derivatives 8× and `dtait_drho` 50× (L1), the autodiff gradient 4.1×, an `SphKernelParams` read 25× serde_json, 28× at a midpoint | port-parity §27 (part a): `src/compute.cyr`, `src/compute_ad.cyr`; ADR 0002 #26 (`PvF32Column`, the gravity fields, the traits' status words, the autodiff outside the bundle); ledger L15 (the f32 reads); the mutation tests found two gaps in the port (the op names, a midpoint ending in 0) and one in the transcription (pow's sweep order), closed by a test, two rows and a sixth catalogue function.
+
+**Next:** M7 part b, logging and ai |
 | M8 Release 2.0.0 | — | — | — | — | |

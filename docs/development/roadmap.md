@@ -84,7 +84,10 @@
   1,335 rows in a new golden module: 1,318 bit-exact against the oracle, and 17 against the corrected oracle where
   glibc misrounds a hypot, atan2, sin, cos, ln or exp; all 13 Rust tests)
 - [x] **M6 done 2026-11-12.**
-- [ ] M7: compute (`ComputeOp`, `PackedParticles`, `KernelDerivatives`), logging and ai
+- [x] M7 part a: compute (`PackedParticles` and its f32 packing, the kernel-parameter records and their JSON, the
+  backend traits, `KernelDerivatives` and `autodiff_gradient` on hisab's tape outside the bundle; 1,228 rows in a new
+  golden module; all 11 Rust tests; the f32 JSON reads as serde_json's, ledger L15)
+- [ ] M7 part b: logging (the sakshi init, the chrome://tracing writer of L11) and ai (`DaimonConfig`, `HooshConfig`)
 
 ### 1.3.0
 

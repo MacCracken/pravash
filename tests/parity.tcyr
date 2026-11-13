@@ -23,6 +23,7 @@
 
 include "tests/ulp.cyr"
 include "tests/lib.cyr"
+include "src/compute_ad.cyr"
 
 alloc_init();
 
@@ -2955,11 +2956,312 @@ fn _par_mpm(fp, fl): i64 {
     return 1;
 }
 
+# ── compute (M7 part a) ─────────────────────────────────────────────────────────────
+# Token layouts: scripts/oracle/src/m_compute.rs. An SoA is 18 `v:` columns (the phase as `i:`); a packed record is
+# `i:` count and three `v:` columns of widened f32s.
+
+# The SoA whose columns start at input k into *s, which starts empty: the input after it, or -1 for no memory.
+fn _par_soa_in(k, s: *PvParticleSoa): i64 {
+    var e: PvParticleSoa = PvParticleSoa_new();
+    *s = e;
+    for (var c = 0; c < 18; c = c + 1) {
+        var n = _par_in(k);
+        var col: *PvColumn = _pv_soa_col(s, c);
+        if (col.reserve(n) == 0) { return 0 - 1; }
+        for (var j = 0; j < n; j = j + 1) {
+            if (col.push(_par_in(k + 1 + j)) == 0) { return 0 - 1; }
+        }
+        k = k + 1 + n;
+    }
+    return k;
+}
+
+# Appends the SoA's 18 columns.
+fn _par_soa_out(s: *PvParticleSoa) {
+    for (var c = 0; c < 18; c = c + 1) {
+        var col: *PvColumn = _pv_soa_col(s, c);
+        _par_got_seq(col.len);
+        for (var j = 0; j < col.len; j = j + 1) {
+            if (c == 12) { _par_got_i(col.get(j)); } else { _par_got_f(col.get(j)); }
+        }
+    }
+    return 0;
+}
+
+# The packed record whose tokens start at input k into *p: the input after it, or -1 for no memory.
+fn _par_packed_in(k, p: *PvPackedParticles): i64 {
+    p.count = _par_in(k);
+    k = k + 1;
+    for (var c = 0; c < 3; c = c + 1) {
+        var b: *PvF32Column = _pv_packed_col(p, c);
+        b.data = 0;
+        b.len = 0;
+        b.cap = 0;
+        var n = _par_in(k);
+        if (b.reserve(n) == 0) { return 0 - 1; }
+        for (var j = 0; j < n; j = j + 1) {
+            var x: f64 = _par_in(k + 1 + j);
+            b.push_rounded(x);
+        }
+        k = k + 1 + n;
+    }
+    return k;
+}
+
+# Appends the packed record's tokens.
+fn _par_packed_out(p: *PvPackedParticles) {
+    _par_got_i(p.count);
+    for (var c = 0; c < 3; c = c + 1) {
+        var b: *PvF32Column = _pv_packed_col(p, c);
+        _par_got_seq(b.len);
+        for (var j = 0; j < b.len; j = j + 1) {
+            var x: f64 = b.at(j);
+            _par_got_f(_pv_bits(x));
+        }
+    }
+    return 0;
+}
+
+# Appends an f32 field, widened.
+fn _par_got_f32(x: f32) {
+    var w: f64 = f32_to(x);
+    _par_got_f(_pv_bits(w));
+    return 0;
+}
+
+# Appends a parameter record's fields, in declaration order (f32s widened, u32s as `i:`).
+fn _par_sph_params_out(s: *PvSphKernelParams) {
+    _par_got_f32(s.smoothing_radius);
+    _par_got_f32(s.rest_density);
+    _par_got_f32(s.gas_constant);
+    _par_got_f32(s.viscosity);
+    _par_got_f32(s.gravity_x);
+    _par_got_f32(s.gravity_y);
+    _par_got_f32(s.gravity_z);
+    _par_got_f32(s.dt);
+    _par_got_i(s.particle_count);
+    return 0;
+}
+
+fn _par_grid_params_out(g: *PvGridKernelParams) {
+    _par_got_i(g.nx);
+    _par_got_i(g.ny);
+    _par_got_f32(g.dx);
+    _par_got_f32(g.dt);
+    _par_got_f32(g.viscosity);
+    _par_got_f32(g.buoyancy_alpha);
+    _par_got_f32(g.ambient_density);
+    return 0;
+}
+
+fn _par_shallow_params_out(h: *PvShallowKernelParams) {
+    _par_got_i(h.nx);
+    _par_got_i(h.ny);
+    _par_got_f32(h.dx);
+    _par_got_f32(h.dt);
+    _par_got_f32(h.gravity);
+    _par_got_f32(h.damping);
+    _par_got_f32(h.dry_threshold);
+    return 0;
+}
+
+# The autodiff catalogue (m_compute.rs's ad0 … ad5), on hisab's tape.
+fn _par_ad0(t, v, n): i64 {
+    var a = ad_mul(t, load64(v), load64(v + 8));
+    var b = ad_mul(t, load64(v + 16), load64(v + 16));
+    var c = ad_mul(t, b, load64(v));
+    var d = ad_div(t, load64(v + 8), load64(v + 16));
+    var e = ad_add(t, a, c);
+    return ad_sub(t, e, d);
+}
+
+fn _par_ad1(t, v, n): i64 {
+    var s = ad_sin(t, load64(v));
+    var e = ad_exp(t, load64(v + 8));
+    var p = ad_mul(t, s, e);
+    return ad_add(t, p, load64(v + 16));
+}
+
+fn _par_ad2(t, v, n): i64 {
+    var h2 = ad_mul(t, load64(v + 8), load64(v + 8));
+    var r2 = ad_mul(t, load64(v), load64(v));
+    var d = ad_sub(t, h2, r2);
+    var d2 = ad_mul(t, d, d);
+    var d3 = ad_mul(t, d2, d);
+    var h3 = ad_mul(t, h2, load64(v + 8));
+    var h6 = ad_mul(t, h3, h3);
+    var h9 = ad_mul(t, h6, h3);
+    var sf: f64 = 64.0;
+    var den: f64 = sf * PV_F64_PI;
+    var kv: f64 = 315.0 / den;
+    var k = ad_const(t, kv);
+    var c = ad_div(t, k, h9);
+    return ad_mul(t, c, d3);
+}
+
+fn _par_ad3(t, v, n): i64 {
+    var l = ad_ln(t, load64(v));
+    var a = ad_mul(t, l, load64(v + 8));
+    var c = ad_cos(t, load64(v + 16));
+    var b = ad_sub(t, a, c);
+    var e: f64 = 2.5;
+    var p = ad_pow(t, load64(v), e);
+    return ad_add(t, b, p);
+}
+
+fn _par_ad4(t, v, n): i64 {
+    var tv: f64 = 3.0;
+    var three = ad_const(t, tv);
+    var a = ad_sub(t, load64(v), three);
+    var ng = ad_neg(t, a);
+    var b = ad_mul(t, ng, load64(v + 8));
+    var c = ad_div(t, load64(v), load64(v + 8));
+    return ad_add(t, b, c);
+}
+
+fn _par_ad5(t, v, n): i64 {
+    var e: f64 = 1.5;
+    var p = ad_pow(t, load64(v), e);
+    return ad_mul(t, p, load64(v + 8));
+}
+
+# The compute rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
+fn _par_compute(fp, fl): i64 {
+    var soa: PvParticleSoa;
+    var pk: PvPackedParticles;
+    if (_par_eq(fp, fl, "PackedParticles::from_soa") == 1) {
+        if (_par_soa_in(0, &soa) < 0) { return 0 - 1; }
+        if (PvPackedParticles_from_soa(&soa, &pk) == 0) { return 0 - 1; }
+        _par_packed_out(&pk);
+        PvPackedParticles_drop(&pk);
+        PvParticleSoa_drop(&soa);
+        return 1;
+    }
+    var which = 0 - 1;
+    if (_par_eq(fp, fl, "PackedParticles::unpack_density_pressure") == 1) { which = 0; }
+    if (_par_eq(fp, fl, "PackedParticles::unpack_velocity") == 1) { which = 1; }
+    if (_par_eq(fp, fl, "PackedParticles::unpack_positions") == 1) { which = 2; }
+    if (which >= 0) {
+        var k = _par_packed_in(0, &pk);
+        if (k < 0 || _par_soa_in(k, &soa) < 0) { return 0 - 1; }
+        if (which == 0) { pk.unpack_density_pressure(&soa); }
+        if (which == 1) { pk.unpack_velocity(&soa); }
+        if (which == 2) { pk.unpack_positions(&soa); }
+        _par_soa_out(&soa);
+        PvPackedParticles_drop(&pk);
+        PvParticleSoa_drop(&soa);
+        return 1;
+    }
+    var sp: PvSphKernelParams;
+    var gp: PvGridKernelParams;
+    var hp: PvShallowKernelParams;
+    if (_par_eq(fp, fl, "SphKernelParams::default") == 1) {
+        sp = PvSphKernelParams_default();
+        _par_sph_params_out(&sp);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "GridKernelParams::default") == 1) {
+        gp = PvGridKernelParams_default();
+        _par_grid_params_out(&gp);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "ShallowKernelParams::default") == 1) {
+        hp = PvShallowKernelParams_default();
+        _par_shallow_params_out(&hp);
+        return 1;
+    }
+    var kind = 0 - 1;
+    if (_par_eq(fp, fl, "SphKernelParams::from_json") == 1) { kind = 0; }
+    if (_par_eq(fp, fl, "GridKernelParams::from_json") == 1) { kind = 1; }
+    if (_par_eq(fp, fl, "ShallowKernelParams::from_json") == 1) { kind = 2; }
+    if (kind >= 0) {
+        var doc = _par_in_cstr(0);
+        if (doc == 0) { return 0 - 1; }
+        var dl = strlen(doc);
+        var t = 0;
+        var v = 0;
+        var rec = &sp;
+        var size = sizeof(PvSphKernelParams);
+        if (kind == 0) { t, v = PvSphKernelParams_from_json(doc, dl, &sp); }
+        if (kind == 1) {
+            t, v = PvGridKernelParams_from_json(doc, dl, &gp);
+            rec = &gp;
+            size = sizeof(PvGridKernelParams);
+        }
+        if (kind == 2) {
+            t, v = PvShallowKernelParams_from_json(doc, dl, &hp);
+            rec = &hp;
+            size = sizeof(PvShallowKernelParams);
+        }
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        if (kind == 0) { _par_sph_params_out(&sp); }
+        if (kind == 1) { _par_grid_params_out(&gp); }
+        if (kind == 2) { _par_shallow_params_out(&hp); }
+        # The round trip of the port's own text.
+        var sb = str_builder_new();
+        var rc = 0;
+        if (kind == 0) { rc = sp.to_json(sb); }
+        if (kind == 1) { rc = gp.to_json(sb); }
+        if (kind == 2) { rc = hp.to_json(sb); }
+        if (rc != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb);
+        var back[40];
+        var t2 = 0;
+        var v2 = 0;
+        if (kind == 0) { t2, v2 = PvSphKernelParams_from_json(d, n, &back); }
+        if (kind == 1) { t2, v2 = PvGridKernelParams_from_json(d, n, &back); }
+        if (kind == 2) { t2, v2 = PvShallowKernelParams_from_json(d, n, &back); }
+        if (is_err_result(t2) == 1 || memeq(rec, &back, size) != 1) { return 0 - 1; }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KernelDerivatives::dpoly6_dr2") == 1) {
+        var a: f64 = PvKernelDerivatives_dpoly6_dr2(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(a));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KernelDerivatives::dwendland_c2_dr") == 1) {
+        var b: f64 = PvKernelDerivatives_dwendland_c2_dr(_par_in(0), _par_in(1));
+        _par_got_f(_pv_bits(b));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KernelDerivatives::deos_drho") == 1) {
+        var c: f64 = PvKernelDerivatives_deos_drho(_par_in(0));
+        _par_got_f(_pv_bits(c));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KernelDerivatives::dtait_drho") == 1) {
+        var e: f64 = PvKernelDerivatives_dtait_drho(_par_in(0), _par_in(1), _par_in(2), _par_in(3));
+        _par_got_f(_pv_bits(e));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "KernelDerivatives::autodiff_gradient") == 1) {
+        var id = _par_in(0);
+        var nx = _par_in(1);
+        var x = fl_alloc(nx * 8 + 8);
+        for (var i = 0; i < nx; i = i + 1) { store64(x + i * 8, _par_in(2 + i)); }
+        var f = &_par_ad0;
+        if (id == 1) { f = &_par_ad1; }
+        if (id == 2) { f = &_par_ad2; }
+        if (id == 3) { f = &_par_ad3; }
+        if (id == 4) { f = &_par_ad4; }
+        if (id == 5) { f = &_par_ad5; }
+        var gp2, gn = PvKernelDerivatives_autodiff_gradient(f, x, nx);
+        fl_free(x);
+        if (gp2 == 0) { return 0 - 1; }
+        _par_got_seq(gn);
+        for (var j = 0; j < gn; j = j + 1) { _par_got_f(load64(gp2 + j * 8)); }
+        fl_free(gp2);
+        return 1;
+    }
+    return 0;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
     if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
+    if (_par_eq(mp, ml, "compute") == 1) { return _par_compute(fp, fl); }
     if (_par_eq(mp, ml, "coupling") == 1) { return _par_coupling(fp, fl); }
     if (_par_eq(mp, ml, "mpm") == 1) { return _par_mpm(fp, fl); }
     if (_par_eq(mp, ml, "vortex") == 1) { return _par_vortex(fp, fl); }
@@ -3144,6 +3446,8 @@ fn _par_c_bound(fp, fl): i64 {
     # correctly).
     if (_par_eq(fp, fl, "MpmParticle::stress") == 1) { return 0; }
     if (_par_eq(fp, fl, "MpmSolver::step") == 1) { return 0; }
+    # M7 part a: dTait/dρ is Rust's arithmetic on the correctly rounded powf, so each row equals the corrected oracle.
+    if (_par_eq(fp, fl, "KernelDerivatives::dtait_drho") == 1) { return 0; }
     return 0 - 1;
 }
 

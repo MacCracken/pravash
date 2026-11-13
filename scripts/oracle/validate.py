@@ -5181,6 +5181,296 @@ def check_mpm(rows):
     return counts
 
 
+# ── compute (M7 part a) ─────────────────────────────────────────────────────────────────────
+# PackedParticles' f32 packing, the kernel parameters' serde reads, the KernelDerivatives, and hisab 1.4.0's
+# reverse-mode tape (the oracle's `reverse_gradient`), each transcribed from rust-old/src/compute.rs and hisab 1.4.0's
+# src/autodiff.rs.
+
+def cm_cols(x, k, n):
+    """n `v:` sequences from x[k]: (the lists, the index after)."""
+    cols = []
+    for _ in range(n):
+        m = x[k][1]
+        cols.append(list(x[k + 1:k + 1 + m]))
+        k += 1 + m
+    return cols, k
+
+
+def cm_seq_toks(lists):
+    out = []
+    for c in lists:
+        out += [("v", len(c))] + c
+    return out
+
+
+def cm_from_soa(soa):
+    """`PackedParticles::from_soa`: the consistent length's particles as f32s (`as f32`), velocity padded with 0."""
+    n = min(len(c) for c in soa)
+    pm, vel, dp = [], [], []
+    for i in range(n):
+        pm += [f32(soa[0][i]), f32(soa[1][i]), f32(soa[2][i]), f32(soa[11][i])]
+        vel += [f32(soa[3][i]), f32(soa[4][i]), f32(soa[5][i]), 0.0]
+        dp += [f32(soa[9][i]), f32(soa[10][i])]
+    return [n] + cm_seq_toks([pm, vel, dp])
+
+
+def cm_unpack(which, count, bufs, soa):
+    """The unpacks: whole chunks only, at most `count`, bounded by every column written."""
+    soa = [list(c) for c in soa]
+    if which == 0:
+        buf, w, cols = bufs[2], 2, (9, 10)
+    elif which == 1:
+        buf, w, cols = bufs[1], 4, (3, 4, 5)
+    else:
+        buf, w, cols = bufs[0], 4, (0, 1, 2)
+    n = min([count, len(buf) // w] + [len(soa[c]) for c in cols])
+    for i in range(n):
+        for j, c in enumerate(cols):
+            soa[c][i] = buf[i * w + j]
+    return cm_seq_toks(soa)
+
+
+F32_MAX_HALF_UP = 2 ** 128 - 2 ** 103   # the overflow threshold: f32::MAX's midpoint to 2^128
+
+
+def f32_nearest(q, neg_zero=False):
+    """The f32 nearest the rational q, ties to even, widened; None when it rounds to ±∞."""
+    if q == 0:
+        return -0.0 if neg_zero else 0.0
+    a = abs(q)
+    if a >= F32_MAX_HALF_UP:
+        return None
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if Fraction(2) ** e > a:
+        e -= 1
+    qe = max(e, -126) - 23
+    scaled = a / Fraction(2) ** qe
+    n = scaled.numerator // scaled.denominator
+    rem = scaled - n
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+        n += 1
+    v = float(n * Fraction(2) ** qe)
+    return -v if q < 0 else v
+
+
+def j_f32(v):
+    """An f32 field as serde_json 1.0.154 reads one under `float_roundtrip`: a float's decimal rounded to f32 once
+    (refused when that is ±∞); an integer through `u64 as f32` / `i64 as f32`; a negative integer below i64::MIN
+    through `-(u as f64)`, then `as f32`; `-0` is −0.0."""
+    if isinstance(v, tuple) and v[0] == "int":
+        if v[1] == "-0":
+            return -0.0
+        n = int(v[1])
+        if -(2 ** 64 - 1) <= n < -(2 ** 63):
+            return f32(-float(-n))
+        w = f32_nearest(Fraction(n))
+    elif isinstance(v, tuple) and v[0] == "float":
+        x = float(v[1])
+        if not math.isfinite(x):
+            raise JsonRefused("out of range")
+        if abs(x) < 2.0 ** -200:
+            return math.copysign(0.0, x) if x != 0.0 else (-0.0 if v[1].startswith("-") else 0.0)
+        w = f32_nearest(Fraction(v[1]))
+    else:
+        raise JsonRefused("not a number")
+    if w is None:
+        raise JsonRefused("out of range")
+    return w
+
+
+def j_u32(v):
+    if not (isinstance(v, tuple) and v[0] == "int") or v[1] == "-0":
+        raise JsonRefused("not an integer")
+    n = int(v[1])
+    if not 0 <= n <= 2 ** 32 - 1:
+        raise JsonRefused("out of range")
+    return n
+
+
+def cm_json(func, doc):
+    """The fields serde_json reads from doc as func's parameter record, or ["E:Deserialize"]."""
+    try:
+        v = j_load(doc)
+        if func.startswith("SphKernelParams"):
+            f = j_struct(v, ["smoothing_radius", "rest_density", "gas_constant", "viscosity", "gravity", "dt",
+                             "particle_count"])
+            g = j_arr(f[4], 3)
+            return [j_f32(e) for e in f[0:4]] + [j_f32(e) for e in g] + [j_f32(f[5]), j_u32(f[6])]
+        names = (["nx", "ny", "dx", "dt", "viscosity", "buoyancy_alpha", "ambient_density"]
+                 if func.startswith("GridKernelParams") else
+                 ["nx", "ny", "dx", "dt", "gravity", "damping", "dry_threshold"])
+        f = j_struct(v, names)
+        return [j_u32(f[0]), j_u32(f[1])] + [j_f32(e) for e in f[2:]]
+    except JsonRefused:
+        return ["E:Deserialize"]
+
+
+def cm_dpoly6(r2, h):
+    h2 = h * h
+    if h <= 0.0 or r2 > h2:
+        return 0.0
+    h3 = h2 * h
+    h9 = h3 * h3 * h3
+    c = fdiv(315.0, 64.0 * PI * h9)
+    diff = h2 - r2
+    return -3.0 * c * diff * diff
+
+
+def cm_dtait(d, r0, c, g, P):
+    """`dtait_drho`, pow from P."""
+    rho0 = r_max(r0, 1e-10)
+    return c * c * P["pow"](fdiv(d, rho0), g - 1.0)
+
+
+class CmTape:
+    """hisab 1.4.0's `Tape`: each op records its forward value (std's sin, cos, exp, ln and powf: glibc's)."""
+
+    def __init__(self):
+        self.ops, self.vals = [], []
+
+    def push(self, op, val):
+        self.ops.append(op)
+        self.vals.append(val)
+        return len(self.ops) - 1
+
+    def var(self, x):
+        return self.push(("const",), x)
+
+    def bin(self, kind, a, b):
+        va, vb = self.vals[a], self.vals[b]
+        val = {"add": va + vb, "sub": va - vb, "mul": va * vb}[kind] if kind != "div" else fdiv(va, vb)
+        return self.push((kind, a, b), val)
+
+    def un(self, kind, a):
+        va = self.vals[a]
+        val = {"neg": lambda: -va, "sin": lambda: _libm.sin(va), "cos": lambda: _libm.cos(va),
+               "exp": lambda: _libm.exp(va), "ln": lambda: _libm.log(va)}[kind]()
+        return self.push((kind, a), val)
+
+    def powf(self, a, n):
+        return self.push(("pow", a, n), _libm.pow(self.vals[a], n))
+
+    def backward(self, out):
+        n = len(self.ops)
+        gr = [0.0] * n
+        gr[out] = 1.0
+        v = self.vals
+        for i in range(n - 1, -1, -1):
+            g = gr[i]
+            if g == 0.0:
+                continue
+            op = self.ops[i]
+            k = op[0]
+            if k == "add":
+                gr[op[1]] += g
+                gr[op[2]] += g
+            elif k == "sub":
+                gr[op[1]] += g
+                gr[op[2]] -= g
+            elif k == "mul":
+                gr[op[1]] += g * v[op[2]]
+                gr[op[2]] += g * v[op[1]]
+            elif k == "div":
+                a, b = op[1], op[2]
+                gr[a] += fdiv(g, v[b])
+                gr[b] -= fdiv(g * v[a], v[b] * v[b])
+            elif k == "neg":
+                gr[op[1]] -= g
+            elif k == "sin":
+                gr[op[1]] += g * _libm.cos(v[op[1]])
+            elif k == "cos":
+                gr[op[1]] -= g * _libm.sin(v[op[1]])
+            elif k == "exp":
+                gr[op[1]] += g * v[i]
+            elif k == "ln":
+                gr[op[1]] += fdiv(g, v[op[1]])
+            elif k == "pow":
+                gr[op[1]] += g * op[2] * _libm.pow(v[op[1]], op[2] - 1.0)
+        return gr
+
+
+def cm_catalogue(fid, t, x):
+    """m_compute.rs's ad0 … ad5, op for op."""
+    if fid == 0:
+        a = t.bin("mul", x[0], x[1])
+        b = t.bin("mul", x[2], x[2])
+        c = t.bin("mul", b, x[0])
+        d = t.bin("div", x[1], x[2])
+        e = t.bin("add", a, c)
+        return t.bin("sub", e, d)
+    if fid == 1:
+        s = t.un("sin", x[0])
+        e = t.un("exp", x[1])
+        return t.bin("add", t.bin("mul", s, e), x[2])
+    if fid == 2:
+        h2 = t.bin("mul", x[1], x[1])
+        r2 = t.bin("mul", x[0], x[0])
+        d = t.bin("sub", h2, r2)
+        d3 = t.bin("mul", t.bin("mul", d, d), d)
+        h3 = t.bin("mul", h2, x[1])
+        h9 = t.bin("mul", t.bin("mul", h3, h3), h3)
+        k = t.var(315.0 / (64.0 * PI))
+        return t.bin("mul", t.bin("div", k, h9), d3)
+    if fid == 3:
+        a = t.bin("mul", t.un("ln", x[0]), x[1])
+        b = t.bin("sub", a, t.un("cos", x[2]))
+        return t.bin("add", b, t.powf(x[0], 2.5))
+    if fid == 5:
+        return t.bin("mul", t.powf(x[0], 1.5), x[1])
+    three = t.var(3.0)
+    n = t.un("neg", t.bin("sub", x[0], three))
+    b = t.bin("mul", n, x[1])
+    return t.bin("add", b, t.bin("div", x[0], x[1]))
+
+
+def cm_want(func, x, P):
+    """A compute row's recomputed outputs, or None for a function without a check."""
+    if func == "PackedParticles::from_soa":
+        soa, _ = cm_cols(x, 0, 18)
+        return cm_from_soa(soa)
+    if func.startswith("PackedParticles::unpack_"):
+        count = x[0]
+        bufs, k = cm_cols(x, 1, 3)
+        soa, _ = cm_cols(x, k, 18)
+        which = {"density_pressure": 0, "velocity": 1, "positions": 2}[func.split("unpack_")[1]]
+        return cm_unpack(which, count, bufs, soa)
+    if func == "SphKernelParams::default":
+        return [0.0] * 8 + [0]
+    if func in ("GridKernelParams::default", "ShallowKernelParams::default"):
+        return [0, 0] + [0.0] * 5
+    if func == "KernelDerivatives::dpoly6_dr2":
+        return [cm_dpoly6(x[0], x[1])]
+    if func == "KernelDerivatives::dwendland_c2_dr":
+        return [sph_kernel("kernel_wendland_c2_grad", x[0], x[1])]
+    if func == "KernelDerivatives::deos_drho":
+        return [x[0]]
+    if func == "KernelDerivatives::dtait_drho":
+        return [cm_dtait(x[0], x[1], x[2], x[3], P)]
+    if func == "KernelDerivatives::autodiff_gradient":
+        t = CmTape()
+        vs = [t.var(v) for v in x[2:2 + x[1][1]]]
+        gr = t.backward(cm_catalogue(x[0], t, vs))
+        return [("v", len(vs))] + [gr[i] for i in vs]
+    return None
+
+
+def check_compute(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        got = [tok_val(t) for t in outs]
+        if func.endswith("::from_json"):
+            want = cm_json(func, unpct(ins[0][2:]))
+        else:
+            want = cm_want(func, [tok_val(t) for t in ins], GLIBC)
+        if want is None:
+            fail(f"{where}: no check for {func}")
+            continue
+        if not same_list(got, want):
+            fail(f"{where}: {func} recorded {got!r}, recomputed {want!r}")
+    return counts
+
+
 def tokens_text(vals):
     """Recomputed outputs as token text: floats `f:`, ("v", n) `v:n`, an error's text as it is, integers `i:`."""
     return " ".join(f"f:{bits(w):016x}" if isinstance(w, float) else (f"v:{w[1]}" if isinstance(w, tuple)
@@ -5264,6 +5554,15 @@ def corrections(module, rows):
             more = f"; … and {len(seen) - 3} more" if len(seen) > 3 else ""
             out.append((fn, " ".join(ins), tokens_text(want), "oracle " + ("(state)" if fn == "MpmSolver::step" else
                         " ".join(outs)) + "; " + "; ".join(seen[:3]) + more))
+            continue
+        if module == "compute" and fn == "KernelDerivatives::dtait_drho":
+            x = [tok_val(t) for t in ins]
+            want = cm_want(fn, x, mpfr_logged(log))
+            got = [tok_val(t) for t in outs]
+            if same_list(got, want):
+                continue
+            seen = list(dict.fromkeys(log))
+            out.append((fn, " ".join(ins), tokens_text(want), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
             continue
         if module in ("vortex", "bridge") and fn in M1B_C:
             x = [tok_val(t) for t in ins]
@@ -5543,6 +5842,11 @@ def main():
             print(f"mpm: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "mpm", path, rows)
             MPM_CACHE.clear()
+        elif path.stem == "compute":
+            counts = check_compute(rows)
+            summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))
+            print(f"compute: {len(rows)} rows recomputed ({summary})")
+            check_corrections(root, "compute", path, rows)
         elif path.stem == "json":
             counts = check_json(rows)
             summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))

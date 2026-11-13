@@ -2,6 +2,7 @@
 bridge
 buoyancy
 common
+compute
 constants
 coupling
 grid

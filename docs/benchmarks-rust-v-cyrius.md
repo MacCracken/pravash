@@ -822,3 +822,41 @@ MPM states copied in before each step.
   10–20 ns. About 3.6 µs of correctly rounded calls a particle accounts for most of the step.
 - **The elastic block** makes one ln a particle. **The fluid column** makes none: 6.8× is the port's per-particle and
   per-node arithmetic, close to the FLIP step's (part b).
+
+## M7 part a: compute (2026-11-12)
+
+Pinned to core 15, three interleaved runs (the medians below). Rust's criterion suite has no compute group. The twin
+`scripts/probes/rust/src/bin/bench_compute_a.rs` and `tests/pravash.bcyr`'s `bench_compute_a` time the bodies its
+header lists: a 1,000-particle packing and its unpacks, the closed-form derivatives over 1,024 cycled arguments, the
+autodiff gradient of the poly6 kernel (13 tape nodes), and an `SphKernelParams` read of serde_json's own document,
+plain and with dt on an f32 midpoint.
+
+| Bench | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `compute_a/from_soa_1000` | 9.77–10.5 µs | 51.0–55.4 µs | 5.2× |
+| `compute_a/unpack_1000` (the three unpacks) | 1.39–1.44 µs | 24.8–25.0 µs | 18× |
+| `compute_a/dpoly6_dr2` | 2.28–2.33 ns | 19 ns | 8.2× |
+| `compute_a/dtait_drho` | 15.9–16.1 ns | 793–798 ns | 50× |
+| `compute_a/dwendland_c2_dr` | 3.62–3.65 ns | 29–30 ns | 8.0× |
+| `compute_a/autodiff_poly6` | 252–262 ns | 1.01–1.21 µs | 4.1× |
+| `compute_a/sph_params_read` | 230–238 ns | 5.69–5.91 µs | 25× |
+| `compute_a/sph_params_read_tie` | 257–269 ns | 7.29–7.63 µs | 28× |
+
+**The packing loops, before and after** (pinned, interleaved A/B, three runs each; the same bits, every parity row
+unchanged). The first port looked each SoA column up and called a column method per value, about 20 ns a value.
+Hoisting the nine column pointers and writing through `*f32` / `load64` views:
+
+| Bench | Before | After | Faster |
+|---|---|---|---|
+| `from_soa_1000` | 191.4–193.5 µs | 52.2–53.3 µs | 3.7× |
+| `unpack_1000` | 178.9–182.0 µs | 24.4–24.8 µs | 7.3× |
+
+**Reading it.**
+- **37 µs of the packing is allocation.** Three `fl_alloc` / `fl_free` cycles of 16, 16 and 8 KB take 37.0 µs alone on
+  the same core: the freelist maps and unmaps every block over 4 KB (M1's finding). Rust's three `Vec::with_capacity`
+  come from glibc's heap. The numbers are appended to the cyrius issue.
+- **The unpacks** are 3 ns a value of load, widen and store, against Rust's vectorised loop.
+- **`dtait_drho` is the correctly rounded pow** (ledger L1), as the SPH Tait EOS is (52×, M4 part a).
+- **The autodiff gradient** reuses one tape, where Rust builds a tape and its two vectors per call.
+- **The parameter read** is bayan's tree build and the field lookups, as M1's JSON rows are (about 20×). The midpoint
+  read adds 1.55 µs: the pre-order walk, the text scan and one bignum comparison (L15).

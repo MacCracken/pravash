@@ -1,0 +1,512 @@
+# compute.tcyr — the ported Rust tests of rust-old/src/compute.rs (M7 part a): all 11, in Rust's order.
+#
+# Rust's `Vec<f32>` buffers are `PvF32Column`s; `particles.density_pressure[0] = 1000.0` is `set(0, 1000.0)`. The
+# file also includes src/compute_ad.cyr, which ships outside the `[lib]` bundle (hisab is test-scope here). Cyrius-only
+# groups follow: the layouts, f32 rounding to nearest even, a backend implemented and called through `dyn`, the
+# autodiff gradient against analytical gradients and on a tape it has to grow, the derivatives against finite
+# differences (class R), and the f32 JSON reads' stand-in (ledger L15).
+
+include "tests/lib.cyr"
+include "src/compute_ad.cyr"
+
+# 1 when |a − b| < tol.
+fn near(a: f64, b: f64, tol: f64): i64 {
+    var d: f64 = a - b;
+    var ad: f64 = f64_abs(d);
+    if (ad < tol) { return 1; }
+    return 0;
+}
+
+# An SoA of the n particles at ps into *soa (asserting it was built).
+fn soa_of(soa: *PvParticleSoa, ps: *PvFluidParticle, n) {
+    assert_eq(PvParticleSoa_from_aos(soa, ps, n), 1, "SoA built");
+    return 0;
+}
+
+# A buffer of n particles `FluidParticle::new(position, mass)`.
+fn particles(n, x: f64, y: f64, z: f64, m: f64): i64 {
+    var buf = fl_alloc(n * sizeof(PvFluidParticle) + 8);
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    for (var i = 0; i < n; i = i + 1) {
+        var p: PvFluidParticle = PvFluidParticle_new(PvVec3_new(x, y, z), m);
+        memcpy(ps + i, &p, sizeof(PvFluidParticle));
+    }
+    return buf;
+}
+
+# The first block of Rust tests: packing and unpacking, the parameters, the operations.
+fn test_packing() {
+    test_group("test_packed_particles_roundtrip");
+    var pb = particles(2, 1.0, 2.0, 3.0, 0.5);
+    var ps: *PvFluidParticle = _pv_as_particles(pb);
+    var p1: *PvFluidParticle = ps + 1;
+    p1.position = PvVec3_new(4.0, 5.0, 6.0);
+    p1.mass = 0.25;
+    var soa: PvParticleSoa;
+    soa_of(&soa, ps, 2);
+    var pk: PvPackedParticles;
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var a0: f64 = pk.position_mass.at(0);
+    var a1: f64 = pk.position_mass.at(1);
+    var a2: f64 = pk.position_mass.at(2);
+    var a3: f64 = pk.position_mass.at(3);
+    var a4: f64 = pk.position_mass.at(4);
+    var e = 0.000001;
+    assert_eq(pk.count, 2, "two particles");
+    assert(near(a0, 1.0, e) == 1 && near(a1, 2.0, e) == 1 && near(a2, 3.0, e) == 1, "the first position");
+    assert(near(a3, 0.5, e) == 1 && near(a4, 4.0, e) == 1, "its mass, and the second's x");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(pb);
+
+    test_group("test_packed_unpack_density");
+    var qb = particles(1, 0.0, 0.0, 0.0, 1.0);
+    soa_of(&soa, _pv_as_particles(qb), 1);
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    pk.density_pressure.set(0, 1000.0);
+    pk.density_pressure.set(1, 500.0);
+    pk.unpack_density_pressure(&soa);
+    var d0: f64 = soa.density.at(0);
+    var p0: f64 = soa.pressure.at(0);
+    assert(near(d0, 1000.0, 0.001) == 1 && near(p0, 500.0, 0.001) == 1, "density and pressure written back");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+
+    test_group("test_packed_unpack_velocity");
+    soa_of(&soa, _pv_as_particles(qb), 1);
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    pk.velocity.set(0, 1.5);
+    pk.velocity.set(1, 2.5);
+    pk.velocity.set(2, 3.5);
+    pk.unpack_velocity(&soa);
+    var v0: f64 = soa.vel_x.at(0);
+    var v1: f64 = soa.vel_y.at(0);
+    var v2: f64 = soa.vel_z.at(0);
+    assert(near(v0, 1.5, 0.001) == 1 && near(v1, 2.5, 0.001) == 1 && near(v2, 3.5, 0.001) == 1, "velocity back");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(qb);
+
+    test_group("test_packed_empty");
+    var empty: PvParticleSoa = PvParticleSoa_new();
+    assert_eq(PvPackedParticles_from_soa(&empty, &pk), 1, "packed");
+    assert(pk.count == 0 && pk.position_mass.len == 0, "nothing packed");
+    PvPackedParticles_drop(&pk);
+
+    test_group("test_sph_kernel_params");
+    var sp: PvSphKernelParams = PvSphKernelParams_default();
+    sp.smoothing_radius = 0.05;
+    sp.rest_density = 1000.0;
+    sp.gas_constant = 2000.0;
+    sp.viscosity = 0.001;
+    sp.gravity_y = -9.81;
+    sp.dt = 0.001;
+    sp.particle_count = 100;
+    var dtw: f64 = f32_to(sp.dt);
+    assert(dtw > 0.0 && sp.particle_count == 100, "set fields read back");
+
+    test_group("test_compute_op_variants");
+    assert(PV_COMPUTE_OP_SPH_DENSITY != PV_COMPUTE_OP_SPH_STEP, "SphDensity ≠ SphStep");
+    assert(PV_COMPUTE_OP_GRID_ADVECT != PV_COMPUTE_OP_SHALLOW_STEP, "GridAdvect ≠ ShallowStep");
+    return 0;
+}
+
+# The audit's regressions (1.3.0), in Rust's order.
+fn test_regressions() {
+    test_group("test_unpack_short_buffers_no_panic");
+    var pb = particles(4, 0.0, 0.0, 0.0, 1.0);
+    var soa: PvParticleSoa;
+    soa_of(&soa, _pv_as_particles(pb), 4);
+    var pk: PvPackedParticles;
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    pk.density_pressure.truncate(3);
+    pk.velocity.truncate(5);
+    pk.position_mass.truncate(0);
+    pk.unpack_density_pressure(&soa);
+    pk.unpack_velocity(&soa);
+    pk.unpack_positions(&soa);
+    assert(soa.density.len == 4, "short buffers: no panic");
+    PvPackedParticles_drop(&pk);
+
+    test_group("test_from_soa_mismatched_lengths");
+    soa.pressure.truncate(1);
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    assert_eq(pk.count, 1, "only the complete particles");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(pb);
+
+    test_group("test_kernel_params_default_constructible");
+    var p: PvSphKernelParams = PvSphKernelParams_default();
+    p.smoothing_radius = 0.05;
+    var sr: f64 = f32_to(p.smoothing_radius);
+    var f32eps: f64 = 0.00000011920928955078125;
+    assert(near(sr, 0.05, f32eps) == 1, "a default with one field set");
+    var g: PvGridKernelParams = PvGridKernelParams_default();
+    var s: PvShallowKernelParams = PvShallowKernelParams_default();
+    assert(g.nx == 0 && s.ny == 0, "both other defaults");
+
+    test_group("test_dtait_drho_gamma_zero_finite");
+    var d: f64 = PvKernelDerivatives_dtait_drho(1000.0, 1000.0, 10.0, 0.0);
+    var d7: f64 = PvKernelDerivatives_dtait_drho(1000.0, 1000.0, 10.0, 7.0);
+    assert(_pv_is_finite(d) == 1 && near(d7, 100.0, 0.000000001) == 1, "γ = 0 finite, γ = 7 at rest c²");
+
+    test_group("test_dpoly6_zero_radius");
+    var z: f64 = PvKernelDerivatives_dpoly6_dr2(0.0, 0.0);
+    assert(z == 0.0, "h = 0: 0");
+    return 0;
+}
+
+# A backend for the tests: it counts its calls and writes density 1 for every particle.
+struct MockBackend {
+    calls;
+}
+
+impl PvComputeBackend for MockBackend {
+    # The SPH operations only.
+    fn supports(self, op): i64 {
+        if (op == PV_COMPUTE_OP_SPH_DENSITY || op == PV_COMPUTE_OP_SPH_STEP) { return 1; }
+        return 0;
+    }
+
+    # Density 1 everywhere.
+    fn sph_density(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        self.calls = self.calls + 1;
+        for (var i = 0; i < particles.count; i = i + 1) { particles.density_pressure.set(2 * i, 1.0); }
+        return PV_ERR_NONE;
+    }
+
+    # Not implemented: an error code.
+    fn sph_step(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        return PV_ERR_INVALID_PARAMETER;
+    }
+
+    # Copies src to dst.
+    fn grid_advect(self, dst, src, vx, vy, n, params: *PvGridKernelParams): i64 {
+        memcpy(dst, src, n * 4);
+        return PV_ERR_NONE;
+    }
+
+    # Nothing.
+    fn shallow_step(self, height, vx, vy, ground, n, params: *PvShallowKernelParams): i64 {
+        return PV_ERR_NONE;
+    }
+}
+
+# Runs the density through any backend.
+fn run_density(b: dyn PvComputeBackend, pk: *PvPackedParticles, p: *PvSphKernelParams): i64 {
+    if (b.supports(PV_COMPUTE_OP_SPH_DENSITY) == 0) { return 0 - 1; }
+    return b.sph_density(pk, p);
+}
+
+# Cyrius-only: the layouts, f32 rounding, and a backend through `dyn`.
+fn test_cyrius() {
+    test_group("compute_layouts");
+    assert_eq(sizeof(PvF32Column), 24, "a buffer is 24 bytes");
+    assert_eq(sizeof(PvPackedParticles), 80, "the packed record is 80 bytes");
+    assert(sizeof(PvSphKernelParams) == 36 && sizeof(PvGridKernelParams) == 28, "the parameter records, packed");
+    assert_eq(sizeof(PvShallowKernelParams), 28, "and the shallow-water one");
+    var pk: PvPackedParticles;
+    var c1: *PvF32Column = _pv_packed_col(&pk, 1);
+    assert_eq(_pv_addr(c1), _pv_addr(&pk) + 32, "buffer 1 (velocity) at byte 32");
+
+    test_group("compute_f32_rounding");
+    var pb = particles(1, 0.1, 16777217.0, -0.0, 0.3);
+    var soa: PvParticleSoa;
+    soa_of(&soa, _pv_as_particles(pb), 1);
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var x: f64 = pk.position_mass.at(0);
+    var y: f64 = pk.position_mass.at(1);
+    var zb = load32(pk.position_mass.data + 8);
+    var pad: f64 = pk.velocity.at(3);
+    assert(x == 0.10000000149011612 && y == 16777216.0, "nearest f32, ties to even");
+    assert(zb == 0x80000000 && pad == 0.0 && load32(pk.velocity.data + 12) == 0, "−0 kept, the padding +0");
+    PvPackedParticles_drop(&pk);
+
+    test_group("compute_op_names");
+    var on0 = streq(compute_op_name(PV_COMPUTE_OP_SPH_DENSITY), "SphDensity");
+    var on1 = streq(compute_op_name(PV_COMPUTE_OP_SPH_STEP), "SphStep");
+    var on2 = streq(compute_op_name(PV_COMPUTE_OP_GRID_ADVECT), "GridAdvect");
+    var on3 = streq(compute_op_name(PV_COMPUTE_OP_SHALLOW_STEP), "ShallowStep");
+    assert(on0 == 1 && on1 == 1, "the SPH operations by their Rust names");
+    assert(on2 == 1 && on3 == 1, "the grid and shallow-water operations");
+    var unk = streq(compute_op_name(4), "Unknown");
+    assert(PV_COMPUTE_OP_SPH_DENSITY == 0 && PV_COMPUTE_OP_SHALLOW_STEP == 3 && unk == 1,
+      "explicit values 0 … 3, and a value past them unknown");
+
+    test_group("compute_backend_through_dyn");
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var mb: MockBackend;
+    mb.calls = 0;
+    var params: PvSphKernelParams = PvSphKernelParams_default();
+    var rc = run_density(&mb, &pk, &params);
+    var d: f64 = pk.density_pressure.at(0);
+    assert(rc == PV_ERR_NONE && mb.calls == 1 && d == 1.0, "the backend wrote the density");
+    assert(mb.sph_step(&pk, &params) == PV_ERR_INVALID_PARAMETER, "an error is a code");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(pb);
+    return 0;
+}
+
+# f(x) = x0·x1 + sin(x2): the gradient is (x1, x0, cos x2).
+fn ad_f1(t, vars, n): i64 {
+    var a = ad_mul(t, load64(vars), load64(vars + 8));
+    var s = ad_sin(t, load64(vars + 16));
+    return ad_add(t, a, s);
+}
+
+# f(x) = x0 + Σ_{k<200} ((x0·x1 − x1·x0) + x0): 1,000 operations from a 64-node first tape, so the tape grows; the
+# gradient is (201, 0).
+fn ad_long(t, vars, n): i64 {
+    var x0 = load64(vars);
+    var x1 = load64(vars + 8);
+    var acc = x0;
+    for (var k = 0; k < 200; k = k + 1) {
+        var a = ad_mul(t, x0, x1);
+        var b = ad_mul(t, x1, x0);
+        var c = ad_sub(t, a, b);
+        acc = ad_add(t, acc, ad_add(t, c, x0));
+    }
+    return acc;
+}
+
+# Cyrius-only: the autodiff gradient, and the analytical derivatives against finite differences (class R).
+fn test_derivatives() {
+    test_group("autodiff_matches_analytical_gradients");
+    var x[24];
+    store64(&x, _pv_bits(1.5));
+    store64(&x + 8, _pv_bits(-0.5));
+    store64(&x + 16, _pv_bits(0.7));
+    var gp, gn = PvKernelDerivatives_autodiff_gradient(&ad_f1, &x, 3);
+    var g0: f64 = load64(gp);
+    var g1: f64 = load64(gp + 8);
+    var g2: f64 = load64(gp + 16);
+    var c2: f64 = _pv_cos(0.7);
+    var tol = 0.000000000001;
+    var ok01 = near(g0, -0.5, tol) & near(g1, 1.5, tol);
+    assert(gn == 3 && ok01 == 1 && near(g2, c2, tol) == 1, "(x1, x0, cos x2)");
+    fl_free(gp);
+    var lp, ln = PvKernelDerivatives_autodiff_gradient(&ad_long, &x, 2);
+    var l0: f64 = load64(lp);
+    var l1: f64 = load64(lp + 8);
+    assert(ln == 2 && l0 == 201.0 && l1 == 0.0, "a 1,000-node function grows the tape: (201, 0)");
+    fl_free(lp);
+    var used = alloc_used();
+    for (var k = 0; k < 50; k = k + 1) {
+        var rp, rn = PvKernelDerivatives_autodiff_gradient(&ad_f1, &x, 3);
+        fl_free(rp);
+    }
+    assert_eq(alloc_used() - used, 0, "50 more gradients on the kept tape take no heap");
+    var zp, zn = PvKernelDerivatives_autodiff_gradient(&ad_f1, &x, 0);
+    assert(zp == 0 && zn == 0, "no inputs: nothing");
+
+    test_group("derivatives_against_finite_differences");
+    var ok = 1;
+    var hs[24];
+    store64(&hs, _pv_bits(0.05));
+    store64(&hs + 8, _pv_bits(1.0));
+    store64(&hs + 16, _pv_bits(0.3));
+    for (var hi = 0; hi < 3; hi = hi + 1) {
+        var h: f64 = load64(&hs + hi * 8);
+        for (var k2 = 1; k2 < 10; k2 = k2 + 1) {
+            var fk: f64 = f64_from(k2);
+            var r: f64 = fk * 0.1 * h;
+            var r2: f64 = r * r;
+            var e: f64 = 0.000001 * h * h;
+            var wp: f64 = kernel_poly6(f64_sqrt(r2 + e), h);
+            var wm: f64 = kernel_poly6(f64_sqrt(r2 - e), h);
+            var fd: f64 = (wp - wm) / (2.0 * e);
+            var an: f64 = PvKernelDerivatives_dpoly6_dr2(r2, h);
+            var rel: f64 = f64_abs(fd - an) / f64_abs(an);
+            if (rel > 0.00001) { ok = 0; }
+            var eps: f64 = 0.000001 * h;
+            var cp: f64 = kernel_wendland_c2(r + eps, h);
+            var cm: f64 = kernel_wendland_c2(r - eps, h);
+            var fw: f64 = (cp - cm) / (2.0 * eps);
+            var aw: f64 = PvKernelDerivatives_dwendland_c2_dr(r, h);
+            var relw: f64 = f64_abs(fw - aw) / f64_abs(aw);
+            if (relw > 0.00001) { ok = 0; }
+        }
+    }
+    for (var k3 = 1; k3 < 8; k3 = k3 + 1) {
+        var fk3: f64 = f64_from(k3);
+        var rho: f64 = 900.0 + fk3 * 30.0;
+        var de: f64 = 0.001;
+        var pp: f64 = equation_of_state_tait(rho + de, 1000.0, 10.0, 7.0);
+        var pm: f64 = equation_of_state_tait(rho - de, 1000.0, 10.0, 7.0);
+        var ft: f64 = (pp - pm) / (2.0 * de);
+        var at: f64 = PvKernelDerivatives_dtait_drho(rho, 1000.0, 10.0, 7.0);
+        var relt: f64 = f64_abs(ft - at) / f64_abs(at);
+        if (relt > 0.000001) { ok = 0; }
+    }
+    assert_eq(ok, 1, "poly6, Wendland C2 and Tait derivatives agree with central differences");
+    var kd: f64 = PvKernelDerivatives_deos_drho(2000.0);
+    assert(kd == 2000.0, "the linear EOS: k");
+    return 0;
+}
+
+# 2^k, exactly (repeated doubling or halving).
+fn pow2(k): f64 {
+    var x: f64 = 1.0;
+    for (var i = 0; i < k; i = i + 1) { x = x * 2.0; }
+    for (var j = 0; j > k; j = j - 1) { x = x * 0.5; }
+    return x;
+}
+
+# The sign the exact decimal comparison gives for the C string s against x.
+fn dcmp(s, x: f64): i64 {
+    return _pv_dec_cmp(s, strlen(s), x);
+}
+
+# The widened f32 the stand-in rounds x to, given the sign c: its bits, or -1 for ±∞.
+fn r32(x: f64, c): i64 {
+    var t, b = _pv_f32_round(x, c);
+    if (t == 0) { return 0 - 1; }
+    return b;
+}
+
+# The f32 reads' stand-in (ledger L15): the tie test, the rounding with a sign, the exact decimal comparison, the
+# integers, and the number text found by document position.
+fn test_f32_reads() {
+    test_group("compute_f32_reads");
+    var one: f64 = 1.0;
+    var u24: f64 = pow2(0 - 24);
+    var u23: f64 = pow2(0 - 23);
+    var m1: f64 = one + u24;
+    var up1: f64 = one + u23;
+    var t3: f64 = 3.0 * u24;
+    var m3: f64 = one + t3;
+    var s1: f64 = pow2(0 - 150);
+    var s3: f64 = 3.0 * s1;
+    var s0: f64 = pow2(0 - 151);
+    var p128: f64 = pow2(128);
+    var p103: f64 = pow2(103);
+    var big: f64 = p128 - p103;
+    var fmax: f64 = 340282346638528859811704183484516925440.0;
+    assert(_pv_f32_is_tie(m1) == 1 && _pv_f32_is_tie(m3) == 1, "1 + 2^-24 and 1 + 3·2^-24 are midpoints");
+    assert(_pv_f32_is_tie(one) == 0 && _pv_f32_is_tie(up1) == 0, "f32 values are not");
+    assert(_pv_f32_is_tie(s1) == 1 && _pv_f32_is_tie(s3) == 1 && _pv_f32_is_tie(s0) == 0, "the subnormal midpoints");
+    assert(_pv_f32_is_tie(big) == 1 && _pv_f32_is_tie(fmax) == 0, "2^128 − 2^103 is the overflow midpoint");
+    var e39: f64 = 1000000000000000000000000000000000000000.0;
+    var zero: f64 = 0.0;
+    assert(_pv_f32_is_tie(e39) == 0 && _pv_f32_is_tie(zero) == 0, "nor are 1e39 and 0");
+
+    assert(r32(m1, 0) == _pv_bits(one) && r32(m1, 1) == _pv_bits(up1) && r32(m1, 0 - 1) == _pv_bits(one),
+      "a tie: even, or the side the decimal lies on");
+    var up3: f64 = one + pow2(0 - 22);
+    assert(r32(m3, 0) == _pv_bits(up3) && r32(m3, 0 - 1) == _pv_bits(up1), "1 + 3·2^-24: up to even, or down");
+    var nm1: f64 = -m1;
+    var nup1: f64 = -up1;
+    assert(r32(nm1, 1) == _pv_bits(nup1), "a negative tie moves away from 0 when the decimal is larger");
+    assert(r32(big, 0 - 1) == _pv_bits(fmax) && r32(big, 0) == 0 - 1 && r32(big, 1) == 0 - 1,
+      "the overflow midpoint: f32::MAX just below it, ±∞ (refused) at and above");
+    assert(r32(e39, 0) == 0 - 1 && r32(fmax, 0) == _pv_bits(fmax), "past the range ±∞; f32::MAX itself");
+    var nz: f64 = -0.0;
+    assert(r32(nz, 0) == _pv_bits(nz), "−0 keeps its sign");
+    var p149: f64 = pow2(0 - 149);
+    assert(r32(s1, 1) == _pv_bits(p149) && r32(s1, 0) == 0 && r32(s1, 0 - 1) == 0, "2^-150: 2^-149 above, else 0");
+
+    assert(dcmp("1.000000059604644775390625", m1) == 0, "the midpoint's exact digits");
+    assert(dcmp("1.0000000596046448", m1) == 1 && dcmp("1.0000000596046447", m1) == 0 - 1,
+      "its shortest f64 digits lie above it, the next below");
+    assert(dcmp("1000000059604644775390625e-24", m1) == 0 && dcmp("100000005960464477539062.5E-23", m1) == 0,
+      "an integer mantissa and an exponent");
+    assert(dcmp("1.0000000596046447753906250000", m1) == 0 && dcmp("-1.000000059604644775390625", m1) == 0,
+      "trailing zeros, and the sign ignored");
+    var sbs = str_builder_new();
+    str_builder_add_cstr(sbs, "0.");
+    for (var zz = 0; zz < 45; zz = zz + 1) { str_builder_add_cstr(sbs, "0"); }
+    str_builder_add_cstr(sbs, "70064923216240853546186479164495806564013097093825");
+    str_builder_add_cstr(sbs, "788587853414194489554134293030074331909418106079101562500");
+    var ds1 = str_builder_build(sbs);
+    assert(_pv_dec_cmp(str_data(ds1), str_len(ds1), s1) == 0, "2^-150's 105 significant digits");
+    assert(dcmp("7.006492321624086e-46", s1) == 1 && dcmp("7.006492321624085e-46", s1) == 0 - 1, "and beside it");
+    assert(dcmp("16777217", 16777216.0) == 1 && dcmp("0.5", 0.5) == 0 && dcmp("5e-1", 0.5) == 0, "integers, halves");
+    var m25: f64 = 33554450.0;
+    assert(_pv_f32_is_tie(m25) == 1 && dcmp("33554450.0", m25) == 0 && dcmp("3355445e1", m25) == 0,
+      "a midpoint with a trailing zero (A scaled by 10^e)");
+    var m25b: f64 = 33554470.0;
+    var up25: f64 = 33554472.0;
+    var d70 = "33554470.0";
+    var e70 = _pv_dec_cmp(d70, strlen(d70), m25b);
+    assert(e70 == 0 && r32(m25b, e70) == _pv_bits(up25), "33554470: a tie whose even neighbour is above");
+    var b25a = dcmp("33554450.000000001", m25);
+    var b25b = dcmp("33554449.999999999", m25);
+    assert(b25a == 1 && b25b == 0 - 1 && dcmp("33554460", m25) == 1, "and beside it");
+    assert(dcmp("1e500", one) == 1 && dcmp("1e-500", one) == 0 - 1, "decided by order");
+    assert(dcmp("0", one) == 0 - 1 && dcmp("-0.0e7", one) == 0 - 1, "and zero below any nonzero");
+    var tiny: f64 = pow2(0 - 1074);
+    assert(dcmp("5e-324", tiny) == 1 && dcmp("4.9e-324", tiny) == 0 - 1, "the smallest subnormal");
+    # 900 zeros past the midpoint's digits, then a 1: past the kept 800, a nonzero digit still counts.
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "1.000000059604644775390625");
+    for (var z = 0; z < 900; z = z + 1) { str_builder_add_cstr(sb, "0"); }
+    var ld0 = str_builder_build(sb);
+    var n0 = str_len(ld0);
+    assert(_pv_dec_cmp(str_data(ld0), n0, m1) == 0, "900 trailing zeros: still the midpoint");
+    str_builder_add_cstr(sb, "1");
+    var ld1 = str_builder_build(sb);
+    assert(_pv_dec_cmp(str_data(ld1), str_len(ld1), m1) == 1, "then a 1 past the kept digits: above it");
+
+    var a60: f64 = pow2(60);
+    var a37: f64 = pow2(37);
+    var w60: f64 = a60 + a37;
+    var nw60: f64 = -w60;
+    var p63: f64 = pow2(63);
+    var np63: f64 = -p63;
+    assert(_pv_f32_of_int(1152921573326323713) == _pv_bits(w60), "2^60 + 2^36 + 1: up, once (its f64 is the tie)");
+    var i60 = _pv_f32_of_int(1152921573326323712);
+    var n60 = _pv_f32_of_int(0 - 1152921573326323713);
+    assert(i60 == _pv_bits(a60) && n60 == _pv_bits(nw60), "the tie itself to even; the negative mirror");
+    var imax = _pv_f32_of_int(9223372036854775807);
+    var imin = _pv_f32_of_int(0 - 9223372036854775807 - 1);
+    assert(imax == _pv_bits(p63) && imin == _pv_bits(np63), "i64::MAX and i64::MIN");
+    assert(_pv_f32_of_int(16777217) == _pv_bits(16777216.0) && _pv_f32_of_int(16777219) == _pv_bits(16777220.0),
+      "past 2^24, ties to even");
+
+    var doc = "{\"a\":\"x\\\"1,2\",\"b\":[3,-4.5e1,{\"9\":\"]9\"}],\"d\":7}";
+    var v = _pv_jr_parse(doc, strlen(doc));
+    assert(v != 0, "the document parses");
+    var arr = bayan_json_v_obj_get_by_cstr(v, "b");
+    var tp, tn = _pv_jr_num_text(bayan_json_v_arr_get(arr, 1));
+    assert(tn == 6 && memeq(tp, "-4.5e1", 6) == 1, "a number found past a string with an escaped quote and digits");
+    var dp, dn = _pv_jr_num_text(bayan_json_v_obj_get_by_cstr(v, "d"));
+    assert(dn == 1 && load8(dp) == 55, "and after a nested object whose key and value hold digits");
+    var np, nn = _pv_jr_num_text(arr);
+    assert(np == 0 && nn == 0, "an array is no number");
+
+    var sp: PvSphKernelParams;
+    var sbd = str_builder_new();
+    str_builder_add_cstr(sbd, "{\"9e9\":\"1.0000000596046448\",\"smoothing_radius\":1.0000000596046448,");
+    str_builder_add_cstr(sbd, "\"rest_density\":0,\"gas_constant\":0,\"viscosity\":0,");
+    str_builder_add_cstr(sbd, "\"gravity\":[1.0000000596046447,0,-1.0000000596046448],");
+    str_builder_add_cstr(sbd, "\"dt\":1.0000000596046447,\"particle_count\":0}");
+    var d2s = str_builder_build(sbd);
+    var rt, rv = PvSphKernelParams_from_json(str_data(d2s), str_len(d2s), &sp);
+    var h: f64 = f32_to(sp.smoothing_radius);
+    var gx: f64 = f32_to(sp.gravity_x);
+    var gz: f64 = f32_to(sp.gravity_z);
+    var dt: f64 = f32_to(sp.dt);
+    assert(is_err_result(rt) == 0 && h == up1 && gx == one && gz == nup1 && dt == one,
+      "each field rounded from its own text: one f64, three f32s");
+    var d3 = "[1,1,1,1,[0,0,0],340282356779733661637539395458142568448.0,1]";
+    var et, ev = PvSphKernelParams_from_json(d3, strlen(d3), &sp);
+    assert(is_err_result(et) == 1, "the overflow midpoint itself is refused (serde_json: out of range)");
+    return 0;
+}
+
+# Runs the ported compute tests.
+fn main() {
+    alloc_init();
+    test_packing();
+    test_regressions();
+    test_cyrius();
+    test_derivatives();
+    test_f32_reads();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);
