@@ -34,6 +34,7 @@ mod m_common;
 mod m_compute;
 mod m_constants;
 mod m_coupling;
+mod m_debug;
 mod m_grid;
 mod m_grid_c;
 mod m_json;
@@ -68,6 +69,7 @@ fn golden_modules(root: &Path) -> Result<Vec<tsv::Module>, String> {
         m_compute::emit(),
         m_constants::emit(root)?,
         m_coupling::emit(),
+        m_debug::emit(),
         m_grid::emit(),
         m_json::emit(),
         m_logging::emit(),

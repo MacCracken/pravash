@@ -2352,3 +2352,57 @@ added for the shallow-water example, which needed the private `_pv_bits` without
 **Not yet scheduled.** `tests/pravash.fcyr` is still the scaffold's stub, whose comment promised the port's targets
 at M8. The Rust crate had no fuzz targets, and the plan never scheduled any. It is listed for part e: targets for the
 JSON readers and the `PRAVASH_LOG` parser, the inputs a consumer doesn't control.
+
+## 31. M8 part d: Rust's derived Debug (2026-11-13)
+
+**The scope.** Rust 1.3.0 derives `Debug` on 36 public types. The maintainer chose to port it (part c's question),
+after the language check: Cyrius's derives are Serialize, Deserialize, accessors, json and cyml, so the derive's
+code is written by hand, and the stdlib has no shortest round-trip printer. Both are requested at cyrius (ledger
+L16). 35 types are ported. `PravashError`'s Debug prints its variants' fields, which a 2.0 code doesn't hold
+(ADR 0002 #1), so it has an exception in the surface diff, and `pv_error_name(code)` gives the variant's name.
+
+**The printer** (`src/fmtf.cyr`) is impetus's Burger & Dybvig free-format search on a 40-limb bignum, with three
+changes: the tie always goes up (core's rule), the f32 case (the hidden bit, the least exponent and the thresholds
+as an f32's), and every write returning 0 or -1 instead of the stdlib builders that exit. The rows pin it over
+6,871 f64 and 2,565 f32 values. They cover:
+- the specials and the subnormal edges;
+- every power of ten that parses, and both its neighbours;
+- eight steps of the last bit either side of 1e-4 and of 1e16;
+- every power of two, with a binade's largest value every fifth;
+- seeded bits, short decimals and integers.
+
+Every one matched on its first replay.
+
+**The builders** (`src/debug.cyr`) take the depth of the line each value starts on, so a nested value's lines are
+indented as core's `PadAdapter` indents them. The 156 type rows load each value's full state, the private scratch
+from the oracle's dumps. The 10 `debug_after` rows load a state, run the port's own steps (shallow water;
+the grid on Gauss–Seidel, CG, multigrid and BFECC; k-ε; MAC; VOF; the phase field), and compare the text after them.
+They passed on the first run. So the port's steps leave Rust's scratch bit for bit, which the step rows had only
+checked by length.
+
+**One defect, before it landed.** The first draft sized its word buffers in entries: `var conf[3]` holds 3 bytes,
+so three `store64`s overran the frame. The compact form came out right, the pretty form printed compact separators
+inside nested values (the caller's `alternate` was overwritten), and the full replay hung. The buffers are sized in
+bytes now (24, 32, 16). CLAUDE.md states the rule; it was missed here because the compact rows passed.
+
+**validate.py** recomputes every row with its own Burger & Dybvig search on Python's integers (the k found by exact
+comparison, not estimated). Each result is read back by Python's parser, and the value tree is rendered as core's
+builders do. The after-step states come from the oracle, so for those rows it parses Rust's compact text into a tree
+instead, checks that every float in it is the printer's text for its own value, and renders both forms again.
+
+**Mutations of the printer and builders** (the debug module replayed alone): 14 of 15 caught:
+- the tie to even, 1e-4 exponential, 1e16 positional, the f32 thresholds compared as f64;
+- the interval's ends never reading back, NaN keeping its sign, an integer without `.0`;
+- a pretty close one level deep, an empty pretty list opened on a line;
+- two fields swapped, a scratch buffer left out, an f32 printed as its f64, glam's tuple named `Vec3`, a bool as
+  `1`.
+
+The 15th makes the interval of the one value per format with f the hidden bit at the least exponent
+(`MIN_POSITIVE`) asymmetric. Both rows print the same digits either way, so no input tells the two apart: an
+equivalent mutant.
+
+**The oracle's toolchain.** `rust-old/rust-toolchain.toml` says `stable`, and stable moved from rustc 1.99.1, the
+oracle's, to 1.100.0 (2026-11-09, Unicode 18.0.0). A generator rebuilt on 1.100 rewrites `src/str_debug_data.cyr`:
+916 ranges of `\u{…}` escapes for 1.99.1's 910. No golden row changes, `debug.tsv` included (float printing is the
+same in both), but `--check` fails on the table. Every run here used `cargo +1.99.1`. A pin outside `rust-old/`, which
+stays unedited, is a decision for part e.

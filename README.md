@@ -9,8 +9,8 @@
 
 pravash **2.0** is a Cyrius library: a parity port of the Rust crate **1.3.0**, which stays frozen in
 [`rust-old/`](rust-old/) as the reference implementation. It is checked against Rust value by value:
-- **58,405 golden rows** in 17 modules replay Rust's own results on x86_64 Linux, x86_64 Windows (PE) and aarch64,
-  with the same output bits on all three. 57,674 match Rust within their tolerance class. 728 are accepted under an
+- **68,007 golden rows** in 18 modules replay Rust's own results on x86_64 Linux, x86_64 Windows (PE) and aarch64,
+  with the same output bits on all three. 67,276 match Rust within their tolerance class. 728 are accepted under an
   ADR instead: 597 that the f64 neighbour keys change, checked against an independent f64 transcription (ADR 0002
   #2), and 131 where glibc misrounds and the port gives the correctly rounded value
   ([ADR 0004](docs/adr/0004-correct-rounding-is-the-accuracy-target.md)). 3 wait on bayan's JSON policies. Every
@@ -19,8 +19,8 @@ pravash **2.0** is a Cyrius library: a parity port of the Rust crate **1.3.0**, 
   [Rust-test ledger](docs/development/rust-test-ledger.md): 391 ported, and the 14 tests of the oracle hooks not
   applicable.
 - **The surface:** every public Rust item has its Cyrius counterpart, and every public Cyrius name maps back to a
-  Rust item or a recorded reason (`scripts/surface_parity.py`). Rust's derived `Debug` on 36 types is the one gap,
-  and it is the next part of the release.
+  Rust item or a recorded reason (`scripts/surface_parity.py`), and each of Rust's 157 derives (the serde pair,
+  Default, Clone, PartialEq, Debug) has its counterpart.
 
 2.0 changes the API in deliberate places ([ADR 0002](docs/adr/0002-port-api-divergences.md)). Moving from the
 Rust crate: [the migration guide](docs/guides/migration-2.0.md). The [port plan](docs/development/pravash-port-plan.md)
@@ -49,6 +49,8 @@ records the decisions, and [`state.md`](docs/development/state.md) the current s
   transcendental a step calls is pravash's own and correctly rounded.
 - **Threads:** a runtime count per solver, `set_threads(n)`, on a persistent pool, in place of the `parallel` feature.
 - **JSON:** the 22 types Rust serializes read and write serde_json's documents.
+- **Debug:** `x.debug(sb, alternate)` writes Rust's `{:?}` and `{:#?}` text for every type that derives it, the float
+  digits included.
 - **No aborts:** every fallible call returns a `Result` with a `PV_ERR_*` code, or a neutral value where Rust would
   panic.
 
@@ -122,8 +124,6 @@ is derived from the oracle.
   near a cell boundary they can order a particle's neighbours differently. The sums then differ in their last bits,
   and a fast or chaotic scene grows that into different numbers: the SPH examples agree with Rust at frame 0 and not
   at frame 10 ([migration guide #7](docs/guides/migration-2.0.md#7-sph-neighbours-use-f64-keys)).
-- **`Debug` text** exists for the ai configs only. The other 36 types' `{:?}` and `{:#?}` are the next part of the
-  release.
 - **Speed:** the median benchmark takes 4.4× Rust 1.3.0's time, from 0.76× (the small SPH solver steps and the DST
   grid steps are level or faster) to 37× (`create_particle_block`, on the freelist's large blocks). At 8 threads the
   SPH step gains 2.2–3.2×, where Rust's rayon gains 1.05–1.95× ([the record](docs/benchmarks-rust-v-cyrius.md)).

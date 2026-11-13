@@ -30,8 +30,58 @@
   - **Logging** goes through sakshi, whose default prints pravash's warnings to stderr, where Rust with no subscriber
     printed nothing (#28).
   - **The ai configs** hold their strings as bytes and are set by methods (#27).
-  - **Not carried:** the `oracle` feature and `PravashError`'s detail strings. `Debug` exists so far only for the ai
-    configs; the other 36 types are M8 part d.
+  - **Debug** is `x.debug(sb, alternate)` onto a `str_builder`, Rust's `{:?}` (0) and `{:#?}` (1) text; an enum's is
+    `<snake>_debug(k, sb, alternate)` (#29).
+  - **Not carried:** the `oracle` feature, and `PravashError`'s detail strings and with them its `Debug` text.
+
+### Added (Cyrius)
+- **Rust's derived `Debug` on the 35 public types** (M8 part d; ADR 0002 #29): `x.debug(sb, alternate)` on each
+  struct, `<snake>_debug` for each enum, `drag_coefficient_debug` for the unit struct. Each prints Rust's fields in
+  Rust's order, the private scratch included, as core's builders write them.
+  - **`src/fmtf.cyr`**, Rust's float text: impetus's Burger & Dybvig printer, with the f32 case added and every write
+    returning 0 or -1. It gives the shortest digits that read back, the closest of them, and on a tie the upper one;
+    the form is positional with a fractional digit, or exponential below 1e-4 and from 1e16.
+  - **`src/debug.cyr`**, the derive's builders: a struct, a tuple (glam's `DVec3`), a list, and the pretty form's
+    indentation at any depth.
+  - **A new golden module, `debug.tsv`**: 9,602 rows, class A, every one matching on the first replay after one fix
+    (below). It holds 6,871 f64 and 2,565 f32 printings (the specials, every power of ten and of two with their
+    neighbours, eight steps either side of both thresholds, seeded sweeps), 156 values of the 35 types (the scratch
+    from the oracle's dumps), and 10 states after their own steps.
+  - **The after-step rows** check the port's private state: after its own shallow-water, grid (Gauss–Seidel, CG,
+    multigrid, BFECC), k-ε, MAC, VOF and phase-field steps, the scratch holds Rust's bits.
+  - **`validate.py`** recomputes all 9,602 rows in Python. The after-step states come from the oracle, so for those
+    rows it parses Rust's text and renders both forms again.
+  - **Tests:** `debug_unknown_kinds` (a kind word outside its enum prints `Unknown`, in both forms and nested) and
+    `debug_appends`, 3 more checks in `tests/common.tcyr`.
+  - **Mutations:** 14 of 15 are caught: the tie rule, both thresholds and the f32 thresholds, NaN's sign, the `.0`,
+    the interval ends, the pretty indentation, a swapped field, a scratch buffer left out, an f32 printed as its f64,
+    glam's tuple name, a bool's text. The 15th leaves `MIN_POSITIVE`'s interval symmetric, and both formats' rows
+    print the same digits either way, so it is an equivalent mutant.
+  - **Upstream:** `#derive(Debug)` and a shortest round-trip printer requested at cyrius, with these numbers
+    (ledger L16).
+
+### Fixed (Cyrius)
+- **A stack overrun in the first draft of the Debug code**, caught before it landed: `var conf[3]` holds 3 bytes,
+  not 3 words. The `store64` writes into it corrupted the caller's frame, so the pretty form printed the compact
+  separators, and the full replay hung. The buffers are sized in bytes now.
+
+### Changed (Cyrius)
+- **The surface diff** matches all 157 Rust derives, with 0 pending. An enum's Debug is `<snake>_debug`; the unit
+  struct's is renamed; `PravashError`'s is an exception, since a code holds no payload. 501 public Cyrius names: 386
+  Rust items and 115 Cyrius-only by 18 rules.
+
+### Performance
+- **Debug text against Rust** (`debug_d/*`, a twin on the frozen oracle, two rounds pinned to core 15, interleaved):
+
+  | Row | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+  |---|---|---|---|
+  | `{:?}` of 8 f64s, positional and exponential, one at the subnormal edge | 0.59 µs | 32 µs | 54× |
+  | `{:?}` of a `FluidParticle` | 0.92 µs | 5.9 µs | 6.4× |
+  | `{:#?}` of the same | 2.2 µs | 8.2 µs | 3.8× |
+  | `{:?}` of an 8 × 8 `FluidGrid` after a multigrid step | 39 µs | 1.25 ms | 32× |
+
+  The exact digit search is the cost: it scales the value by 10^k on a 40-limb bignum. Printing is never on the
+  step path; the stdlib printer requested in L16 would replace it.
 
 ### Added (Cyrius)
 - **The full surface diff** (M8 part c, `scripts/surface_parity.py`). Beyond each public Rust item's counterpart,

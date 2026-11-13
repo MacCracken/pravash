@@ -3939,11 +3939,686 @@ fn _par_logging(fp, fl): i64 {
     return 0;
 }
 
+# ── debug (M8 part d) ───────────────────────────────────────────────────────────────
+# `f64::debug` and `f32::debug` give one text; `<Type>::debug` takes the value's fields in declaration order and
+# gives `{:?}` and `{:#?}` (token layouts: scripts/oracle/src/m_debug.rs).
+
+# 1 when input token k's body is `text`.
+fn _par_tok_is(k, text): i64 {
+    return _par_eq(_par_in(k), load64(_par_in_l + k * 8), text);
+}
+
+# Input tokens k … k + 2 as a vector.
+fn _par_v3_at(k): PvVec3 {
+    var x: f64 = _par_in(k);
+    var y: f64 = _par_in(k + 1);
+    var z: f64 = _par_in(k + 2);
+    return PvVec3_new(x, y, z);
+}
+
+# The column at token k (`v:<n>` and n f64s) into *c, which starts empty: the index after it, or -1 for no memory.
+fn _par_dbg_col(k, c: *PvColumn): i64 {
+    var n = _par_in(k);
+    if (_par_col_in(k + 1, n, c) == 0) { return 0 - 1; }
+    return k + 1 + n;
+}
+
+# The f32 column at token k (`v:<n>` and n widened f32s) into *c, which starts empty: the index after it, or -1.
+fn _par_dbg_col32(k, c: *PvF32Column): i64 {
+    c.data = 0;
+    c.len = 0;
+    c.cap = 0;
+    var n = _par_in(k);
+    if (c.reserve(n) == 0) { return 0 - 1; }
+    for (var j = 0; j < n; j = j + 1) {
+        var x: f64 = _par_in(k + 1 + j);
+        c.push_rounded(x);
+    }
+    return k + 1 + n;
+}
+
+# Records the two texts: 1, or -1 when a builder couldn't grow.
+fn _par_dbg_texts(rc, sb0, sb1): i64 {
+    if (rc != 0) { return 0 - 1; }
+    var d0, n0 = _par_sb_text(sb0);
+    var d1, n1 = _par_sb_text(sb1);
+    _par_got_text(d0, n0);
+    _par_got_text(d1, n1);
+    return 1;
+}
+
+# The kind named by the `e:` token k (`<prefix><name>`) among the names a … d (0 for none), as its index (0 … 3),
+# or -1.
+fn _par_dbg_kind(k, prefix, a, b, c, d): i64 {
+    var names[32];
+    store64(&names, a);
+    store64(&names + 8, b);
+    store64(&names + 16, c);
+    store64(&names + 24, d);
+    var pl = strlen(prefix);
+    var p = _par_in(k);
+    var n = load64(_par_in_l + k * 8);
+    if (n <= pl || memeq(p, prefix, pl) == 0) { return 0 - 1; }
+    for (var j = 0; j < 4; j = j + 1) {
+        var w = load64(&names + j * 8);
+        if (w != 0 && _par_eq(p + pl, n - pl, w) == 1) { return j; }
+    }
+    return 0 - 1;
+}
+
+# The non-Newtonian model whose tokens start at k into *m: the index after it, or -1.
+fn _par_dbg_nn(k, m: *PvNonNewtonianModel): i64 {
+    var kind = _par_dbg_kind(k, "NonNewtonianViscosity.", "PowerLaw", "Bingham", "HerschelBulkley", 0);
+    var z: f64 = 0.0;
+    m.kind = kind;
+    m.consistency = z;
+    m.power_index = z;
+    m.yield_stress = z;
+    m.plastic_viscosity = z;
+    if (kind == PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW) {
+        m.consistency = _par_in(k + 1);
+        m.power_index = _par_in(k + 2);
+        return k + 3;
+    }
+    if (kind == PV_NON_NEWTONIAN_VISCOSITY_BINGHAM) {
+        m.yield_stress = _par_in(k + 1);
+        m.plastic_viscosity = _par_in(k + 2);
+        return k + 3;
+    }
+    if (kind == PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY) {
+        m.yield_stress = _par_in(k + 1);
+        m.consistency = _par_in(k + 2);
+        m.power_index = _par_in(k + 3);
+        return k + 4;
+    }
+    return 0 - 1;
+}
+
+# The body shape whose tokens start at k into *s: the index after it, or -1.
+fn _par_dbg_shape(k, s: *PvShape): i64 {
+    var kind = _par_dbg_kind(k, "BodyShape.", "Sphere", "Box", 0, 0);
+    if (kind == PV_BODY_SHAPE_SPHERE) {
+        var r: f64 = _par_in(k + 1);
+        var sp: PvShape = PvShape_sphere(r);
+        *s = sp;
+        return k + 2;
+    }
+    if (kind == PV_BODY_SHAPE_BOX) {
+        var hx: f64 = _par_in(k + 1);
+        var hy: f64 = _par_in(k + 2);
+        var hz: f64 = _par_in(k + 3);
+        var bx: PvShape = PvShape_box(hx, hy, hz);
+        *s = bx;
+        return k + 4;
+    }
+    return 0 - 1;
+}
+
+# The constitutive model whose tokens start at k into *m: the index after it, or -1.
+fn _par_dbg_law(k, m: *PvConstitutiveLaw): i64 {
+    var kind = _par_dbg_kind(k, "ConstitutiveModel.", "Fluid", "NeoHookean", "DruckerPrager", 0);
+    var z: f64 = 0.0;
+    m.kind = kind;
+    m.bulk_modulus = z;
+    m.viscosity = z;
+    m.youngs_modulus = z;
+    m.poisson_ratio = z;
+    m.friction_angle = z;
+    if (kind == PV_CONSTITUTIVE_MODEL_FLUID) {
+        m.bulk_modulus = _par_in(k + 1);
+        m.viscosity = _par_in(k + 2);
+        return k + 3;
+    }
+    if (kind == PV_CONSTITUTIVE_MODEL_NEO_HOOKEAN) {
+        m.youngs_modulus = _par_in(k + 1);
+        m.poisson_ratio = _par_in(k + 2);
+        return k + 3;
+    }
+    if (kind == PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER) {
+        m.youngs_modulus = _par_in(k + 1);
+        m.poisson_ratio = _par_in(k + 2);
+        m.friction_angle = _par_in(k + 3);
+        return k + 4;
+    }
+    return 0 - 1;
+}
+
+# The full shallow-water state whose tokens start at k into *w: the index after it, or -1 for no memory.
+fn _par_dbg_sw(k, w: *PvShallowWater): i64 {
+    w.nx = _par_in(k);
+    w.ny = _par_in(k + 1);
+    w.dx = _par_in(k + 2);
+    var at = k + 3;
+    for (var c4 = 0; c4 < 4; c4 = c4 + 1) {
+        if (at >= 0) { at = _par_dbg_col(at, _pv_sw_col(w, c4)); }
+    }
+    if (at < 0) { return 0 - 1; }
+    w.gravity = _par_in(at);
+    w.damping = _par_in(at + 1);
+    at = _par_dbg_col(at + 2, _pv_sw_col(w, 4));
+    if (at < 0) { return 0 - 1; }
+    w.dry_threshold = _par_in(at);
+    w.breaking_threshold = _par_in(at + 1);
+    w.breaking_dissipation = _par_in(at + 2);
+    w.dispersion_coeff = _par_in(at + 3);
+    w.use_green_naghdi = _par_in(at + 4);
+    w.use_riemann = _par_in(at + 5);
+    at = at + 6;
+    for (var c5 = 5; c5 < 10; c5 = c5 + 1) {
+        if (at >= 0) { at = _par_dbg_col(at, _pv_sw_col(w, c5)); }
+    }
+    return at;
+}
+
+# The grid config whose 13 tokens start at k into *gc.
+fn _par_dbg_gc(k, gc: *PvGridConfig) {
+    gc.dt = _par_in(k);
+    gc.viscosity = _par_in(k + 1);
+    gc.diffusion_iterations = _par_in(k + 2);
+    gc.pressure_iterations = _par_in(k + 3);
+    gc.boundary = _par_bc_in(k + 4);
+    gc.vorticity_confinement = _par_in(k + 5);
+    gc.buoyancy_alpha = _par_in(k + 6);
+    gc.ambient_density = _par_in(k + 7);
+    gc.use_maccormack = _par_in(k + 8);
+    gc.use_bfecc = _par_in(k + 9);
+    gc.smagorinsky_cs = _par_in(k + 10);
+    gc.use_multigrid = _par_in(k + 11);
+    gc.use_cg = _par_in(k + 12);
+    return 0;
+}
+
+# The full grid state (scratch and multigrid levels included) whose tokens start at k into *g: the index after it,
+# or -1 for no memory.
+fn _par_dbg_fg(k, g: *PvFluidGrid): i64 {
+    _pv_fg_zero(g);
+    g.nx = _par_in(k);
+    g.ny = _par_in(k + 1);
+    g.dx = _par_in(k + 2);
+    var ga = k + 3;
+    for (var c8 = 0; c8 < 8; c8 = c8 + 1) {
+        if (ga >= 0) { ga = _par_dbg_col(ga, _pv_fg_col(g, c8)); }
+    }
+    if (ga < 0) { return 0 - 1; }
+    var levels: *PvColumn = _pv_fg_col(g, 8);
+    var nl = _par_in(ga);
+    ga = ga + 1;
+    for (var j = 0; j < nl; j = j + 1) {
+        if (_pv_mg_levels_push(levels) == 0) { return 0 - 1; }
+        var lv = load64(levels.data + j * 8);
+        for (var q = 0; q < 3; q = q + 1) {
+            if (ga >= 0) { ga = _par_dbg_col(ga, _pv_mg_col(lv, q)); }
+        }
+    }
+    return ga;
+}
+
+# The full k-ε state whose tokens start at k into *ke: the index after it, or -1 for no memory.
+fn _par_dbg_ke(k, ke: *PvKEpsilon): i64 {
+    var kk = _par_dbg_col(k, _pv_ke_col(ke, 0));
+    if (kk >= 0) { kk = _par_dbg_col(kk, _pv_ke_col(ke, 1)); }
+    if (kk < 0) { return 0 - 1; }
+    ke.c_mu = _par_in(kk);
+    ke.c_eps1 = _par_in(kk + 1);
+    ke.c_eps2 = _par_in(kk + 2);
+    kk = _par_dbg_col(kk + 3, _pv_ke_col(ke, 2));
+    if (kk >= 0) { kk = _par_dbg_col(kk, _pv_ke_col(ke, 3)); }
+    return kk;
+}
+
+# The full MAC grid state whose tokens start at k into *mg: the index after it, or -1 for no memory.
+fn _par_dbg_mac(k, mg: *PvMacGrid): i64 {
+    mg.nx = _par_in(k);
+    mg.ny = _par_in(k + 1);
+    mg.dx = _par_in(k + 2);
+    var ma = k + 3;
+    for (var c6 = 0; c6 < 6; c6 = c6 + 1) {
+        if (ma >= 0) { ma = _par_dbg_col(ma, _pv_mac_col(mg, c6)); }
+    }
+    return ma;
+}
+
+# The full VOF state whose tokens start at k into *v: the index after it, or -1 for no memory.
+fn _par_dbg_vof(k, v: *PvVofField): i64 {
+    v.nx = _par_in(k);
+    v.ny = _par_in(k + 1);
+    v.dx = _par_in(k + 2);
+    var va = _par_dbg_col(k + 3, _pv_vof_col(v, 0));
+    if (va >= 0) { va = _par_dbg_col(va, _pv_vof_col(v, 1)); }
+    return va;
+}
+
+# The full phase-field state whose tokens start at k into *pf: the index after it, or -1 for no memory.
+fn _par_dbg_pf(k, pf: *PvPhaseField): i64 {
+    pf.nx = _par_in(k);
+    pf.ny = _par_in(k + 1);
+    pf.dx = _par_in(k + 2);
+    var pa = _par_dbg_col(k + 3, _pv_pf_col(pf, 0));
+    if (pa < 0) { return 0 - 1; }
+    pf.mobility = _par_in(pa);
+    pf.epsilon = _par_in(pa + 1);
+    return _par_dbg_col(pa + 2, _pv_pf_col(pf, 1));
+}
+
+# The float printers and the value types (common, buoyancy, shallow, grid).
+fn _par_debug_a(fp, fl, sb0, sb1): i64 {
+    if (_par_eq(fp, fl, "f64::debug") == 1) {
+        var x: f64 = _par_in(0);
+        if (_pv_debug_f64(sb0, x) != 0) { return 0 - 1; }
+        var d, n = _par_sb_text(sb0);
+        _par_got_text(d, n);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "f32::debug") == 1) {
+        var w32: f64 = _par_in(0);
+        var x32: f32 = f32_from(w32);
+        if (_pv_debug_f32(sb0, x32) != 0) { return 0 - 1; }
+        var d2, n2 = _par_sb_text(sb0);
+        _par_got_text(d2, n2);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "FluidMaterial::debug") == 1) {
+        var m: PvFluidMaterial;
+        m.density = _par_in(0);
+        m.viscosity = _par_in(1);
+        m.surface_tension = _par_in(2);
+        m.speed_of_sound = _par_in(3);
+        return _par_dbg_texts(m.debug(sb0, 0) | m.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "FluidParticle::debug") == 1) {
+        var p: PvFluidParticle;
+        _par_particle_in(0, &p);
+        return _par_dbg_texts(p.debug(sb0, 0) | p.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "ParticleSoa::debug") == 1) {
+        var s: PvParticleSoa;
+        if (_par_soa_in(0, &s) < 0) { return 0 - 1; }
+        var rs = _par_dbg_texts(s.debug(sb0, 0) | s.debug(sb1, 1), sb0, sb1);
+        PvParticleSoa_drop(&s);
+        return rs;
+    }
+    if (_par_eq(fp, fl, "ArenaHandle::debug") == 1) {
+        var h: PvArenaHandle;
+        h.start = _par_in(0);
+        h.len = _par_in(1);
+        h.generation = _par_in(2);
+        return _par_dbg_texts(h.debug(sb0, 0) | h.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "FluidConfig::debug") == 1) {
+        var c: PvFluidConfig;
+        c.dt = _par_in(0);
+        c.gravity = _par_v3_at(1);
+        c.smoothing_radius = _par_in(4);
+        c.gas_constant = _par_in(5);
+        c.rest_density = _par_in(6);
+        c.bounds_min = _par_v3_at(7);
+        c.bounds_max = _par_v3_at(10);
+        c.boundary_damping = _par_in(13);
+        return _par_dbg_texts(c.debug(sb0, 0) | c.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "DragCoefficient::debug") == 1) {
+        return _par_dbg_texts(drag_coefficient_debug(sb0, 0) | drag_coefficient_debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "FlowRegime::debug") == 1) {
+        var fr = _par_dbg_kind(0, "FlowRegime.", "Laminar", "Transitional", "Turbulent", 0);
+        return _par_dbg_texts(flow_regime_debug(fr, sb0, 0) | flow_regime_debug(fr, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "ShallowWater::debug") == 1) {
+        var w: PvShallowWater;
+        if (_par_dbg_sw(0, &w) < 0) { return 0 - 1; }
+        var rw = _par_dbg_texts(w.debug(sb0, 0) | w.debug(sb1, 1), sb0, sb1);
+        PvShallowWater_drop(&w);
+        return rw;
+    }
+    if (_par_eq(fp, fl, "SedimentConfig::debug") == 1) {
+        var sc: PvSedimentConfig;
+        sc.shields_critical = _par_in(0);
+        sc.grain_diameter = _par_in(1);
+        sc.sediment_density = _par_in(2);
+        sc.water_density = _par_in(3);
+        sc.erosion_rate = _par_in(4);
+        sc.deposition_rate = _par_in(5);
+        return _par_dbg_texts(sc.debug(sb0, 0) | sc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "BoundaryCondition::debug") == 1) {
+        var bc = _par_bc_in(0);
+        return _par_dbg_texts(boundary_condition_debug(bc, sb0, 0) | boundary_condition_debug(bc, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "GridConfig::debug") == 1) {
+        var gc: PvGridConfig;
+        _par_dbg_gc(0, &gc);
+        return _par_dbg_texts(gc.debug(sb0, 0) | gc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "FluidGrid::debug") == 1) {
+        var g: PvFluidGrid;
+        if (_par_dbg_fg(0, &g) < 0) { return 0 - 1; }
+        var rg = _par_dbg_texts(g.debug(sb0, 0) | g.debug(sb1, 1), sb0, sb1);
+        PvFluidGrid_drop(&g);
+        return rg;
+    }
+    if (_par_eq(fp, fl, "KEpsilon::debug") == 1) {
+        var ke: PvKEpsilon;
+        if (_par_dbg_ke(0, &ke) < 0) { return 0 - 1; }
+        var rk = _par_dbg_texts(ke.debug(sb0, 0) | ke.debug(sb1, 1), sb0, sb1);
+        PvKEpsilon_drop(&ke);
+        return rk;
+    }
+    if (_par_eq(fp, fl, "MacGrid::debug") == 1) {
+        var mg: PvMacGrid;
+        if (_par_dbg_mac(0, &mg) < 0) { return 0 - 1; }
+        var rm = _par_dbg_texts(mg.debug(sb0, 0) | mg.debug(sb1, 1), sb0, sb1);
+        PvMacGrid_drop(&mg);
+        return rm;
+    }
+    return 0;
+}
+
+# The interface, SPH, coupling, MPM and compute types.
+fn _par_debug_b(fp, fl, sb0, sb1): i64 {
+    if (_par_eq(fp, fl, "VofField::debug") == 1) {
+        var v: PvVofField;
+        if (_par_dbg_vof(0, &v) < 0) { return 0 - 1; }
+        var rv = _par_dbg_texts(v.debug(sb0, 0) | v.debug(sb1, 1), sb0, sb1);
+        PvVofField_drop(&v);
+        return rv;
+    }
+    if (_par_eq(fp, fl, "PhaseField::debug") == 1) {
+        var pf: PvPhaseField;
+        if (_par_dbg_pf(0, &pf) < 0) { return 0 - 1; }
+        var rp = _par_dbg_texts(pf.debug(sb0, 0) | pf.debug(sb1, 1), sb0, sb1);
+        PvPhaseField_drop(&pf);
+        return rp;
+    }
+    if (_par_eq(fp, fl, "PhaseProperties::debug") == 1) {
+        var pp: PvPhaseProperties;
+        pp.rest_density = _par_in(0);
+        pp.gas_constant = _par_in(1);
+        pp.viscosity = _par_in(2);
+        return _par_dbg_texts(pp.debug(sb0, 0) | pp.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "MultiPhaseConfig::debug") == 1) {
+        var mc: PvMultiPhaseConfig;
+        mc.phases.data = 0;
+        mc.phases.len = 0;
+        mc.phases.cap = 0;
+        var np = _par_in(0);
+        if (mc.phases.reserve(3 * np) == 0) { return 0 - 1; }
+        for (var j = 0; j < 3 * np; j = j + 1) {
+            if (mc.phases.push(_par_in(1 + j)) == 0) { return 0 - 1; }
+        }
+        mc.interface_tension = _par_in(1 + 3 * np);
+        var rmc = _par_dbg_texts(mc.debug(sb0, 0) | mc.debug(sb1, 1), sb0, sb1);
+        PvMultiPhaseConfig_drop(&mc);
+        return rmc;
+    }
+    if (_par_eq(fp, fl, "ViscoelasticConfig::debug") == 1) {
+        var vc: PvViscoelasticConfig;
+        vc.elastic_modulus = _par_in(0);
+        vc.relaxation_time = _par_in(1);
+        return _par_dbg_texts(vc.debug(sb0, 0) | vc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "HeatConfig::debug") == 1) {
+        var hc: PvHeatConfig;
+        hc.diffusivity = _par_in(0);
+        return _par_dbg_texts(hc.debug(sb0, 0) | hc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "PhaseChangeConfig::debug") == 1) {
+        var pc: PvPhaseChangeConfig;
+        pc.transition_temperature = _par_in(0);
+        pc.latent_heat = _par_in(1);
+        pc.heat_capacity = _par_in(2);
+        pc.phase_below = _par_in(3);
+        pc.phase_above = _par_in(4);
+        return _par_dbg_texts(pc.debug(sb0, 0) | pc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "CombustionConfig::debug") == 1) {
+        var cc: PvCombustionConfig;
+        cc.ignition_temperature = _par_in(0);
+        cc.reaction_rate = _par_in(1);
+        cc.heat_release = _par_in(2);
+        return _par_dbg_texts(cc.debug(sb0, 0) | cc.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "NonNewtonianViscosity::debug") == 1) {
+        var nn: PvNonNewtonianModel;
+        if (_par_dbg_nn(0, &nn) < 0) { return 0 - 1; }
+        var r0 = non_newtonian_viscosity_debug(&nn, sb0, 0);
+        return _par_dbg_texts(r0 | non_newtonian_viscosity_debug(&nn, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "SecondaryType::debug") == 1) {
+        var st = _par_dbg_kind(0, "SecondaryType.", "Foam", "Spray", "Bubble", 0);
+        return _par_dbg_texts(secondary_type_debug(st, sb0, 0) | secondary_type_debug(st, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "SecondaryParticle::debug") == 1) {
+        var sp: PvSecondaryParticle;
+        sp.position = _par_v3_at(0);
+        sp.velocity = _par_v3_at(3);
+        sp.lifetime = _par_in(6);
+        sp.kind = _par_dbg_kind(7, "SecondaryType.", "Foam", "Spray", "Bubble", 0);
+        return _par_dbg_texts(sp.debug(sb0, 0) | sp.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "BodyShape::debug") == 1) {
+        var bs: PvShape;
+        if (_par_dbg_shape(0, &bs) < 0) { return 0 - 1; }
+        return _par_dbg_texts(body_shape_debug(&bs, sb0, 0) | body_shape_debug(&bs, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "RigidBody::debug") == 1) {
+        var rb: PvRigidBody;
+        var shape: PvShape;
+        rb.position = _par_v3_at(0);
+        rb.velocity = _par_v3_at(3);
+        rb.mass = _par_in(6);
+        var ra = _par_dbg_shape(7, &shape);
+        if (ra < 0) { return 0 - 1; }
+        rb.shape = shape;
+        rb.force = _par_v3_at(ra);
+        return _par_dbg_texts(rb.debug(sb0, 0) | rb.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "ConstitutiveModel::debug") == 1) {
+        var law: PvConstitutiveLaw;
+        if (_par_dbg_law(0, &law) < 0) { return 0 - 1; }
+        var rl = constitutive_model_debug(&law, sb0, 0) | constitutive_model_debug(&law, sb1, 1);
+        return _par_dbg_texts(rl, sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "MpmParticle::debug") == 1) {
+        var mp: PvMpmParticle;
+        var ml: PvConstitutiveLaw;
+        var g00: f64 = _par_in(0);
+        var g01: f64 = _par_in(1);
+        var g10: f64 = _par_in(2);
+        var g11: f64 = _par_in(3);
+        var fg: PvMat2 = PvMat2_new(g00, g01, g10, g11);
+        mp.deformation_grad = fg;
+        var mpa = _par_dbg_law(4, &ml);
+        if (mpa < 0) { return 0 - 1; }
+        mp.model = ml;
+        mp.volume_0 = _par_in(mpa);
+        return _par_dbg_texts(mp.debug(sb0, 0) | mp.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "PackedParticles::debug") == 1) {
+        var pk: PvPackedParticles;
+        if (_par_packed_in(0, &pk) < 0) { return 0 - 1; }
+        var rpk = _par_dbg_texts(pk.debug(sb0, 0) | pk.debug(sb1, 1), sb0, sb1);
+        PvPackedParticles_drop(&pk);
+        return rpk;
+    }
+    if (_par_eq(fp, fl, "SphKernelParams::debug") == 1) {
+        var sk: PvSphKernelParams;
+        var w_sk_smoothing_radius: f64 = _par_in(0);
+        sk.smoothing_radius = f32_from(w_sk_smoothing_radius);
+        var w_sk_rest_density: f64 = _par_in(1);
+        sk.rest_density = f32_from(w_sk_rest_density);
+        var w_sk_gas_constant: f64 = _par_in(2);
+        sk.gas_constant = f32_from(w_sk_gas_constant);
+        var w_sk_viscosity: f64 = _par_in(3);
+        sk.viscosity = f32_from(w_sk_viscosity);
+        var w_sk_gravity_x: f64 = _par_in(4);
+        sk.gravity_x = f32_from(w_sk_gravity_x);
+        var w_sk_gravity_y: f64 = _par_in(5);
+        sk.gravity_y = f32_from(w_sk_gravity_y);
+        var w_sk_gravity_z: f64 = _par_in(6);
+        sk.gravity_z = f32_from(w_sk_gravity_z);
+        var w_sk_dt: f64 = _par_in(7);
+        sk.dt = f32_from(w_sk_dt);
+        sk.particle_count = _par_in(8);
+        return _par_dbg_texts(sk.debug(sb0, 0) | sk.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "GridKernelParams::debug") == 1) {
+        var gk: PvGridKernelParams;
+        gk.nx = _par_in(0);
+        gk.ny = _par_in(1);
+        var w_gk_dx: f64 = _par_in(2);
+        gk.dx = f32_from(w_gk_dx);
+        var w_gk_dt: f64 = _par_in(3);
+        gk.dt = f32_from(w_gk_dt);
+        var w_gk_viscosity: f64 = _par_in(4);
+        gk.viscosity = f32_from(w_gk_viscosity);
+        var w_gk_buoyancy_alpha: f64 = _par_in(5);
+        gk.buoyancy_alpha = f32_from(w_gk_buoyancy_alpha);
+        var w_gk_ambient_density: f64 = _par_in(6);
+        gk.ambient_density = f32_from(w_gk_ambient_density);
+        return _par_dbg_texts(gk.debug(sb0, 0) | gk.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "ShallowKernelParams::debug") == 1) {
+        var hk: PvShallowKernelParams;
+        hk.nx = _par_in(0);
+        hk.ny = _par_in(1);
+        var w_hk_dx: f64 = _par_in(2);
+        hk.dx = f32_from(w_hk_dx);
+        var w_hk_dt: f64 = _par_in(3);
+        hk.dt = f32_from(w_hk_dt);
+        var w_hk_gravity: f64 = _par_in(4);
+        hk.gravity = f32_from(w_hk_gravity);
+        var w_hk_damping: f64 = _par_in(5);
+        hk.damping = f32_from(w_hk_damping);
+        var w_hk_dry_threshold: f64 = _par_in(6);
+        hk.dry_threshold = f32_from(w_hk_dry_threshold);
+        return _par_dbg_texts(hk.debug(sb0, 0) | hk.debug(sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "ComputeOp::debug") == 1) {
+        var op = _par_dbg_kind(0, "ComputeOp.", "SphDensity", "SphStep", "GridAdvect", "ShallowStep");
+        return _par_dbg_texts(compute_op_debug(op, sb0, 0) | compute_op_debug(op, sb1, 1), sb0, sb1);
+    }
+    if (_par_eq(fp, fl, "NeuralCorrection::debug") == 1) {
+        var nc: PvNeuralCorrection;
+        var na = _par_dbg_col32(0, _pv_as_f32_column(_pv_addr(&nc)));
+        if (na >= 0) { na = _par_dbg_col32(na, _pv_as_f32_column(_pv_addr(&nc) + 24)); }
+        if (na < 0) { return 0 - 1; }
+        var rn = _par_dbg_texts(nc.debug(sb0, 0) | nc.debug(sb1, 1), sb0, sb1);
+        PvNeuralCorrection_drop(&nc);
+        return rn;
+    }
+    return 0;
+}
+
+# The six stepping types after their steps: the port's own steps must leave Rust's state, scratch included.
+fn _par_debug_after(fp, fl, sb0, sb1): i64 {
+    var bad = 0;
+    if (_par_eq(fp, fl, "ShallowWater::debug_after") == 1) {
+        var w: PvShallowWater;
+        var k = _par_dbg_sw(0, &w);
+        if (k < 0) { return 0 - 1; }
+        var dt: f64 = _par_in(k);
+        for (var s = 0; s < _par_in(k + 1); s = s + 1) {
+            var t, e = w.step(dt);
+        }
+        var rw = _par_dbg_texts(w.debug(sb0, 0) | w.debug(sb1, 1), sb0, sb1);
+        PvShallowWater_drop(&w);
+        return rw;
+    }
+    if (_par_eq(fp, fl, "FluidGrid::debug_after") == 1) {
+        var g: PvFluidGrid;
+        var gc: PvGridConfig;
+        var gk = _par_dbg_fg(0, &g);
+        if (gk < 0) { return 0 - 1; }
+        _par_dbg_gc(gk, &gc);
+        for (var s2 = 0; s2 < _par_in(gk + 13); s2 = s2 + 1) {
+            var t2, e2 = g.step(&gc);
+        }
+        var rg = _par_dbg_texts(g.debug(sb0, 0) | g.debug(sb1, 1), sb0, sb1);
+        PvFluidGrid_drop(&g);
+        return rg;
+    }
+    if (_par_eq(fp, fl, "KEpsilon::debug_after") == 1) {
+        var ke: PvKEpsilon;
+        var vx: PvColumn = PvColumn_new();
+        var vy: PvColumn = PvColumn_new();
+        var kk = _par_dbg_ke(0, &ke);
+        if (kk >= 0) { kk = _par_dbg_col(kk, &vx); }
+        if (kk >= 0) { kk = _par_dbg_col(kk, &vy); }
+        if (kk < 0) { return 0 - 1; }
+        var dx: f64 = _par_in(kk + 2);
+        var dt: f64 = _par_in(kk + 3);
+        for (var s3 = 0; s3 < _par_in(kk + 4); s3 = s3 + 1) {
+            bad = bad | ke.step(vx.data, vx.len, vy.data, vy.len, _par_in(kk), _par_in(kk + 1), dx, dt);
+        }
+        var rk = _par_dbg_texts(ke.debug(sb0, 0) | ke.debug(sb1, 1), sb0, sb1);
+        PvKEpsilon_drop(&ke);
+        vx.drop();
+        vy.drop();
+        return rk;
+    }
+    if (_par_eq(fp, fl, "MacGrid::debug_after") == 1) {
+        var mg: PvMacGrid;
+        var mc: PvGridConfig;
+        var mk = _par_dbg_mac(0, &mg);
+        if (mk < 0) { return 0 - 1; }
+        _par_dbg_gc(mk, &mc);
+        for (var s4 = 0; s4 < _par_in(mk + 13); s4 = s4 + 1) {
+            var t4, e4 = mg.step(&mc);
+        }
+        var rm = _par_dbg_texts(mg.debug(sb0, 0) | mg.debug(sb1, 1), sb0, sb1);
+        PvMacGrid_drop(&mg);
+        return rm;
+    }
+    var vof = _par_eq(fp, fl, "VofField::debug_after");
+    var pfd = _par_eq(fp, fl, "PhaseField::debug_after");
+    if (vof + pfd == 0) { return 0; }
+    var v: PvVofField;
+    var pf: PvPhaseField;
+    var ux: PvColumn = PvColumn_new();
+    var uy: PvColumn = PvColumn_new();
+    var at = 0;
+    if (vof == 1) { at = _par_dbg_vof(0, &v); } else { at = _par_dbg_pf(0, &pf); }
+    if (at >= 0) { at = _par_dbg_col(at, &ux); }
+    if (at >= 0) { at = _par_dbg_col(at, &uy); }
+    if (at < 0) { return 0 - 1; }
+    var udt: f64 = _par_in(at);
+    for (var s5 = 0; s5 < _par_in(at + 1); s5 = s5 + 1) {
+        if (vof == 1) {
+            var t5, e5 = v.advect(ux.data, ux.len, uy.data, uy.len, udt);
+        } else {
+            var t6, e6 = pf.step(ux.data, ux.len, uy.data, uy.len, udt);
+        }
+    }
+    var rr = 0;
+    if (vof == 1) {
+        rr = _par_dbg_texts(v.debug(sb0, 0) | v.debug(sb1, 1), sb0, sb1);
+        PvVofField_drop(&v);
+    } else {
+        rr = _par_dbg_texts(pf.debug(sb0, 0) | pf.debug(sb1, 1), sb0, sb1);
+        PvPhaseField_drop(&pf);
+    }
+    ux.drop();
+    uy.drop();
+    return rr;
+}
+
+fn _par_debug(fp, fl): i64 {
+    var sb0 = str_builder_new();
+    var sb1 = str_builder_new();
+    var rc = _par_debug_a(fp, fl, sb0, sb1);
+    if (rc != 0) { return rc; }
+    rc = _par_debug_b(fp, fl, sb0, sb1);
+    if (rc != 0) { return rc; }
+    return _par_debug_after(fp, fl, sb0, sb1);
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "bridge") == 1) { return _par_bridge(fp, fl); }
     if (_par_eq(mp, ml, "buoyancy") == 1) { return _par_buoyancy(fp, fl); }
     if (_par_eq(mp, ml, "ai") == 1) { return _par_ai(fp, fl); }
+    if (_par_eq(mp, ml, "debug") == 1) { return _par_debug(fp, fl); }
     if (_par_eq(mp, ml, "logging") == 1) { return _par_logging(fp, fl); }
     if (_par_eq(mp, ml, "common") == 1) { return _par_common(fp, fl); }
     if (_par_eq(mp, ml, "compute") == 1) { return _par_compute(fp, fl); }

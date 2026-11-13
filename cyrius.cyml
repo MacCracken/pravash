@@ -96,4 +96,6 @@ modules = [
     "src/str_debug_data.cyr",
     "src/ai.cyr",
     "src/json.cyr",
+    "src/fmtf.cyr",
+    "src/debug.cyr",
 ]

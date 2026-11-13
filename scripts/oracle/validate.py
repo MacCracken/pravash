@@ -6203,6 +6203,356 @@ def check_tables(root):
               f"MPFR {MPFR.VERSION}'s")
 
 
+# ── debug (M8 part d) ──────────────────────────────────────────────────────────────
+# Rust's derived Debug, recomputed from the row's tokens: the float printer by Burger & Dybvig's free-format
+# algorithm on Python's integers (the shortest digits that read back, the closest of them, a tie going up, as core's
+# Grisu-with-Dragon printer), each result read back with Python's own parser; the derive's shapes by a value tree
+# rendered as core's builders and its PadAdapter do. The `debug_after` rows' states come from the oracle's steps,
+# which validate.py doesn't transcribe with their scratch: for those rows it parses Rust's compact text into a value
+# tree, checks every float in it is the printer's text for its own value, and renders both forms again.
+
+def dbg_shortest(f, e, hidden, emin):
+    """(digits, k) with value f · 2^e = 0.d1…dn · 10^k: the shortest digits that read back, the closest, ties up."""
+    even = f % 2 == 0
+    if e >= 0:
+        if f != hidden:
+            r, s, mp, mm = f << (e + 1), 2, 1 << e, 1 << e
+        else:
+            r, s, mp, mm = f << (e + 2), 4, 1 << (e + 1), 1 << e
+    elif e == emin or f != hidden:
+        r, s, mp, mm = f << 1, 1 << (1 - e), 1, 1
+    else:
+        r, s, mp, mm = f << 2, 1 << (2 - e), 2, 1
+    # The least k with (r + mp) / s below 10^k (or at it, when the interval's end reads back): exact search.
+    k = 0
+    while True:
+        hi = (r + mp) * (10 ** -k if k < 0 else 1)
+        lo = s * (10 ** k if k > 0 else 1)
+        if (hi < lo) or (not even and hi == lo):
+            break
+        k += 1
+    while True:
+        hi = (r + mp) * (10 ** -(k - 1) if k - 1 < 0 else 1)
+        lo = s * (10 ** (k - 1) if k - 1 > 0 else 1)
+        if (hi < lo) or (not even and hi == lo):
+            k -= 1
+        else:
+            break
+    if k >= 0:
+        s *= 10 ** k
+    else:
+        r, mp, mm = r * 10 ** -k, mp * 10 ** -k, mm * 10 ** -k
+    digits = []
+    while True:
+        r, mp, mm = r * 10, mp * 10, mm * 10
+        d, r = divmod(r, s)
+        tc1 = r < mm or (even and r == mm)
+        tc2 = r + mp > s or (even and r + mp == s)
+        if not tc1 and not tc2:
+            digits.append(d)
+            continue
+        if tc1 and tc2:
+            d += 1 if 2 * r >= s else 0
+        elif tc2:
+            d += 1
+        digits.append(d)
+        return "".join(map(str, digits)), k
+
+
+def dbg_float(b, is32):
+    """Rust's `{:?}` of the f64 (or f32) with bits b."""
+    sign_bit, exp_bits, frac_bits = (31, 8, 23) if is32 else (63, 11, 52)
+    neg = (b >> sign_bit) & 1
+    mag = b & ((1 << sign_bit) - 1)
+    emax = (1 << exp_bits) - 1
+    be, frac = mag >> frac_bits, mag & ((1 << frac_bits) - 1)
+    if be == emax:
+        return "NaN" if frac else ("-inf" if neg else "inf")
+    if mag == 0:
+        return "-0.0" if neg else "0.0"
+    bias = (1 << (exp_bits - 1)) - 1
+    hidden = 1 << frac_bits
+    emin = 1 - bias - frac_bits
+    f, e = (frac, emin) if be == 0 else (frac | hidden, be - bias - frac_bits)
+    digits, k = dbg_shortest(f, e, hidden, emin)
+    # Read back, by Python's parser (correctly rounded): the digits are the value.
+    text_val = float(f"0.{digits}e{k}")
+    back = struct.unpack("<I", struct.pack("<f", text_val))[0] if is32 else bits(text_val)
+    if back != mag:
+        fail(f"debug: the shortest digits {digits}e{k} of {b:#x} don't read back")
+    # The exponential form below 1e-4 and from 1e16, compared in the value's own format.
+    if is32:
+        lo32 = struct.unpack("<I", struct.pack("<f", 1e-4))[0]
+        hi32 = struct.unpack("<I", struct.pack("<f", 1e16))[0]
+        expo = mag < lo32 or mag >= hi32
+    else:
+        ax = from_bits(mag)
+        expo = ax < 1e-4 or ax >= 1e16
+    out = "-" if neg else ""
+    n = len(digits)
+    if expo:
+        out += digits[0] + ("." + digits[1:] if n > 1 else "") + f"e{k - 1}"
+    elif k <= 0:
+        out += "0." + "0" * -k + digits
+    elif k >= n:
+        out += digits + "0" * (k - n) + ".0"
+    else:
+        out += digits[:k] + "." + digits[k:]
+    return out
+
+
+def dbg_render(v, alt):
+    """A value tree as `{:?}` (alt False) or `{:#?}`: ("raw", text), ("struct", name, [(field, v)]),
+    ("tuple", name, [v]), ("list", [v])."""
+    def pad(text):
+        return "".join("    " + line for line in text.splitlines(keepends=True))
+    kind = v[0]
+    if kind == "raw":
+        return v[1]
+    if kind == "struct":
+        name, fields = v[1], v[2]
+        if not fields:
+            return name
+        if alt:
+            return name + " {\n" + "".join(pad(f"{f}: {dbg_render(x, True)},\n") for f, x in fields) + "}"
+        return name + " { " + ", ".join(f"{f}: {dbg_render(x, False)}" for f, x in fields) + " }"
+    name, items = ("", v[1]) if kind == "list" else (v[1] + "(", v[2])
+    opener, closer = ("[", "]") if kind == "list" else (name, ")")
+    if not items:
+        return opener + closer
+    if alt:
+        return opener + "\n" + "".join(pad(dbg_render(x, True) + ",\n") for x in items) + closer
+    return opener + ", ".join(dbg_render(x, False) for x in items) + closer
+
+
+# Each type's fields in declaration order (scripts/oracle/src/m_debug.rs), by kind: f f64, g f32 (widened), i
+# integer, b bool, v DVec3, aN [f64; N], gN [f32; N], V Vec<f64>, G Vec<f32>, U Vec<u8>, E:<Enum> a unit variant,
+# P:<Enum> a variant with its fields, PH the phases, MG the multigrid levels, S:<Type> a nested struct.
+DBG_TYPES = {
+    "FluidMaterial": "density f viscosity f surface_tension f speed_of_sound f",
+    "FluidParticle": "position v velocity v acceleration v density f pressure f mass f phase i conformation a3 "
+                     "temperature f fuel f",
+    "ParticleSoa": "pos_x V pos_y V pos_z V vel_x V vel_y V vel_z V accel_x V accel_y V accel_z V density V "
+                   "pressure V mass V phase U conf_xx V conf_xy V conf_yy V temperature V fuel V",
+    "ArenaHandle": "start i len i generation i",
+    "FluidConfig": "dt f gravity v smoothing_radius f gas_constant f rest_density f bounds_min v bounds_max v "
+                   "boundary_damping f",
+    "DragCoefficient": "",
+    "ShallowWater": "nx i ny i dx f height V vx V vy V ground V gravity f damping f manning_n V dry_threshold f "
+                    "breaking_threshold f breaking_dissipation f dispersion_coeff f use_green_naghdi b "
+                    "use_riemann b scratch_vx V scratch_vy V scratch_h V scratch_lap V scratch_line V",
+    "SedimentConfig": "shields_critical f grain_diameter f sediment_density f water_density f erosion_rate f "
+                      "deposition_rate f",
+    "GridConfig": "dt f viscosity f diffusion_iterations i pressure_iterations i boundary E:BoundaryCondition "
+                  "vorticity_confinement f buoyancy_alpha f ambient_density f use_maccormack b use_bfecc b "
+                  "smagorinsky_cs f use_multigrid b use_cg b",
+    "FluidGrid": "nx i ny i dx f vx V vy V pressure V density V scratch_a V scratch_b V scratch_c V diffuse_rhs V "
+                 "mg_levels MG",
+    "KEpsilon": "k V epsilon V c_mu f c_eps1 f c_eps2 f scratch_k V scratch_eps V",
+    "MacGrid": "nx i ny i dx f vx V vy V pressure V density V scratch_div V scratch_density V",
+    "VofField": "nx i ny i dx f alpha V scratch V",
+    "PhaseField": "nx i ny i dx f phi V mobility f epsilon f scratch V",
+    "PhaseProperties": "rest_density f gas_constant f viscosity f",
+    "MultiPhaseConfig": "phases PH interface_tension f",
+    "ViscoelasticConfig": "elastic_modulus f relaxation_time f",
+    "HeatConfig": "diffusivity f",
+    "PhaseChangeConfig": "transition_temperature f latent_heat f heat_capacity f phase_below i phase_above i",
+    "CombustionConfig": "ignition_temperature f reaction_rate f heat_release f",
+    "SecondaryParticle": "position v velocity v lifetime f kind E:SecondaryType",
+    "RigidBody": "position v velocity v mass f shape P:BodyShape force v",
+    "MpmParticle": "deformation_grad a4 model P:ConstitutiveModel volume_0 f",
+    "PackedParticles": "count i position_mass G velocity G density_pressure G",
+    "SphKernelParams": "smoothing_radius g rest_density g gas_constant g viscosity g gravity g3 dt g particle_count i",
+    "GridKernelParams": "nx i ny i dx g dt g viscosity g buoyancy_alpha g ambient_density g",
+    "ShallowKernelParams": "nx i ny i dx g dt g gravity g damping g dry_threshold g",
+    "NeuralCorrection": "velocity_delta G pressure_delta G",
+}
+# A variant with fields: its fields, all f64 ("a3" for an array).
+DBG_VARIANTS = {
+    "PowerLaw": "consistency f power_index f",
+    "Bingham": "yield_stress f plastic_viscosity f",
+    "HerschelBulkley": "yield_stress f consistency f power_index f",
+    "Sphere": "radius f",
+    "Box": "half_extents a3",
+    "Fluid": "bulk_modulus f viscosity f",
+    "NeoHookean": "youngs_modulus f poisson_ratio f",
+    "DruckerPrager": "youngs_modulus f poisson_ratio f friction_angle f",
+}
+DBG_ENUMS = ("FlowRegime", "BoundaryCondition", "SecondaryType", "ComputeOp")
+DBG_PAYLOAD = ("NonNewtonianViscosity", "BodyShape", "ConstitutiveModel")
+
+
+def dbg_f32_bits(t):
+    """The f32 bits of a widened-f32 token."""
+    return struct.unpack("<I", struct.pack("<f", tok_f(t)))[0]
+
+
+class DbgReader:
+    """Reads a value tree from the row's tokens."""
+
+    def __init__(self, toks):
+        self.toks, self.k = toks, 0
+
+    def next(self):
+        t = self.toks[self.k]
+        self.k += 1
+        return t
+
+    def f(self):
+        return ("raw", dbg_float(int(self.next()[2:], 16), False))
+
+    def g(self):
+        return ("raw", dbg_float(dbg_f32_bits(self.next()), True))
+
+    def seq(self, item):
+        n = tok_i(self.next())
+        return ("list", [item() for _ in range(n)])
+
+    def fields(self, spec):
+        words = spec.split()
+        return [(words[j], self.value(words[j + 1])) for j in range(0, len(words), 2)]
+
+    def value(self, kind):
+        if kind == "f":
+            return self.f()
+        if kind == "g":
+            return self.g()
+        if kind == "i":
+            return ("raw", str(tok_i(self.next())))
+        if kind == "b":
+            return ("raw", "true" if tok_i(self.next()) else "false")
+        if kind == "v":
+            return ("tuple", "DVec3", [self.f() for _ in range(3)])
+        if kind[0] == "a":
+            return ("list", [self.f() for _ in range(int(kind[1:]))])
+        if kind[0] == "g":
+            return ("list", [self.g() for _ in range(int(kind[1:]))])
+        if kind == "V":
+            return self.seq(self.f)
+        if kind == "G":
+            return self.seq(self.g)
+        if kind == "U":
+            return self.seq(lambda: ("raw", str(tok_i(self.next()))))
+        if kind.startswith("E:"):
+            return ("raw", self.next().split(".", 1)[1])
+        if kind.startswith("P:"):
+            variant = self.next().split(".", 1)[1]
+            return ("struct", variant, self.fields(DBG_VARIANTS[variant]))
+        if kind == "PH":
+            return self.seq(lambda: ("struct", "PhaseProperties", self.fields(DBG_TYPES["PhaseProperties"])))
+        if kind == "MG":
+            return self.seq(lambda: ("tuple", "", [self.seq(self.f) for _ in range(3)]))
+        raise ValueError(f"no reader for {kind}")
+
+
+def dbg_value(func, ins):
+    """The value tree of a `<Type>::debug` row (for `debug_after`, of its state before the steps)."""
+    name = func.split("::")[0]
+    r = DbgReader(ins)
+    if name in DBG_ENUMS:
+        return ("raw", r.next().split(".", 1)[1])
+    if name in DBG_PAYLOAD:
+        variant = r.next().split(".", 1)[1]
+        return ("struct", variant, r.fields(DBG_VARIANTS[variant]))
+    return ("struct", name, r.fields(DBG_TYPES[name]))
+
+
+def dbg_parse(text):
+    """The value tree of a compact Debug text (as `dbg_render` writes it), every float checked against the printer.
+    Raises ValueError where the text is no such rendering."""
+    at = 0
+
+    def peek(s):
+        return text.startswith(s, at)
+
+    def eat(s):
+        nonlocal at
+        if not peek(s):
+            raise ValueError(f"expected {s!r} at {at}")
+        at += len(s)
+
+    def word():
+        nonlocal at
+        m = re.compile(r"[A-Za-z0-9_.+-]+").match(text, at)
+        if not m:
+            raise ValueError(f"no word at {at}")
+        at = m.end()
+        return m.group(0)
+
+    def items(close):
+        out = []
+        while not peek(close):
+            if out:
+                eat(", ")
+            out.append(val())
+        eat(close)
+        return out
+
+    def val():
+        if peek("["):
+            eat("[")
+            return ("list", items("]"))
+        if peek("("):
+            eat("(")
+            return ("tuple", "", items(")"))
+        w = word()
+        if peek("("):
+            eat("(")
+            return ("tuple", w, items(")"))
+        if peek(" {"):
+            eat(" { ")
+            fields = []
+            while not peek(" }"):
+                if fields:
+                    eat(", ")
+                f = word()
+                eat(": ")
+                fields.append((f, val()))
+            eat(" }")
+            return ("struct", w, fields)
+        if re.match(r"^-?(\d|inf$|NaN$)", w) and ("." in w or "e" in w or w in ("inf", "-inf", "NaN")):
+            x = float(w)
+            if dbg_float(bits(x), False) != w:
+                raise ValueError(f"{w} is not the printer's text for its value")
+        return ("raw", w)
+
+    tree = val()
+    if at != len(text):
+        raise ValueError(f"trailing text at {at}")
+    return tree
+
+
+def check_debug(rows):
+    counts = {}
+    for func, cls, ins, outs, where in rows:
+        counts[func] = counts.get(func, 0) + 1
+        if func in ("f64::debug", "f32::debug"):
+            b = dbg_f32_bits(ins[0]) if func == "f32::debug" else int(ins[0][2:], 16)
+            want = [ai_s(dbg_float(b, func == "f32::debug"))]
+        elif func.endswith("::debug_after"):
+            got = [unpct_utf8(o[2:]) for o in outs]
+            try:
+                tree = dbg_parse(got[0])
+            except ValueError as e:
+                fail(f"{where}: {func}: Rust's text doesn't parse ({e})")
+                continue
+            if tree[0] != "struct" or tree[1] != func.split("::")[0]:
+                fail(f"{where}: {func}: the text is no {func.split('::')[0]}")
+            want = [ai_s(dbg_render(tree, False)), ai_s(dbg_render(tree, True))]
+        elif func.endswith("::debug"):
+            if func == "DragCoefficient::debug":
+                tree = ("struct", "DragCoefficient", [])
+            else:
+                tree = dbg_value(func, ins)
+            want = [ai_s(dbg_render(tree, False)), ai_s(dbg_render(tree, True))]
+        else:
+            fail(f"{where}: unknown function {func}")
+            continue
+        if want != outs:
+            fail(f"{where}: {func}: recomputed {want[0][:120]!r}, golden {outs[0][:120]!r}")
+    return counts
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests" / "golden"
@@ -6238,6 +6588,10 @@ def main():
             print(f"mpm: {len(rows)} rows recomputed ({summary})")
             check_corrections(root, "mpm", path, rows)
             MPM_CACHE.clear()
+        elif path.stem == "debug":
+            counts = check_debug(rows)
+            summary = ", ".join(f"{k.split('::')[0]} {v}" for k, v in sorted(counts.items()))
+            print(f"debug: {len(rows)} rows recomputed ({summary})")
         elif path.stem == "ai":
             counts = check_ai(root, rows)
             summary = ", ".join(f"{k.split('::')[-1]} {v}" for k, v in sorted(counts.items()))

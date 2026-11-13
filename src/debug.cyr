@@ -1,0 +1,949 @@
+# debug.cyr — Rust's derived `Debug` for the public types (M8 part d): `x.debug(sb, alternate)` appends `{:?}`
+# (alternate 0) or `{:#?}` (1), and returns 0, or -1 when the builder can't grow.
+#
+# The derive's shapes, as core's builders write them:
+# - a struct is `Name { a: 1.0, b: 2 }`, and pretty `Name {\n    a: 1.0,\n    b: 2,\n}`; a unit struct is its name;
+# - a tuple struct (glam's `DVec3`) is `DVec3(1.0, 2.0, 3.0)`, and pretty one element a line, each with a comma;
+# - a `Vec` or an array is `[1.0, 2.0]`, and pretty one element a line; empty, it is `[]` in both forms;
+# - a unit variant is its name, and a variant with fields is a struct named after the variant;
+# - in the pretty form a nested value's lines are indented four more spaces (core's `PadAdapter`).
+# A float is Rust's shortest text (src/fmtf.cyr), an f32 as an f32; an integer is decimal; a bool `true` or `false`.
+# Every field Rust declares is printed in its order, private scratch included; the port's own extras (the DST
+# plans, the solve buffers, the thread count) are not. A kind word outside its enum, which Rust can't hold, prints
+# as `Unknown`.
+#
+# `PravashError` has no counterpart: a 2.0 error is a code with no payload (ADR 0002 #1), and `pv_error_name(code)`
+# gives its variant's name. The ai configs' Debug is in src/ai.cyr.
+#
+# UPSTREAM(L16): cyrius:docs/development/issues/2026-11-13-derive-debug-and-shortest-float-digits.md
+
+# ── the builders ────────────────────────────────────────────────────────────────────
+
+# 4 × depth spaces.
+#must_use
+fn _pv_dd_indent(sb, depth): i64 {
+    var rc = 0;
+    for (var i = 0; i < depth; i = i + 1) { rc = rc | _pv_jw(sb, "    "); }
+    return rc;
+}
+
+# Opens a struct: `Name {` (pretty `Name {` and a newline).
+#must_use
+fn _pv_dd_open(sb, name, alt): i64 {
+    var rc = _pv_jw(sb, name);
+    if (alt == 0) { return rc | _pv_jw(sb, " {"); }
+    return rc | _pv_jw(sb, " {\n");
+}
+
+# A field's name, before its value: ` a: `, or `, a: ` after the first (pretty: the indent of depth + 1, `a: `).
+#must_use
+fn _pv_dd_field(sb, name, alt, depth, first): i64 {
+    var rc = 0;
+    if (alt == 1) {
+        rc = _pv_dd_indent(sb, depth + 1);
+    } elif (first == 1) {
+        rc = _pv_jw(sb, " ");
+    } else {
+        rc = _pv_jw(sb, ", ");
+    }
+    rc = rc | _pv_jw(sb, name);
+    return rc | _pv_jw(sb, ": ");
+}
+
+# After a field's value: nothing (pretty `,` and a newline).
+#must_use
+fn _pv_dd_end(sb, alt): i64 {
+    if (alt == 0) { return 0; }
+    return _pv_jw(sb, ",\n");
+}
+
+# Closes a struct: ` }` (pretty: the indent of depth, `}`).
+#must_use
+fn _pv_dd_close(sb, alt, depth): i64 {
+    if (alt == 0) { return _pv_jw(sb, " }"); }
+    return _pv_dd_indent(sb, depth) | _pv_jw(sb, "}");
+}
+
+# Opens a tuple or a list of n items with `text` (`DVec3(`, `[`); pretty adds a newline unless n is 0.
+#must_use
+fn _pv_dd_seq_open(sb, text, alt, n): i64 {
+    var rc = _pv_jw(sb, text);
+    if (alt == 1 && n > 0) { rc = rc | _pv_jw(sb, "\n"); }
+    return rc;
+}
+
+# Before item i: `, ` after the first (pretty: the indent of depth + 1).
+#must_use
+fn _pv_dd_item(sb, alt, depth, i): i64 {
+    if (alt == 1) { return _pv_dd_indent(sb, depth + 1); }
+    if (i == 0) { return 0; }
+    return _pv_jw(sb, ", ");
+}
+
+# Closes a tuple or a list of n items with `text` (`)`, `]`); pretty, when n > 0, after the indent of depth.
+#must_use
+fn _pv_dd_seq_close(sb, text, alt, depth, n): i64 {
+    if (alt == 1 && n > 0) { return _pv_dd_indent(sb, depth) | _pv_jw(sb, text); }
+    return _pv_jw(sb, text);
+}
+
+# ── values ──────────────────────────────────────────────────────────────────────────
+
+# `true` for a nonzero word, `false` for 0.
+#must_use
+fn _pv_dd_bool(sb, w): i64 {
+    if (w != 0) { return _pv_jw(sb, "true"); }
+    return _pv_jw(sb, "false");
+}
+
+# The n f64 words at p as a list.
+#must_use
+fn _pv_dd_f64s(sb, p, n, alt, depth): i64 {
+    var rc = _pv_dd_seq_open(sb, "[", alt, n);
+    for (var i = 0; i < n; i = i + 1) {
+        rc = rc | _pv_dd_item(sb, alt, depth, i);
+        var x: f64 = load64(p + i * 8);
+        rc = rc | _pv_debug_f64(sb, x);
+        rc = rc | _pv_dd_end(sb, alt);
+    }
+    return rc | _pv_dd_seq_close(sb, "]", alt, depth, n);
+}
+
+# The n integer words at p as a list.
+#must_use
+fn _pv_dd_words(sb, p, n, alt, depth): i64 {
+    var rc = _pv_dd_seq_open(sb, "[", alt, n);
+    for (var i = 0; i < n; i = i + 1) {
+        rc = rc | _pv_dd_item(sb, alt, depth, i);
+        rc = rc | _pv_jw_int(sb, load64(p + i * 8));
+        rc = rc | _pv_dd_end(sb, alt);
+    }
+    return rc | _pv_dd_seq_close(sb, "]", alt, depth, n);
+}
+
+# The n f32 elements at p as a list.
+#must_use
+fn _pv_dd_f32s(sb, p, n, alt, depth): i64 {
+    var rc = _pv_dd_seq_open(sb, "[", alt, n);
+    var b: *f32 = _pv_as_f32s(p);
+    for (var i = 0; i < n; i = i + 1) {
+        rc = rc | _pv_dd_item(sb, alt, depth, i);
+        var x: f32 = b[i];
+        rc = rc | _pv_debug_f32(sb, x);
+        rc = rc | _pv_dd_end(sb, alt);
+    }
+    return rc | _pv_dd_seq_close(sb, "]", alt, depth, n);
+}
+
+# A `DVec3` as glam's Debug writes it: `DVec3(x, y, z)`.
+#must_use
+fn _pv_dd_vec3(sb, v: PvVec3, alt, depth): i64 {
+    var w[24];
+    store64(&w, _pv_bits(v.x));
+    store64(&w + 8, _pv_bits(v.y));
+    store64(&w + 16, _pv_bits(v.z));
+    var rc = _pv_dd_seq_open(sb, "DVec3(", alt, 3);
+    for (var i = 0; i < 3; i = i + 1) {
+        rc = rc | _pv_dd_item(sb, alt, depth, i);
+        var x: f64 = load64(&w + i * 8);
+        rc = rc | _pv_debug_f64(sb, x);
+        rc = rc | _pv_dd_end(sb, alt);
+    }
+    return rc | _pv_dd_seq_close(sb, ")", alt, depth, 3);
+}
+
+# ── fields ──────────────────────────────────────────────────────────────────────────
+
+# An f64 field.
+#must_use
+fn _pv_dd_ff(sb, name, x: f64, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_debug_f64(sb, x);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# An f32 field.
+#must_use
+fn _pv_dd_f32f(sb, name, x: f32, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_debug_f32(sb, x);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# An integer field.
+#must_use
+fn _pv_dd_if(sb, name, n, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_jw_int(sb, n);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# A bool field.
+#must_use
+fn _pv_dd_bf(sb, name, w, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_dd_bool(sb, w);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# A field holding a unit variant, printed as `text`.
+#must_use
+fn _pv_dd_tf(sb, name, text, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_jw(sb, text);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# A `Vec<f64>` field.
+#must_use
+fn _pv_dd_cf(sb, name, c: *PvColumn, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_dd_f64s(sb, c.data, c.len, alt, depth + 1);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# A `Vec<f32>` field.
+#must_use
+fn _pv_dd_c32f(sb, name, c: *PvF32Column, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_dd_f32s(sb, c.data, c.len, alt, depth + 1);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# A `DVec3` field.
+#must_use
+fn _pv_dd_vf(sb, name, v: PvVec3, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_dd_vec3(sb, v, alt, depth + 1);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# An `[f64; n]` field from n words at p.
+#must_use
+fn _pv_dd_af(sb, name, p, n, alt, depth, first): i64 {
+    var rc = _pv_dd_field(sb, name, alt, depth, first);
+    rc = rc | _pv_dd_f64s(sb, p, n, alt, depth + 1);
+    return rc | _pv_dd_end(sb, alt);
+}
+
+# ── common ──────────────────────────────────────────────────────────────────────────
+
+#must_use
+fn _pv_dd_material(m: *PvFluidMaterial, sb, alt, depth): i64 {
+    var rc = _pv_dd_open(sb, "FluidMaterial", alt);
+    rc = rc | _pv_dd_ff(sb, "density", m.density, alt, depth, 1);
+    rc = rc | _pv_dd_ff(sb, "viscosity", m.viscosity, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "surface_tension", m.surface_tension, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "speed_of_sound", m.speed_of_sound, alt, depth, 0);
+    return rc | _pv_dd_close(sb, alt, depth);
+}
+
+impl PvFluidMaterial {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        return _pv_dd_material(self, sb, alternate, 0);
+    }
+}
+
+#must_use
+fn _pv_dd_particle(p: *PvFluidParticle, sb, alt, depth): i64 {
+    var conf[24];
+    store64(&conf, _pv_bits(p.conformation.0));
+    store64(&conf + 8, _pv_bits(p.conformation.1));
+    store64(&conf + 16, _pv_bits(p.conformation.2));
+    var rc = _pv_dd_open(sb, "FluidParticle", alt);
+    rc = rc | _pv_dd_vf(sb, "position", p.position, alt, depth, 1);
+    rc = rc | _pv_dd_vf(sb, "velocity", p.velocity, alt, depth, 0);
+    rc = rc | _pv_dd_vf(sb, "acceleration", p.acceleration, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "density", p.density, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "pressure", p.pressure, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "mass", p.mass, alt, depth, 0);
+    rc = rc | _pv_dd_if(sb, "phase", p.phase, alt, depth, 0);
+    rc = rc | _pv_dd_af(sb, "conformation", &conf, 3, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "temperature", p.temperature, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "fuel", p.fuel, alt, depth, 0);
+    return rc | _pv_dd_close(sb, alt, depth);
+}
+
+impl PvFluidParticle {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        return _pv_dd_particle(self, sb, alternate, 0);
+    }
+}
+
+# The name of a `ParticleSoa` column, in declaration order (`_pv_soa_col`'s).
+#must_use
+fn _pv_dd_soa_name(k): i64 {
+    match k {
+        0 => { return "pos_x"; }
+        1 => { return "pos_y"; }
+        2 => { return "pos_z"; }
+        3 => { return "vel_x"; }
+        4 => { return "vel_y"; }
+        5 => { return "vel_z"; }
+        6 => { return "accel_x"; }
+        7 => { return "accel_y"; }
+        8 => { return "accel_z"; }
+        9 => { return "density"; }
+        10 => { return "pressure"; }
+        11 => { return "mass"; }
+        12 => { return "phase"; }
+        13 => { return "conf_xx"; }
+        14 => { return "conf_xy"; }
+        15 => { return "conf_yy"; }
+        16 => { return "temperature"; }
+        17 => { return "fuel"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+impl PvParticleSoa {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): the 18 columns, `phase` as integers. 0, or -1 when the
+    # builder can't grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "ParticleSoa", alternate);
+        for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
+            var first = 0;
+            if (k == 0) { first = 1; }
+            var c: *PvColumn = _pv_soa_col(self, k);
+            if (k == 12) {
+                rc = rc | _pv_dd_field(sb, _pv_dd_soa_name(k), alternate, 0, first);
+                rc = rc | _pv_dd_words(sb, c.data, c.len, alternate, 1);
+                rc = rc | _pv_dd_end(sb, alternate);
+            } else {
+                rc = rc | _pv_dd_cf(sb, _pv_dd_soa_name(k), c, alternate, 0, first);
+            }
+        }
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvArenaHandle {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1) of the private fields. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "ArenaHandle", alternate);
+        rc = rc | _pv_dd_if(sb, "start", self.start, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "len", self.len, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "generation", self.generation, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvFluidConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "FluidConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "dt", self.dt, alternate, 0, 1);
+        rc = rc | _pv_dd_vf(sb, "gravity", self.gravity, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "smoothing_radius", self.smoothing_radius, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "gas_constant", self.gas_constant, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "rest_density", self.rest_density, alternate, 0, 0);
+        rc = rc | _pv_dd_vf(sb, "bounds_min", self.bounds_min, alternate, 0, 0);
+        rc = rc | _pv_dd_vf(sb, "bounds_max", self.bounds_max, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "boundary_damping", self.boundary_damping, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── buoyancy, shallow ───────────────────────────────────────────────────────────────
+
+# Appends Rust's Debug of the unit struct `DragCoefficient`: its name, in both forms. 0, or -1 when the builder
+# can't grow. Mirrors the derived `Debug`.
+#must_use
+fn drag_coefficient_debug(sb, alternate): i64 {
+    return _pv_jw(sb, "DragCoefficient");
+}
+
+# Appends Rust's Debug of a flow regime: the variant's name, in both forms. 0, or -1 when the builder can't grow.
+# Mirrors the derived `Debug`.
+#must_use
+fn flow_regime_debug(k, sb, alternate): i64 {
+    return _pv_jw(sb, flow_regime_name(k));
+}
+
+impl PvShallowWater {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): every field, the five scratch buffers included. 0, or -1
+    # when the builder can't grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "ShallowWater", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dx", self.dx, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "height", _pv_sw_col(self, 0), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "vx", _pv_sw_col(self, 1), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "vy", _pv_sw_col(self, 2), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "ground", _pv_sw_col(self, 3), alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "gravity", self.gravity, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "damping", self.damping, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "manning_n", _pv_sw_col(self, 4), alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dry_threshold", self.dry_threshold, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "breaking_threshold", self.breaking_threshold, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "breaking_dissipation", self.breaking_dissipation, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dispersion_coeff", self.dispersion_coeff, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_green_naghdi", self.use_green_naghdi, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_riemann", self.use_riemann, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_vx", _pv_sw_col(self, 5), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_vy", _pv_sw_col(self, 6), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_h", _pv_sw_col(self, 7), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_lap", _pv_sw_col(self, 8), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_line", _pv_sw_col(self, 9), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvSedimentConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "SedimentConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "shields_critical", self.shields_critical, alternate, 0, 1);
+        rc = rc | _pv_dd_ff(sb, "grain_diameter", self.grain_diameter, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "sediment_density", self.sediment_density, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "water_density", self.water_density, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "erosion_rate", self.erosion_rate, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "deposition_rate", self.deposition_rate, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── grid ────────────────────────────────────────────────────────────────────────────
+
+# Appends Rust's Debug of a boundary condition: the variant's name, in both forms. 0, or -1 when the builder can't
+# grow. Mirrors the derived `Debug`.
+#must_use
+fn boundary_condition_debug(k, sb, alternate): i64 {
+    return _pv_jw(sb, boundary_condition_name(k));
+}
+
+impl PvGridConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "GridConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "dt", self.dt, alternate, 0, 1);
+        rc = rc | _pv_dd_ff(sb, "viscosity", self.viscosity, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "diffusion_iterations", self.diffusion_iterations, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "pressure_iterations", self.pressure_iterations, alternate, 0, 0);
+        rc = rc | _pv_dd_tf(sb, "boundary", boundary_condition_name(self.boundary), alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "vorticity_confinement", self.vorticity_confinement, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "buoyancy_alpha", self.buoyancy_alpha, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "ambient_density", self.ambient_density, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_maccormack", self.use_maccormack, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_bfecc", self.use_bfecc, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "smagorinsky_cs", self.smagorinsky_cs, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_multigrid", self.use_multigrid, alternate, 0, 0);
+        rc = rc | _pv_dd_bf(sb, "use_cg", self.use_cg, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# The multigrid levels (a column of `*_PvMgLevel`) as Rust's `Vec<(Vec<f64>, Vec<f64>, Vec<f64>)>`: a list of
+# tuples.
+#must_use
+fn _pv_dd_mg_levels(sb, lv: *PvColumn, alt, depth): i64 {
+    var rc = _pv_dd_seq_open(sb, "[", alt, lv.len);
+    for (var j = 0; j < lv.len; j = j + 1) {
+        rc = rc | _pv_dd_item(sb, alt, depth, j);
+        var r = load64(lv.data + j * 8);
+        rc = rc | _pv_dd_seq_open(sb, "(", alt, 3);
+        for (var q = 0; q < 3; q = q + 1) {
+            rc = rc | _pv_dd_item(sb, alt, depth + 1, q);
+            var c: *PvColumn = _pv_mg_col(r, q);
+            rc = rc | _pv_dd_f64s(sb, c.data, c.len, alt, depth + 2);
+            rc = rc | _pv_dd_end(sb, alt);
+        }
+        rc = rc | _pv_dd_seq_close(sb, ")", alt, depth + 1, 3);
+        rc = rc | _pv_dd_end(sb, alt);
+    }
+    return rc | _pv_dd_seq_close(sb, "]", alt, depth, lv.len);
+}
+
+# The name of a `FluidGrid` column 0 … 7 (`_pv_fg_col`'s): the public fields, then the scratch.
+#must_use
+fn _pv_dd_fg_name(k): i64 {
+    match k {
+        0 => { return "vx"; }
+        1 => { return "vy"; }
+        2 => { return "pressure"; }
+        3 => { return "density"; }
+        4 => { return "scratch_a"; }
+        5 => { return "scratch_b"; }
+        6 => { return "scratch_c"; }
+        7 => { return "diffuse_rhs"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+impl PvFluidGrid {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): Rust's fields, the scratch and the multigrid levels
+    # included (not the port's solve buffers, DST plans or thread count). 0, or -1 when the builder can't grow.
+    # Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "FluidGrid", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dx", self.dx, alternate, 0, 0);
+        for (var k = 0; k < 8; k = k + 1) {
+            rc = rc | _pv_dd_cf(sb, _pv_dd_fg_name(k), _pv_fg_col(self, k), alternate, 0, 0);
+        }
+        rc = rc | _pv_dd_field(sb, "mg_levels", alternate, 0, 0);
+        rc = rc | _pv_dd_mg_levels(sb, _pv_fg_col(self, 8), alternate, 1);
+        rc = rc | _pv_dd_end(sb, alternate);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvKEpsilon {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), the scratch included. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "KEpsilon", alternate);
+        rc = rc | _pv_dd_cf(sb, "k", _pv_ke_col(self, 0), alternate, 0, 1);
+        rc = rc | _pv_dd_cf(sb, "epsilon", _pv_ke_col(self, 1), alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "c_mu", self.c_mu, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "c_eps1", self.c_eps1, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "c_eps2", self.c_eps2, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_k", _pv_ke_col(self, 2), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch_eps", _pv_ke_col(self, 3), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# The name of a `MacGrid` column (`_pv_mac_col`'s).
+#must_use
+fn _pv_dd_mac_name(k): i64 {
+    match k {
+        0 => { return "vx"; }
+        1 => { return "vy"; }
+        2 => { return "pressure"; }
+        3 => { return "density"; }
+        4 => { return "scratch_div"; }
+        5 => { return "scratch_density"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+impl PvMacGrid {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), the scratch included. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "MacGrid", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dx", self.dx, alternate, 0, 0);
+        for (var k = 0; k < 6; k = k + 1) {
+            rc = rc | _pv_dd_cf(sb, _pv_dd_mac_name(k), _pv_mac_col(self, k), alternate, 0, 0);
+        }
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── vof, phase field ────────────────────────────────────────────────────────────────
+
+impl PvVofField {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), the scratch included. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "VofField", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dx", self.dx, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "alpha", _pv_vof_col(self, 0), alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch", _pv_vof_col(self, 1), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvPhaseField {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), the scratch included. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "PhaseField", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "dx", self.dx, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "phi", _pv_pf_col(self, 0), alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "mobility", self.mobility, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "epsilon", self.epsilon, alternate, 0, 0);
+        rc = rc | _pv_dd_cf(sb, "scratch", _pv_pf_col(self, 1), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── sph ─────────────────────────────────────────────────────────────────────────────
+
+# A phase's three properties from the three words at p.
+#must_use
+fn _pv_dd_phase(sb, p, alt, depth): i64 {
+    var rd: f64 = load64(p);
+    var gc: f64 = load64(p + 8);
+    var mu: f64 = load64(p + 16);
+    var rc = _pv_dd_open(sb, "PhaseProperties", alt);
+    rc = rc | _pv_dd_ff(sb, "rest_density", rd, alt, depth, 1);
+    rc = rc | _pv_dd_ff(sb, "gas_constant", gc, alt, depth, 0);
+    rc = rc | _pv_dd_ff(sb, "viscosity", mu, alt, depth, 0);
+    return rc | _pv_dd_close(sb, alt, depth);
+}
+
+impl PvPhaseProperties {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        return _pv_dd_phase(sb, self, alternate, 0);
+    }
+}
+
+impl PvMultiPhaseConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): the phases as a list of `PhaseProperties`. 0, or -1 when
+    # the builder can't grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var n = self.phases.len / 3;
+        var rc = _pv_dd_open(sb, "MultiPhaseConfig", alternate);
+        rc = rc | _pv_dd_field(sb, "phases", alternate, 0, 1);
+        rc = rc | _pv_dd_seq_open(sb, "[", alternate, n);
+        for (var j = 0; j < n; j = j + 1) {
+            rc = rc | _pv_dd_item(sb, alternate, 1, j);
+            rc = rc | _pv_dd_phase(sb, self.phases.data + j * 24, alternate, 2);
+            rc = rc | _pv_dd_end(sb, alternate);
+        }
+        rc = rc | _pv_dd_seq_close(sb, "]", alternate, 1, n);
+        rc = rc | _pv_dd_end(sb, alternate);
+        rc = rc | _pv_dd_ff(sb, "interface_tension", self.interface_tension, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvViscoelasticConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "ViscoelasticConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "elastic_modulus", self.elastic_modulus, alternate, 0, 1);
+        rc = rc | _pv_dd_ff(sb, "relaxation_time", self.relaxation_time, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvHeatConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "HeatConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "diffusivity", self.diffusivity, alternate, 0, 1);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvPhaseChangeConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "PhaseChangeConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "transition_temperature", self.transition_temperature, alternate, 0, 1);
+        rc = rc | _pv_dd_ff(sb, "latent_heat", self.latent_heat, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "heat_capacity", self.heat_capacity, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "phase_below", self.phase_below, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "phase_above", self.phase_above, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvCombustionConfig {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "CombustionConfig", alternate);
+        rc = rc | _pv_dd_ff(sb, "ignition_temperature", self.ignition_temperature, alternate, 0, 1);
+        rc = rc | _pv_dd_ff(sb, "reaction_rate", self.reaction_rate, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "heat_release", self.heat_release, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# Appends Rust's Debug of a non-Newtonian model: its variant as a struct of the variant's fields (`PowerLaw {
+# consistency: .., power_index: .. }`), or `Unknown` for a kind outside the enum. 0, or -1 when the builder can't
+# grow. Mirrors the derived `Debug`.
+#must_use
+fn non_newtonian_viscosity_debug(m: *PvNonNewtonianModel, sb, alternate): i64 {
+    match m.kind {
+        PV_NON_NEWTONIAN_VISCOSITY_POWER_LAW => {
+            var rc = _pv_dd_open(sb, "PowerLaw", alternate);
+            rc = rc | _pv_dd_ff(sb, "consistency", m.consistency, alternate, 0, 1);
+            rc = rc | _pv_dd_ff(sb, "power_index", m.power_index, alternate, 0, 0);
+            return rc | _pv_dd_close(sb, alternate, 0);
+        }
+        PV_NON_NEWTONIAN_VISCOSITY_BINGHAM => {
+            var rc = _pv_dd_open(sb, "Bingham", alternate);
+            rc = rc | _pv_dd_ff(sb, "yield_stress", m.yield_stress, alternate, 0, 1);
+            rc = rc | _pv_dd_ff(sb, "plastic_viscosity", m.plastic_viscosity, alternate, 0, 0);
+            return rc | _pv_dd_close(sb, alternate, 0);
+        }
+        PV_NON_NEWTONIAN_VISCOSITY_HERSCHEL_BULKLEY => {
+            var rc = _pv_dd_open(sb, "HerschelBulkley", alternate);
+            rc = rc | _pv_dd_ff(sb, "yield_stress", m.yield_stress, alternate, 0, 1);
+            rc = rc | _pv_dd_ff(sb, "consistency", m.consistency, alternate, 0, 0);
+            rc = rc | _pv_dd_ff(sb, "power_index", m.power_index, alternate, 0, 0);
+            return rc | _pv_dd_close(sb, alternate, 0);
+        }
+        _ => { return _pv_jw(sb, "Unknown"); }
+    }
+    return 0;
+}
+
+# The Rust variant name of a secondary particle's kind (`"Foam"`), or "Unknown".
+#must_use
+fn _pv_secondary_type_name(k): i64 {
+    match k {
+        PV_SECONDARY_TYPE_FOAM => { return "Foam"; }
+        PV_SECONDARY_TYPE_SPRAY => { return "Spray"; }
+        PV_SECONDARY_TYPE_BUBBLE => { return "Bubble"; }
+        _ => { return "Unknown"; }
+    }
+    return "Unknown";
+}
+
+# Appends Rust's Debug of a secondary particle's kind: the variant's name, in both forms. 0, or -1 when the builder
+# can't grow. Mirrors the derived `Debug`.
+#must_use
+fn secondary_type_debug(k, sb, alternate): i64 {
+    return _pv_jw(sb, _pv_secondary_type_name(k));
+}
+
+impl PvSecondaryParticle {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "SecondaryParticle", alternate);
+        rc = rc | _pv_dd_vf(sb, "position", self.position, alternate, 0, 1);
+        rc = rc | _pv_dd_vf(sb, "velocity", self.velocity, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "lifetime", self.lifetime, alternate, 0, 0);
+        rc = rc | _pv_dd_tf(sb, "kind", _pv_secondary_type_name(self.kind), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── coupling, mpm ───────────────────────────────────────────────────────────────────
+
+# A body shape at depth.
+#must_use
+fn _pv_dd_shape(s: *PvShape, sb, alt, depth): i64 {
+    if (s.kind == PV_BODY_SHAPE_SPHERE) {
+        var rc = _pv_dd_open(sb, "Sphere", alt);
+        rc = rc | _pv_dd_ff(sb, "radius", s.radius, alt, depth, 1);
+        return rc | _pv_dd_close(sb, alt, depth);
+    }
+    if (s.kind == PV_BODY_SHAPE_BOX) {
+        var h[24];
+        store64(&h, _pv_bits(s.half_extents.0));
+        store64(&h + 8, _pv_bits(s.half_extents.1));
+        store64(&h + 16, _pv_bits(s.half_extents.2));
+        var rc = _pv_dd_open(sb, "Box", alt);
+        rc = rc | _pv_dd_af(sb, "half_extents", &h, 3, alt, depth, 1);
+        return rc | _pv_dd_close(sb, alt, depth);
+    }
+    return _pv_jw(sb, "Unknown");
+}
+
+# Appends Rust's Debug of a body shape: `Sphere { radius: .. }` or `Box { half_extents: [..] }`, or `Unknown` for a
+# kind outside the enum. 0, or -1 when the builder can't grow. Mirrors the derived `Debug`.
+#must_use
+fn body_shape_debug(s: *PvShape, sb, alternate): i64 {
+    return _pv_dd_shape(s, sb, alternate, 0);
+}
+
+impl PvRigidBody {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var shape: PvShape = self.shape;
+        var rc = _pv_dd_open(sb, "RigidBody", alternate);
+        rc = rc | _pv_dd_vf(sb, "position", self.position, alternate, 0, 1);
+        rc = rc | _pv_dd_vf(sb, "velocity", self.velocity, alternate, 0, 0);
+        rc = rc | _pv_dd_ff(sb, "mass", self.mass, alternate, 0, 0);
+        rc = rc | _pv_dd_field(sb, "shape", alternate, 0, 0);
+        rc = rc | _pv_dd_shape(&shape, sb, alternate, 1);
+        rc = rc | _pv_dd_end(sb, alternate);
+        rc = rc | _pv_dd_vf(sb, "force", self.force, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# A constitutive model at depth.
+#must_use
+fn _pv_dd_law(m: *PvConstitutiveLaw, sb, alt, depth): i64 {
+    match m.kind {
+        PV_CONSTITUTIVE_MODEL_FLUID => {
+            var rc = _pv_dd_open(sb, "Fluid", alt);
+            rc = rc | _pv_dd_ff(sb, "bulk_modulus", m.bulk_modulus, alt, depth, 1);
+            rc = rc | _pv_dd_ff(sb, "viscosity", m.viscosity, alt, depth, 0);
+            return rc | _pv_dd_close(sb, alt, depth);
+        }
+        PV_CONSTITUTIVE_MODEL_NEO_HOOKEAN => {
+            var rc = _pv_dd_open(sb, "NeoHookean", alt);
+            rc = rc | _pv_dd_ff(sb, "youngs_modulus", m.youngs_modulus, alt, depth, 1);
+            rc = rc | _pv_dd_ff(sb, "poisson_ratio", m.poisson_ratio, alt, depth, 0);
+            return rc | _pv_dd_close(sb, alt, depth);
+        }
+        PV_CONSTITUTIVE_MODEL_DRUCKER_PRAGER => {
+            var rc = _pv_dd_open(sb, "DruckerPrager", alt);
+            rc = rc | _pv_dd_ff(sb, "youngs_modulus", m.youngs_modulus, alt, depth, 1);
+            rc = rc | _pv_dd_ff(sb, "poisson_ratio", m.poisson_ratio, alt, depth, 0);
+            rc = rc | _pv_dd_ff(sb, "friction_angle", m.friction_angle, alt, depth, 0);
+            return rc | _pv_dd_close(sb, alt, depth);
+        }
+        _ => { return _pv_jw(sb, "Unknown"); }
+    }
+    return 0;
+}
+
+# Appends Rust's Debug of a constitutive model: its variant as a struct of the variant's fields, or `Unknown` for a
+# kind outside the enum. 0, or -1 when the builder can't grow. Mirrors the derived `Debug`.
+#must_use
+fn constitutive_model_debug(m: *PvConstitutiveLaw, sb, alternate): i64 {
+    return _pv_dd_law(m, sb, alternate, 0);
+}
+
+impl PvMpmParticle {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): the deformation gradient as Rust's `[f64; 4]`, row-major.
+    # 0, or -1 when the builder can't grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var g[32];
+        store64(&g, _pv_bits(self.deformation_grad.m00));
+        store64(&g + 8, _pv_bits(self.deformation_grad.m01));
+        store64(&g + 16, _pv_bits(self.deformation_grad.m10));
+        store64(&g + 24, _pv_bits(self.deformation_grad.m11));
+        var law: PvConstitutiveLaw = self.model;
+        var rc = _pv_dd_open(sb, "MpmParticle", alternate);
+        rc = rc | _pv_dd_af(sb, "deformation_grad", &g, 4, alternate, 0, 1);
+        rc = rc | _pv_dd_field(sb, "model", alternate, 0, 0);
+        rc = rc | _pv_dd_law(&law, sb, alternate, 1);
+        rc = rc | _pv_dd_end(sb, alternate);
+        rc = rc | _pv_dd_ff(sb, "volume_0", self.volume_0, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# ── compute ─────────────────────────────────────────────────────────────────────────
+
+impl PvPackedParticles {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), each buffer as its f32s. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "PackedParticles", alternate);
+        rc = rc | _pv_dd_if(sb, "count", self.count, alternate, 0, 1);
+        rc = rc | _pv_dd_c32f(sb, "position_mass", _pv_packed_col(self, 0), alternate, 0, 0);
+        rc = rc | _pv_dd_c32f(sb, "velocity", _pv_packed_col(self, 1), alternate, 0, 0);
+        rc = rc | _pv_dd_c32f(sb, "density_pressure", _pv_packed_col(self, 2), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvSphKernelParams {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1): `gravity` as Rust's `[f32; 3]`. 0, or -1 when the builder
+    # can't grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var gv[16];
+        store64(&gv, 0);
+        store64(&gv + 8, 0);
+        var b: *f32 = _pv_as_f32s(&gv);
+        b[0] = self.gravity_x;
+        b[1] = self.gravity_y;
+        b[2] = self.gravity_z;
+        var rc = _pv_dd_open(sb, "SphKernelParams", alternate);
+        rc = rc | _pv_dd_f32f(sb, "smoothing_radius", self.smoothing_radius, alternate, 0, 1);
+        rc = rc | _pv_dd_f32f(sb, "rest_density", self.rest_density, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "gas_constant", self.gas_constant, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "viscosity", self.viscosity, alternate, 0, 0);
+        rc = rc | _pv_dd_field(sb, "gravity", alternate, 0, 0);
+        rc = rc | _pv_dd_f32s(sb, &gv, 3, alternate, 1);
+        rc = rc | _pv_dd_end(sb, alternate);
+        rc = rc | _pv_dd_f32f(sb, "dt", self.dt, alternate, 0, 0);
+        rc = rc | _pv_dd_if(sb, "particle_count", self.particle_count, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvGridKernelParams {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "GridKernelParams", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "dx", self.dx, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "dt", self.dt, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "viscosity", self.viscosity, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "buoyancy_alpha", self.buoyancy_alpha, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "ambient_density", self.ambient_density, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+impl PvShallowKernelParams {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1). 0, or -1 when the builder can't grow. Mirrors the derived
+    # `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "ShallowKernelParams", alternate);
+        rc = rc | _pv_dd_if(sb, "nx", self.nx, alternate, 0, 1);
+        rc = rc | _pv_dd_if(sb, "ny", self.ny, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "dx", self.dx, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "dt", self.dt, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "gravity", self.gravity, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "damping", self.damping, alternate, 0, 0);
+        rc = rc | _pv_dd_f32f(sb, "dry_threshold", self.dry_threshold, alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}
+
+# Appends Rust's Debug of a compute operation: the variant's name, in both forms. 0, or -1 when the builder can't
+# grow. Mirrors the derived `Debug`.
+#must_use
+fn compute_op_debug(k, sb, alternate): i64 {
+    return _pv_jw(sb, compute_op_name(k));
+}
+
+impl PvNeuralCorrection {
+    # Appends Rust's `{:?}` (alternate 0) or `{:#?}` (1), each buffer as its f32s. 0, or -1 when the builder can't
+    # grow. Mirrors the derived `Debug`.
+    #must_use
+    fn debug(self, sb, alternate): i64 {
+        var rc = _pv_dd_open(sb, "NeuralCorrection", alternate);
+        rc = rc | _pv_dd_c32f(sb, "velocity_delta", _pv_as_f32_column(_pv_addr(self)), alternate, 0, 1);
+        rc = rc | _pv_dd_c32f(sb, "pressure_delta", _pv_as_f32_column(_pv_addr(self) + 24), alternate, 0, 0);
+        return rc | _pv_dd_close(sb, alternate, 0);
+    }
+}

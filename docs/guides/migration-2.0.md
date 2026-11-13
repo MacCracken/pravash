@@ -64,6 +64,7 @@ namespace serves pravash and its consumers: `sph::step` is `sph_step`, and `logg
 | `x.clone()` | `PvX_clone(&out, &x)`: 1, or 0 with nothing held; a type with no storage copies by assignment |
 | `serde_json::to_string(&x)` | `x.to_json(sb)` onto a `str_builder` |
 | `serde_json::from_str::<X>(s)` | `PvX_from_json(buf, len, &out)`, a `Result` whose `Err` is `PV_ERR_DESERIALIZE` |
+| `format!("{x:?}")`, `format!("{x:#?}")` | `x.debug(sb, 0)`, `x.debug(sb, 1)` onto a `str_builder`; an enum's `<snake>_debug(k, sb, alternate)` (#13 below) |
 
 A solver step, with its `Result`:
 
@@ -341,6 +342,25 @@ This one needs no code change. Rust 1.3.0 promised the same bits only on one pla
 x86_64 Linux, x86_64 Windows and aarch64, because every transcendental a step calls is pravash's own and correctly
 rounded (ADR 0002 #7).
 
+### #13 Debug writes onto a builder
+
+Rust's derived `Debug` is `x.debug(sb, alternate)` on each struct: Rust's `{:?}` text with alternate 0 and `{:#?}`
+with 1, onto a `str_builder`, returning 0, or -1 when the builder can't grow. A unit-variant enum's kind word prints
+through `<snake>_debug(k, sb, alternate)` (`flow_regime_debug`), a payload enum's through
+`<snake>_debug(&payload, sb, alternate)` (`body_shape_debug`). The text is Rust's to the byte: the field order, the
+private scratch, the float digits (ADR 0002 #29).
+
+```cyrius
+var c: PvFluidConfig = PvFluidConfig_water_2d();
+var sb = str_builder_new();
+if (c.debug(sb, 0) != 0) { return 1; }                          # Rust: format!("{c:?}")
+var text = str_builder_build(sb);
+var head = "FluidConfig { dt: 0.001, gravity: DVec3(0.0, -9.81, 0.0), smoothing_radius: 0.05, ";
+if (memeq(str_data(text), head, strlen(head)) == 0) { return 1; }
+var regime = str_builder_new();
+if (flow_regime_debug(PV_FLOW_REGIME_LAMINAR, regime, 1) != 0) { return 1; }    # Rust: format!("{r:#?}")
+```
+
 ## What stays the same
 
 - **The physics.** The golden corpus replays Rust 1.3.0's own results for every module: single calls, single steps
@@ -358,9 +378,8 @@ rounded (ADR 0002 #7).
 ## Not carried over
 
 - The `oracle` feature (port tooling, never public API).
-- `PravashError`'s detail strings and thiserror's messages (#1).
-- `Debug` on the other 36 public types. In this build only the ai configs have it (#11); the rest, as
-  `x.debug(sb, alternate)`, are the next part of the release (port plan M8 part d).
+- `PravashError`'s detail strings and thiserror's messages (#1), and with them its `Debug` text:
+  `pv_error_name(code)` gives the variant's name.
 
 ## Known limitations
 

@@ -6,6 +6,7 @@ common
 compute
 constants
 coupling
+debug
 grid
 json
 logging

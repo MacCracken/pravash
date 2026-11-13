@@ -98,7 +98,7 @@
 - [x] M8 part c: the full surface-parity diff (derives, trait methods and the reverse direction; six missing clones
   ported, three Rust-private types made private), the README, the migration guide, the CHANGELOG's Breaking section,
   Rust's examples ported with their outputs, and the docs' code compiled and run (`scripts/doc_examples.py`, in CI)
-- [ ] M8 part d: Rust's derived `Debug` on the 36 public types without it (`x.debug(sb, alternate)` for `{:?}` and
+- [x] M8 part d: Rust's derived `Debug` on the 36 public types without it (`x.debug(sb, alternate)` for `{:?}` and
   `{:#?}`), golden rows from the oracle, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
   a `#derive(Debug)` request filed at cyrius
 - [ ] M8 part e: VERSION 2.0.0 and the release gate on three targets; the fuzz target (`tests/pravash.fcyr` is the

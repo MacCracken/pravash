@@ -1068,3 +1068,26 @@ The "with `defer`" column is a run of 13 rows only, three rounds each.
 - **The Debug ASCII fast path.** The first port decoded each code point and searched the escape table, which made
   `daimon_debug` 2.15–2.17 µs. Printable ASCII other than `"` and `\` now skips both. It went to 879–886 ns, with the
   same bytes: every ai row still matches and the 42 checks pass.
+
+## M8 part d: Debug text (2026-11-13)
+
+Rust's criterion suite has no Debug bench, so these are against a twin on the frozen oracle,
+`scripts/probes/rust/src/bin/bench_debug_d.rs` (rustc 1.99.1). Two rounds, pinned to core 15, the twin and
+`cyrius bench` interleaved. Each iteration writes into a fresh `String` or `str_builder`, as `format!` does.
+
+| Bench | Rust 1.3.0 | Cyrius | Cyrius / Rust |
+|---|---|---|---|
+| `debug_d/f64_mix`: `{:?}` of eight f64s, positional and exponential, short and 17-digit, one at the subnormal edge | 585–600 ns | 31.9–32.2 µs | 54× |
+| `debug_d/particle`: `{:?}` of `FluidParticle::new_2d(0.5, 0.25, 0.001)` | 906–930 ns | 5.88–6.00 µs | 6.4× |
+| `debug_d/particle_pretty`: `{:#?}` of the same | 2.14–2.19 µs | 8.16–8.28 µs | 3.8× |
+| `debug_d/grid_8x8`: `{:?}` of an 8 × 8 `FluidGrid` after a multigrid step | 39.0–39.7 µs | 1.25 ms | 32× |
+
+**Reading it.**
+- **The float printer is the cost.** Burger & Dybvig's search scales each value by 10^k on a 40-limb bignum and
+  finds each digit by repeated subtraction, so a value far from 1 (1e-7, 1e16, `MIN_POSITIVE`) costs the most. Rust's
+  core runs Grisu on 64-bit words and falls back to Dragon only when Grisu can't decide.
+- **A particle is cheaper.** Eleven of its seventeen floats are 0.0, which takes a fast path. Its pretty form adds
+  indentation, on both sides, so the ratio falls to 3.8×.
+- **A grid is ≈ 650 floats**, and runs 32× Rust's time, between the two.
+- **Not on the step path.** The ratio is a finding: the stdlib printer requested in ledger L16 (Ryu or Schubfach)
+  would replace `src/fmtf.cyr`.

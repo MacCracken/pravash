@@ -25,7 +25,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M5 SPH solvers | ✅ **done 2026-11-12.** Part e: the solver's thread count (`set_threads`; Rust's three `parallel` loops on the pool, every step row at 2, 3, 4 and 8 threads giving the serial bits; ADR 0002 #4) and the D3 switch to f64 neighbour keys (hisab 3.4.1's cell, integer neighbour cells; 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription; ADR 0002 #2). Part d ✅ 2026-11-12: `src/sph_multiphase.cyr`, the multiphase step with `PvPhaseProperties` and `PvMultiPhaseConfig`; 26 rows, the first 25 bit-exact on the first replay and the 26th closing the mutation tests' one gap; the last 5 Rust tests of `sph.rs`; ADR 0002 #22. Part c ✅ 2026-11-12: `src/sph_dfsph.cyr`, the DFSPH step; 35 rows, bit-exact on the first replay; 6 Rust tests; ADR 0002 #21. Part b ✅ 2026-11-12: `src/sph_pcisph.cyr`, the PCISPH step; 37 rows, bit-exact on the first replay; 4 Rust tests; ADR 0002 #20. Part a ✅ 2026-11-12: `src/sph.cyr`, `PvSphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension, the f32 lists of M4 part b) and `adaptive_dt`; 66 rows, every one bit-exact on the first replay; 19 Rust tests and 5 integration tests; ADR 0002 #19. |
 | M6 Coupling and MPM | ✅ **done 2026-11-12.** Part a ✅ 2026-11-12: `src/coupling.cyr`, the rigid bodies (`PvBodyShape` / `PvShape`, `PvRigidBody`, the two-way coupling, integration with and without added mass, both drags, the particle level set; JSON for `BodyShape` and `RigidBody`). `drag_from_particles_indexed` takes the caller's cells-only `PvNeighborGrid` (`PvNeighborGrid_build`, f64 keys; ADR 0002 #23). A new golden module, `coupling.tsv`: 4,798 rows, every one bit-exact on the first replay but an indexed drag at 10⁶, which `coupling.d3.tsv` maps (ADR 2); 22 of the 33 Rust tests. Part b ✅ 2026-11-12: `src/flip.cyr`, the `FlipSolver` (P2G, the projection, FLIP/PIC and APIC G2P, the APIC resize; ADR 0002 #24): 245 rows, every one bit-exact on the first replay, among them 210 class S trajectories and scenarios; all 33 Rust tests of `coupling.rs` and all 33 integration tests. Part c ✅ 2026-11-12: `src/mpm.cyr` (`PvConstitutiveModel` / `PvConstitutiveLaw` and its JSON, `PvMat2`, `PvMpmParticle`, `PvMpmSolver`; the 2 × 2 SVD and Drucker–Prager on the correctly rounded primitives; ADR 0002 #25): a new golden module, `mpm.tsv`, 1,336 rows, 1,319 bit-exact against the oracle and 17 against the corrected oracle `mpm.cr.tsv` where glibc misrounds; all 13 Rust tests |
 | M7 Compute, logging and ai | ✅ **done 2026-11-12.** Part b ✅ 2026-11-12: `src/ai.cyr` (`PvDaimonConfig`, `PvHooshConfig`: the defaults, the setters with their ownership bits, JSON, Rust's `{:?}` and `{:#?}` with the key redacted, `<str as Debug>`'s escapes from `src/str_debug_data.cyr`, generated from rustc 1.99.1's core; ADR 0002 #27) and `src/logging.cyr` (the three inits, the PRAVASH_LOG filter as tracing-subscriber's EnvFilter decides it, and the Trace Event file through a sakshi hook, ledger L11; ADR 0002 #28), with every one of Rust's 60 spans and 12 warnings at its point in every module. Two new golden modules, `ai.tsv` 579 rows and `logging.tsv` 251 (99 filter rows, 152 trace rows over 37 calls), all matching on the first replay; the instrumentation changed no other row; all 3 Rust tests. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
-| M8 Release 2.0.0 | in progress. Part c ✅ 2026-11-13: the full surface diff (`scripts/surface_parity.py` adds Rust's derives, its trait methods and the reverse direction: 625 items ok, the 36 `Debug` derives pending part d; 466 public Cyrius names, 351 Rust items and 115 Cyrius-only by 18 rules citing their ADR rows). It found six missing clones, ported with a test group each, and three Rust-private types left public, now `_Pv` names. The README, `docs/guides/migration-2.0.md` and the CHANGELOG's Breaking section; Rust's three examples ported (`docs/examples/`) with outputs derived from the oracle (`scripts/oracle/examples.py`: shallow water prints Rust's output exactly, and the SPH examples leave it at the second step by ADR 0002 #2 alone); `scripts/doc_examples.py` runs the 14 blocks and programs, in CI. Part b ✅ 2026-11-12: the release benchmark record (`scripts/bench_record.py`): all 57 rows of Rust's 21 criterion groups in both columns, three pinned interleaved rounds (median 4.4× Rust's time, 0.76× to 37×), and the thread-count rows (the SPH step 2.2–3.2× faster at 8 threads, Rust's rayon 1.05–1.95×). Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
+| M8 Release 2.0.0 | in progress. Part d ✅ 2026-11-13: Rust's derived `Debug` on the 35 public types (`src/fmtf.cyr`, Rust's shortest float text, impetus's printer with the f32 case; `src/debug.cyr`, the builders and a `debug(sb, alternate)` each; ADR 0002 #29; ledger L16, `#derive(Debug)` and the printer requested at cyrius). A new golden module, `debug.tsv`: 9,602 rows (6,871 f64 and 2,565 f32 printings, 156 values, 10 states after their own steps, which leave Rust's scratch), all matching, all recomputed by validate.py; 14 of 15 mutations caught, the 15th equivalent. Part c ✅ 2026-11-13: the full surface diff (`scripts/surface_parity.py` adds Rust's derives, its trait methods and the reverse direction: 625 items ok, the 36 `Debug` derives pending part d; 466 public Cyrius names, 351 Rust items and 115 Cyrius-only by 18 rules citing their ADR rows). It found six missing clones, ported with a test group each, and three Rust-private types left public, now `_Pv` names. The README, `docs/guides/migration-2.0.md` and the CHANGELOG's Breaking section; Rust's three examples ported (`docs/examples/`) with outputs derived from the oracle (`scripts/oracle/examples.py`: shallow water prints Rust's output exactly, and the SPH examples leave it at the second step by ADR 0002 #2 alone); `scripts/doc_examples.py` runs the 14 blocks and programs, in CI. Part b ✅ 2026-11-12: the release benchmark record (`scripts/bench_record.py`): all 57 rows of Rust's 21 criterion groups in both columns, three pinned interleaved rounds (median 4.4× Rust's time, 0.76× to 37×), and the thread-count rows (the SPH step 2.2–3.2× faster at 8 threads, Rust's rayon 1.05–1.95×). Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
 
 ## Toolchain
 
@@ -33,7 +33,10 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **hisab**: 3.4.1 (Cyrius), commit `d6703c5`, `scope = "test"`: the bundle calls none, and its one caller, `src/compute_ad.cyr`, stays outside `[lib]` (ADR 0002 #26). It also declares a sakshi package, so `cyrius deps` warns that it refuses to overwrite the stdlib leaf; the two copies are byte-identical
 - **sakshi**: 2.5.10, a stdlib leaf since M7 part b (pravash's tracing)
 - **ganita**: 1.2.15, bundled in the 6.7.18 stdlib
-- **Rust oracle**: rustc 1.99.1, hisab 1.4.0, glam 0.29.3 (`rust-old/Cargo.lock`), glibc 2.44
+- **Rust oracle**: rustc 1.99.1, hisab 1.4.0, glam 0.29.3 (`rust-old/Cargo.lock`), glibc 2.44. Nothing pins the
+  toolchain: `rust-old/rust-toolchain.toml` names `stable`, which moved to rustc 1.100.0 (Unicode 18.0.0) on
+  2026-11-09. Built with 1.100, the generator rewrites `src/str_debug_data.cyr` (916 ranges for 1.99.1's 910), so its
+  `--check` fails; every other output is the same. Run it as `cargo +1.99.1 …` until a pin is decided
 
 ## Source
 
@@ -47,7 +50,8 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   `src/grid_solve.cyr`, `src/grid.cyr`, `src/mac_grid.cyr`, `src/k_epsilon.cyr`, `src/vof.cyr`, `src/phase_field.cyr`,
   `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr`, `src/sph.cyr`, `src/sph_pcisph.cyr`,
   `src/sph_dfsph.cyr`, `src/sph_multiphase.cyr`, `src/coupling.cyr`, `src/flip.cyr`, `src/mpm.cyr`, `src/compute.cyr`,
-  `src/str_debug_data.cyr` (generated), `src/ai.cyr` and `src/json.cyr`, bundled as `dist/pravash.cyr`; `src/compute_ad.cyr` outside the bundle (a consumer includes it
+  `src/str_debug_data.cyr` (generated), `src/ai.cyr`, `src/json.cyr`, `src/fmtf.cyr` and `src/debug.cyr`, bundled as
+  `dist/pravash.cyr`; `src/compute_ad.cyr` outside the bundle (a consumer includes it
   and declares hisab); the scaffold's `src/main.cyr` stub.
 
 ## Tests
@@ -55,13 +59,14 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **Rust oracle** (`cargo test --manifest-path rust-old/Cargo.toml --all-features`): 351 unit, 33 integration,
   14 oracle, 7 doc tests `ignore`d.
 - **Cyrius**:
-  - `tests/parity.tcyr` replays the corpus: 17 modules, 0 failing; 57,674 ok, 728 accepted (ADR 4: 131 against the
+  - `tests/parity.tcyr` replays the corpus: 18 modules, 0 failing; 67,276 ok, 728 accepted (ADR 4: 131 against the
     corrected oracle, ADR 2: 597 against the f64-key oracle), 0 failed, 0 measured, 3 pending (three JSON rows on
     bayan's policies). Every `FluidGrid::step` row (376) and every `SphSolver` step row (147) also runs at 2, 3, 4
     and 8 threads, 0 differing from one. Bits are identical on x86_64 ELF, x86_64 PE and aarch64.
   - `tests/crmath.tcyr`: 85 checks in 18 groups.
   - The ported Rust tests:
-    - `tests/common.tcyr`: all 49 of `common.rs`, and the SoA clone (M8 part c): 125 checks;
+    - `tests/common.tcyr`: all 49 of `common.rs`, the SoA clone (M8 part c), and the Debug of kinds outside their
+      enums and of a builder that holds text (M8 part d): 128 checks;
     - `tests/error.tcyr`: the 6 (17 checks);
     - `tests/buoyancy.tcyr` (16), `vortex.tcyr` (12), `bridge.tcyr` (17);
     - `tests/shallow.tcyr`: all 44 of `shallow.rs` (155 checks);
@@ -88,25 +93,28 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
       example of `init_profiling`, run (M8 part a): 51 checks;
     - `tests/integration.tcyr`: all 33 of `rust-old/tests/integration.rs` (79 checks).
   - `scripts/surface_parity.py` (the full diff since M8 part c): error, common, buoyancy, vortex, bridge, shallow,
-    grid, vof, phase_field, sph, coupling, mpm, compute, ai and logging. 625 items ok, 0 missing: the public items,
-    the 7 trait methods and 157 derives (121 matched, the 36 `Debug` pending part d). The reverse direction: 466
-    public Cyrius names, 351 Rust items and 115 Cyrius-only by 18 rules.
-  - `scripts/doc_examples.py` (M8 part c, in CI): 14 blocks and programs, all running (the README's Quick Start, 10
+    grid, vof, phase_field, sph, coupling, mpm, compute, ai and logging. 625 items ok, 0 missing, 0 pending: the
+    public items, the 7 trait methods and all 157 derives (M8 part d added the 35 types' Debug; `PravashError`'s is an
+    exception). The reverse direction: 501 public Cyrius names, 386 Rust items and 115 Cyrius-only by 18 rules.
+  - `scripts/doc_examples.py` (M8 part c, in CI): 15 blocks and programs, all running (the README's Quick Start, 11
     in the migration guide, Rust's three examples against their `.out`). `scripts/oracle/examples.py` derives the
     `.out` files from the Rust examples and validate.py's transcription.
   - `scripts/rust_test_ledger.py --check` ([`rust-test-ledger.md`](rust-test-ledger.md), M8 part a): all 405 Rust
     tests accounted for. 391 are ported to same-named groups (351 unit, 33 integration, and the 7 `ignore`d doc
     tests written against the API and run). The 14 oracle-hook tests are n/a.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
-- **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), grid 1,120 (511 class
+- **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), debug 9,602, grid 1,120 (511 class
   S step rows), json 302, logging 251, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
   224 (63 class S) and vortex 2,293 rows, and the corrected oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv`
   3, `bridge.cr.tsv` 26, `grid.cr.tsv` 20, `sph.cr.tsv` 22 and `mpm.cr.tsv` 17 rows; and the f64-key oracle (ADR 0002 #2):
   `math.d3.tsv` 558, `sph.d3.tsv` 38 and `coupling.d3.tsv` 1 rows.
-  `validate.py` recomputes all 58,405 rows, every solver step by transcription, and the list-dependent rows again on
-  f64 keys: 0 failures (in about 100 s);
+  `validate.py` recomputes all 68,007 rows, every solver step by transcription, and the list-dependent rows again on
+  f64 keys, and every Debug text by its own printer: 0 failures (in about 100 s);
   `probe_tables.py` 41 of 41.
 - **Benchmarks** (`tests/pravash.bcyr`, [`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md)).
+  - **Debug text** (M8 part d, `debug_d/*` against a twin, two pinned interleaved rounds): eight f64s 54× Rust's
+    time (32 µs, the exact bignum digit search), a particle 6.4× and its pretty form 3.8×, an 8 × 8 grid after a step
+    32×. Off the step path; filed with L16.
   - **The 2.0.0 record** (M8 part b, written by `scripts/bench_record.py`): all 57 rows of Rust's 21 criterion
     groups, three pinned interleaved rounds. The port runs at a median of 4.4× Rust's time (geometric mean 3.9×),
     from 0.76× to 37×:
@@ -165,9 +173,13 @@ stand-ins so far:
 - L11: `src/logging.cyr`'s Trace Event writer (a sakshi emit hook);
 - L15: `_pv_jr_f32` in `src/json.cyr` (the f32 reads: RN32 of the f64, the decimal compared exactly at a midpoint);
 - L13: `src/column.cyr`;
-- L14: `_pv_fmod` in `src/mathx.cyr`.
+- L14: `_pv_fmod` in `src/mathx.cyr`;
+- L16: `src/fmtf.cyr` and `src/debug.cyr` (Rust's float text and the derive's builders).
 
-Each is marked. `scripts/upstream_ledger.py --check`: 17 notes, 0 failures.
+Each is marked. `scripts/upstream_ledger.py --check`: 19 notes, 0 failures.
+
+- **M8 part d:** cyrius `2026-11-13-derive-debug-and-shortest-float-digits.md` (L16), with pravash's rows and the
+  `debug_d` numbers (Cyrius 3.8–54× Rust's time).
 
 Filed 2026-11-11:
 - **hisab:** `2026-11-11-spatial-hash-per-step-rebuild-allocates.md`, `2026-11-11-no-matrix-free-linear-cg.md`,
@@ -232,11 +244,11 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M8 part d, Rust's derived `Debug` on the 36 public types the surface diff lists as pending:
-- `x.debug(sb, alternate)` for `{:?}` and `{:#?}` on each, following the ai configs' (`src/ai.cyr`);
-- golden rows of both forms from the oracle, over seeded values with the float specials;
-- Rust's shortest float digits for an f64 or f32 field, with impetus's `fmtf.cyr` as the stand-in;
-- a `#derive(Debug)` request filed at cyrius.
-
-Then part e: VERSION 2.0.0, the release gate (the full corpus green on x86_64 ELF, x86_64 PE and aarch64) and the
-fuzz target (`tests/pravash.fcyr` is still the scaffold's stub).
+M8 part e, the release:
+- VERSION 2.0.0, with `cyrius.cyml` reading it;
+- the release gate: the full corpus green on x86_64 ELF, x86_64 PE and aarch64;
+- the fuzz target: `tests/pravash.fcyr` is still the scaffold's stub, which promised the port's targets at M8 (the
+  JSON readers and the `PRAVASH_LOG` parser, the inputs a consumer doesn't control);
+- the oracle toolchain's pin (above);
+- then the maintainer's steps: the tag, the 1.3.x deprecation notice on crates.io, and the consumers' first Cyrius
+  builds.

@@ -1,0 +1,427 @@
+# fmtf.cyr — f64 and f32 to text, as Rust's `{:?}` writes them (M8 part d).
+#
+# Rust's Debug for a float prints the SHORTEST digits that parse back to the same value, choosing the closest to the
+# exact value among them, and on an exact tie between two closest candidates the upper one (core's Grisu with its
+# Dragon fallback: 2^-25 is 2.9802322387695313e-8). The digits are positional with at least one fractional digit
+# (`1.0`, `0.0001`, `9999999999999998.0`) unless the value is nonzero and below 1e-4 or at least 1e16, which take
+# the exponential form (`1e16`, `9.999999999999999e-5`, `5e-324`); NaN is `NaN` with no sign, and ±∞ `inf`, `-inf`.
+# An f32 is printed as an f32: its own shortest digits and thresholds.
+#
+# The digits come from Burger & Dybvig's free-format algorithm ("Printing Floating-Point Numbers Quickly and
+# Accurately", 1996) on a small bignum: exact, with no tables. It is impetus's src/fmtf.cyr (ADR 0010 there), with
+# the f32 case added and every write returning 0, or -1 when the builder can't grow. tests/golden/debug.tsv pins both
+# printers against Rust over the specials, the powers of ten and of two with their neighbours, the thresholds, and
+# seeded sweeps. Printing is never on the step path.
+#
+# UPSTREAM(L16): cyrius:docs/development/issues/2026-11-13-derive-debug-and-shortest-float-digits.md
+
+# ── bignum ──────────────────────────────────────────────────────────────────────────
+# A non-negative integer in 32-bit limbs, little-endian: word 0 the limb count, words 1..40 the limbs. 40 limbs hold
+# 2^1280; the algorithm's values stay below 2^1140 for an f64 and far below for an f32. No leading zero limbs.
+
+# a := v, for 0 <= v < 2^63.
+fn _pv_bn_set(a, v) {
+    var n = 0;
+    var x = v;
+    while (x != 0) {
+        store64(a + 8 + n * 8, x & 0xFFFFFFFF);
+        x = x >> 32;
+        n = n + 1;
+    }
+    store64(a, n);
+    return 0;
+}
+
+# dst := src.
+fn _pv_bn_copy(dst, src) {
+    var n = load64(src);
+    for (var i = 0; i <= n; i = i + 1) { store64(dst + i * 8, load64(src + i * 8)); }
+    return 0;
+}
+
+# a := a × m, for 0 < m < 2^31.
+fn _pv_bn_mul_small(a, m) {
+    var n = load64(a);
+    var carry = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var t = load64(a + 8 + i * 8) * m + carry;
+        store64(a + 8 + i * 8, t & 0xFFFFFFFF);
+        carry = t >> 32;
+    }
+    while (carry != 0) {
+        store64(a + 8 + n * 8, carry & 0xFFFFFFFF);
+        carry = carry >> 32;
+        n = n + 1;
+    }
+    store64(a, n);
+    return 0;
+}
+
+# a := a × 10^k, for k >= 0 (in steps of 10^9).
+fn _pv_bn_mul_pow10(a, k) {
+    var left = k;
+    while (left >= 9) {
+        _pv_bn_mul_small(a, 1000000000);
+        left = left - 9;
+    }
+    var m = 1;
+    for (var i = 0; i < left; i = i + 1) { m = m * 10; }
+    if (m > 1) { _pv_bn_mul_small(a, m); }
+    return 0;
+}
+
+# a := a × 2^k, for k >= 0.
+fn _pv_bn_shl(a, k) {
+    var n = load64(a);
+    if (n == 0) { return 0; }
+    var q = k / 32;
+    var b = k % 32;
+    if (b != 0) {
+        var carry = 0;
+        for (var i = 0; i < n; i = i + 1) {
+            var t = (load64(a + 8 + i * 8) << b) | carry;
+            store64(a + 8 + i * 8, t & 0xFFFFFFFF);
+            carry = t >> 32;
+        }
+        if (carry != 0) {
+            store64(a + 8 + n * 8, carry);
+            n = n + 1;
+        }
+    }
+    if (q > 0) {
+        var i = n - 1;
+        while (i >= 0) {
+            store64(a + 8 + (i + q) * 8, load64(a + 8 + i * 8));
+            i = i - 1;
+        }
+        for (var j = 0; j < q; j = j + 1) { store64(a + 8 + j * 8, 0); }
+        n = n + q;
+    }
+    store64(a, n);
+    return 0;
+}
+
+# dst := a + b (dst distinct from both).
+fn _pv_bn_sum(dst, a, b) {
+    var na = load64(a);
+    var nb = load64(b);
+    var n = na;
+    if (nb > n) { n = nb; }
+    var carry = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var x = 0;
+        var y = 0;
+        if (i < na) { x = load64(a + 8 + i * 8); }
+        if (i < nb) { y = load64(b + 8 + i * 8); }
+        var t = x + y + carry;
+        store64(dst + 8 + i * 8, t & 0xFFFFFFFF);
+        carry = t >> 32;
+    }
+    if (carry != 0) {
+        store64(dst + 8 + n * 8, carry);
+        n = n + 1;
+    }
+    store64(dst, n);
+    return 0;
+}
+
+# -1, 0 or 1 as a < b, a = b, a > b.
+#must_use
+fn _pv_bn_cmp(a, b): i64 {
+    var na = load64(a);
+    var nb = load64(b);
+    if (na != nb) {
+        if (na < nb) { return 0 - 1; }
+        return 1;
+    }
+    var i = na - 1;
+    while (i >= 0) {
+        var x = load64(a + 8 + i * 8);
+        var y = load64(b + 8 + i * 8);
+        if (x != y) {
+            if (x < y) { return 0 - 1; }
+            return 1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+# a := a − b, for a >= b.
+fn _pv_bn_sub(a, b) {
+    var na = load64(a);
+    var nb = load64(b);
+    var borrow = 0;
+    for (var i = 0; i < na; i = i + 1) {
+        var y = 0;
+        if (i < nb) { y = load64(b + 8 + i * 8); }
+        var t = load64(a + 8 + i * 8) - y - borrow;
+        borrow = 0;
+        if (t < 0) {
+            t = t + 0x100000000;
+            borrow = 1;
+        }
+        store64(a + 8 + i * 8, t);
+    }
+    while (na > 0 && load64(a + na * 8) == 0) { na = na - 1; }
+    store64(a, na);
+    return 0;
+}
+
+# The number of bits in x > 0.
+#must_use
+fn _pv_bitlen(x): i64 {
+    var n = 0;
+    var v = x;
+    while (v != 0) {
+        v = v >> 1;
+        n = n + 1;
+    }
+    return n;
+}
+
+# ── shortest digits (Burger & Dybvig, free format) ──────────────────────────────────
+
+# The shortest decimal digits of the positive finite value f × 2^e that read back to it in its format, the closest
+# to its exact value among them, an exact tie between two going up (core's printer). `hidden` is the format's hidden
+# bit (2^52, 2^23) and `emin` its least exponent (-1074, -149): f = hidden with e > emin is a power of two, whose
+# lower neighbour is half as far. Writes the ASCII digits to `digits` (17 bytes is enough) and returns (n, k), with
+# value = 0.d1d2…dn × 10^k.
+fn _pv_shortest(f, e, hidden, emin, digits) {
+    # IEEE round-half-even on reading: the interval's ends belong to it when f is even.
+    var even = 1 - (f & 1);
+    var r[328];
+    var s[328];
+    var mp[328];
+    var mm[328];
+    var t[328];
+    if (e >= 0) {
+        if (f != hidden) {
+            _pv_bn_set(&r, f);
+            _pv_bn_shl(&r, e + 1);
+            _pv_bn_set(&s, 2);
+            _pv_bn_set(&mp, 1);
+            _pv_bn_shl(&mp, e);
+            _pv_bn_copy(&mm, &mp);
+        } else {
+            _pv_bn_set(&r, f);
+            _pv_bn_shl(&r, e + 2);
+            _pv_bn_set(&s, 4);
+            _pv_bn_set(&mp, 1);
+            _pv_bn_shl(&mp, e + 1);
+            _pv_bn_set(&mm, 1);
+            _pv_bn_shl(&mm, e);
+        }
+    } else {
+        if (e == emin || f != hidden) {
+            _pv_bn_set(&r, f);
+            _pv_bn_shl(&r, 1);
+            _pv_bn_set(&s, 1);
+            _pv_bn_shl(&s, 1 - e);
+            _pv_bn_set(&mp, 1);
+            _pv_bn_set(&mm, 1);
+        } else {
+            _pv_bn_set(&r, f);
+            _pv_bn_shl(&r, 2);
+            _pv_bn_set(&s, 1);
+            _pv_bn_shl(&s, 2 - e);
+            _pv_bn_set(&mp, 2);
+            _pv_bn_set(&mm, 1);
+        }
+    }
+    # k = ⌈log10(v) − 1e-10⌉ from the binary exponent: never too large, at most one too small (the fixup below adds
+    # the one).
+    var lg: f64 = f64_from(e + _pv_bitlen(f) - 1);
+    var est: f64 = lg * 0.30102999566398114 - 0.0000000001;
+    var k = f64_to(f64_ceil(est));
+    if (k >= 0) {
+        _pv_bn_mul_pow10(&s, k);
+    } else {
+        _pv_bn_mul_pow10(&r, 0 - k);
+        _pv_bn_mul_pow10(&mp, 0 - k);
+        _pv_bn_mul_pow10(&mm, 0 - k);
+    }
+    _pv_bn_sum(&t, &r, &mp);
+    var c = _pv_bn_cmp(&t, &s);
+    if ((even == 1 && c >= 0) || (even == 0 && c > 0)) {
+        _pv_bn_mul_small(&s, 10);
+        k = k + 1;
+    }
+    var n = 0;
+    while (1) {
+        _pv_bn_mul_small(&r, 10);
+        _pv_bn_mul_small(&mp, 10);
+        _pv_bn_mul_small(&mm, 10);
+        var d = 0;
+        while (_pv_bn_cmp(&r, &s) >= 0) {
+            _pv_bn_sub(&r, &s);
+            d = d + 1;
+        }
+        var lo = _pv_bn_cmp(&r, &mm);
+        var tc1 = 0;
+        if (lo < 0 || (even == 1 && lo == 0)) { tc1 = 1; }
+        _pv_bn_sum(&t, &r, &mp);
+        var hi = _pv_bn_cmp(&t, &s);
+        var tc2 = 0;
+        if (hi > 0 || (even == 1 && hi == 0)) { tc2 = 1; }
+        if (tc1 == 0 && tc2 == 0) {
+            store8(digits + n, 48 + d);
+            n = n + 1;
+        } else {
+            if (tc1 == 1 && tc2 == 1) {
+                # Both neighbours read back: the closer one, 2r against s; a tie goes up.
+                _pv_bn_copy(&t, &r);
+                _pv_bn_shl(&t, 1);
+                if (_pv_bn_cmp(&t, &s) >= 0) { d = d + 1; }
+            } elif (tc2 == 1) {
+                d = d + 1;
+            }
+            store8(digits + n, 48 + d);
+            n = n + 1;
+            return (n, k);
+        }
+    }
+    return (n, k);
+}
+
+# ── Rust's Debug form ───────────────────────────────────────────────────────────────
+
+# Appends 0.d1…dn × 10^k (negative when `neg` is 1) as core's Debug writes it: positional with at least one
+# fractional digit, or with `expo` 1 the exponential form d1.d2…dn e(k−1). 0, or -1 when the builder can't grow.
+#must_use
+fn _pv_dbg_digits(sb, neg, digits, n, k, expo): i64 {
+    var out[400];
+    var len = 0;
+    if (neg == 1) {
+        store8(&out, 45);
+        len = 1;
+    }
+    if (expo == 1) {
+        store8(&out + len, load8(digits));
+        len = len + 1;
+        if (n > 1) {
+            store8(&out + len, 46);
+            len = len + 1;
+            for (var i = 1; i < n; i = i + 1) {
+                store8(&out + len, load8(digits + i));
+                len = len + 1;
+            }
+        }
+        store8(&out + len, 101);
+        len = len + 1;
+        var rc = _pv_jw_n(sb, &out, len);
+        return rc | _pv_jw_int(sb, k - 1);
+    }
+    if (k <= 0) {
+        store8(&out + len, 48);
+        store8(&out + len + 1, 46);
+        len = len + 2;
+        for (var z = 0; z < 0 - k; z = z + 1) {
+            store8(&out + len, 48);
+            len = len + 1;
+        }
+        for (var i = 0; i < n; i = i + 1) {
+            store8(&out + len, load8(digits + i));
+            len = len + 1;
+        }
+    } elif (k >= n) {
+        for (var i = 0; i < n; i = i + 1) {
+            store8(&out + len, load8(digits + i));
+            len = len + 1;
+        }
+        for (var z = 0; z < k - n; z = z + 1) {
+            store8(&out + len, 48);
+            len = len + 1;
+        }
+        store8(&out + len, 46);
+        store8(&out + len + 1, 48);
+        len = len + 2;
+    } else {
+        for (var i = 0; i < k; i = i + 1) {
+            store8(&out + len, load8(digits + i));
+            len = len + 1;
+        }
+        store8(&out + len, 46);
+        len = len + 1;
+        for (var i = k; i < n; i = i + 1) {
+            store8(&out + len, load8(digits + i));
+            len = len + 1;
+        }
+    }
+    return _pv_jw_n(sb, &out, len);
+}
+
+# Appends x as Rust's `{:?}` (and `{:#?}`) writes an f64. 0, or -1 when the builder can't grow. Mirrors
+# `<f64 as Debug>::fmt`.
+#must_use
+fn _pv_debug_f64(sb, x: f64): i64 {
+    if (x != x) { return _pv_jw(sb, "NaN"); }
+    var bits = _pv_bits(x);
+    var neg = 0;
+    if (bits < 0) { neg = 1; }
+    var mag = bits & 0x7FFFFFFFFFFFFFFF;
+    if (mag == 0x7FF0000000000000) {
+        if (neg == 1) { return _pv_jw(sb, "-inf"); }
+        return _pv_jw(sb, "inf");
+    }
+    if (mag == 0) {
+        if (neg == 1) { return _pv_jw(sb, "-0.0"); }
+        return _pv_jw(sb, "0.0");
+    }
+    var be = (mag >> 52) & 0x7FF;
+    var f = mag & 0xFFFFFFFFFFFFF;
+    var e = 0 - 1074;
+    if (be != 0) {
+        f = f | 0x10000000000000;
+        e = be - 1075;
+    }
+    var digits[24];
+    var n, k = _pv_shortest(f, e, 0x10000000000000, 0 - 1074, &digits);
+    var ax: f64 = x;
+    if (neg == 1) { ax = -x; }
+    var expo = 0;
+    if (ax < 0.0001 || ax >= 10000000000000000.0) { expo = 1; }
+    return _pv_dbg_digits(sb, neg, &digits, n, k, expo);
+}
+
+# The 32 bits of an f32.
+#must_use
+fn _pv_f32_word(x: f32): i64 {
+    var buf[8];
+    store64(&buf, 0);
+    var b: *f32 = _pv_as_f32s(&buf);
+    b[0] = x;
+    return load64(&buf) & 0xFFFFFFFF;
+}
+
+# Appends x as Rust's `{:?}` (and `{:#?}`) writes an f32: its own shortest digits, and the exponential form below
+# 1e-4f32 or from 1e16f32. 0, or -1 when the builder can't grow. Mirrors `<f32 as Debug>::fmt`.
+#must_use
+fn _pv_debug_f32(sb, x: f32): i64 {
+    var w = _pv_f32_word(x);
+    var neg = (w >> 31) & 1;
+    var mag = w & 0x7FFFFFFF;
+    if (mag > 0x7F800000) { return _pv_jw(sb, "NaN"); }
+    if (mag == 0x7F800000) {
+        if (neg == 1) { return _pv_jw(sb, "-inf"); }
+        return _pv_jw(sb, "inf");
+    }
+    if (mag == 0) {
+        if (neg == 1) { return _pv_jw(sb, "-0.0"); }
+        return _pv_jw(sb, "0.0");
+    }
+    var be = (mag >> 23) & 0xFF;
+    var f = mag & 0x7FFFFF;
+    var e = 0 - 149;
+    if (be != 0) {
+        f = f | 0x800000;
+        e = be - 150;
+    }
+    var digits[24];
+    var n, k = _pv_shortest(f, e, 0x800000, 0 - 149, &digits);
+    # The thresholds as f32s (1e-4f32 and 1e16f32), compared on the magnitude's bits: both are positive, so their
+    # bit patterns order as their values.
+    var expo = 0;
+    if (mag < _pv_f32_word(f32_from(0.0001)) || mag >= _pv_f32_word(f32_from(10000000000000000.0))) { expo = 1; }
+    return _pv_dbg_digits(sb, neg, &digits, n, k, expo);
+}

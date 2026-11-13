@@ -529,6 +529,70 @@ fn test_clone() {
     return 0;
 }
 
+# The text a debug call appends, as a C string compared with `want`.
+fn debug_is(sb, want): i64 {
+    var s = str_builder_build(sb);
+    if (str_len(s) != strlen(want)) { return 0; }
+    return memeq(str_data(s), want, str_len(s));
+}
+
+# The Debug of a kind word outside its enum (M8 part d), which Rust can't hold and the golden rows can't reach:
+# `Unknown`, in both forms, from every enum's printer; and a nested payload outside its enum.
+fn test_debug_kinds() {
+    test_group("debug_unknown_kinds");
+    var ok = 1;
+    for (var alt = 0; alt < 2; alt = alt + 1) {
+        var a = str_builder_new();
+        var ra = flow_regime_debug(7, a, alt);
+        var b = str_builder_new();
+        var rb = boundary_condition_debug(0 - 1, b, alt);
+        var c = str_builder_new();
+        var rc = secondary_type_debug(3, c, alt);
+        var d = str_builder_new();
+        var rd = compute_op_debug(4, d, alt);
+        if (ra + rb + rc + rd != 0) { ok = 0; }
+        if (debug_is(a, "Unknown") + debug_is(b, "Unknown") + debug_is(c, "Unknown") + debug_is(d, "Unknown") != 4) {
+            ok = 0;
+        }
+    }
+    assert_eq(ok, 1, "the four unit-variant enums print Unknown for a word outside them, in both forms");
+    var nn: PvNonNewtonianModel = PvNonNewtonianModel_power_law(1.0, 0.5);
+    nn.kind = 9;
+    var e = str_builder_new();
+    var re = non_newtonian_viscosity_debug(&nn, e, 1);
+    var shape: PvShape = PvShape_sphere(0.5);
+    shape.kind = 5;
+    var f = str_builder_new();
+    var rf = body_shape_debug(&shape, f, 0);
+    var law: PvConstitutiveLaw = PvConstitutiveLaw_fluid(1000.0, 0.1);
+    law.kind = 3;
+    var g = str_builder_new();
+    var rg = constitutive_model_debug(&law, g, 0);
+    assert(re + rf + rg == 0 && debug_is(e, "Unknown") + debug_is(f, "Unknown") + debug_is(g, "Unknown") == 3,
+        "and the three payload enums");
+    var body: PvRigidBody = PvRigidBody_new(PvVec3_new(1.0, 2.0, 3.0), 4.0, shape);
+    var h = str_builder_new();
+    var rh = body.debug(h, 0);
+    var w = str_builder_new();
+    var rw = _pv_jw(w, "RigidBody { position: DVec3(1.0, 2.0, 3.0), velocity: DVec3(0.0, 0.0, 0.0), mass: 4.0, ");
+    rw = rw | _pv_jw(w, "shape: Unknown, force: DVec3(0.0, 0.0, 0.0) }");
+    var ws = str_builder_build(w);
+    var hs = str_builder_build(h);
+    var same = 0;
+    if (str_len(ws) == str_len(hs) && memeq(str_data(ws), str_data(hs), str_len(ws)) == 1) { same = 1; }
+    assert(rh + rw == 0 && same == 1, "a nested shape outside its enum prints Unknown in its place");
+
+    test_group("debug_appends");
+    var m: PvFluidMaterial = PV_FLUID_MATERIAL_WATER;
+    var j = str_builder_new();
+    var r1 = _pv_jw(j, "> ");
+    var r2 = m.debug(j, 0);
+    var s = str_builder_build(j);
+    var head = "> FluidMaterial { density: 1000.0, ";
+    assert(r1 + r2 == 0 && memeq(str_data(s), head, strlen(head)) == 1, "debug appends to what the builder holds");
+    return 0;
+}
+
 # Runs the ported common tests.
 fn main() {
     alloc_init();
@@ -542,6 +606,7 @@ fn main() {
     test_arena();
     test_serde();
     test_clone();
+    test_debug_kinds();
     return assert_summary();
 }
 

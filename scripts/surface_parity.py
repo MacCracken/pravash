@@ -93,24 +93,26 @@ EXCEPTIONS = {
 # value copied by assignment; PartialEq and Eq on an enum compare its words with `==`. Otherwise a derive is a
 # function: Serialize `Pv<T>::to_json` (an enum's `<snake>_to_json`), Deserialize `Pv<T>_from_json`
 # (`<snake>_from_json`), Default `Pv<T>_default`, Clone `Pv<T>_clone`, PartialEq and Eq `Pv<T>::eq`, Debug
-# `Pv<T>::debug` and thiserror's Error `pv_error_message`. A derive the rules name otherwise is in DERIVE_RENAMES;
+# `Pv<T>::debug` (an enum's `<snake>_debug`) and thiserror's Error `pv_error_message`. A derive the rules name otherwise is in DERIVE_RENAMES;
 # one that waits on a later part is in PENDING_DERIVES (counted and listed); any other needs a DERIVE_EXCEPTIONS
 # entry with its reason.
 DERIVE_RENAMES = {
-    # A unit struct of coefficients (EXCEPTIONS above): its serde form is a pair of free functions.
+    # A unit struct of coefficients (EXCEPTIONS above): its serde form and its Debug are free functions.
     ("DragCoefficient", "Serialize"): "drag_coefficient_to_json",
     ("DragCoefficient", "Deserialize"): "drag_coefficient_from_json",
+    ("DragCoefficient", "Debug"): "drag_coefficient_debug",
 }
 DERIVE_EXCEPTIONS = {
     "buoyancy::derive PartialEq for DragCoefficient": "a unit struct: its one value equals itself, and the port has "
                                                       "no value of it, only the PV_DRAG_COEFFICIENT_* constants",
     "coupling::derive Clone for RigidBody": "no storage of its own (three PvVec3, a mass and a PvShape): a struct "
                                             "assignment copies it, as Rust's Clone does",
+    "error::derive Debug for PravashError": "a 2.0 error is a PV_ERR_* code with no payload (ADR 0002 #1), so the "
+                                            "variant's fields Debug prints aren't there; pv_error_name(code) gives "
+                                            "the variant's name",
 }
 # Derives a later part ports, by trait: counted and listed, never silently dropped.
-PENDING_DERIVES = {
-    "Debug": "M8 part d: a `debug(sb, alternate)` per type for `{:?}` and `{:#?}`, golden rows from the oracle",
-}
+PENDING_DERIVES = {}
 # Public Cyrius names with no Rust item: (a regex over the name, why the port has it). Each rule must match a name.
 CYRIUS_ONLY = [
     (r"Pv\w+_drop", "Rust's Drop, made explicit (ADR 0002 #9)"),
@@ -563,7 +565,7 @@ def main():
                     "Clone": [f"Pv{tname}_clone"],
                     "PartialEq": [f"Pv{tname}::eq"],
                     "Eq": [f"Pv{tname}::eq"],
-                    "Debug": [f"Pv{tname}::debug"],
+                    "Debug": [f"{stem}_debug"] if is_enum else [f"Pv{tname}::debug"],
                     "thiserror::Error": ["pv_error_message"],
                 }.get(tr)
                 if want is None:
