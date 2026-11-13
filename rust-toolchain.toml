@@ -1,8 +1,0 @@
-# The Rust oracle's toolchain, rustc 1.99.1 (docs/development/state.md), for every cargo command run from the repo
-# root: the frozen crate (rust-old/), the golden generator (scripts/oracle/) and the probes (scripts/probes/rust/).
-# rust-old/'s own rust-toolchain.toml names `stable` and is never edited, so this file decides from here. On stable
-# 1.100.0 (Unicode 18.0.0) the generator writes another `src/str_debug_data.cyr` and its --check fails (port-parity
-# §31). Move the pin only with the oracle's: regenerate the corpus and check every output.
-[toolchain]
-channel = "1.99.1"
-components = ["rustfmt", "clippy"]
