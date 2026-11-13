@@ -45,6 +45,7 @@ cyrius bench                                   # run tests/*.bcyr
 python3 -I -B scripts/golden/validate.py .           # recompute every row of the frozen corpus
 python3 -I -B scripts/golden/validate.py . --write   # regenerate the correctly rounded rows, the f64-key rows and cr tables (MPFR)
 python3 -I -B scripts/golden/probe_tables.py .       # generated constants compile to 1.3.0's bits
+python3 -I -B scripts/golden/cr_sweep.py .           # the correctly rounded math vs MPFR beyond the corpus
 ```
 
 The golden corpus (`tests/golden/`) is frozen at 2.0.0 ([`scripts/golden/README.md`](scripts/golden/README.md)).

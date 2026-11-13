@@ -74,7 +74,7 @@ fn _pv_log_level(t): i64 {
 
 # ── the filter ──────────────────────────────────────────────────────────────────────
 
-# 1 when byte c is ASCII whitespace (str::trim's, for the bytes an environment variable holds).
+# 1 when byte c is ASCII whitespace.
 #must_use
 fn _pv_log_ws(c): i64 {
     if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
@@ -131,14 +131,54 @@ fn _pv_log_word_byte(c): i64 {
     return 0;
 }
 
+# The bytes of the White_Space character (str::trim's set, in UTF-8) that starts at s + a, before s + m: 1 for ASCII
+# whitespace; 2 for U+0085 and U+00A0; 3 for U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000; else 0.
+#must_use
+fn _pv_log_ws_at(s, a, m): i64 {
+    var c = load8(s + a);
+    if (_pv_log_ws(c) == 1) { return 1; }
+    if (c == 194 && a + 1 < m) {
+        var d = load8(s + a + 1);
+        if (d == 133 || d == 160) { return 2; }
+        return 0;
+    }
+    if (a + 2 < m) {
+        var e1 = load8(s + a + 1);
+        var e2 = load8(s + a + 2);
+        if (c == 225 && e1 == 154 && e2 == 128) { return 3; }
+        if (c == 226 && e1 == 128 && ((e2 >= 128 && e2 <= 138) || e2 == 168 || e2 == 169 || e2 == 175)) { return 3; }
+        if (c == 226 && e1 == 129 && e2 == 159) { return 3; }
+        if (c == 227 && e1 == 128 && e2 == 128) { return 3; }
+    }
+    return 0;
+}
+
+# The bytes of the White_Space character that ends at s + b, starting at or after s + a, or 0 (as _pv_log_ws_at).
+#must_use
+fn _pv_log_ws_before(s, a, b): i64 {
+    if (b - 1 >= a && _pv_log_ws(load8(s + b - 1)) == 1) { return 1; }
+    if (b - 2 >= a && _pv_log_ws_at(s, b - 2, b) == 2) { return 2; }
+    if (b - 3 >= a && _pv_log_ws_at(s, b - 3, b) == 3) { return 3; }
+    return 0;
+}
+
 # One directive (the m bytes at s, untrimmed, holding no comma), as EnvFilter's Directive::parse reads it, into the
 # words at w: w[0] its level, w[1] its target's pointer (0 for none), w[2] the target's length. Returns 0 for a static
 # directive, 1 for one with a span name or fields (w unset), or -1 for one that doesn't parse.
 fn _pv_log_directive(s, m, w): i64 {
+    # str::trim: Unicode White_Space at both ends (2.0.1; ASCII only before).
     var a = 0;
-    while (a < m && _pv_log_ws(load8(s + a)) == 1) { a = a + 1; }
+    var adv = 1;
+    while (a < m && adv > 0) {
+        adv = _pv_log_ws_at(s, a, m);
+        a = a + adv;
+    }
     var b = m;
-    while (b > a && _pv_log_ws(load8(s + b - 1)) == 1) { b = b - 1; }
+    var back = 1;
+    while (b > a && back > 0) {
+        back = _pv_log_ws_before(s, a, b);
+        b = b - back;
+    }
     # The states (Rust's ParseState): 0 Start, 1 LevelOrTarget, 2 Span, 3 Field, 4 Fields, 5 Target, 6 Level.
     var st = 0;
     var mark = 0;
@@ -335,13 +375,12 @@ fn _pv_log_put_int(p, n, cap, v): i64 {
     var d[24];
     var nd = 0;
     var neg = 0;
-    var u = v;
-    if (v < 0) {
-        neg = 1;
-        u = 0 - v;
-    }
+    var u = v;   # kept negative for a negative v, so i64::MIN (whose negation wraps) prints its digits
+    if (v < 0) { neg = 1; }
     while (nd == 0 || u != 0) {
-        store8(&d + nd, 48 + (u % 10));
+        var r = u % 10;
+        if (r < 0) { r = 0 - r; }
+        store8(&d + nd, 48 + r);
         u = u / 10;
         nd = nd + 1;
     }
@@ -465,9 +504,33 @@ var _pv_tr_len = 0;
 var _pv_tr_count = 0;
 var _pv_tr_t0 = 0;
 
-# Writes the buffer out.
+# The trace's first write error (a negative errno), 0 while every write landed whole.
+var _pv_tr_err = 0;
+
+# Writes all n bytes at p to fd, retrying a short write and an interrupted one: 0, or the negative errno (-EIO for
+# a write that makes no progress).
+#must_use
+fn _pv_tr_write_all(fd, p, n): i64 {
+    var off = 0;
+    while (off < n) {
+        var w = file_write(fd, p + off, n - off);
+        if (w > 0) {
+            off = off + w;
+        } elif (w != 0 - 4) {
+            if (w == 0) { return 0 - 5; }
+            return w;
+        }
+    }
+    return 0;
+}
+
+# Writes the buffer out, keeping the first error in _pv_tr_err (the rest of a failed chunk is dropped: the file is
+# already short).
 fn _pv_tr_flush() {
-    if (_pv_tr_fd >= 0 && _pv_tr_len > 0) { var w = file_write(_pv_tr_fd, &_pv_tr_buf, _pv_tr_len); }
+    if (_pv_tr_fd >= 0 && _pv_tr_len > 0) {
+        var e = _pv_tr_write_all(_pv_tr_fd, &_pv_tr_buf, _pv_tr_len);
+        if (e != 0 && _pv_tr_err == 0) { _pv_tr_err = e; }
+    }
     _pv_tr_len = 0;
     return 0;
 }
@@ -488,17 +551,21 @@ fn _pv_tr_put(s) {
     return 0;
 }
 
-# Appends the n bytes at p as a JSON string (pravash's texts are plain ASCII; a quote, backslash or control byte is
-# escaped all the same).
+# Appends the n bytes at p as a JSON string: a quote or backslash escaped, a control byte as `\u00XX`, as serde_json
+# writes them. A byte of 0x80 or above is `\u00XX` too (its Latin-1 reading), so a consumer's text that isn't UTF-8
+# still leaves a valid JSON file (pravash's own texts are ASCII).
 fn _pv_tr_str(p, n) {
     _pv_tr_put("\"");
+    var hex = "0123456789abcdef";
     for (var k = 0; k < n; k = k + 1) {
         var c = load8(p + k);
         if (c == 34 || c == 92) {
             _pv_tr_put("\\");
             _pv_tr_put_n(p + k, 1);
-        } elif (c < 32) {
-            _pv_tr_put(" ");
+        } elif (c < 32 || c >= 128) {
+            _pv_tr_put("\\u00");
+            _pv_tr_put_n(hex + (c >> 4), 1);
+            _pv_tr_put_n(hex + (c & 15), 1);
         } else {
             _pv_tr_put_n(p + k, 1);
         }
@@ -650,8 +717,10 @@ fn _pv_tr_hook(ts, level, category, msg, msg_len, sixth): i64 {
 
 # Starts chrome://tracing output to `trace-<unix µs>.json` in the working directory and fills *guard: 1, or 0 when the
 # file can't be created. Every target then enables TRACE through sakshi's hook, which the writer takes over; when an
-# init already ran, the file is written empty instead (Rust's: its layer isn't registered when a subscriber is). The
-# trace is closed by PvFlushGuard_drop. Mirrors `logging::init_profiling`.
+# init already ran, the file is written empty instead (Rust's: its layer isn't registered when a subscriber is); while
+# another trace is open, the new file is written empty and closed at once, and that trace goes on. The trace is
+# closed by PvFlushGuard_drop. The writer takes sakshi's output while it runs, and the drop sends it to stderr, not
+# to a consumer's own sakshi output. Mirrors `logging::init_profiling`.
 #must_use
 fn logging_init_profiling(guard: *PvFlushGuard): i64 {
     guard.fd = 0 - 1;
@@ -661,10 +730,17 @@ fn logging_init_profiling(guard: *PvFlushGuard): i64 {
     n = _pv_log_put_int(&name, n, 63, clock_epoch_ns() / 1000);
     n = _pv_log_put(&name, n, 63, ".json");
     store8(&name + n, 0);
-    memcpy(&_pv_tr_path, &name, n + 1);
     var fd = file_open(&name, O_WRONLY | O_CREAT | O_TRUNC, 420);
     if (fd < 0) { return 0; }
+    memcpy(&_pv_tr_path, &name, n + 1);
+    if (_pv_tr_fd >= 0) {
+        # A trace is open: this one is the empty list, written now, and the open trace's state is left alone.
+        var e = _pv_tr_write_all(fd, "[\n\n]", 4);
+        var c = file_close(fd);
+        return 1;
+    }
     guard.fd = fd;
+    _pv_tr_err = 0;
     _pv_tr_fd = fd;
     _pv_tr_len = 0;
     _pv_tr_count = 0;
@@ -681,17 +757,22 @@ fn logging_init_profiling(guard: *PvFlushGuard): i64 {
 }
 
 impl PvFlushGuard {
-    # Writes out what the trace holds so far. Mirrors `FlushGuard::flush`.
-    fn flush(self) {
-        if (self.fd >= 0 && self.fd == _pv_tr_fd) { _pv_tr_flush(); }
+    # Writes out what the trace holds so far: 0, or the trace's first write error (a negative errno). Mirrors
+    # `FlushGuard::flush`.
+    fn flush(self): i64 {
+        if (self.fd >= 0 && self.fd == _pv_tr_fd) {
+            _pv_tr_flush();
+            return _pv_tr_err;
+        }
         return 0;
     }
 }
 
 # Ends the trace: closes the entry list and the file, and removes the hook. pravash then traces nothing (every
 # target off) and sakshi has its level from before and writes to stderr: Rust's chrome layer stays installed and
-# writes nowhere, so nothing is printed either. Mirrors dropping the `FlushGuard`.
-fn PvFlushGuard_drop(guard: *PvFlushGuard) {
+# writes nowhere, so nothing is printed either. 0, or the trace's first write or close error (a negative errno).
+# Mirrors dropping the `FlushGuard`.
+fn PvFlushGuard_drop(guard: *PvFlushGuard): i64 {
     if (guard.fd < 0 || guard.fd != _pv_tr_fd) { return 0; }
     if (guard.active == 1) {
         var c = sakshi_clear_emit_hook();
@@ -701,8 +782,9 @@ fn PvFlushGuard_drop(guard: *PvFlushGuard) {
     _pv_tr_put("\n]");
     _pv_tr_flush();
     var r = file_close(guard.fd);
+    if (r < 0 && _pv_tr_err == 0) { _pv_tr_err = r; }
     _pv_tr_fd = 0 - 1;
     guard.fd = 0 - 1;
     guard.active = 0;
-    return 0;
+    return _pv_tr_err;
 }

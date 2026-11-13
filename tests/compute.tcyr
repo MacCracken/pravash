@@ -784,6 +784,63 @@ fn test_clone() {
     return 0;
 }
 
+# y², for a gradient taken inside another function's recording.
+fn ad_sq(t, vars, n): i64 {
+    var y = load64(vars);
+    return ad_mul(t, y, y);
+}
+
+# f(x) = x0² + c, c the gradient of y² at y = 5 (10), taken inside f by a nested call: ∂f/∂x0 = 2·x0.
+fn ad_nested(t, vars, n): i64 {
+    var y[8];
+    store64(&y, _pv_bits(5.0));
+    var gp, gn = PvKernelDerivatives_autodiff_gradient(&ad_sq, &y, 1);
+    var c: f64 = 0.0;
+    if (gn == 1) {
+        c = load64(gp);
+        fl_free(gp);
+    }
+    var x0 = load64(vars);
+    var sq = ad_mul(t, x0, x0);
+    return ad_add(t, sq, ad_var(t, c));
+}
+
+# A function whose root is no node, on a tape with room.
+fn ad_bad(t, vars, n): i64 {
+    return 0 - 1;
+}
+
+# 2.0.1 hardening (Cyrius-only): an f32 buffer refuses a size whose bytes overflow, and push_rounded grows it.
+fn test_hardening() {
+    test_group("hardening_f32_column");
+    var c: PvF32Column;
+    c.data = 0;
+    c.len = 0;
+    c.cap = 0;
+    assert_eq(c.reserve(2305843009213693952), 0, "reserve refuses an n whose n · 4 overflows");
+    assert(c.cap == 0 && c.data == 0, "and leaves the buffer empty");
+    var ok = 1;
+    for (var i = 0; i < 20; i = i + 1) { ok = ok & c.push_rounded(f64_from(i) + 0.5); }
+    assert(ok == 1 && c.len == 20 && c.cap >= 20, "push_rounded grows past an unreserved capacity");
+    var last: f64 = c.at(19);
+    assert(last == 19.5, "and keeps every value");
+    c.drop();
+
+    test_group("hardening_autodiff_nested_and_bad_roots");
+    var z[8];
+    store64(&z, _pv_bits(3.0));
+    var np, nn = PvKernelDerivatives_autodiff_gradient(&ad_nested, &z, 1);
+    var n0: f64 = 0.0;
+    if (nn == 1) { n0 = load64(np); }
+    assert(nn == 1 && n0 == 6.0, "a gradient inside f keeps the outer recording: 6 at 3 (10 before 2.0.1)");
+    fl_free(np);
+    var before = alloc_used();
+    var bp, bn = PvKernelDerivatives_autodiff_gradient(&ad_bad, &z, 1);
+    assert(bp == 0 && bn == 0, "a root that isn't a node is refused");
+    assert(alloc_used() - before < 1048576, "at once, without growing the tape (1.6 GB before 2.0.1)");
+    return 0;
+}
+
 # Runs the ported compute tests.
 fn main() {
     alloc_init();
@@ -794,6 +851,7 @@ fn main() {
     test_f32_reads();
     test_docs();
     test_clone();
+    test_hardening();
     return assert_summary();
 }
 

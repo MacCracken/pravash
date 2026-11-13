@@ -18,6 +18,24 @@ Speed is measured, not gated (CLAUDE.md, port plan §0). These are first numbers
 work yet. They are recorded so the compiler, ganita and hisab can see where pravash's workload spends its time. A
 slow row is a finding to file, with its numbers, not a reason to change the port.
 
+
+## 2.0.1 hardening: Cyrius against 2.0.0 (2026-11-13)
+
+Two rounds of `cyrius bench`, pinned to core 15 and interleaved with a worktree of 2.0.0. Times are the median of
+the rounds.
+- **Overall:** over 204 rows the median new/old ratio is 0.995, and so is the geometric mean. Every row is in
+  0.83–1.18×, inside the shared host's ±20% noise.
+- **The one row the hardening touched measurably** is `shallow_disturbance`, whose loop now stops at the field's
+  end. With its bounds hoisted out of the cell loop it is 1.09× at 32 × 32 (8.4 → 9.2 µs), 1.05× at 64 × 64 and
+  1.04× at 128 × 128.
+- **Before the hoist** it was 1.23×, two compares a cell.
+
+| Row | 2.0.0 | 2.0.1 | New / old |
+|---|---|---|---|
+| `shallow_disturbance/32x32` | 8.42 µs | 9.22 µs | 1.09× |
+| `shallow_disturbance/64x64` | 31.3 µs | 32.8 µs | 1.05× |
+| `shallow_disturbance/128x128` | 120.0 µs | 124.4 µs | 1.04× |
+
 ## Method
 
 - **Host:** x86_64 Linux, shared. Every run is pinned to one core (`taskset -c 15`), and Rust and Cyrius runs

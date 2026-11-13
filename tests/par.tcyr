@@ -141,6 +141,19 @@ fn main() {
     _pv_pool_drop(p8);
     _pv_pool_drop(0);
 
+    test_group("pool_count_capped");
+    # 2.0.1: a count whose sizes would overflow (m · 16 wraps at 2^60) starts _PV_POOL_MAX threads.
+    var pc = _pv_pool_new(2305843009213693954);
+    if (THREADS_CONCURRENT == 1 && CHAN_BLOCKING == 1) {
+        assert(pc != 0, "a count past the cap starts a pool");
+        var pp: *_PvPool = _pv_as_pool(pc);
+        assert_eq(pp.threads, _PV_POOL_MAX, "of _PV_POOL_MAX threads");
+        for (var i7 = 0; i7 < n; i7 = i7 + 1) { store64(slots + i7 * 8, 0); }
+        _pv_par_for(pc, 0, n, &mark, &ctx);
+        assert_eq(all_eq(slots, n, 1), 1, "which runs each index once");
+    }
+    _pv_pool_drop(pc);
+
     test_group("grid_thread_count_lifecycle");
     var g: PvFluidGrid;
     var tn, en = PvFluidGrid_new(10, 10, 0.1, &g);
@@ -155,6 +168,13 @@ fn main() {
     var h: PvFluidGrid;
     assert_eq(PvFluidGrid_clone(&h, &g), 1, "clone");
     assert(h.threads == 4 && h.pool == 0, "a clone keeps the count, not the pool");
+    var gkept = g.pool;
+    var gused = alloc_used();
+    for (var r6 = 0; r6 < 20; r6 = r6 + 1) {
+        var gt = g.set_threads(4);
+        var ge = step_err(&g, &cfg);
+    }
+    assert(g.pool == gkept && alloc_used() - gused == 0, "set_threads(4) at 4 keeps the grid's pool (2.0.1)");
     assert_eq(g.set_threads(0), 1, "a count below 1 is 1");
     assert(g.pool == 0 && g.threads == 1, "and stops the pool");
     assert_eq(step_err(&g, &cfg), PV_ERR_NONE, "a serial step");
@@ -190,6 +210,14 @@ fn main() {
     var used = alloc_used();
     for (var r2 = 0; r2 < 20; r2 = r2 + 1) { var t2, v2 = s.step(work, bn, &scfg, 0.001); }
     assert_eq(alloc_used() - used, 0, "20 more steps at 4 threads take no heap");
+    # 2.0.1: the same count keeps the pool (a restart's channels and TLS never return to the heap).
+    var kept = s.pool;
+    var used2 = alloc_used();
+    for (var r3 = 0; r3 < 50; r3 = r3 + 1) {
+        var st = s.set_threads(4);
+        var t5, v5 = s.step(work, bn, &scfg, 0.001);
+    }
+    assert(s.pool == kept && alloc_used() - used2 == 0, "set_threads(4) at 4 keeps the pool: 50 calls take no heap");
     assert_eq(s.set_threads(0), 1, "a count below 1 is 1");
     assert(s.pool == 0 && s.threads == 1, "and stops the pool");
     var t3 = s.set_threads(3);

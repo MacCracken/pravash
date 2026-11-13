@@ -1224,6 +1224,25 @@ fn test_dst_plan() {
     return 0;
 }
 
+# 2.0.1 hardening (Cyrius-only): a MacGrid whose nx, ny disagree with its faces ends its walk at their end.
+fn test_hardening() {
+    test_group("hardening_mac_inconsistent_sizes");
+    var g: PvMacGrid;
+    var t, v = PvMacGrid_new(6, 6, 0.1, &g);
+    assert(is_err_result(t) == 0, "a 6 × 6 MAC grid");
+    var s0: f64 = g.max_speed();
+    g.nx = 4294967296;
+    g.ny = 4294967296;
+    var s1: f64 = g.max_speed();
+    assert(s1 == s0, "max_speed returns (2^64 cells otherwise), every face past the field skipped");
+    var dt: f64 = g.cfl_dt(0.5);
+    assert(dt > 0.0, "and so does cfl_dt");
+    g.nx = 6;
+    g.ny = 6;
+    PvMacGrid_drop(&g);
+    return 0;
+}
+
 # Runs the ported FluidGrid tests.
 fn main() {
     alloc_init();
@@ -1242,6 +1261,7 @@ fn main() {
     test_audit_state();
     test_layout();
     test_dst_plan();
+    test_hardening();
     return assert_summary();
 }
 

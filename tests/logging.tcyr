@@ -244,6 +244,80 @@ fn test_doc() {
     return 0;
 }
 
+# 2.0.1 hardening (Cyrius-only): i64::MIN's digits, str::trim's Unicode whitespace, the trace file's JSON escapes, a
+# second trace while one is open, write errors returned, and the warning for a negative phase.
+fn test_hardening() {
+    test_group("hardening_int_min_renders");
+    var d[64];
+    var n = _pv_log_put_int(&d, 0, 63, 0 - 9223372036854775807 - 1);
+    assert(n == 20 && memeq(&d, "-9223372036854775808", 20) == 1, "i64::MIN prints its digits");
+
+    test_group("hardening_filter_trims_unicode_whitespace");
+    var s[32];
+    var src = "pravash::sph=warn,[x]";
+    memcpy(&s, src, 21);
+    store8(&s + 21, 194);   # U+00A0, which str::trim strips
+    store8(&s + 22, 160);
+    var lv[64];
+    assert_eq(_pv_log_parse(&s, 23, 1, &lv), 1, "a trailing U+00A0 is trimmed, so the strict parse holds");
+    assert_eq(load64(&lv + _PV_LOG_SPH * 8), _PV_LOG_WARN, "and sph is WARN (every target `info` before 2.0.1)");
+
+    test_group("hardening_trace_text_is_json");
+    _pv_tr_len = 0;
+    var tb[8];
+    store8(&tb, 97);
+    store8(&tb + 1, 10);
+    store8(&tb + 2, 98);
+    store8(&tb + 3, 255);
+    _pv_tr_str(&tb, 4);
+    assert(_pv_tr_len == 16 && memeq(&_pv_tr_buf, "\"a\\u000ab\\u00ff\"", 16) == 1,
+      "a control byte and a byte past ASCII are \\u00XX");
+    _pv_tr_len = 0;
+
+    test_group("hardening_second_trace_while_one_is_open");
+    var moved = sys_chdir("build");
+    var g1: PvFlushGuard;
+    assert_eq(logging_init_profiling(&g1), 1, "a trace");
+    var p1[64];
+    memcpy(&p1, _pv_trace_path(), strlen(_pv_trace_path()) + 1);
+    var t0 = clock_epoch_ns() / 1000;
+    while (clock_epoch_ns() / 1000 == t0) { var spin = 0; }   # the next name is a microsecond later
+    var g2: PvFlushGuard;
+    assert_eq(logging_init_profiling(&g2), 1, "a second while the first is open");
+    assert(g2.fd < 0 && g2.active == 0 && _pv_tr_fd == g1.fd, "written and closed at once; the first goes on");
+    var buf = fl_alloc(256);
+    var n2 = file_read_all(_pv_trace_path(), buf, 255);
+    assert(n2 == 4 && memeq(buf, "[\n\n]", 4) == 1, "the second is `[\\n\\n]`");
+    var del2 = sys_unlink(_pv_trace_path());
+    var cc = file_close(g1.fd);   # behind the guard's back: every write now fails
+    _pv_tr_put("x");
+    assert(g1.flush() < 0, "a failed write is returned by flush");
+    assert(PvFlushGuard_drop(&g1) < 0, "and by the drop");
+    var del1 = sys_unlink(&p1);
+    fl_free(buf);
+    if (moved == 0) { var back = sys_chdir(".."); }
+
+    test_group("hardening_negative_phase_warns");
+    var h = sakshi_set_emit_hook(&hook);
+    all_levels(_PV_LOG_WARN);
+    seen_len = 0;
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var mc: PvMultiPhaseConfig = PvMultiPhaseConfig_single(1000.0, 2000.0, 0.001);
+    var bp, bn = create_particle_block(0.4, 0.4, 0.08, 0.08, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    b.phase = 0 - 1;
+    var sv: PvSphSolver = PvSphSolver_new();
+    var st, sx = sv.step_multiphase(b, bn, &cfg, &mc);
+    var warned = has(&seen_text, seen_len, "phase index out of bounds");
+    assert(warned == 1, "phase −1 is warned of, as a phase past the list is");
+    PvSphSolver_drop(&sv);
+    PvMultiPhaseConfig_drop(&mc);
+    fl_free(bp);
+    var c = sakshi_clear_emit_hook();
+    _pv_log_filtered = 0;
+    return 0;
+}
+
 # Runs the logging tests.
 fn main() {
     alloc_init();
@@ -252,6 +326,7 @@ fn main() {
     test_filter();
     test_trace_file();
     test_doc();
+    test_hardening();
     return assert_summary();
 }
 

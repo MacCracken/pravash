@@ -13,8 +13,8 @@
 #
 # Every formula is Rust's in Rust's operation order; the DST's sines and cosines are correctly rounded (ADR 0004),
 # and the periodic sampler's `%` is the exact fmod (src/mathx.cyr, L14). An index outside a field, where Rust panics,
-# reads NaN and writes nothing (ADR 0002 #8). Rust's `trace_span!`s arrive with M7's logging, and the three parallel
-# row loops with src/par.cyr (M3 part e); a serial loop gives the same bits.
+# reads NaN and writes nothing (ADR 0002 #8). Rust's `trace_span!`s are sakshi spans (src/logging.cyr), and the three
+# parallel row loops run on src/par.cyr (M3 part e); a serial loop gives the same bits.
 
 # The wall rule for the velocity ghosts. Append-only values. Mirrors `BoundaryCondition`.
 enum PvBoundaryCondition {
@@ -1235,12 +1235,14 @@ fn _pv_fg_advect_by(dst, src, vx, vy, nx, ny, dt: f64, inv_dx: f64, config: *PvG
 
 impl PvFluidGrid {
     # Sets the thread count `step` uses: n ≥ 1 (a count below 1 is 1, serial). Any count gives the serial bits.
-    # The grid's pool stops now, and the next step starts one of the new size (or runs serially where threads
-    # can't start: src/par.cyr). Returns the count. Cyrius-only: Rust's `parallel` feature is compile-time (port
-    # plan D6, ADR 0002 #4).
+    # A count equal to the current one changes nothing. Otherwise the grid's pool stops now, and the next step
+    # starts one of the new size (or runs serially where threads can't start: src/par.cyr). Returns the count.
+    # Cyrius-only: Rust's `parallel` feature is compile-time (port plan D6, ADR 0002 #4).
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
+        # The same count keeps the pool: a pool can't return its heap (src/par.cyr).
+        if (t == self.threads) { return t; }
         _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;

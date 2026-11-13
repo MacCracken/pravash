@@ -14,6 +14,7 @@ is the corpus, the tools that check it, and the rows they derive:
 python3 -I -B scripts/golden/validate.py .           # recompute every row; exit 1 on any difference
 python3 -I -B scripts/golden/validate.py . --write   # rewrite the correctly rounded rows, the f64-key rows and the cr tables
 python3 -I -B scripts/golden/probe_tables.py .       # compile every generated value, compare its bits
+python3 -I -B scripts/golden/cr_sweep.py .           # 209,062 random inputs of the correctly rounded math vs MPFR
 ```
 
 `validate.py` calls glibc through ctypes for the class-C rows, so it runs on the recorded glibc (2.44), locally. The

@@ -5,9 +5,10 @@
 
 ## Version
 
-**2.0.0** (`VERSION`), the Cyrius library, released 2026-11-13 (tag `2.0.0`, commit `0f2b054`). `cyrius.cyml` reads the version
-through `version = "${file:VERSION}"`, and the release workflow checks both against the tag and publishes the
-CHANGELOG's `## [2.0.0]` section.
+**2.0.1** (`VERSION`), the hardening release, ready to tag (2026-11-13): CLAUDE.md's P(-1) pass on the Cyrius code,
+and Rust's departure from the tree. 2.0.0, the Cyrius library, was released 2026-11-13 (tag `2.0.0`, commit
+`0f2b054`). `cyrius.cyml` reads the version through `version = "${file:VERSION}"`, and the release workflow checks
+both against the tag and publishes the CHANGELOG's section.
 
 The last Rust release is **1.3.0** (the audited 1.3.0 plus the hidden dump hooks), tagged `1.3.0` and published to
 crates.io (2026-11-11, port plan D1). The tree holds no Rust: `rust-old/` and the Rust generator left it after 2.0.0
@@ -105,7 +106,11 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   - `tests/pravash.fcyr` (M8 part e, `cyrius fuzz`, in CI): the 22 JSON readers on 13,200 mutated documents (1,582
     accepted, each written and read back to the same text, each small solver stepped) and the `PRAVASH_LOG` parser on
     40,000 strings; no invariant broken. The scaffold's `tests/pravash.tcyr` smoke test is gone.
-  - Every suite passes on x86_64 ELF, x86_64 PE and aarch64 (1,437 checks on each; M8 part e's release gate).
+  - Every suite passes on x86_64 ELF, x86_64 PE and aarch64: 1,499 checks on each since 2.0.1 (1,437 at 2.0.0). The
+    62 new ones are 2.0.1's hardening groups (the overflow guards, the pool, the solver loops, the dropped solvers,
+    the autodiff tapes, the JSON contracts, the trace writer).
+  - `scripts/golden/cr_sweep.py` (2.0.1, local): 209,062 random inputs of the eight correctly rounded functions
+    against MPFR 4.2.2, 0 differences.
 - **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), debug 9,602, grid 1,120 (511 class
   S step rows), json 302, logging 251, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
   224 (63 class S) and vortex 2,293 rows, and the correctly rounded rows (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv`
@@ -248,9 +253,10 @@ Direct (declared in `cyrius.cyml`):
 ## Next
 
 The port is done, and 2.0.0 is released. The [roadmap](roadmap.md) plans what follows:
-- **2.0.x:** a P(-1) pass on the Cyrius code, then the remaining findings of the 1.3.0 and 1.1.0 audits (grid, sph,
-  mpm, coupling, shallow, bridge), each with an ADR and derived rows where it moves a recorded row;
+- **2.0.x:** the findings that change Rust's behaviour, each with an ADR and derived rows where it moves a recorded
+  row: the 1.3.0 and 1.1.0 audits' (grid, sph, mpm, coupling, shallow, bridge) and 2.0.1's (time-step limits,
+  solver reports, non-finite inputs Rust passes through);
 - **2.1.x:** the consumers' first Cyrius builds (kiran, joshua, impetus), the 1.3.x deprecation notice on crates.io,
   and the three JSON rows pending on bayan's policies;
-- **2.2.x – 2.x.x:** the 15 open stand-ins converting as their libraries ship (port plan §8): the stdlib, ganita, hisab
+- **2.2.x – 2.x.x:** the 16 open stand-ins converting as their libraries ship (port plan §8): the stdlib, ganita, hisab
   on the step path (L8, the largest), then sakshi's tracing and the speed findings.

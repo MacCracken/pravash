@@ -129,8 +129,13 @@ impl PvMacGrid {
     #must_use
     fn max_speed(self): f64 {
         var m: f64 = 0.0;
-        for (var y = 0; y < self.ny; y = y + 1) {
-            for (var x = 0; x < self.nx; x = x + 1) {
+        # A cell whose lower v face (y·nx + x) is past vy reads NaN and is skipped, so the walk ends there.
+        var yend = _pv_rows_in(self.nx, self.vy.len);
+        if (self.ny < yend) { yend = self.ny; }
+        for (var y = 0; y < yend; y = y + 1) {
+            var xend = self.vy.len - y * self.nx;
+            if (self.nx < xend) { xend = self.nx; }
+            for (var x = 0; x < xend; x = x + 1) {
                 var u, v = self.velocity_at(x, y);
                 var uf: f64 = u;
                 var vf: f64 = v;

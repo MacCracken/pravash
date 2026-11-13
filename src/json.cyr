@@ -24,12 +24,21 @@
 # - a vector takes an array of exactly 3 numbers; a `Vec<f64>` / `Vec<u8>` any number;
 # - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`, a struct variant (`BodyShape`'s)
 #   the one-key object `{"Name":fields}`, its fields read as a struct's; the unit struct `DragCoefficient` is `null`.
-# Anything else is Err(PV_ERR_DESERIALIZE), and *out is then untouched (a `ParticleSoa` holds no storage). Two bayan
+# Anything else is Err(PV_ERR_DESERIALIZE). A record without storage is then untouched; one with storage (a grid,
+# a field, the shallow-water state) holds none, so dropping it is safe. *out is overwritten, never released: drop a
+# live record before reading into it. Two bayan
 # policies are stricter than serde_json, so a few documents serde_json reads are refused here (impetus port plan §8,
 # S3 and S4, filed at bayan): an integer above i64::MAX (serde_json reads one into an f64), and a duplicated unknown
 # field (serde_json ignores it).
 #
 # Not thread-safe: the decode arena is module state, reset by each read.
+#
+# Memory (2.0.1): a parsed tree takes about 20× its document's size, on a growable arena that keeps its chunks for
+# the process (`cyrius:docs/development/issues/2026-11-05-arena-grow-keeps-a-chunk-per-larger-allocation.md`, with
+# pravash's numbers), so cap the size of an untrusted document before reading it. A writer grows the caller's
+# builder through the stdlib, which never frees an outgrown buffer
+# (`cyrius:docs/development/issues/2026-11-13-str-builder-grow-never-frees-the-outgrown-buffer.md`): reuse one
+# cleared builder for repeated writes, and it stops growing at the largest text.
 #
 # UPSTREAM(L10): cyrius:docs/development/issues/2026-11-11-derive-json-no-vector-array-or-tagged-variant-shapes.md
 #   replace with `#derive(Serialize)` / `#derive(Deserialize)` once the derive has the array form for a vector struct
@@ -69,6 +78,20 @@ fn _pv_jw_f64(sb, x: f64): i64 {
 fn _pv_jw_int(sb, n): i64 {
     if (str_builder_add_int_a(default_alloc(), sb, n) != 0) { return 0 - 1; }
     return 0;
+}
+
+# Appends n as a u8 (Rust's `phase`): -1 when n is outside 0 … 255, which no reader takes.
+#must_use
+fn _pv_jw_u8(sb, n): i64 {
+    if (n < 0 || n > 255) { return 0 - 1; }
+    return _pv_jw_int(sb, n);
+}
+
+# Appends n as a u32: -1 when n is outside 0 … u32::MAX, which no reader takes.
+#must_use
+fn _pv_jw_u32(sb, n): i64 {
+    if (n < 0 || n > 4294967295) { return 0 - 1; }
+    return _pv_jw_int(sb, n);
 }
 
 # Appends `[x,y,z]`.
@@ -290,7 +313,7 @@ impl PvFluidParticle {
         rc = rc | _pv_jw_key(sb, "mass", 0);
         rc = rc | _pv_jw_f64(sb, self.mass);
         rc = rc | _pv_jw_key(sb, "phase", 0);
-        rc = rc | _pv_jw_int(sb, self.phase);
+        rc = rc | _pv_jw_u8(sb, self.phase);
         rc = rc | _pv_jw_key(sb, "conformation", 0);
         rc = rc | _pv_jw_f64x3(sb, self.conformation.0, self.conformation.1, self.conformation.2);
         rc = rc | _pv_jw_key(sb, "temperature", 0);
@@ -431,6 +454,12 @@ impl PvParticleSoa {
 # agree, as Rust's public Vecs need not).
 #must_use
 fn PvParticleSoa_from_json(buf, len, out: *PvParticleSoa): Result {
+    for (var z = 0; z < _PV_SOA_COLUMNS; z = z + 1) {   # first: on every refusal *out then holds no storage
+        var zc: *PvColumn = _pv_soa_col(out, z);
+        zc.data = 0;
+        zc.len = 0;
+        zc.cap = 0;
+    }
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, _PV_SOA_COLUMNS);
     var s: PvParticleSoa = PvParticleSoa_new();
@@ -449,9 +478,11 @@ fn PvParticleSoa_from_json(buf, len, out: *PvParticleSoa): Result {
 
 # ── FlowRegime, DragCoefficient ─────────────────────────────────────────────────────
 
-# Appends the flow regime as serde_json writes a `FlowRegime` (`"Laminar"`): 0, or -1.
+# Appends the flow regime as serde_json writes a `FlowRegime` (`"Laminar"`): 0, or -1 when the builder can't grow or
+# k is no `FlowRegime` (whose text no reader takes).
 #must_use
 fn flow_regime_to_json(k, sb): i64 {
+    if (k < PV_FLOW_REGIME_LAMINAR || k > PV_FLOW_REGIME_TURBULENT) { return 0 - 1; }
     var rc = _pv_jw(sb, "\"");
     rc = rc | _pv_jw(sb, flow_regime_name(k));
     rc = rc | _pv_jw(sb, "\"");
@@ -581,6 +612,12 @@ impl PvShallowWater {
 # field lengths are the document's (they need not agree with nx·ny: `step` refuses an inconsistent state).
 #must_use
 fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {   # first: on every refusal *out then holds no storage
+        var z: *PvColumn = _pv_sw_col(out, k);
+        z.data = 0;
+        z.len = 0;
+        z.cap = 0;
+    }
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 16);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -598,12 +635,6 @@ fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
     ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 14, "use_green_naghdi"), &w + 72);
     ok = ok & _pv_jr_bool(_pv_jr_at(v, f, 15, "use_riemann"), &w + 80);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
-        var z: *PvColumn = _pv_sw_col(out, k);
-        z.data = 0;
-        z.len = 0;
-        z.cap = 0;
-    }
     # The five public fields: height, vx, vy, ground (fields 3–6), manning_n (field 9).
     for (var c = 0; c < 5; c = c + 1) {
         var fi = c + 3;
@@ -636,9 +667,11 @@ fn PvShallowWater_from_json(buf, len, out: *PvShallowWater): Result {
 
 # ── BoundaryCondition, GridConfig, FluidGrid (M3) ───────────────────────────────────
 
-# Appends the boundary condition as serde_json writes a `BoundaryCondition` (`"NoSlip"`): 0, or -1.
+# Appends the boundary condition as serde_json writes a `BoundaryCondition` (`"NoSlip"`): 0, or -1 when the builder
+# can't grow or k is no `BoundaryCondition` (whose text no reader takes).
 #must_use
 fn boundary_condition_to_json(k, sb): i64 {
+    if (k < PV_BOUNDARY_CONDITION_NO_SLIP || k > PV_BOUNDARY_CONDITION_PERIODIC) { return 0 - 1; }
     var rc = _pv_jw(sb, "\"");
     rc = rc | _pv_jw(sb, boundary_condition_name(k));
     rc = rc | _pv_jw(sb, "\"");
@@ -767,6 +800,7 @@ impl PvFluidGrid {
 # grid).
 #must_use
 fn PvFluidGrid_from_json(buf, len, out: *PvFluidGrid): Result {
+    _pv_fg_zero(out);   # first: on every refusal *out then holds no storage
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 7);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -775,7 +809,6 @@ fn PvFluidGrid_from_json(buf, len, out: *PvFluidGrid): Result {
     ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    _pv_fg_zero(out);
     for (var c = 0; c < 4; c = c + 1) {
         if (_pv_jr_col(_pv_jr_at(v, f, c + 3, _pv_fg_field(c + 3)), _pv_fg_col(out, c), 0) == 0) {
             PvFluidGrid_drop(out);
@@ -816,6 +849,7 @@ impl PvMacGrid {
 # lengths are the document's (`step` refuses an inconsistent grid).
 #must_use
 fn PvMacGrid_from_json(buf, len, out: *PvMacGrid): Result {
+    _pv_mac_zero(out);   # first: on every refusal *out then holds no storage
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 7);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -824,7 +858,6 @@ fn PvMacGrid_from_json(buf, len, out: *PvMacGrid): Result {
     ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    _pv_mac_zero(out);
     for (var c = 0; c < 4; c = c + 1) {
         if (_pv_jr_col(_pv_jr_at(v, f, c + 3, _pv_fg_field(c + 3)), _pv_mac_col(out, c), 0) == 0) {
             PvMacGrid_drop(out);
@@ -877,6 +910,7 @@ impl PvKEpsilon {
 # document's (`step` refuses ones that aren't the grid's).
 #must_use
 fn PvKEpsilon_from_json(buf, len, out: *PvKEpsilon): Result {
+    _pv_ke_zero(out);   # first: on every refusal *out then holds no storage
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 5);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -885,7 +919,6 @@ fn PvKEpsilon_from_json(buf, len, out: *PvKEpsilon): Result {
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 3, "c_eps1"), &w + 8);
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "c_eps2"), &w + 16);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    _pv_ke_zero(out);
     for (var c = 0; c < 2; c = c + 1) {
         if (_pv_jr_col(_pv_jr_at(v, f, c, _pv_ke_field(c)), _pv_ke_col(out, c), 0) == 0) {
             PvKEpsilon_drop(out);
@@ -927,6 +960,7 @@ impl PvVofField {
 # (`advect` refuses one that isn't nx·ny).
 #must_use
 fn PvVofField_from_json(buf, len, out: *PvVofField): Result {
+    _pv_vof_zero(out);   # first: on every refusal *out then holds no storage
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 4);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -935,7 +969,6 @@ fn PvVofField_from_json(buf, len, out: *PvVofField): Result {
     ok = ok & _pv_jr_usize(_pv_jr_at(v, f, 1, "ny"), &w + 8);
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 2, "dx"), &w + 16);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    _pv_vof_zero(out);
     if (_pv_jr_col(_pv_jr_at(v, f, 3, "alpha"), _pv_vof_col(out, 0), 0) == 0) {
         PvVofField_drop(out);
         return Err(PV_ERR_DESERIALIZE);
@@ -975,6 +1008,7 @@ impl PvPhaseField {
 # (`step` refuses one that isn't nx·ny).
 #must_use
 fn PvPhaseField_from_json(buf, len, out: *PvPhaseField): Result {
+    _pv_pf_zero(out);   # first: on every refusal *out then holds no storage
     var v = _pv_jr_parse(buf, len);
     var f = _pv_jr_form(v, 6);
     if (f == 0) { return Err(PV_ERR_DESERIALIZE); }
@@ -985,7 +1019,6 @@ fn PvPhaseField_from_json(buf, len, out: *PvPhaseField): Result {
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 4, "mobility"), &w + 24);
     ok = ok & _pv_jr_f64(_pv_jr_at(v, f, 5, "epsilon"), &w + 32);
     if (ok == 0) { return Err(PV_ERR_DESERIALIZE); }
-    _pv_pf_zero(out);
     if (_pv_jr_col(_pv_jr_at(v, f, 3, "phi"), _pv_pf_col(out, 0), 0) == 0) {
         PvPhaseField_drop(out);
         return Err(PV_ERR_DESERIALIZE);
@@ -1568,7 +1601,7 @@ impl PvSphKernelParams {
         rc = rc | _pv_jw_key(sb, "dt", 0);
         rc = rc | _pv_jw_f32(sb, self.dt);
         rc = rc | _pv_jw_key(sb, "particle_count", 0);
-        rc = rc | _pv_jw_int(sb, self.particle_count);
+        rc = rc | _pv_jw_u32(sb, self.particle_count);
         rc = rc | _pv_jw(sb, "}");
         return rc;
     }
@@ -1618,9 +1651,9 @@ fn PvSphKernelParams_from_json(buf, len, out: *PvSphKernelParams): Result {
 fn _pv_jw_kernel_grid(sb, nx, ny, vals, n0, n1, n2, n3, n4): i64 {
     var rc = _pv_jw(sb, "{");
     rc = rc | _pv_jw_key(sb, "nx", 1);
-    rc = rc | _pv_jw_int(sb, nx);
+    rc = rc | _pv_jw_u32(sb, nx);
     rc = rc | _pv_jw_key(sb, "ny", 0);
-    rc = rc | _pv_jw_int(sb, ny);
+    rc = rc | _pv_jw_u32(sb, ny);
     var names[40];
     store64(&names, n0);
     store64(&names + 8, n1);
@@ -1831,7 +1864,8 @@ fn _pv_jr_str(v, w): i64 {
 }
 
 impl PvDaimonConfig {
-    # Appends the config as serde_json writes a `DaimonConfig`: 0, or -1 when the builder can't grow.
+    # Appends the config as serde_json writes a `DaimonConfig`: 0, or -1 when the builder can't grow. The API key is
+    # written in clear, as serde's derive writes it: only `debug` redacts it, so keep the text where the key may go.
     #must_use
     fn to_json(self, sb): i64 {
         var rc = _pv_jw(sb, "{");

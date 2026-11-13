@@ -234,7 +234,7 @@ impl PvSphSolver {
     # One multiphase step of the n particles at ps, in Rust's order:
     # - the config is validated (its error returned); n = 0 is Ok; no phase is PV_ERR_INVALID_PARAMETER; h as f32 must
     #   be finite and > 0 (PV_ERR_INVALID_SMOOTHING_RADIUS). Nothing changes on any of these. An out-of-range phase
-    #   falls back to phase 0 (Rust also warns, once a step; logging arrives with M7);
+    #   (negative, or past the list) falls back to phase 0, with one warning a step, as Rust's;
     # - the neighbour lists, the densities, each pressure by its phase's equation of state;
     # - from a snapshot, on the solver's pool, each acceleration: gravity, the symmetric pressure term, the viscosity at
     #   the mean of the two phases' ((μᵢ + μⱼ)·½), the free-surface colour field for σ > 0 (its Laplacian from the self
@@ -257,7 +257,7 @@ impl PvSphSolver {
         var bad_phase = 0;
         for (var bq = 0; bq < n; bq = bq + 1) {
             var pb: *PvFluidParticle = ps + bq;
-            if (pb.phase >= nphases) { bad_phase = bad_phase + 1; }
+            if (pb.phase < 0 || pb.phase >= nphases) { bad_phase = bad_phase + 1; }
         }
         if (bad_phase > 0) {
             var msg = "phase index out of bounds, falling back to phase 0";

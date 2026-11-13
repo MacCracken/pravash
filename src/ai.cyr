@@ -18,7 +18,9 @@
 const _PV_AI_OWN_ENDPOINT = 1;
 const _PV_AI_OWN_KEY = 2;
 
-# A daimon service's config: its endpoint, and its API key (0 for none). Mirrors `DaimonConfig`.
+# A daimon service's config: its endpoint, and its API key (0 for none). Mirrors `DaimonConfig`. Each string is its
+# pointer and its length, and the length is authoritative: JSON's `\u0000` puts a NUL inside one (as Rust's String
+# may hold), so read the bytes by length, never as a C string, before handing an endpoint to a socket.
 struct PvDaimonConfig {
     endpoint;
     endpoint_len;
@@ -57,6 +59,12 @@ fn PvHooshConfig_default(): PvHooshConfig {
 }
 
 # A freelist copy of the n bytes at p, NUL-terminated (so Some("") is a nonzero pointer), or 0 for no memory.
+# Zeroes the n bytes of a key before it is freed, so a released key doesn't stay readable in the freelist.
+fn _pv_ai_wipe(p, n) {
+    if (p != 0 && n > 0) { memset(p, 0, n); }
+    return 0;
+}
+
 #must_use
 fn _pv_ai_copy(p, n): i64 {
     if (n < 0) { return 0; }
@@ -71,7 +79,10 @@ fn _pv_ai_copy(p, n): i64 {
 # dropping the `DaimonConfig`.
 fn PvDaimonConfig_drop(c: *PvDaimonConfig) {
     if ((c.owned & _PV_AI_OWN_ENDPOINT) != 0 && c.endpoint != 0) { fl_free(c.endpoint); }
-    if ((c.owned & _PV_AI_OWN_KEY) != 0 && c.api_key != 0) { fl_free(c.api_key); }
+    if ((c.owned & _PV_AI_OWN_KEY) != 0 && c.api_key != 0) {
+        _pv_ai_wipe(c.api_key, c.api_key_len);
+        fl_free(c.api_key);
+    }
     c.endpoint = "";
     c.endpoint_len = 0;
     c.api_key = 0;
@@ -109,7 +120,10 @@ impl PvDaimonConfig {
     fn set_api_key(self, p, n): i64 {
         var d = _pv_ai_copy(p, n);
         if (d == 0) { return 0; }
-        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) {
+            _pv_ai_wipe(self.api_key, self.api_key_len);
+            fl_free(self.api_key);
+        }
         self.api_key = d;
         self.api_key_len = n;
         self.owned = self.owned | _PV_AI_OWN_KEY;
@@ -118,7 +132,10 @@ impl PvDaimonConfig {
 
     # Removes the key. Rust's `c.api_key = None`.
     fn clear_api_key(self) {
-        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) { fl_free(self.api_key); }
+        if ((self.owned & _PV_AI_OWN_KEY) != 0 && self.api_key != 0) {
+            _pv_ai_wipe(self.api_key, self.api_key_len);
+            fl_free(self.api_key);
+        }
         self.api_key = 0;
         self.api_key_len = 0;
         self.owned = self.owned & _PV_AI_OWN_ENDPOINT;

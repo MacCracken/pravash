@@ -273,7 +273,9 @@ impl PvSphSolver {
                 }
                 var avg: f64 = err_sum / scale;
                 if (avg < max_error) {
+                    # Converged: leave the loop, as Rust's `break` (the last count, so `it + 1` can't wrap).
                     done = 1;
+                    it = max_iterations - 1;
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }
@@ -308,6 +310,7 @@ impl PvSphSolver {
                 var avg2: f64 = (div_sum * dt) / scale;
                 if (avg2 < max_error) {
                     done2 = 1;
+                    it2 = max_iterations - 1;
                 } else {
                     _pv_dfsph_apply_kappa(self, ps, n, &kc, dt);
                 }

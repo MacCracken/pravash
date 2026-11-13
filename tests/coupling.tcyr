@@ -919,6 +919,14 @@ fn main() {
     test_indexed_drag();
     test_level_set_refusals();
     test_flip_cyrius();
+    test_group("hardening_dropped_flip_refuses_a_step");
+    var df: PvFlipSolver;
+    flip_new(&df, 8, 8, 0.1, 0.95);
+    PvFlipSolver_drop(&df);
+    var dq = one_2d(0.4, 0.4, 1.0, 0.0, 0.0);
+    var ft, fv = df.step(_pv_as_particles(dq), 1, PvVec3_new(0.0, -9.81, 0.0), 0.001);
+    assert(is_err_result(ft) == 1 && fv == PV_ERR_INVALID_GRID_RESOLUTION, "a dropped FLIP's step is refused");
+    fl_free(dq);
     return assert_summary();
 }
 

@@ -9,7 +9,7 @@
 # Every formula is Rust's in Rust's operation order; `cbrt` (Manning friction, sediment) is ganita's, correctly
 # rounded as 1.3.0's compiler_builtins cbrt is, and the damping `powf` the correctly rounded one (ADR 0004). An
 # index outside a field, where Rust panics, reads NaN or false and writes nothing (ADR 0002 #8). Rust's
-# `trace_span!`s arrive with M7's logging.
+# `trace_span!`s are sakshi spans (src/logging.cyr).
 
 struct PvShallowWater {
     nx;
@@ -156,7 +156,9 @@ impl PvShallowWater {
             var nan: f64 = PV_F64_NAN;
             return nan;
         }
-        var d: f64 = self.height.at(i) - self.ground.at(i);
+        var hgt: f64 = self.height.at(i);
+        var gnd: f64 = self.ground.at(i);
+        var d: f64 = hgt - gnd;
         var r: f64 = _pv_max(d, 0.0);
         return r;
     }
@@ -232,15 +234,22 @@ impl PvShallowWater {
         var r2: f64 = radius * radius;
         var inv_radius: f64 = 1.0 / radius;
         var dx: f64 = self.dx;
-        for (var y = 0; y < self.ny; y = y + 1) {
-            for (var x = 0; x < self.nx; x = x + 1) {
-                var px: f64 = f64_from(x) * dx;
-                var py: f64 = f64_from(y) * dx;
+        var yend = _pv_rows_in(self.nx, self.height.len);
+        if (self.ny < yend) { yend = self.ny; }
+        for (var y = 0; y < yend; y = y + 1) {
+            var xend = self.height.len - y * self.nx;
+            if (self.nx < xend) { xend = self.nx; }
+            for (var x = 0; x < xend; x = x + 1) {
+                var xf: f64 = f64_from(x);
+                var yf: f64 = f64_from(y);
+                var px: f64 = xf * dx;
+                var py: f64 = yf * dx;
                 var ddx: f64 = px - cx;
                 var ddy: f64 = py - cy;
                 var dist2: f64 = (ddx * ddx) + (ddy * ddy);
                 if (dist2 < r2) {
-                    var factor: f64 = 1.0 - (f64_sqrt(dist2) * inv_radius);
+                    var dist: f64 = f64_sqrt(dist2);
+                    var factor: f64 = 1.0 - (dist * inv_radius);
                     var i = y * self.nx + x;
                     var h: f64 = self.height.get_f(i);
                     var s = self.height.set_f(i, h + ((amplitude * factor) * factor));
@@ -279,7 +288,8 @@ impl PvShallowWater {
         var cell_area: f64 = self.dx * self.dx;
         var nx = self.nx;
         var ny = self.ny;
-        if (nx < 3 || ny < 3 || self.height.len < nx * ny || self.ground.len < nx * ny) { return 0.0; }
+        if (nx < 3 || ny < 3 || nx > 9223372036854775807 / ny) { return 0.0; }
+        if (self.height.len < nx * ny || self.ground.len < nx * ny) { return 0.0; }
         var sum: f64 = 0.0;
         var hp = self.height.data;
         var gp = self.ground.data;
@@ -301,7 +311,8 @@ impl PvShallowWater {
     fn max_wave_height(self, rest_height: f64): f64 {
         var m: f64 = 0.0;
         for (var i = 0; i < self.height.len; i = i + 1) {
-            var d: f64 = self.height.at(i) - rest_height;
+            var hgt: f64 = self.height.at(i);
+            var d: f64 = hgt - rest_height;
             var ad: f64 = f64_abs(d);
             m = _pv_max(m, ad);
         }
@@ -320,12 +331,15 @@ impl PvShallowWater {
         var g: f64 = self.gravity;
         var mws: f64 = 0.0;
         for (var i = 0; i < n; i = i + 1) {
-            var d: f64 = self.height.at(i) - self.ground.at(i);
+            var hgt: f64 = self.height.at(i);
+            var gnd: f64 = self.ground.at(i);
+            var d: f64 = hgt - gnd;
             var depth: f64 = _pv_max(d, 0.0);
             var u: f64 = self.vx.at(i);
             var v: f64 = self.vy.at(i);
             var speed: f64 = f64_sqrt((u * u) + (v * v));
-            var ws: f64 = speed + f64_sqrt(g * depth);
+            var wave: f64 = f64_sqrt(g * depth);
+            var ws: f64 = speed + wave;
             mws = _pv_max(mws, ws);
         }
         var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
@@ -402,7 +416,8 @@ fn update_sediment(sw: *PvShallowWater, concentration, conc_len, config: *PvSedi
             var depth: f64 = _pv_max(dd, 0.0);
             if (depth < dry_thr) { continue; }
             var ci: f64 = load64(concentration + i * 8);
-            var suspended: f64 = _pv_max(ci, 0.0) * depth;
+            var cpos: f64 = _pv_max(ci, 0.0);
+            var suspended: f64 = cpos * depth;
             var u: f64 = sw.vx.at(i);
             var v: f64 = sw.vy.at(i);
             var speed_sq: f64 = (u * u) + (v * v);
@@ -471,7 +486,8 @@ fn _pv_sw_hll(h_l0: f64, u_l: f64, h_r0: f64, u_r: f64, g: f64) {
     var f_hu_r: f64 = ((h_r * u_r) * u_r) + ((hg * h_r) * h_r);
     if (s_l >= 0.0) { return (f_h_l, f_hu_l); }
     if (s_r <= 0.0) { return (f_h_r, f_hu_r); }
-    var denom: f64 = 1.0 / _pv_max(s_r - s_l, eps);
+    var span: f64 = _pv_max(s_r - s_l, eps);
+    var denom: f64 = 1.0 / span;
     var slr: f64 = s_l * s_r;
     var f_h: f64 = (((s_r * f_h_l) - (s_l * f_h_r)) + (slr * (h_r - h_l))) * denom;
     var f_hu: f64 = (((s_r * f_hu_l) - (s_l * f_hu_r)) + (slr * ((h_r * u_r) - (h_l * u_l)))) * denom;
@@ -562,6 +578,12 @@ impl PvShallowWater {
         ok = ok & self.scratch_vy.resize(size, zw);
         ok = ok & self.scratch_h.resize(size, zw);
         ok = ok & self.scratch_lap.resize(size, zw);
+        # Dispersion's line scratch too, before any field changes (an out-of-memory then leaves the state whole).
+        if (self.dispersion_coeff > 0.0) {
+            var line = nx;
+            if (ny > line) { line = ny; }
+            ok = ok & self.scratch_line.resize(2 * line, zw);
+        }
         if (ok == 0) { _pv_span_end(trace); return Err(PV_ERR_OUT_OF_MEMORY); }
 
         var hp = self.height.data;

@@ -1260,7 +1260,7 @@ fn apply_implicit_viscosity(ps: *PvFluidParticle, n, offsets, n_off, indices, n_
             max_change = _pv_max(max_change, change);
             pi.velocity = PvVec3_new(nx, ny, nz);
         }
-        if (max_change < stop) { it = iterations; }
+        if (max_change < stop) { it = iterations - 1; }   # the last count, so `it + 1` can't wrap
     }
     fl_free(v_old);
     _pv_span_end(trace); return 1;

@@ -32,11 +32,12 @@ impl PvColumn {
         return self.len;
     }
 
-    # Room for at least `n` slots: 1, or 0 when the memory isn't there (the column unchanged). Mirrors
-    # `Vec::reserve` to a total of n.
+    # Room for at least `n` slots: 1, or 0 when the memory isn't there or n · 8 bytes overflows (the column unchanged).
+    # Mirrors `Vec::reserve` to a total of n (whose overflow panics).
     #must_use
     fn reserve(self, n): i64 {
         if (n <= self.cap) { return 1; }
+        if (n > 1152921504606846975) { return 0; }   # (2^63 − 1) / 8
         var d = fl_alloc(n * 8);
         if (d == 0) { return 0; }
         if (self.len > 0) { memcpy(d, self.data, self.len * 8); }
@@ -152,6 +153,16 @@ impl PvColumn {
         self.cap = 0;
         return 0;
     }
+}
+
+# The rows of an nx-wide row-major field whose first cell lies inside a column of `len` slots: 0 when nx or len is
+# below 1, else ⌈len / nx⌉. A loop over nx × ny cells that skips the cells past a column (ADR 0002 #14) stops at
+# this row, and within row y at len − y·nx cells, where every later cell would be skipped too, so sizes that
+# disagree with the column can't make it spin (2.0.1). y·nx ≤ len − 1 inside the bound, so it can't overflow.
+#must_use
+fn _pv_rows_in(nx, len): i64 {
+    if (nx < 1 || len < 1) { return 0; }
+    return (len - 1) / nx + 1;
 }
 
 # Swaps two column records (their storage, length and capacity), as `std::mem::swap` swaps two Vecs.

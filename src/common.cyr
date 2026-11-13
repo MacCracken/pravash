@@ -11,7 +11,7 @@
 # - Nothing aborts: where Rust panics (an index out of range) or aborts (out of memory), the call returns NaN,
 #   0, (0, 0) or 0 for failure, as each function says.
 # - Owned storage is freelist (`fl_alloc`), released by the type's `_drop`.
-# - Rust's `tracing::warn!` on a stale or double-freed arena handle arrives with M7's logging (sakshi).
+# - Rust's `tracing::warn!` on a stale or double-freed arena handle is a sakshi warning (src/logging.cyr).
 
 # ── FluidMaterial ───────────────────────────────────────────────────────────────────
 
@@ -300,8 +300,8 @@ fn PvParticleSoa_default(): PvParticleSoa {
     return s;
 }
 
-# An empty store with room for `n` particles in every column: 1, or 0 when the memory isn't there (then *out
-# holds no storage). Mirrors `ParticleSoa::with_capacity`.
+# An empty store with room for `n` particles in every column: 1, or 0 when the memory isn't there or n is negative
+# (then *out holds no storage). Mirrors `ParticleSoa::with_capacity`.
 #must_use
 fn PvParticleSoa_with_capacity(out: *PvParticleSoa, n): i64 {
     for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
@@ -310,6 +310,7 @@ fn PvParticleSoa_with_capacity(out: *PvParticleSoa, n): i64 {
         z.len = 0;
         z.cap = 0;
     }
+    if (n < 0) { return 0; }
     for (var k = 0; k < _PV_SOA_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_soa_col(out, k);
         if (c.reserve(n) == 0) {
@@ -355,7 +356,8 @@ fn PvParticleSoa_clone(out: *PvParticleSoa, src: *PvParticleSoa): i64 {
 # record is laid out exactly as the 18 columns are, so word k of particle i is column k's slot i.
 const _PV_PARTICLE_WORDS = 18;
 
-# The store of the `n` particles at `ps`: 1, or 0 when the memory isn't there (then *out holds no storage).
+# The store of the `n` particles at `ps`: 1, or 0 when the memory isn't there or n is negative (then *out holds no
+# storage).
 # Mirrors `ParticleSoa::from_aos`. Each column's `n` slots are reserved, then filled straight from the records'
 # words (Rust's pushes, without a call per field).
 #must_use
@@ -510,10 +512,11 @@ fn _pv_as_arena(p): *PvParticleArena {
 }
 
 # An arena of `capacity` default particles (`FluidParticle::new(DVec3::ZERO, 0.0)`), or 0 when the memory isn't
-# there (Rust aborts) or `capacity` is negative. Mirrors `ParticleArena::new`.
+# there (Rust aborts), `capacity` is negative, or its records' bytes overflow (Rust panics). Mirrors
+# `ParticleArena::new`.
 #must_use
 fn PvParticleArena_new(capacity): *PvParticleArena {
-    if (capacity < 0) { return _pv_as_arena(0); }
+    if (capacity < 0 || capacity > (9223372036854775807 - 8) / sizeof(PvFluidParticle)) { return _pv_as_arena(0); }
     var a: *PvParticleArena = _pv_as_arena(fl_alloc(sizeof(PvParticleArena)));
     if (a == 0) { return a; }
     var fcap = capacity / 2 + 1;

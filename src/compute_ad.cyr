@@ -6,56 +6,75 @@
 # hisab itself, as itihas ships its optional MCP surface. Its rows are class D (port plan §5, set by probe 8,
 # port-parity §4.8): hisab 3.4.1's reverse sweep accumulates in another order from 1.4.0's (within 3 ulp).
 #
-# One tape is kept for the process and grown when a function fills it (hisab's tapes are never freed: its allocator
-# only bumps), so a call allocates only its result once the tape is large enough. Not thread-safe, as the JSON
-# decoder's arena isn't.
+# One tape per nesting depth is kept for the process and grown when a function fills it (hisab's tapes are never
+# freed: its allocator only bumps), so a call allocates only its result once its tape is large enough. A function may
+# itself take a gradient: the inner call records on the next depth's tape, as Rust's fresh tape per call keeps the
+# outer recording. Not thread-safe, as the JSON decoder's arena isn't. The tapes live on the bump heap, so a consumer's
+# `alloc_reset` frees them under pravash, as it frees every bump allocation (pravash itself never calls it).
 
-var _pv_ad_tape = 0;
-var _pv_ad_cap = 0;
+# The tapes and their capacities, one word a depth.
+var _pv_ad_tapes: i64[8];
+var _pv_ad_caps: i64[8];
+var _pv_ad_depth = 0;
+
+# The deepest nesting a gradient may reach.
+const _PV_AD_MAX_DEPTH = 8;
 
 # The largest tape a gradient may grow to, in nodes: 2^24 (640 MB of hisab's 40-byte nodes).
 const _PV_AD_MAX_CAP = 16777216;
 
 # The gradient ∂f/∂xᵢ of f at the n inputs at x (f64 words), by hisab's reverse-mode tape: `f(tape, vars, n)` records
 # the function on the tape from its n input variables (`ad_var` indices, a word each at `vars`) with hisab's `ad_*`
-# operations, and returns its output's index. A function that fills the tape (an index that isn't `ad_ok`) is run
-# again on one twice the size; f must be a pure function of its inputs, as Rust's `Fn` is. Returns (pointer, n), a
-# freelist buffer of the n gradient components the caller frees, or (0, 0) for n ≤ 0, for a root that is not a node
-# even on the largest tape, a refused sweep, or no memory. Mirrors `KernelDerivatives::autodiff_gradient`.
+# operations, and returns its output's index. A function that fills the tape is run again on one twice the size; f must
+# be a pure function of its inputs, as Rust's `Fn` is. Returns (pointer, n), a freelist buffer of the n gradient
+# components the caller frees, or (0, 0) for n ≤ 0, for a root that is not a node (at once when the tape isn't full;
+# even on the largest tape when it is), past _PV_AD_MAX_DEPTH nested calls, a refused sweep, or no memory. Mirrors
+# `KernelDerivatives::autodiff_gradient`.
 #must_use
 fn PvKernelDerivatives_autodiff_gradient(f, x, n) {
     if (n <= 0) { return (0, 0); }
+    var depth = _pv_ad_depth;
+    if (depth >= _PV_AD_MAX_DEPTH) { return (0, 0); }
     var vars = fl_alloc(n * 8);
     if (vars == 0) { return (0, 0); }
     var cap = 64;
     while (cap < 4 * n) { cap = cap * 2; }
     var done = 0;
     var root = 0 - 1;
+    var t = 0;
     while (done == 0) {
         if (cap > _PV_AD_MAX_CAP) {
             fl_free(vars);
             return (0, 0);
         }
-        if (_pv_ad_tape == 0 || _pv_ad_cap < cap) {
+        t = _pv_ad_tapes[depth];
+        if (t == 0 || _pv_ad_caps[depth] < cap) {
             var t0 = ad_tape_new(cap);
             if (t0 == 0) {
                 fl_free(vars);
                 return (0, 0);
             }
-            _pv_ad_tape = t0;
-            _pv_ad_cap = cap;
+            _pv_ad_tapes[depth] = t0;
+            _pv_ad_caps[depth] = cap;
+            t = t0;
         }
-        var t = _pv_ad_tape;
+        var tcap = _pv_ad_caps[depth];
         ad_tape_reset(t);
         for (var i = 0; i < n; i = i + 1) { store64(vars + i * 8, ad_var(t, load64(x + i * 8))); }
+        _pv_ad_depth = depth + 1;
         root = fncall3(f, t, vars, n);
-        if (ad_ok(t, root) == 1 && ad_tape_len(t) < _pv_ad_cap) {
+        _pv_ad_depth = depth;
+        if (ad_ok(t, root) == 1 && ad_tape_len(t) < tcap) {
             done = 1;
+        } elif (ad_tape_len(t) < tcap) {
+            # Not a node, though the tape has room: a bigger tape can't help.
+            fl_free(vars);
+            return (0, 0);
         } else {
-            cap = _pv_ad_cap * 2;
+            cap = tcap * 2;
         }
     }
-    var gt, gv = ad_grad(_pv_ad_tape, root);
+    var gt, gv = ad_grad(t, root);
     if (is_err_result(gt) == 1) {
         fl_free(vars);
         return (0, 0);
@@ -65,7 +84,7 @@ fn PvKernelDerivatives_autodiff_gradient(f, x, n) {
         fl_free(vars);
         return (0, 0);
     }
-    for (var k = 0; k < n; k = k + 1) { store64(out + k * 8, ad_grad_of(_pv_ad_tape, load64(vars + k * 8))); }
+    for (var k = 0; k < n; k = k + 1) { store64(out + k * 8, ad_grad_of(t, load64(vars + k * 8))); }
     fl_free(vars);
     return (out, n);
 }

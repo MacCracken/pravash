@@ -593,6 +593,58 @@ fn test_debug_kinds() {
     return 0;
 }
 
+# 2.0.1 hardening (Cyrius-only): a size whose bytes overflow is refused, never allocated short.
+fn test_hardening() {
+    test_group("hardening_column_reserve_overflow");
+    var c: PvColumn = PvColumn_new();
+    assert_eq(c.push(7), 1, "a word in");
+    var huge = 2305843009213693953;   # 2^61 + 1: n · 8 wraps to 8
+    assert_eq(c.reserve(huge), 0, "reserve refuses an n whose bytes overflow");
+    assert(c.len == 1 && c.cap == 8 && c.get(0) == 7, "and leaves the column as it was");
+    assert_eq(c.resize(huge, 0), 0, "resize too");
+    assert_eq(c.reserve(1152921504606846976), 0, "the first n past (2^63 − 1) / 8");
+    c.drop();
+
+    test_group("hardening_soa_and_arena_sizes");
+    var s: PvParticleSoa;
+    assert_eq(PvParticleSoa_with_capacity(&s, huge), 0, "with_capacity refuses an overflowing n");
+    assert_eq(PvParticleSoa_with_capacity(&s, 0 - 1), 0, "and a negative one");
+    var p: PvFluidParticle = PvFluidParticle_new(PvVec3_zero(), 1.0);
+    assert_eq(PvParticleSoa_from_aos(&s, &p, 0 - 1), 0, "from_aos refuses a negative count");
+    var a: *PvParticleArena = PvParticleArena_new(huge);
+    assert(a == 0, "an arena whose records' bytes overflow is refused");
+    var a2: *PvParticleArena = PvParticleArena_new(4);
+    assert(a2 != 0 && a2.capacity == 4, "a small one is made");
+    PvParticleArena_drop(a2);
+
+    test_group("hardening_json_writers_refuse_unreadable_values");
+    var sb = str_builder_new();
+    assert_eq(flow_regime_to_json(7, sb), 0 - 1, "a kind outside FlowRegime");
+    assert_eq(boundary_condition_to_json(9, sb), 0 - 1, "and outside BoundaryCondition");
+    assert_eq(load64(sb + 8), 0, "write nothing");
+    var q: PvFluidParticle = PvFluidParticle_new(PvVec3_zero(), 1.0);
+    q.phase = 300;
+    assert_eq(q.to_json(sb), 0 - 1, "a phase past u8 (no reader takes it) fails the write");
+
+    test_group("hardening_json_refusal_leaves_no_storage");
+    var sw: PvShallowWater;
+    for (var k = 0; k < _PV_SW_COLUMNS; k = k + 1) {
+        var zc: *PvColumn = _pv_sw_col(&sw, k);
+        zc.data = 4096 + k;   # junk, as an uninitialised record holds
+        zc.cap = 9;
+    }
+    var rt, rv = PvShallowWater_from_json("[1", 2, &sw);
+    assert(is_err_result(rt) == 1 && rv == PV_ERR_DESERIALIZE, "a document that doesn't parse is refused");
+    var clean = 1;
+    for (var k2 = 0; k2 < _PV_SW_COLUMNS; k2 = k2 + 1) {
+        var c2: *PvColumn = _pv_sw_col(&sw, k2);
+        if (c2.data != 0 || c2.cap != 0) { clean = 0; }
+    }
+    assert_eq(clean, 1, "and *out holds no storage, so dropping it is safe");
+    PvShallowWater_drop(&sw);
+    return 0;
+}
+
 # Runs the ported common tests.
 fn main() {
     alloc_init();
@@ -607,6 +659,7 @@ fn main() {
     test_serde();
     test_clone();
     test_debug_kinds();
+    test_hardening();
     return assert_summary();
 }
 

@@ -37,6 +37,21 @@ fn filled(n, x: f64): i64 {
     return p;
 }
 
+# 2.0.1 hardening (Cyrius-only): a fill whose nx, ny disagree with the field ends at the field's end.
+fn test_hardening() {
+    test_group("hardening_vof_inconsistent_sizes");
+    var v: PvVofField;
+    assert_eq(fresh(&v, 8, 8, 0.1), 1, "new");
+    v.nx = 4294967296;
+    v.ny = 4294967296;
+    v.fill_rect(0.0, 0.0, 0.25, 0.05);
+    v.nx = 8;
+    v.ny = 8;
+    assert(v.alpha.len == 64 && v.is_full(1, 0) == 1, "fill_rect returns (2^64 cells otherwise), its first row filled");
+    PvVofField_drop(&v);
+    return 0;
+}
+
 # Runs the ported VofField tests.
 fn main() {
     alloc_init();
@@ -155,6 +170,7 @@ fn main() {
     assert(c0.data == v.alpha.data && c1.data == v.scratch.data, "0: alpha, 1: scratch");
     assert(v.alpha.len == 20 && v.scratch.len == 20, "nx·ny each");
     PvVofField_drop(&v);
+    test_hardening();
     return assert_summary();
 }
 

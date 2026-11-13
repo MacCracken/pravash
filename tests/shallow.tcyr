@@ -871,6 +871,27 @@ fn test_layout() {
     return 0;
 }
 
+# 2.0.1 hardening (Cyrius-only): sizes that disagree with the fields can't read outside them or make a loop spin.
+fn test_hardening() {
+    test_group("hardening_shallow_inconsistent_sizes");
+    var sw: PvShallowWater;
+    var st, sv = PvShallowWater_new(4, 4, 0.1, 1.0, &sw);
+    assert(is_err_result(st) == 0, "a 4 × 4 basin");
+    var h1: f64 = sw.height.get_f(1);
+    sw.nx = 4294967296;
+    sw.ny = 4294967296;
+    var got: f64 = sw.interior_volume();
+    assert(got == 0.0, "interior_volume: an nx · ny that overflows is refused, not read past the fields");
+    sw.add_disturbance(0.1, 0.1, 0.15, 0.5);
+    assert(sw.height.len == 16, "add_disturbance stops at the field's end (2^64 cells otherwise)");
+    sw.nx = 4;
+    sw.ny = 4;
+    var h1b: f64 = sw.height.get_f(1);
+    assert(h1b > h1, "and a cell it reached (word 1, within 0.15 of the drop) rose");
+    PvShallowWater_drop(&sw);
+    return 0;
+}
+
 # Runs the ported shallow water tests.
 fn main() {
     alloc_init();
@@ -884,6 +905,7 @@ fn main() {
     test_audit_waves();
     test_audit_state();
     test_layout();
+    test_hardening();
     return assert_summary();
 }
 

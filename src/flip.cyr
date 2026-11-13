@@ -7,8 +7,8 @@
 # does (ADR 0002 #24). Every formula is Rust's in its operation order: each cell index and fraction is
 # floor(g).max(0).min(n − 2) and (g − x0).clamp(0, 1) with Rust's NaN-ignoring max and min; the splat's weights are
 # products of the fractions times the mass; the sampler's are the value times one fraction then the other. A step
-# allocates nothing once the APIC column has grown. Rust's `trace_span!`s arrive with M7's logging. Slices are
-# (pointer, count) (ADR 0002 #9).
+# allocates nothing once the APIC column has grown. Rust's `trace_span!`s are sakshi spans (src/logging.cyr). Slices
+# are (pointer, count) (ADR 0002 #9).
 
 # The FLIP/PIC solver: the grid (nx × ny cells of size dx), the blend `flip_ratio` (0 PIC, 1 FLIP; re-clamped at use),
 # `use_apic` (0 / 1, overriding the blend), `narrow_band_cells` (a usize, reserved: Rust reads it nowhere), then the
@@ -53,13 +53,30 @@ fn _pv_flip_zero(s: *PvFlipSolver) {
     return 0;
 }
 
-# Releases every column; the solver holds no storage after. Mirrors dropping the `FlipSolver`.
+# Releases every column; the solver holds no storage after, and its size is 0 × 0, which `step` refuses. Mirrors
+# dropping the `FlipSolver`.
 fn PvFlipSolver_drop(s: *PvFlipSolver) {
     for (var k = 0; k < _PV_FLIP_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_flip_col(s, k);
         c.drop();
     }
+    s.nx = 0;
+    s.ny = 0;
     return 0;
+}
+
+# 1 when the solver holds its fields: nx, ny ≥ 4 and the seven grid columns nx · ny long. 0 after a drop or a failed
+# `new`, which a step refuses (Rust can't step a dropped solver).
+#must_use
+fn _pv_flip_whole(s: *PvFlipSolver): i64 {
+    var nx = s.nx;
+    var ny = s.ny;
+    if (nx < 4 || ny < 4 || nx > 9223372036854775807 / ny) { return 0; }
+    for (var k = 0; k < 7; k = k + 1) {
+        var c: *PvColumn = _pv_flip_col(s, k);
+        if (c.len != nx * ny) { return 0; }
+    }
+    return 1;
 }
 
 # A solver of zeros into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx or
@@ -70,6 +87,8 @@ fn PvFlipSolver_drop(s: *PvFlipSolver) {
 #must_use
 fn PvFlipSolver_new(nx, ny, dx: f64, flip_ratio: f64, out: *PvFlipSolver): Result {
     _pv_flip_zero(out);
+    out.nx = 0;
+    out.ny = 0;
     # nx and ny are usizes: a word at or above 2^63 reads negative, and is a size Rust accepts until nx·ny.
     if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
     if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
@@ -375,6 +394,7 @@ impl PvFlipSolver {
     #must_use
     fn step(self, ps: *PvFluidParticle, n, gravity: PvVec3, dt: f64): Result {
         var trace = _pv_span(_PV_LOG_COUPLING, "flip::step", "n", n, 0, 0, 0, 0);
+        if (_pv_flip_whole(self) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         if (_pv_is_finite(self.flip_ratio) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         var nx = self.nx;

@@ -29,10 +29,11 @@ struct PvF32Column {
 }
 
 impl PvF32Column {
-    # Room for at least n elements: 1, or 0 when the memory isn't there (unchanged).
+    # Room for at least n elements: 1, or 0 when the memory isn't there or n · 4 bytes overflows (unchanged).
     #must_use
     fn reserve(self, n): i64 {
         if (n <= self.cap) { return 1; }
+        if (n > 2305843009213693951) { return 0; }   # (2^63 − 1) / 4
         var d = fl_alloc(n * 4);
         if (d == 0) { return 0; }
         if (self.len > 0) { memcpy(d, self.data, self.len * 4); }
@@ -42,12 +43,18 @@ impl PvF32Column {
         return 1;
     }
 
-    # Appends x rounded to f32 (Rust's `x as f32`), into reserved room: the caller has reserved it.
-    fn push_rounded(self, x: f64) {
+    # Appends x rounded to f32 (Rust's `x as f32`): 1, or 0 when the column can't grow (unchanged). The capacity
+    # doubles from 8. Mirrors `Vec::push`.
+    fn push_rounded(self, x: f64): i64 {
+        if (self.len == self.cap) {
+            var want = self.cap * 2;
+            if (want < 8) { want = 8; }
+            if (self.reserve(want) == 0) { return 0; }
+        }
         var b: *f32 = _pv_as_f32s(self.data);
         b[self.len] = x;
         self.len = self.len + 1;
-        return 0;
+        return 1;
     }
 
     # Element i widened to f64 (exact), unchecked. Mirrors `f64::from(v[i])`.

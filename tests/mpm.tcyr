@@ -455,6 +455,18 @@ fn main() {
     test_regressions();
     test_layout_and_refusals();
     test_step_paths();
+    test_group("hardening_dropped_solver_refuses_a_step");
+    var ds: PvMpmSolver;
+    mpm_new(&ds, 8, 8, 0.1);
+    PvMpmSolver_drop(&ds);
+    var dp = fl_alloc(sizeof(PvFluidParticle) + 8);
+    var dp1: PvFluidParticle = PvFluidParticle_new_2d(0.4, 0.4, 1.0);
+    memcpy(dp, &dp1, sizeof(PvFluidParticle));
+    var dm = mpm_states(1, PvConstitutiveLaw_fluid(1000.0, 1.0), 0.01);
+    var dt, dv = ds.step(_pv_as_particles(dp), 1, _pv_as_mpm_particles(dm), 1, PvVec3_new(0.0, -9.81, 0.0), 0.001);
+    assert(is_err_result(dt) == 1 && dv == PV_ERR_INVALID_GRID_RESOLUTION, "a dropped MPM's step is refused");
+    fl_free(dp);
+    fl_free(dm);
     return assert_summary();
 }
 

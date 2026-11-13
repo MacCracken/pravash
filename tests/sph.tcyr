@@ -1589,6 +1589,64 @@ fn test_clone() {
     return 0;
 }
 
+# 2.0.1 hardening (Cyrius-only): the solver loops end when they converge, whatever their limit; the counts whose
+# byte size overflows are refused before anything is read; a negative phase falls back to phase 0.
+fn test_hardening() {
+    test_group("hardening_solvers_stop_at_convergence");
+    # An i64::MAX limit with a tolerance every first round meets: a loop that runs on after converging never returns.
+    var big = 9223372036854775807;
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var bp, bn = create_particle_block(0.4, 0.4, 0.08, 0.08, 0.02, 0.001);
+    var b: *PvFluidParticle = _pv_as_particles(bp);
+    var s: PvSphSolver = PvSphSolver_new();
+    var dt, dv = s.step_dfsph(b, bn, &cfg, 0.001, big, 1000000000.0);
+    assert(is_err_result(dt) == 0, "DFSPH leaves both solver loops at the first round");
+    var pt, pv = s.step_pcisph(b, bn, &cfg, 0.001, big, 1000000000.0);
+    assert(is_err_result(pt) == 0, "PCISPH leaves its loop at the first round");
+    var nl: PvNeighborLists = s.neighbor_lists();
+    var iv = apply_implicit_viscosity(b, bn, nl.offsets, nl.n_off, nl.indices, nl.n_idx, cfg.smoothing_radius, 0.001,
+      0.001, big);
+    assert_eq(iv, 1, "implicit viscosity leaves its loop once the change is below its stop");
+
+    test_group("hardening_sizes_that_overflow");
+    var huge = 2305843009213693953;   # 2^61 + 1: n · 8 wraps to 8
+    var w: f64 = 0.25;
+    var kp, kn = batch_poly6(&w, huge, 0.1);
+    assert(kp == 0 && kn == 0, "batch_poly6 refuses an n whose n · 8 overflows");
+    var qp, qn = batch_distance_squared(PvVec3_zero(), &w, huge);
+    assert(qp == 0 && qn == 0, "and batch_distance_squared");
+    assert_eq(sort_by_zorder(b, huge, 0.1), 0, "sort_by_zorder refuses before reading a particle");
+    var g: PvNeighborGrid;
+    PvNeighborGrid_init(&g);
+    var gt, gv = PvNeighborGrid_build(&g, b, huge, 0.1);
+    assert(is_err_result(gt) == 1 && gv == PV_ERR_OUT_OF_MEMORY, "the neighbour grid refuses as out of memory");
+    assert(g.offsets.len == 0 && g.indices.len == 0, "and has no lists");
+    PvNeighborGrid_drop(&g);
+
+    test_group("hardening_negative_phase_falls_back");
+    var mc: PvMultiPhaseConfig = PvMultiPhaseConfig_single(1000.0, 2000.0, 0.001);
+    var mp, mn = create_particle_block(0.4, 0.4, 0.08, 0.08, 0.02, 0.001);
+    var m: *PvFluidParticle = _pv_as_particles(mp);
+    var c2p, c2n = create_particle_block(0.4, 0.4, 0.08, 0.08, 0.02, 0.001);
+    var c2: *PvFluidParticle = _pv_as_particles(c2p);
+    m.phase = 0 - 1;
+    var s2: PvSphSolver = PvSphSolver_new();
+    var s3: PvSphSolver = PvSphSolver_new();
+    var mt, mv = s2.step_multiphase(m, mn, &cfg, &mc);
+    var ct, cv = s3.step_multiphase(c2, c2n, &cfg, &mc);
+    assert(is_err_result(mt) == 0 && is_err_result(ct) == 0, "both step");
+    assert(_pv_bits(m.position.x) == _pv_bits(c2.position.x) && _pv_bits(m.velocity.y) == _pv_bits(c2.velocity.y),
+      "phase −1 steps as phase 0");
+    PvSphSolver_drop(&s2);
+    PvSphSolver_drop(&s3);
+    PvMultiPhaseConfig_drop(&mc);
+    fl_free(mp);
+    fl_free(c2p);
+    PvSphSolver_drop(&s);
+    fl_free(bp);
+    return 0;
+}
+
 # Runs the ported SPH tests.
 fn main() {
     alloc_init();
@@ -1610,6 +1668,7 @@ fn main() {
     test_solver_layout();
     test_docs();
     test_clone();
+    test_hardening();
     return assert_summary();
 }
 

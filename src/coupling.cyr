@@ -1,14 +1,14 @@
 # coupling.cyr — fluid–body coupling of Rust 1.3.0's src/coupling.rs (M6 part a): rigid bodies with their shapes and
 # signed distances, the two-way SPH coupling, body integration with and without added mass, drag from nearby
 # particles (by brute force and through a caller's neighbour grid), and the particle level set. The FLIP/APIC solver
-# arrives with part b.
+# is src/flip.cyr.
 #
 # `BodyShape` is a data-carrying enum: the kind enum `PvBodyShape` and the payload struct `PvShape`, the union of
 # the variants' fields (port plan §7.3, ADR 0002 #23). Every formula is Rust's in its operation order: glam's dot
 # products ((x·x' + y·y') + z·z'), vector-by-scalar products and quotients component by component, Rust's NaN-
 # ignoring min and max. A shape kind outside the enum, which Rust can't hold, gives NaN. Slices are (pointer, count)
-# (ADR 0002 #9); a body is a `PvRigidBody` record. Rust's `trace_span!`s and the level set's size warning arrive with
-# M7's logging.
+# (ADR 0002 #9); a body is a `PvRigidBody` record. Rust's `trace_span!`s and the level set's size warning are sakshi's
+# (src/logging.cyr).
 #
 # `drag_from_particles_indexed` takes the caller's `PvNeighborGrid`, built by `PvNeighborGrid_build` (src/neighbor.cyr),
 # where Rust takes a hisab 1.4.0 `SpatialHash` the caller fills with each particle's f32 position: the grid's keys are

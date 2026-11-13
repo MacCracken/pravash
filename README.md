@@ -58,7 +58,7 @@ Declare it in your `cyrius.cyml`; `cyrius deps` vendors it with the stdlib modul
 ```toml
 [deps.pravash]
 git = "https://github.com/MacCracken/pravash.git"
-tag = "2.0.0"
+tag = "2.0.1"
 modules = ["dist/pravash.cyr"]
 ```
 

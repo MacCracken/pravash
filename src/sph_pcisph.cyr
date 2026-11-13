@@ -335,7 +335,7 @@ impl PvSphSolver {
             }
             if (max_error < max_density_error) {
                 converged = 1;
-                it = iterations;
+                it = iterations - 1;   # the last count, so `it + 1` can't wrap
             } else {
                 for (var u = 0; u < n; u = u + 1) {
                     var pu: f64 = load64(pres + u * 8);

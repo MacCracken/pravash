@@ -263,13 +263,15 @@ struct PvNeighborLists {
 }
 
 impl PvSphSolver {
-    # Sets the thread count the steps use: n ≥ 1 (a count below 1 is 1, serial). Any count gives the serial bits. The
-    # solver's pool stops now, and the next step starts one of the new size (or runs serially where threads can't
-    # start: src/par.cyr). Returns the count. Cyrius-only: Rust's `parallel` feature is compile-time (port plan D6,
-    # ADR 0002 #4).
+    # Sets the thread count the steps use: n ≥ 1 (a count below 1 is 1, serial). Any count gives the serial bits. A
+    # count equal to the current one changes nothing. Otherwise the solver's pool stops now, and the next step starts
+    # one of the new size (or runs serially where threads can't start: src/par.cyr). Returns the count. Cyrius-only:
+    # Rust's `parallel` feature is compile-time (port plan D6, ADR 0002 #4).
     fn set_threads(self, n): i64 {
         var t = n;
         if (t < 1) { t = 1; }
+        # The same count keeps the pool: a pool's channels are never returned to the heap (src/par.cyr).
+        if (t == self.threads) { return t; }
         _pv_pool_drop(self.pool);
         self.pool = 0;
         self.threads = t;
@@ -284,7 +286,9 @@ impl PvSphSolver {
     }
 
     # The neighbour lists from the most recent step: particle i's neighbours are indices[offsets[i] .. offsets[i + 1]]
-    # (empty before a first step). Mirrors `neighbor_lists`.
+    # (empty before a first step, or after a step that ran out of memory building them). The pointers are the
+    # solver's: the next step or `PvSphSolver_drop` may move or free them, so read them before either. Mirrors
+    # `neighbor_lists`.
     #must_use
     fn neighbor_lists(self): PvNeighborLists {
         var g: *PvNeighborGrid = _pv_sph_grid(self);

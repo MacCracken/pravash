@@ -19,7 +19,7 @@ wraps each fragment in a `main`, includes `dist/pravash.cyr`, and fails on a com
 # your cyrius.cyml
 [deps.pravash]
 git = "https://github.com/MacCracken/pravash.git"
-tag = "2.0.0"
+tag = "2.0.1"
 modules = ["dist/pravash.cyr"]
 ```
 

@@ -9,7 +9,8 @@
 # cos, the Hencky strain's ln and exp, the friction angle's sin. So the step and stress rows are class C, equal to the
 # correctly rounded rows where glibc misrounds (tests/golden/mpm.cr.tsv). The grid's cell lookup is the FLIP solver's
 # (`_pv_flip_axis`, the same expression). A kind outside the enum, which Rust can't hold, is refused by `validate`
-# and gives a NaN stress. Rust's `trace_span!` arrives with M7's logging. Slices are (pointer, count) (ADR 0002 #9).
+# and gives a NaN stress. Rust's `trace_span!` is a sakshi span (src/logging.cyr). Slices are (pointer, count)
+# (ADR 0002 #9).
 
 # ── ConstitutiveModel ───────────────────────────────────────────────────────────────
 
@@ -448,13 +449,30 @@ fn _pv_mpm_col(s, k): *PvColumn {
     return _pv_as_columns(_pv_addr(s) + 24 + k * 24);
 }
 
-# Releases every column; the solver holds no storage after. Mirrors dropping the `MpmSolver`.
+# Releases every column; the solver holds no storage after, and its size is 0 × 0, which `step` refuses. Mirrors
+# dropping the `MpmSolver`.
 fn PvMpmSolver_drop(s: *PvMpmSolver) {
     for (var k = 0; k < _PV_MPM_COLUMNS; k = k + 1) {
         var c: *PvColumn = _pv_mpm_col(s, k);
         c.drop();
     }
+    s.nx = 0;
+    s.ny = 0;
     return 0;
+}
+
+# 1 when the solver holds its fields: nx, ny ≥ 4 and every column nx · ny long. 0 after a drop or a failed `new`,
+# which a step refuses (Rust can't step a dropped solver).
+#must_use
+fn _pv_mpm_whole(s: *PvMpmSolver): i64 {
+    var nx = s.nx;
+    var ny = s.ny;
+    if (nx < 4 || ny < 4 || nx > 9223372036854775807 / ny) { return 0; }
+    for (var k = 0; k < _PV_MPM_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_mpm_col(s, k);
+        if (c.len != nx * ny) { return 0; }
+    }
+    return 1;
 }
 
 # A solver of zeros into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx or
@@ -463,6 +481,8 @@ fn PvMpmSolver_drop(s: *PvMpmSolver) {
 # can't be allocated. On an error *out holds no storage. Mirrors `MpmSolver::new`.
 #must_use
 fn PvMpmSolver_new(nx, ny, dx: f64, out: *PvMpmSolver): Result {
+    out.nx = 0;
+    out.ny = 0;
     for (var z = 0; z < _PV_MPM_COLUMNS; z = z + 1) {
         var c0: *PvColumn = _pv_mpm_col(out, z);
         c0.data = 0;
@@ -506,6 +526,7 @@ impl PvMpmSolver {
     #must_use
     fn step(self, ps: *PvFluidParticle, n, mpm: *PvMpmParticle, nm, gravity: PvVec3, dt: f64): Result {
         var trace = _pv_span(_PV_LOG_MPM, "mpm::step", "n", n, 0, 0, 0, 0);
+        if (_pv_mpm_whole(self) == 0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
         if (_pv_is_finite(dt) == 0 || dt <= 0.0) { _pv_span_end(trace); return Err(PV_ERR_INVALID_TIMESTEP); }
         if (n != nm) { _pv_span_end(trace); return Err(PV_ERR_INVALID_PARAMETER); }
         for (var c = 0; c < nm; c = c + 1) {

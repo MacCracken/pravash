@@ -1,6 +1,6 @@
 # Pravash Roadmap
 
-> Last updated: 2026-11-13. Planned work only: what is done is in the [CHANGELOG](../../CHANGELOG.md), for 2.0.0
+> Last updated: 2026-11-13 (after 2.0.1). Planned work only: what is done is in the [CHANGELOG](../../CHANGELOG.md), for 2.0.0
 > and every Rust release before it.
 
 2.0.0, the Cyrius library, was released on 2026-11-13. Its golden corpus (`tests/golden/`, frozen) records what Rust
@@ -17,12 +17,34 @@ struct literal is positional, so a new field in an existing public struct would 
 
 ## 2.0.x — the audits' remaining findings
 
-- [ ] **P(-1) on the Cyrius code** (CLAUDE.md), before the first fix: the test and benchmark sweep, the baselines,
-  an internal deep review (gaps, memory, security, errors, docs) and external research. Its findings join the lists
-  below.
+2.0.1's hardening pass (the CHANGELOG) fixed what it found that keeps Rust's behaviour. The items below change it,
+so each needs its ADR first. The 1.3.0 audit deferred most of them as larger design changes, and port plan D5 kept
+them out of 2.0. The 1.1.0 audit's three deferrals are marked, and so are 2.0.1's findings (its review and its
+external research).
 
-The 1.3.0 audit deferred the items below as larger design changes, and port plan D5 kept them out of 2.0. The three
-the 1.1.0 audit deferred are marked.
+### Time steps and solver reports (2.0.1)
+
+- [ ] **`adaptive_dt`'s limits.** It has no acoustic limit Δt ≤ C·h/(c + v_max), no capillary limit for σ > 0, and
+  its viscous limit h²/(6ν) reads the dynamic viscosity the step divides by ρᵢρⱼ as if it were kinematic. The
+  stability constants are written for the smoothing length, about h/2 of pravash's support radius. Under that
+  reading `water_2d`'s dt of 1e-3 is about 4× the acoustic limit.
+- [ ] **A stiffness check.** `validate` checks only k > 0. Warn when c < 10·v_max, Monaghan's rule for about 1%
+  density error.
+- [ ] **Solver reports** (API). PCISPH and DFSPH return Ok whether or not they converged. Report the last solve's
+  iterations and residual. DFSPH also lacks a warm start and a minimum iteration count.
+- [ ] **Non-Newtonian caps.** The power law is uncapped as the shear rate → 0, and Bingham's cap is 1e6·μ_p, which is
+  0 when μ_p = 0. Use Papanastasiou regularisation or an absolute μ_max, and feed it to the viscous time step.
+- [ ] **MPM:** a stable-dt helper, Δt ≤ C·dx/(c_p + |v|). F reset to I outside det F ∈ [1e-4, 1e4] discards the
+  volume; reset a fluid's F to √J·I instead. Neo-Hookean clamps J at 1e-10, so an inverted element gets a huge λ·ln J.
+- [ ] **Phase field:** check dt ≤ dx²/(4Mε²) and ε ≳ dx, where today only a WARN past |φ| = 1.5 fires.
+
+### Non-finite inputs Rust passes through (2.0.1)
+
+- [ ] **MPM:** a NaN mass spreads NaN to its neighbours, and the step still returns Ok. FLIP zeroes a non-finite mass.
+- [ ] **FLIP:** after one PV_ERR_DIVERGED the NaN pressure warm-starts the next solve, so every later step diverges.
+  Clear it on that path, or document that the solver must be rebuilt.
+- [ ] **`terminal_velocity`** returns Ok(NaN) when m·g or the drag term overflows; refuse a non-finite argument.
+- [ ] **VOF `advect`** at dx = 0 with any motion runs 1,024 sub-steps and turns the interior NaN. Refuse the cell size.
 
 ### grid
 
@@ -46,6 +68,11 @@ the 1.1.0 audit deferred are marked.
   Wendland kernels are 2D. Needs a dimension on the solver or its config.
 - [ ] **An external-force input** (API). `step` overwrites `acceleration`, so the viscoelastic and contact-angle
   forces are applied after it and integrated again.
+- [ ] **δ-SPH has no lasting effect** (2.0.1). `apply_delta_sph` diffuses ρ, and the next step's summation
+  recomputes ρ, which undoes it. The Molteni–Colagrossi form also lacks the hydrostatic correction. It needs a
+  continuity-equation density option (2.1+ below); document the limit now.
+- [ ] **Negative free-surface pressure** (2.0.1). Summation density with p = k(ρ − ρ₀) goes negative at the free
+  surface, and particles clump. Offer a clamp ρ ≥ ρ₀ for WCSPH, as SPlisHSPlasH does (API).
 - [ ] **Neighbour lists.** A particle lists the 27 cells at its key ± 1 per axis, unfiltered: about 6× its true
   neighbours in 3D. Filter by h, and drop the empty z-layers in 2D. Run PCISPH's and DFSPH's loops on the solver's
   pool too; they are serial, as in Rust. (2.0 already took out the per-step `accels` allocations: a step takes no
@@ -66,6 +93,9 @@ the 1.1.0 audit deferred are marked.
 
 - [ ] **The height clamping is silent** (1.1.0 audit). Track the mass it removes.
 - [ ] **Fully nonlinear Green–Naghdi.** The current dispersive option is a depth-weighted Peregrine operator.
+- [ ] **Thin layers** (2.0.1). u = hu/h just above the dry threshold can spike and collapse dt. Use Kurganov–Petrova
+  desingularisation, and a draining-time-step flux limit in place of the height clamp. That keeps h ≥ 0 and conserves
+  mass, which also covers the mass item above.
 - [ ] **Tracing in the hot loops** (1.1.0 audit, deferred for its cost). Measure a sakshi span inside the step
   first: `logging_b/span_on` takes 288 ns.
 
@@ -76,7 +106,7 @@ the 1.1.0 audit deferred are marked.
 
 ## 2.1.x — the consumers and the pending rows
 
-- [ ] **The consumers' first Cyrius builds:** kiran, joshua and impetus, on `[deps.pravash]` with `tag = "2.0.0"`.
+- [ ] **The consumers' first Cyrius builds:** kiran, joshua and impetus, on `[deps.pravash]` with `tag = "2.0.1"`.
   None consumes the library yet. Each finding is a 2.1.x issue.
 - [ ] **The bridge partners:** goonj (Cyrius 2.3.1) first. ushma (Rust 1.4.0) and pavan (no local repo) follow
   when they port.
@@ -89,6 +119,19 @@ the 1.1.0 audit deferred are marked.
     bayan refuses (`bayan:docs/development/issues/2026-11-09-json-integer-above-i64-max-refuses-the-document.md`);
   - a repeated unknown key (`"x"` twice), which serde_json ignores and bayan refuses
     (`bayan:docs/development/issues/2026-11-09-json-duplicate-key-has-no-opt-in-for-ignored-members.md`).
+
+### 2.1+ — capabilities (2.0.1's external research)
+
+- [ ] **Boundary particles** for walls and rigid bodies (Akinci et al. 2012). Today's clamp-and-damp walls add no
+  density, so wall particles are density-deficient.
+- [ ] **Particle shifting** (Lind et al. 2012), against the clumping and voids of long runs.
+- [ ] **A continuity-equation density** for WCSPH, with Fourtakas or Antuono density diffusion. This is what gives
+  δ-SPH its effect.
+- [ ] **Geometric (PLIC) VOF**, dimension-split, in place of the donor-cell scheme that smears the interface. Also a
+  mass-conserving Allen–Cahn: the plain one shrinks drops.
+- [ ] **A fixed-corotated MPM model with snow plasticity** (Stomakhin et al.), the inversion-robust standard.
+- [ ] **A calibrated initial lattice:** `create_particle_block` takes the mass independently of the spacing, so
+  Σm·W ≠ ρ₀ at t = 0 and the run starts with a pressure transient. Add a helper that sets m = ρ₀ / ΣW.
 
 ## 2.2.x – 2.x.x — the stand-ins convert
 
@@ -105,6 +148,10 @@ converts early. Within each library, the order below is by size, smallest first.
 - [ ] **L15:** the f32 field read → the stdlib's f32 decimal parse, over bayan's number text.
 - [ ] **L10:** the hand JSON codecs → `#derive(Serialize)` and `#derive(Deserialize)`, with the vector-array and
   tagged-variant shapes.
+- [ ] **L17:** the worker pool keeps 12.8 KB per start → a `thread_join` that frees each thread's handle and TLS
+  block, and a `chan_free`. Also two stdlib requests outside the ledger, with pravash's numbers: the growable arena
+  that keeps a chunk per larger need (the JSON decode arena), and the string builder that never frees an outgrown
+  buffer.
 - [ ] **L16:** the Debug builders and the shortest float printer → `#derive(Debug)`, and the stdlib printer with
   Rust's tie rule. The printer is the slowest row: eight f64s take 54× Rust's time.
 

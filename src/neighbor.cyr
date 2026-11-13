@@ -220,6 +220,7 @@ fn _pv_nb_append(c: *PvColumn, order, a, b): i64 {
 # to the caller.
 #must_use
 fn _pv_nb_cells(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
+    if (n < 0 || n > 9223372036854775807 / 24) { return 0; }   # the 3 · n key words, in bytes
     var one: f64 = 1.0;
     var inv: f64 = one / h;
     g.cell_size = h;
@@ -280,10 +281,9 @@ fn _pv_nb_cells(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
 fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
     var cxo: *PvColumn = _pv_nb_col(g, 7);
     cxo.truncate(0);
-    if (_pv_nb_cells(g, ps, n, h) == 0) { return 0; }
     var coff: *PvColumn = _pv_nb_col(g, 4);
     var cidx: *PvColumn = _pv_nb_col(g, 5);
-    if (coff.resize(n + 1, 0) == 0) { return 0; }
+    if (_pv_nb_cells(g, ps, n, h) == 0 || coff.resize(n + 1, 0) == 0) { coff.truncate(0); cidx.truncate(0); return 0; }
     var keys = g.keys.data;
     var order = g.order.data;
     var cst = g.cstart.data;
@@ -319,6 +319,9 @@ fn _pv_nb_build(g: *PvNeighborGrid, ps: *PvFluidParticle, n, h: f64): i64 {
                         var at = ck + c * 24;
                         if (load64(at + 16) == kz && load64(at + 8) == ky && load64(at) <= xhi) {
                             if (_pv_nb_append(cidx, order, load64(cst + c * 8), load64(cst + (c + 1) * 8)) == 0) {
+                                # Out of memory part way: the lists read as empty, never half written.
+                                coff.truncate(0);
+                                cidx.truncate(0);
                                 return 0;
                             }
                             c = c + 1;
@@ -508,10 +511,10 @@ fn _pv_zorder_cmp(ctx, a, b): i64 {
 # an order its algorithm picks, which the port doesn't copy (ADR 0002 #3, port-parity §4.5). The codes are made once
 # and the sorted order applied in place, a cycle at a time, each record moved by assignment (a word-wise copy; `memcpy`
 # goes byte by byte). 1, or 0 with nothing changed for fewer than 2 particles or a cell size not finite and > 0 (Rust
-# returns), or when the scratch can't be allocated (Rust aborts). Mirrors `sort_by_zorder`.
+# returns), or when the scratch (n · 24 bytes) overflows or can't be allocated (Rust aborts). Mirrors `sort_by_zorder`.
 fn sort_by_zorder(ps: *PvFluidParticle, n, cell_size: f64): i64 {
     var trace = _pv_span(_PV_LOG_SPH, "sph::sort_by_zorder", "n", n, 0, 0, 0, 0);
-    if (n < 2 || _pv_is_positive(cell_size) == 0) { _pv_span_end(trace); return 0; }
+    if (n < 2 || n > 9223372036854775807 / 24 || _pv_is_positive(cell_size) == 0) { _pv_span_end(trace); return 0; }
     var inv: f64 = 1.0 / cell_size;
     var mnx: f64 = PV_F64_MAX;
     var mny: f64 = PV_F64_MAX;

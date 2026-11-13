@@ -2,6 +2,91 @@
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-13
+
+The hardening pass (CLAUDE.md's P(-1)) on the Cyrius code, and Rust's departure from the tree.
+- **The review:** five parallel reviews of the modules, an MPFR sweep and an external-research pass. Every finding
+  was confirmed against the code before it was fixed.
+- **No recorded row changed.** The corpus replays as at 2.0.0 (67,276 ok, 728 accepted, 3 pending) on x86_64 ELF,
+  PE and aarch64.
+- **Checks:** each suite runs 1,499, up from 1,437; the 62 new ones are the regression tests below.
+- **Deferred to 2.0.x:** the findings that would change Rust's behaviour need an ADR first. The
+  [roadmap](docs/development/roadmap.md) lists them under 2.0.x.
+
+### Security
+- **A size whose bytes overflow is refused, never allocated short.** Three reviewers found this independently.
+  - **Where:** `PvColumn.reserve`, under every grid, solver and SoA column; `PvF32Column.reserve`;
+    `PvParticleArena_new`; the worker pool. Each computed n · 8 (n · 144, m · 16) unchecked.
+  - **What happened:** a size in [2^60, 2^63) allocated a few bytes, and the fill then overran the heap: SIGSEGV,
+    confirmed for `PvMpmSolver_new(4, 2^59 + 1)` and `PvFluidGrid_new`.
+  - **Now:** they return 0, and the constructors return `PV_ERR_OUT_OF_MEMORY`, as their contracts said.
+- **`PvShallowWater.interior_volume`** read outside the fields when nx · ny wrapped. A JSON-decoded state carries any
+  nx and ny. It now refuses the overflow.
+- **`batch_poly6`, `batch_distance_squared`, `sort_by_zorder` and the neighbour grid** refuse a count whose bytes
+  overflow, before they read a particle.
+- **The daimon API key** is zeroed before it is freed.
+  - `to_json`'s comment now says it writes the key in clear, as serde does; only `debug` redacts it.
+  - A config's string lengths are authoritative: JSON's `\u0000` can put a NUL inside an endpoint.
+
+### Fixed
+- **sph:**
+  - **DFSPH:** its two solver loops ran on to `max_iterations` after they converged; Rust breaks. A large limit hung
+    the step: 300,000,000 took 0.70 s on 25 particles, against 0.2 ms.
+  - **PCISPH and implicit viscosity:** their loop exits no longer wrap at an i64::MAX limit.
+  - **Phases:** a negative phase is warned of with the out-of-range ones.
+  - **Neighbour lists:** a build that runs out of memory part way leaves empty lists, never half-written ones.
+- **Thread counts** ([ADR 0002 #4](docs/adr/0002-port-api-divergences.md), amended):
+  - `set_threads` with the current count restarted the pool. Each restart leaves 12.8 KB that the stdlib can't free,
+    so 100 calls took 1.28 MB. The same count now keeps the pool, in `PvSphSolver` and `PvFluidGrid`.
+  - A pool holds at most 256 threads. A larger count runs on 256, with the same bits.
+- **grid:**
+  - **Sizes that disagree with the fields** can't make a loop spin any more; before, they meant 2^64 iterations.
+    The loops over nx × ny that skip the cells past a field stop at the field's end: `MacGrid.max_speed` and
+    `cfl_dt`, the VOF and phase-field fills, and `ShallowWater.add_disturbance`.
+  - **Shallow water** sizes dispersion's scratch with the other scratch columns, so running out of memory leaves the
+    state whole.
+- **mpm and flip:** a dropped solver, or one whose `new` failed, could be stepped and wrote through null columns.
+  `step` now refuses it with `PV_ERR_INVALID_GRID_RESOLUTION`, and a drop leaves the solver 0 × 0.
+- **compute:**
+  - **`PvF32Column.push_rounded`** wrote past an unreserved capacity. It now grows like `Vec::push`, returning 1 or 0.
+  - **Nested gradients:** `autodiff_gradient` kept one tape for the process, so a gradient taken inside `f` reset
+    the outer recording: 6 came back as 10. Each nesting depth now has its own tape, up to 8.
+  - **A root that isn't a node** is refused at once. Before, the retries grew the tape to 2^24 nodes: 1.6 GB of heap.
+- **json:**
+  - **Writers** return -1 for a value no reader takes: a `FlowRegime` or `BoundaryCondition` kind outside its enum, a
+    phase past u8, a u32 field past u32::MAX.
+  - **Readers** of a type with storage empty *out first. On any refusal *out holds no storage, so dropping it is
+    safe. Before, an early refusal left *out untouched and a late one zeroed it.
+- **logging:**
+  - **A second `init_profiling` while a trace was open** took over its writer. The first file came out empty, its
+    descriptor stayed open, and sakshi's output stayed on the hook. The second file is now written empty and closed at
+    once, as Rust's is.
+  - **Write errors:** the trace writer retries short writes and keeps the first error, which `flush` and
+    `PvFlushGuard_drop` return.
+  - **i64::MIN** rendered as garbage in span fields.
+  - **PRAVASH_LOG** directives trim Unicode whitespace, as `str::trim` does. A trailing U+00A0 made the strict parse
+    fail.
+  - **The trace file** escapes control bytes as `\u00XX`, and bytes past ASCII too, so it stays valid JSON.
+- **Docs:**
+  - stale "arrives with M7" headers in coupling, mpm, flip, grid, shallow, common and multiphase;
+  - VOF `advect` at dx = 0;
+  - what a pool keeps (`src/par.cyr`);
+  - `neighbor_lists`' pointer lifetime;
+  - the decode arena's size: about 20× each document, kept for the process;
+  - the builder that never frees an outgrown buffer: reuse one cleared builder.
+
+### Added
+- **Regression tests** for every fix: hardening groups in tests/sph, common, compute, par, shallow, grid, vof, mpm,
+  coupling and logging. They add 62 checks.
+- **`scripts/golden/cr_sweep.py`** checks the eight correctly rounded functions against MPFR, bit for bit, beyond
+  the corpus's grids. It runs locally, like `validate.py`. 2.0.1's run: 209,062 random inputs, 0 differences.
+  - The inputs include subnormals, both zeros, the infinities, NaN, trigonometric arguments to 1e308 and at k·π/2,
+    and pow near 1 with large exponents.
+- **Ledger L17** (`src/par.cyr`), filed at cyrius: `thread_join` keeps each thread's handle and TLS block, and there
+  is no `chan_free`.
+- **Two stdlib requests outside the ledger**, both at cyrius: pravash's numbers on the growable-arena issue (the JSON
+  decode arena), and a new issue for the string builder that never frees an outgrown buffer.
+
 ### Removed
 - **Rust leaves the tree** ([ADR 0001's update](docs/adr/0001-cyrius-port-of-rust-1.3.0.md)). `rust-old/` (Rust 1.3.0
   with its dump hooks) is gone, with everything that ran or read it:
@@ -28,8 +113,16 @@
     row's class, inputs and outputs are unchanged.
 - **CLAUDE.md, the README, CONTRIBUTING, SECURITY and the guides** drop the Rust commands. The record documents (the
   port plan, port parity, the benchmarks, the Rust-test ledger) are marked frozen at 2.0.0.
-- **The roadmap** holds only planned work. 2.0.x is a P(-1) pass and the audits' remaining findings. 2.1.x is the
-  consumers and the JSON rows pending on bayan. From 2.2.x the stand-ins convert as their libraries ship.
+- **The roadmap** holds only planned work. 2.0.x holds the audits' remaining findings and 2.0.1's, each needing an
+  ADR. 2.1.x is the consumers and the JSON rows pending on bayan, then capabilities from 2.0.1's research. From
+  2.2.x the stand-ins convert as their libraries ship.
+
+### Performance
+- **No regression from the hardening.** Two rounds pinned to core 15, interleaved with a worktree of 2.0.0. Over the
+  suite's 204 rows the median new/old time is 0.995, and so is the geometric mean. Every row is in 0.83–1.18×, inside
+  the shared host's ±20% noise.
+- **`shallow_disturbance`:** its new bounds first cost 1.23× at 32 × 32. With the bounds hoisted out of the cell
+  loop it is at 1.04–1.09× (32 × 32 to 128 × 128).
 
 ## [2.0.0] - 2026-11-13
 

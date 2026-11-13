@@ -89,10 +89,14 @@ fn PvVofField_clone(out: *PvVofField, src: *PvVofField): i64 {
 # the disc (px − a)² + (py − b)² < c². Shared by `VofField::fill_*` and `PhaseField::set_*`.
 fn _pv_fill_shape(col: *PvColumn, nx, ny, dx: f64, kind, a: f64, b: f64, c: f64, d: f64, w) {
     var r2: f64 = c * c;
-    for (var y = 0; y < ny; y = y + 1) {
+    var yend = _pv_rows_in(nx, col.len);
+    if (ny < yend) { yend = ny; }
+    for (var y = 0; y < yend; y = y + 1) {
         var yf: f64 = f64_from(y);
         var py: f64 = yf * dx;
-        for (var x = 0; x < nx; x = x + 1) {
+        var xend = col.len - y * nx;
+        if (nx < xend) { xend = nx; }
+        for (var x = 0; x < xend; x = x + 1) {
             var xf: f64 = f64_from(x);
             var px: f64 = xf * dx;
             var hit = 0;
@@ -273,12 +277,13 @@ impl PvVofField {
     }
 
     # Advects α by the cell-centred velocity (vx_len and vy_len words at vx and vy) for dt, in
-    # clamp(⌈(((2·v_max)·dt)/dx)/0.5⌉, 1, 1024) sub-steps of dt/count (v_max the largest |v| of vx then vy, folded
-    # from +0; a NaN count, from a cell size of 0 or NaN, runs none, as Rust's `as usize` makes it 0). Ok(0), or the
-    # first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0), PV_ERR_INVALID_PARAMETER (nx or
-    # ny below 4, nx·ny overflowing (Rust panics), α, vx or vy not nx·ny long), PV_ERR_DIVERGED (a non-finite
-    # velocity), PV_ERR_OUT_OF_MEMORY (the scratch can't grow, checked before α changes; Rust aborts). Mirrors
-    # `VofField::advect`.
+    # clamp(⌈(((2·v_max)·dt)/dx)/0.5⌉, 1, 1024) sub-steps of dt/count (v_max the largest |v| of vx then vy, folded from
+    # +0; a NaN count, from a NaN cell size or a cell size and v_max both 0, runs none, as Rust's `as usize` makes it 0;
+    # a cell size of 0 with any motion counts +∞, so 1024 sub-steps whose 1/dx = ∞ turn the interior NaN, as Rust's do).
+    # Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_TIMESTEP (dt not finite and > 0),
+    # PV_ERR_INVALID_PARAMETER (nx or ny below 4, nx·ny overflowing (Rust panics), α, vx or vy not nx·ny long),
+    # PV_ERR_DIVERGED (a non-finite velocity), PV_ERR_OUT_OF_MEMORY (the scratch can't grow, checked before α changes;
+    # Rust aborts). Mirrors `VofField::advect`.
     #must_use
     fn advect(self, vx, vx_len, vy, vy_len, dt: f64): Result {
         var trace = _pv_span(_PV_LOG_VOF, "vof::advect", "nx", self.nx, "ny", self.ny, 0, 0);

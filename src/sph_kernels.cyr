@@ -366,11 +366,12 @@ fn non_newtonian_viscosity_effective_viscosity(m: *PvNonNewtonianModel, strain_r
 # ── the batch and whole-system helpers ──────────────────────────────────────────────
 
 # poly6 at each of the n squared distances at r2 (the coefficients for h, with no check on h, as Rust's), as a new
-# freelist buffer: (pointer, n), which the caller releases with `fl_free`; (0, 0) for n ≤ 0 or no memory. Mirrors
+# freelist buffer: (pointer, n), which the caller releases with `fl_free`; (0, 0) for n ≤ 0, a size n · 8 that
+# overflows, or no memory. Mirrors
 # `batch_poly6` (ADR 0002 #9).
 #must_use
 fn batch_poly6(r2, n, h: f64) {
-    if (n <= 0) { return (0, 0); }
+    if (n <= 0 || n > 9223372036854775807 / 8) { return (0, 0); }
     var out = fl_alloc(n * 8);
     if (out == 0) { return (0, 0); }
     var kc: _PvKernelCoeffs;
@@ -384,10 +385,10 @@ fn batch_poly6(r2, n, h: f64) {
 }
 
 # |pos − positions[i]|² for each of the n `PvVec3`s at positions, as a new freelist buffer: (pointer, n), (0, 0) for
-# n ≤ 0 or no memory. Mirrors `batch_distance_squared` (ADR 0002 #9).
+# n ≤ 0, a size n · 8 that overflows, or no memory. Mirrors `batch_distance_squared` (ADR 0002 #9).
 #must_use
 fn batch_distance_squared(pos: PvVec3, positions, n) {
-    if (n <= 0) { return (0, 0); }
+    if (n <= 0 || n > 9223372036854775807 / 8) { return (0, 0); }
     var out = fl_alloc(n * 8);
     if (out == 0) { return (0, 0); }
     for (var i = 0; i < n; i = i + 1) {
