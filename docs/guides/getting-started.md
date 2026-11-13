@@ -12,6 +12,7 @@ cyrius build src/main.cyr build/pravash     # compile
 cyrius test                                 # every tests/*.tcyr; it must also be warning-free
 cyrius test --bounds
 cyrius bench                                # tests/pravash.bcyr
+cyrius fuzz                                 # tests/pravash.fcyr
 cyrius distlib && cyrius distlib --check    # dist/pravash.cyr, the bundle consumers include
 ```
 
@@ -26,7 +27,7 @@ cyrius distlib && cyrius distlib --check    # dist/pravash.cyr, the bundle consu
   (`validate.py --write`, from MPFR).
 - **`tests/`**: `parity.tcyr` replays the golden corpus (`tests/golden/<module>.tsv`, with `.cr.tsv` for the
   corrected oracle and `.d3.tsv` for the f64 neighbour keys); `<module>.tcyr` holds the ported Rust tests under
-  their Rust names, then Cyrius-only groups; `pravash.bcyr` the benchmarks; `pravash.fcyr` the fuzz target.
+  their Rust names, then Cyrius-only groups; `pravash.bcyr` the benchmarks; `pravash.fcyr` the fuzz harness.
 - **`rust-old/`**: the Rust 1.3.0 crate, the oracle. Never edited; tools drive it from `scripts/oracle/`.
 - **`scripts/`**: the generator and the independent checks (below), the surface and test ledgers, the benchmark
   record, the upstream ledger and the doc examples.
@@ -34,7 +35,8 @@ cyrius distlib && cyrius distlib --check    # dist/pravash.cyr, the bundle consu
 
 ## The checks against the oracle
 
-The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI.
+The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI. Run `cargo`
+from the repo root, where `rust-toolchain.toml` pins the oracle's rustc 1.99.1.
 
 ```sh
 cargo test --manifest-path rust-old/Cargo.toml --all-features                          # the oracle itself

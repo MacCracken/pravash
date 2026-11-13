@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-13
+
+pravash 2.0 is the Cyrius library: the parity port of the Rust crate 1.3.0, which stays frozen in `rust-old/` as the
+oracle. It ships as one bundle, `dist/pravash.cyr`. The release record:
+- **Golden rows:** 68,007 in 18 modules, replayed with the same bits on x86_64 Linux, x86_64 Windows (PE) and
+  aarch64. 67,276 match Rust within their class; 728 are accepted under ADR 0002 #2 (the f64 neighbour keys) and
+  ADR 0004 (correct rounding where glibc misrounds); 3 wait on bayan's JSON policies. `validate.py` recomputes every
+  row without Rust.
+- **The Rust tests:** all 405 are ported or recorded in the Rust-test ledger.
+- **The surface:** every public item and all 157 derives have their counterparts, and every public Cyrius name maps
+  back to a Rust item or a recorded reason.
+- **Speed:** a median of 4.4× Rust 1.3.0's time over its 21 criterion groups.
+
+Moving from the Rust crate: [the migration guide](docs/guides/migration-2.0.md). The entries below the Breaking
+section run from the last part of the port (M8 part e) back to the first (M0), each part with its own Added,
+Changed, Fixed and Performance.
+
 ### Breaking
 - **pravash 2.0 is a Cyrius library.** The Rust crate stays at 1.3.0, frozen in `rust-old/` as the parity oracle;
   2.0 is its port, with the same physics and Rust's names. Code that used the Rust crate moves by
@@ -33,6 +50,33 @@
   - **Debug** is `x.debug(sb, alternate)` onto a `str_builder`, Rust's `{:?}` (0) and `{:#?}` (1) text; an enum's is
     `<snake>_debug(k, sb, alternate)` (#29).
   - **Not carried:** the `oracle` feature, and `PravashError`'s detail strings and with them its `Debug` text.
+
+### Added (Cyrius)
+- **The fuzz harness** (M8 part e, `tests/pravash.fcyr`, run by `cyrius fuzz` and in CI). It targets the inputs a
+  consumer doesn't control (Rust 1.3.0 had no fuzz targets). A seeded generator mutates each of the 22 types' own
+  JSON documents: bytes flipped or replaced by JSON's structural characters, spans cut, repeated or spliced in,
+  extreme numbers put in, nesting 2,000 deep.
+  - **Invariants:** a refusal is `PV_ERR_DESERIALIZE` or `PV_ERR_OUT_OF_MEMORY`. An accepted document writes again,
+    and its text reads back to the same text. A decoded solver or field of at most 4,096 cells steps to Ok or a
+    `PV_ERR_*` code.
+  - **The `PRAVASH_LOG` parser:** 40,000 strings. The strict parse gives 0 or 1, the lenient one always 1, every
+    level is in 0 … 5, and the same text gives the same levels.
+  - **The run:** 13,200 documents, 1,582 of them accepted, and 40,000 strings, 21,381 of them parsed strictly. No
+    invariant broke.
+- **`rust-toolchain.toml`** at the repo root pins the oracle's rustc 1.99.1 for every `cargo` command run from there
+  (the oracle, the generator, the probes); `rust-old/` stays unedited. Stable moved to 1.100.0 on 2026-11-09, and on
+  it the generator writes another `src/str_debug_data.cyr` (Unicode 18), which failed `--check` (port-parity §31).
+
+### Changed (Cyrius)
+- **VERSION is 2.0.0.**
+- **CI** installs the toolchain `rust-toolchain.toml` names for the oracle job, where it installed `stable`, and runs
+  `cyrius fuzz`.
+- **The release gate** (22 gates) runs every suite on x86_64 ELF, x86_64 PE and aarch64, not only the corpus: 1,437
+  checks on each, and the corpus's 67,276 rows ok on each with the same bits.
+- **The two trace-file tests** (`logging_trace_file`, `doc_init_profiling`) no longer assert that `chdir` succeeds.
+  The stdlib's Windows build doesn't wire it (by design), and on PE they write and remove the trace file where they
+  run; every trace check passes on the three targets.
+- **Removed** the scaffold's `tests/pravash.tcyr` smoke test, which the parity harness replaced at M0.
 
 ### Added (Cyrius)
 - **Rust's derived `Debug` on the 35 public types** (M8 part d; ADR 0002 #29): `x.debug(sb, alternate)` on each

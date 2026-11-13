@@ -2406,3 +2406,53 @@ oracle's, to 1.100.0 (2026-11-09, Unicode 18.0.0). A generator rebuilt on 1.100 
 916 ranges of `\u{…}` escapes for 1.99.1's 910. No golden row changes, `debug.tsv` included (float printing is the
 same in both), but `--check` fails on the table. Every run here used `cargo +1.99.1`. A pin outside `rust-old/`, which
 stays unedited, is a decision for part e.
+
+## 32. M8 part e: the release (2026-11-13)
+
+**VERSION 2.0.0.** `cyrius.cyml` reads it (`${file:VERSION}`), and `dist/pravash.cyr`'s header says 2.0.0. The
+CHANGELOG's `## [Unreleased]` became `## [2.0.0] - 2026-11-13`, with a summary of the release record above the
+Breaking section. The release workflow publishes that section as the release body: 94 KB, under GitHub's 125,000
+characters.
+
+**The release gate.** It is the 22 gates of the parts before:
+- `vet`, `build`, `test` and `test --bounds`, warning-free;
+- the corpus on PE and aarch64;
+- `distlib --check`, `deps --locked`, `audit`;
+- the upstream ledger, surface parity, the Rust-test ledger;
+- the generator's `--check` with and without rayon;
+- `validate.py`, `probe_tables.py`;
+- the doc examples and their oracle;
+- the fuzz harness;
+- and, new for the release, every suite on PE and aarch64, not only the corpus.
+
+All pass. Each target runs 1,437 checks, and the corpus gives 67,276 rows ok, 728 accepted and 3 pending on each, with
+the same bits.
+
+**What the first run found.** Two checks failed on PE: the trace-file tests (`logging_trace_file`,
+`doc_init_profiling`) asserted that `sys_chdir("build")` succeeds. The stdlib's Windows build doesn't wire `chdir`,
+by design (`lib/syscalls_windows.cyr`: "wire the reroute when a consumer actually needs it"). pravash needs it only
+for those tests, so nothing is filed. They now move into build/ where they can, and otherwise write and remove the
+trace file where they run. That is 49 checks for 51; every trace check passes on the three targets. Earlier gates
+had run only the corpus on PE, so the two asserts went unseen until the release gate ran every suite there.
+
+**The fuzz harness** (`tests/pravash.fcyr`) replaces the scaffold's stub. Rust 1.3.0 had no fuzz targets, so these are
+the port's, for the inputs a consumer doesn't control:
+- **The JSON readers:** each of the 22 types' own document, mutated 600 times. The mutations flip bytes, write JSON's
+  structural characters, cut, repeat or splice spans, put extreme numbers in (also in a number's place, which keeps
+  most documents readable), and nest 2,000 deep. Of 13,200 documents, 1,582 were accepted. Each accepted one wrote
+  again, and read back to the same text. Each solver or field small enough was stepped, to Ok or a `PV_ERR_*` code.
+  Each refusal was `PV_ERR_DESERIALIZE`. bayan handled the deep nesting.
+- **The `PRAVASH_LOG` parser:** 40,000 strings of target names, levels, separators, span directives, UTF-8 and random
+  bytes. 21,381 parse strictly. Every level is in 0 … 5, the same text gives the same levels, and the lenient parse
+  never refuses.
+
+No invariant broke. The first draft accepted only 206 documents, since nearly every mutation broke the syntax; the
+mutation that replaces a whole number keeps the shape, so the round trip runs on 1,582.
+
+**The oracle's toolchain.** The root `rust-toolchain.toml` pins rustc 1.99.1, the oracle's, for every `cargo` command
+run from the repo root: the frozen crate, the generator and the probes. `rust-old/` keeps its own `stable` file,
+unedited. CI's oracle job installs what the root file names, in place of `stable`. Plain `cargo run … -- --check`
+passes again; on 1.100 it fails on `src/str_debug_data.cyr` (§31).
+
+**Cleanup.** The scaffold's `tests/pravash.tcyr` smoke test is gone; its comment said the parity harness replaces it
+at M0 step 7.

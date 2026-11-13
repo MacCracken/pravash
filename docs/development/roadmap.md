@@ -2,13 +2,13 @@
 
 > Last updated: 2026-11-11
 
-### 2.0.0 — Cyrius port (planned)
+### 2.0.0 — Cyrius port (done; ready to tag)
 
-- [ ] Port to Cyrius with Rust 1.3.0 as the frozen oracle in `rust-old/`: the plan of record is
+- [x] Port to Cyrius with Rust 1.3.0 as the frozen oracle in `rust-old/`: the plan of record is
   [pravash-port-plan.md](pravash-port-plan.md). It follows tanmatra, kimiya and impetus.
-- [ ] 2.0 carries every module and feature: bridge, ai, logging, `parallel` (on `thread.cyr`) and serde (on
+- [x] 2.0 carries every module and feature: bridge, ai, logging, `parallel` (on `thread.cyr`) and serde (on
   `#derive`). The plan's §1.1 language review of Cyrius 6.7.18 found no language reason to defer any of them
-- [ ] Upstream requests (hisab, ganita, the stdlib) are filed at M0 and as found, but never block the port.
+- [x] Upstream requests (hisab, ganita, the stdlib) are filed at M0 and as found, but never block the port.
   pravash ships local stand-ins marked `UPSTREAM(Ln)` and converts them when the library lands (plan §8, the
   conversion ledger)
 - [x] Decisions D1–D6 (plan §0.2), made 2026-11-11:
@@ -101,10 +101,12 @@
 - [x] M8 part d: Rust's derived `Debug` on the 36 public types without it (`x.debug(sb, alternate)` for `{:?}` and
   `{:#?}`), golden rows from the oracle, Rust's shortest float digits (impetus's `fmtf.cyr` as the stand-in), and
   a `#derive(Debug)` request filed at cyrius
-- [ ] M8 part e: VERSION 2.0.0 and the release gate on three targets; the fuzz target (`tests/pravash.fcyr` is the
-  scaffold's stub, which promised M8: targets for the JSON readers and the `PRAVASH_LOG` parser, the inputs a
-  consumer doesn't control); the 1.3.x deprecation notice (the maintainer's crates.io step) and the consumers' first
-  Cyrius builds
+- [x] M8 part e: VERSION 2.0.0, the release gate on three targets (every suite, not only the corpus), the fuzz
+  harness (`tests/pravash.fcyr`: the 22 JSON readers and the `PRAVASH_LOG` parser, in CI), and the oracle's toolchain
+  pinned at the repo root (`rust-toolchain.toml`, rustc 1.99.1)
+- [ ] The maintainer's steps: tag 2.0.0 (the release workflow checks VERSION and `cyrius.cyml` against it and
+  publishes the CHANGELOG's section), the 1.3.x deprecation notice on crates.io, and the consumers' first Cyrius
+  builds (kiran, joshua, impetus)
 
 ### 1.3.0
 
@@ -120,12 +122,12 @@
 - [ ] **grid**: collocated compact Laplacian vs. wide divergence stencil leaves residual divergence after projection — `MacGrid` is exact; consider making MAC the default path
 - [ ] **grid**: `apply_ghost_fluid` sign/units (`σκφ/|∇φ|` is pressure × length); should add σκ to the Poisson RHS with θ-weighting
 - [ ] **grid**: local (per-cell) Smagorinsky ν_t instead of a domain average; k-ε advection/diffusion terms (only sources today)
-- [ ] **grid**: DST pressure solve is O(N²) per line with `sin()` per element — cache a sine table / FFT-based DST (perf)
+- [ ] **grid**: DST pressure solve is O(N²) per line with `sin()` per element — cache a sine table / FFT-based DST (perf). 2.0 caches the sines and eigenvalue terms per transform length (the DST plans, M3 part b: the 63 × 63 step 8.6 ms against 1.3.0's 10.1 ms); the O(N²) sums and an FFT remain
 - [ ] **sph**: 2D kernel normalisation — 3D poly6/spiky/viscosity constants are used on z = 0 particles (Wendland kernels are 2D); needs a dimension on the solver/config
 - [ ] **sph**: `step()` overwrites `acceleration`, so external forces (viscoelastic, contact angle) must be applied after and re-integrated — add an external-force input
 - [ ] **sph**: neighbour lists keep all 27 cells unfiltered (≈6× true neighbours in 3D); filter by h, drop empty z-layers in 2D; parallelise PCISPH/DFSPH/multiphase loops; remove per-step `accels` allocations
 - [ ] **sph**: MLS gradient correction is a no-op in 2D (singular 3×3 moment matrix) — use a 2×2 path
-- [ ] **sph**: f32 spatial hash loses precision at large coordinates (≈0.05h at 1e4 with h = 0.01)
+- [x] **sph**: f32 spatial hash loses precision at large coordinates (≈0.05h at 1e4 with h = 0.01). Fixed in 2.0: the neighbour keys are f64 (ADR 0002 #2, M5 part e)
 - [ ] **mpm**: quadratic B-spline weights + APIC/MLS-MPM transfers (linear hat + PIC is dissipative); fluid viscosity in stress
 - [ ] **coupling**: FLIP cell marking (fluid/air/solid), Neumann solid walls, MAC layout; `particle_level_set` is brute force O(cells·N)
 - [ ] **bridge**: calibrated aeroacoustic noise model (Proudman) for `tke_to_broadband_noise_db`; current scaling is a relative cue

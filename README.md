@@ -148,11 +148,13 @@ cyrius deps                                 # vendor the stdlib and hisab (tests
 cyrius build src/main.cyr build/pravash     # compile
 cyrius test                                 # tests/*.tcyr: the parity harness and the ported Rust tests
 cyrius bench                                # tests/*.bcyr
+cyrius fuzz                                 # tests/pravash.fcyr: the JSON readers and the PRAVASH_LOG parser
 cyrius audit                                # fmt, lint, docs, tests and benches
 cyrius distlib                              # dist/pravash.cyr
 ```
 
-The oracle and the checks against it:
+The oracle and the checks against it (`cargo` from the repo root runs the oracle's rustc 1.99.1, pinned by
+`rust-toolchain.toml`):
 
 ```sh
 cargo test --manifest-path rust-old/Cargo.toml --all-features                          # the Rust 1.3.0 oracle

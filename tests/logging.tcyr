@@ -162,7 +162,9 @@ fn test_filter() {
 fn test_trace_file() {
     test_group("logging_trace_file");
     var m = sys_mkdir("build", 493);
-    assert_eq(sys_chdir("build"), 0, "in build/");
+    # Into build/, so the trace file isn't written in the repo root. The stdlib's Windows chdir is not wired (it
+    # returns -1, lib/syscalls_windows.cyr), so on PE the file is written, and removed, where the test runs.
+    var moved = sys_chdir("build");
     var g: PvFlushGuard;
     _pv_log_init_done = 0;
     assert_eq(logging_init_profiling(&g), 1, "the trace started");
@@ -204,7 +206,7 @@ fn test_trace_file() {
     assert(n2 == 4 && memeq(buf, "[\n\n]", 4) == 1, "`[\\n\\n]`");
     var del2 = sys_unlink(_pv_trace_path());
     fl_free(buf);
-    var back = sys_chdir("..");
+    if (moved == 0) { var back = sys_chdir(".."); }
     return 0;
 }
 
@@ -213,7 +215,9 @@ fn test_trace_file() {
 fn test_doc() {
     test_group("doc_init_profiling");
     var m = sys_mkdir("build", 493);
-    assert_eq(sys_chdir("build"), 0, "in build/");
+    # Into build/, so the trace file isn't written in the repo root. The stdlib's Windows chdir is not wired (it
+    # returns -1, lib/syscalls_windows.cyr), so on PE the file is written, and removed, where the test runs.
+    var moved = sys_chdir("build");
     _pv_log_init_done = 0;
     var guard: PvFlushGuard;
     var started = logging_init_profiling(&guard);
@@ -236,7 +240,7 @@ fn test_doc() {
     assert(steps == 3 && load8(buf + n - 1) == 93, "flushed: the three steps, and the closing `]`");
     var del = sys_unlink(_pv_trace_path());
     fl_free(buf);
-    var back = sys_chdir("..");
+    if (moved == 0) { var back = sys_chdir(".."); }
     return 0;
 }
 

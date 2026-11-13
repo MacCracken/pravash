@@ -5,8 +5,9 @@
 
 ## Version
 
-**1.3.0** (`VERSION`), on its way to **2.0.0**, the Cyrius library. `cyrius.cyml` reads the version through
-`version = "${file:VERSION}"`, and the release workflow checks both against the tag.
+**2.0.0** (`VERSION`), the Cyrius library, ready to tag (M8 part e, 2026-11-13). `cyrius.cyml` reads the version
+through `version = "${file:VERSION}"`, and the release workflow checks both against the tag and publishes the
+CHANGELOG's `## [2.0.0]` section.
 
 The last Rust release is **1.3.0**: commit `a88bc4e` (the audited 1.3.0 plus the hidden `oracle` hooks), frozen
 as the oracle in `rust-old/`. It is tagged `1.3.0` and published to crates.io (2026-11-11, port plan D1).
@@ -25,7 +26,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M5 SPH solvers | ✅ **done 2026-11-12.** Part e: the solver's thread count (`set_threads`; Rust's three `parallel` loops on the pool, every step row at 2, 3, 4 and 8 threads giving the serial bits; ADR 0002 #4) and the D3 switch to f64 neighbour keys (hisab 3.4.1's cell, integer neighbour cells; 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription; ADR 0002 #2). Part d ✅ 2026-11-12: `src/sph_multiphase.cyr`, the multiphase step with `PvPhaseProperties` and `PvMultiPhaseConfig`; 26 rows, the first 25 bit-exact on the first replay and the 26th closing the mutation tests' one gap; the last 5 Rust tests of `sph.rs`; ADR 0002 #22. Part c ✅ 2026-11-12: `src/sph_dfsph.cyr`, the DFSPH step; 35 rows, bit-exact on the first replay; 6 Rust tests; ADR 0002 #21. Part b ✅ 2026-11-12: `src/sph_pcisph.cyr`, the PCISPH step; 37 rows, bit-exact on the first replay; 4 Rust tests; ADR 0002 #20. Part a ✅ 2026-11-12: `src/sph.cyr`, `PvSphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension, the f32 lists of M4 part b) and `adaptive_dt`; 66 rows, every one bit-exact on the first replay; 19 Rust tests and 5 integration tests; ADR 0002 #19. |
 | M6 Coupling and MPM | ✅ **done 2026-11-12.** Part a ✅ 2026-11-12: `src/coupling.cyr`, the rigid bodies (`PvBodyShape` / `PvShape`, `PvRigidBody`, the two-way coupling, integration with and without added mass, both drags, the particle level set; JSON for `BodyShape` and `RigidBody`). `drag_from_particles_indexed` takes the caller's cells-only `PvNeighborGrid` (`PvNeighborGrid_build`, f64 keys; ADR 0002 #23). A new golden module, `coupling.tsv`: 4,798 rows, every one bit-exact on the first replay but an indexed drag at 10⁶, which `coupling.d3.tsv` maps (ADR 2); 22 of the 33 Rust tests. Part b ✅ 2026-11-12: `src/flip.cyr`, the `FlipSolver` (P2G, the projection, FLIP/PIC and APIC G2P, the APIC resize; ADR 0002 #24): 245 rows, every one bit-exact on the first replay, among them 210 class S trajectories and scenarios; all 33 Rust tests of `coupling.rs` and all 33 integration tests. Part c ✅ 2026-11-12: `src/mpm.cyr` (`PvConstitutiveModel` / `PvConstitutiveLaw` and its JSON, `PvMat2`, `PvMpmParticle`, `PvMpmSolver`; the 2 × 2 SVD and Drucker–Prager on the correctly rounded primitives; ADR 0002 #25): a new golden module, `mpm.tsv`, 1,336 rows, 1,319 bit-exact against the oracle and 17 against the corrected oracle `mpm.cr.tsv` where glibc misrounds; all 13 Rust tests |
 | M7 Compute, logging and ai | ✅ **done 2026-11-12.** Part b ✅ 2026-11-12: `src/ai.cyr` (`PvDaimonConfig`, `PvHooshConfig`: the defaults, the setters with their ownership bits, JSON, Rust's `{:?}` and `{:#?}` with the key redacted, `<str as Debug>`'s escapes from `src/str_debug_data.cyr`, generated from rustc 1.99.1's core; ADR 0002 #27) and `src/logging.cyr` (the three inits, the PRAVASH_LOG filter as tracing-subscriber's EnvFilter decides it, and the Trace Event file through a sakshi hook, ledger L11; ADR 0002 #28), with every one of Rust's 60 spans and 12 warnings at its point in every module. Two new golden modules, `ai.tsv` 579 rows and `logging.tsv` 251 (99 filter rows, 152 trace rows over 37 calls), all matching on the first replay; the instrumentation changed no other row; all 3 Rust tests. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
-| M8 Release 2.0.0 | in progress. Part d ✅ 2026-11-13: Rust's derived `Debug` on the 35 public types (`src/fmtf.cyr`, Rust's shortest float text, impetus's printer with the f32 case; `src/debug.cyr`, the builders and a `debug(sb, alternate)` each; ADR 0002 #29; ledger L16, `#derive(Debug)` and the printer requested at cyrius). A new golden module, `debug.tsv`: 9,602 rows (6,871 f64 and 2,565 f32 printings, 156 values, 10 states after their own steps, which leave Rust's scratch), all matching, all recomputed by validate.py; 14 of 15 mutations caught, the 15th equivalent. Part c ✅ 2026-11-13: the full surface diff (`scripts/surface_parity.py` adds Rust's derives, its trait methods and the reverse direction: 625 items ok, the 36 `Debug` derives pending part d; 466 public Cyrius names, 351 Rust items and 115 Cyrius-only by 18 rules citing their ADR rows). It found six missing clones, ported with a test group each, and three Rust-private types left public, now `_Pv` names. The README, `docs/guides/migration-2.0.md` and the CHANGELOG's Breaking section; Rust's three examples ported (`docs/examples/`) with outputs derived from the oracle (`scripts/oracle/examples.py`: shallow water prints Rust's output exactly, and the SPH examples leave it at the second step by ADR 0002 #2 alone); `scripts/doc_examples.py` runs the 14 blocks and programs, in CI. Part b ✅ 2026-11-12: the release benchmark record (`scripts/bench_record.py`): all 57 rows of Rust's 21 criterion groups in both columns, three pinned interleaved rounds (median 4.4× Rust's time, 0.76× to 37×), and the thread-count rows (the SPH step 2.2–3.2× faster at 8 threads, Rust's rayon 1.05–1.95×). Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
+| M8 Release 2.0.0 | ✅ **done 2026-11-13; 2.0.0 ready to tag.** Part e ✅ 2026-11-13: VERSION 2.0.0 and the CHANGELOG's `## [2.0.0]`; the release gate (22 gates: every suite on x86_64 ELF, PE and aarch64, the corpus on each, the generator on the pinned toolchain, validate.py, the docs, the fuzz harness); the fuzz harness (`tests/pravash.fcyr`, in CI); the oracle's rustc 1.99.1 pinned by the root `rust-toolchain.toml`, which CI installs; the two trace-file tests no longer require `chdir`, which the stdlib's Windows build doesn't wire. Part d ✅ 2026-11-13: Rust's derived `Debug` on the 35 public types (`src/fmtf.cyr`, Rust's shortest float text, impetus's printer with the f32 case; `src/debug.cyr`, the builders and a `debug(sb, alternate)` each; ADR 0002 #29; ledger L16, `#derive(Debug)` and the printer requested at cyrius). A new golden module, `debug.tsv`: 9,602 rows (6,871 f64 and 2,565 f32 printings, 156 values, 10 states after their own steps, which leave Rust's scratch), all matching, all recomputed by validate.py; 14 of 15 mutations caught, the 15th equivalent. Part c ✅ 2026-11-13: the full surface diff (`scripts/surface_parity.py` adds Rust's derives, its trait methods and the reverse direction: 625 items ok, the 36 `Debug` derives pending part d; 466 public Cyrius names, 351 Rust items and 115 Cyrius-only by 18 rules citing their ADR rows). It found six missing clones, ported with a test group each, and three Rust-private types left public, now `_Pv` names. The README, `docs/guides/migration-2.0.md` and the CHANGELOG's Breaking section; Rust's three examples ported (`docs/examples/`) with outputs derived from the oracle (`scripts/oracle/examples.py`: shallow water prints Rust's output exactly, and the SPH examples leave it at the second step by ADR 0002 #2 alone); `scripts/doc_examples.py` runs the 14 blocks and programs, in CI. Part b ✅ 2026-11-12: the release benchmark record (`scripts/bench_record.py`): all 57 rows of Rust's 21 criterion groups in both columns, three pinned interleaved rounds (median 4.4× Rust's time, 0.76× to 37×), and the thread-count rows (the SPH step 2.2–3.2× faster at 8 threads, Rust's rayon 1.05–1.95×). Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
 
 ## Toolchain
 
@@ -34,9 +35,10 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 - **sakshi**: 2.5.10, a stdlib leaf since M7 part b (pravash's tracing)
 - **ganita**: 1.2.15, bundled in the 6.7.18 stdlib
 - **Rust oracle**: rustc 1.99.1, hisab 1.4.0, glam 0.29.3 (`rust-old/Cargo.lock`), glibc 2.44. Nothing pins the
-  toolchain: `rust-old/rust-toolchain.toml` names `stable`, which moved to rustc 1.100.0 (Unicode 18.0.0) on
-  2026-11-09. Built with 1.100, the generator rewrites `src/str_debug_data.cyr` (916 ranges for 1.99.1's 910), so its
-  `--check` fails; every other output is the same. Run it as `cargo +1.99.1 …` until a pin is decided
+  toolchain inside `rust-old/` (its `rust-toolchain.toml` names `stable`, which moved to rustc 1.100.0 on
+  2026-11-09); the root `rust-toolchain.toml` pins 1.99.1 for every `cargo` run from the repo root (M8 part e), and
+  CI installs what it names. Built with 1.100, the generator writes another `src/str_debug_data.cyr` (Unicode 18:
+  916 ranges for 1.99.1's 910) and its `--check` fails.
 
 ## Source
 
@@ -90,7 +92,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
       every malformed UTF-8 form, both Debug shapes, the JSON text checks, the two clones): 56 checks;
     - `tests/logging.tcyr`: the 1 of `logging.rs`, and Cyrius-only groups (the span and event texts through a sakshi
       hook, the level gates, a full 16-deep stack, the parser's corners, the trace file), and Rust's `ignore`d doc
-      example of `init_profiling`, run (M8 part a): 51 checks;
+      example of `init_profiling`, run (M8 part a): 49 checks (the two `chdir` asserts went at M8 part e);
     - `tests/integration.tcyr`: all 33 of `rust-old/tests/integration.rs` (79 checks).
   - `scripts/surface_parity.py` (the full diff since M8 part c): error, common, buoyancy, vortex, bridge, shallow,
     grid, vof, phase_field, sph, coupling, mpm, compute, ai and logging. 625 items ok, 0 missing, 0 pending: the
@@ -102,7 +104,10 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
   - `scripts/rust_test_ledger.py --check` ([`rust-test-ledger.md`](rust-test-ledger.md), M8 part a): all 405 Rust
     tests accounted for. 391 are ported to same-named groups (351 unit, 33 integration, and the 7 `ignore`d doc
     tests written against the API and run). The 14 oracle-hook tests are n/a.
-  - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
+  - `tests/pravash.fcyr` (M8 part e, `cyrius fuzz`, in CI): the 22 JSON readers on 13,200 mutated documents (1,582
+    accepted, each written and read back to the same text, each small solver stepped) and the `PRAVASH_LOG` parser on
+    40,000 strings; no invariant broken. The scaffold's `tests/pravash.tcyr` smoke test is gone.
+  - Every suite passes on x86_64 ELF, x86_64 PE and aarch64 (1,437 checks on each; M8 part e's release gate).
 - **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), debug 9,602, grid 1,120 (511 class
   S step rows), json 302, logging 251, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
   224 (63 class S) and vortex 2,293 rows, and the corrected oracle (MPFR 4.2.2): `math.cr.tsv` 43, `vortex.cr.tsv`
@@ -244,11 +249,11 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M8 part e, the release:
-- VERSION 2.0.0, with `cyrius.cyml` reading it;
-- the release gate: the full corpus green on x86_64 ELF, x86_64 PE and aarch64;
-- the fuzz target: `tests/pravash.fcyr` is still the scaffold's stub, which promised the port's targets at M8 (the
-  JSON readers and the `PRAVASH_LOG` parser, the inputs a consumer doesn't control);
-- the oracle toolchain's pin (above);
-- then the maintainer's steps: the tag, the 1.3.x deprecation notice on crates.io, and the consumers' first Cyrius
-  builds.
+The port is done: 2.0.0 is ready to tag. What remains is the maintainer's:
+- commit, then tag `2.0.0`: the release workflow checks VERSION and `cyrius.cyml` against the tag, runs CI, and
+  publishes the CHANGELOG's `## [2.0.0]` section with the source tarball and checksums `cyrius deps` verifies;
+- the 1.3.x deprecation notice on crates.io (port plan D1), pointing at the Cyrius library;
+- the consumers' first Cyrius builds (kiran, joshua, impetus), on `[deps.pravash]` with `tag = "2.0.0"`.
+
+After the release: the stand-ins convert as their libraries ship (port plan §8, 16 rows), and the 1.3.0 audit's
+deferred physics items (roadmap) are 2.x work.

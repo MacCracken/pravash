@@ -11,7 +11,7 @@
 **Pravash** (Sanskrit: journey/flow) — fluid dynamics simulation for AGNOS: SPH, Euler/Navier–Stokes grids,
 shallow water, buoyancy and drag, vortex dynamics, interface tracking, fluid–body coupling and MPM
 
-- **Type**: Flat library (Cyrius), being ported from the Rust crate 1.3.0; the port ships as 2.0.0
+- **Type**: Flat library (Cyrius), ported from the Rust crate 1.3.0; the port is 2.0.0
 - **License**: GPL-3.0-only
 - **Language**: Cyrius. The toolchain is pinned in `cyrius.cyml` `[package].cyrius`
 - **Version**: `VERSION` at the project root is the source of truth. Don't inline the number here
@@ -52,7 +52,8 @@ python3 -I -B scripts/oracle/examples.py .                                      
 ```
 
 The generator and `validate.py` are tied to the recorded glibc (2.44), so they run locally, not in CI (the
-runner's glibc differs): `--check` refuses another platform by name.
+runner's glibc differs): `--check` refuses another platform by name. The oracle's rustc (1.99.1) is pinned by the
+root `rust-toolchain.toml` for every `cargo` command run from the repo root; `rust-old/`'s own file names `stable`.
 
 ## Development Process
 
@@ -86,6 +87,7 @@ python3 -I scripts/upstream_ledger.py --check    # once the ledger exists (M0 st
 python3 -I -B scripts/surface_parity.py .        # from M1 part 3: every ported Rust item has its counterpart
 python3 -I -B scripts/rust_test_ledger.py . --check   # from M8 part a: every Rust test ported or recorded
 python3 -I -B scripts/doc_examples.py .          # from M8 part c: the docs' code blocks and the examples run
+cyrius fuzz tests/pravash.fcyr                   # from M8 part e: the JSON readers and the PRAVASH_LOG parser
 ```
 
 `cyrius test` must be **warning-free**. The float type diagnostics come only from the compiles that `test`

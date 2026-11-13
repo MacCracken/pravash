@@ -1,16 +1,660 @@
-# pravash fuzz harness
+# pravash.fcyr — the fuzz harness (M8 part e): the inputs a consumer doesn't control, as self-driving loops. A
+# seeded generator stands in for libFuzzer (impetus's tests/fuzz_cases.cyr pattern; Rust 1.3.0 had no fuzz targets),
+# and each input's invariant is checked on the spot.
+#
+# Invariants:
+#   - JSON, for each of the 22 types with a reader: no mutated document crashes or hangs `from_json`. A refusal is
+#     PV_ERR_DESERIALIZE or PV_ERR_OUT_OF_MEMORY. An accepted document gives a value whose `to_json` succeeds, and that
+#     text reads back to a value writing the same text again. A decoded solver or field of at most 4,096 cells takes
+#     a step (Ok, or a refusal with a PV_ERR_* code), and every decoded value drops. The documents are the types'
+#     own, mutated: bytes flipped or replaced by JSON's structural characters, spans cut, repeated or spliced in,
+#     extreme numbers spliced in or put in a number's place, and nesting 2,000 deep.
+#   - PRAVASH_LOG: no string crashes the filter parser. The strict parse returns 0 or 1, the lenient one always 1;
+#     every level it gives is in 0 … 5, and the same text gives the same levels.
 
-# Fuzz target: takes `len` bytes at `data`. The port's targets replace this (M8).
-fn fuzz_main(data, len) {
-    if (len == 0) { return 0; }
+include "tests/lib.cyr"
+
+var _fz = 20261113;
+
+# The next pseudo-random word (an LCG, Knuth's MMIX constants).
+fn fz_rand(): i64 {
+    _fz = _fz * 6364136223846793005 + 1442695040888963407;
+    return (_fz >> 11) & 0x1FFFFFFFFFFFFF;
+}
+
+# A pseudo-random integer in [0, m).
+fn fz_u(m): i64 { return fz_rand() % m; }
+
+# Reports a broken invariant and stops.
+fn fz_fail(target, iter, msg) {
+    print("FUZZ FAIL: ", 11);
+    print(target, strlen(target));
+    print(" iteration ", 11);
+    print_num(iter);
+    print(": ", 2);
+    println(msg);
+    sys_exit_group(1);
     return 0;
 }
 
-# Runs the fuzz target once on a fixed input.
+# ── typed views of the value slots ──────────────────────────────────────────────────
+# Cyrius has no cast, so each view is a function whose return type is the pointer type.
+
+# The slot at p as a `PvFluidMaterial`.
+fn fz_material(p): *PvFluidMaterial { return p; }
+# The slot at p as a `PvFluidParticle`.
+fn fz_particle(p): *PvFluidParticle { return p; }
+# The slot at p as a `PvFluidConfig`.
+fn fz_config(p): *PvFluidConfig { return p; }
+# The slot at p as a `PvParticleSoa`.
+fn fz_soa(p): *PvParticleSoa { return p; }
+# The slot at p as a `PvShallowWater`.
+fn fz_sw(p): *PvShallowWater { return p; }
+# The slot at p as a `PvGridConfig`.
+fn fz_gc(p): *PvGridConfig { return p; }
+# The slot at p as a `PvFluidGrid`.
+fn fz_fg(p): *PvFluidGrid { return p; }
+# The slot at p as a `PvMacGrid`.
+fn fz_mac(p): *PvMacGrid { return p; }
+# The slot at p as a `PvKEpsilon`.
+fn fz_ke(p): *PvKEpsilon { return p; }
+# The slot at p as a `PvVofField`.
+fn fz_vof(p): *PvVofField { return p; }
+# The slot at p as a `PvPhaseField`.
+fn fz_pf(p): *PvPhaseField { return p; }
+# The slot at p as a `PvShape`.
+fn fz_shape(p): *PvShape { return p; }
+# The slot at p as a `PvRigidBody`.
+fn fz_body(p): *PvRigidBody { return p; }
+# The slot at p as a `PvConstitutiveLaw`.
+fn fz_law(p): *PvConstitutiveLaw { return p; }
+# The slot at p as a `PvSphKernelParams`.
+fn fz_sk(p): *PvSphKernelParams { return p; }
+# The slot at p as a `PvGridKernelParams`.
+fn fz_gk(p): *PvGridKernelParams { return p; }
+# The slot at p as a `PvShallowKernelParams`.
+fn fz_hk(p): *PvShallowKernelParams { return p; }
+# The slot at p as a `PvDaimonConfig`.
+fn fz_daimon(p): *PvDaimonConfig { return p; }
+# The slot at p as a `PvHooshConfig`.
+fn fz_hoosh(p): *PvHooshConfig { return p; }
+
+var _FZ_TYPES = 22;
+
+# The name of type t, for a failure report.
+fn fz_name(t): i64 {
+    match t {
+        0 => { return "FluidMaterial"; }
+        1 => { return "FluidParticle"; }
+        2 => { return "FluidConfig"; }
+        3 => { return "ParticleSoa"; }
+        4 => { return "FlowRegime"; }
+        5 => { return "DragCoefficient"; }
+        6 => { return "ShallowWater"; }
+        7 => { return "BoundaryCondition"; }
+        8 => { return "GridConfig"; }
+        9 => { return "FluidGrid"; }
+        10 => { return "MacGrid"; }
+        11 => { return "KEpsilon"; }
+        12 => { return "VofField"; }
+        13 => { return "PhaseField"; }
+        14 => { return "BodyShape"; }
+        15 => { return "RigidBody"; }
+        16 => { return "ConstitutiveModel"; }
+        17 => { return "SphKernelParams"; }
+        18 => { return "GridKernelParams"; }
+        19 => { return "ShallowKernelParams"; }
+        20 => { return "DaimonConfig"; }
+        21 => { return "HooshConfig"; }
+        _ => { return "?"; }
+    }
+    return "?";
+}
+
+# ── the codecs, by type ─────────────────────────────────────────────────────────────
+
+# Reads the n bytes at buf as type t into the slot at v: (tag, code) as the reader returns them. A unit enum's word
+# and the unit struct's nothing are kept in the slot's first word.
+fn fz_decode(t, buf, n, v): Result {
+    if (t == 0) { return PvFluidMaterial_from_json(buf, n, fz_material(v)); }
+    if (t == 1) { return PvFluidParticle_from_json(buf, n, fz_particle(v)); }
+    if (t == 2) { return PvFluidConfig_from_json(buf, n, fz_config(v)); }
+    if (t == 3) { return PvParticleSoa_from_json(buf, n, fz_soa(v)); }
+    if (t == 4) { return flow_regime_from_json(buf, n, v); }
+    if (t == 5) { return drag_coefficient_from_json(buf, n); }
+    if (t == 6) { return PvShallowWater_from_json(buf, n, fz_sw(v)); }
+    if (t == 7) { return boundary_condition_from_json(buf, n, v); }
+    if (t == 8) { return PvGridConfig_from_json(buf, n, fz_gc(v)); }
+    if (t == 9) { return PvFluidGrid_from_json(buf, n, fz_fg(v)); }
+    if (t == 10) { return PvMacGrid_from_json(buf, n, fz_mac(v)); }
+    if (t == 11) { return PvKEpsilon_from_json(buf, n, fz_ke(v)); }
+    if (t == 12) { return PvVofField_from_json(buf, n, fz_vof(v)); }
+    if (t == 13) { return PvPhaseField_from_json(buf, n, fz_pf(v)); }
+    if (t == 14) { return body_shape_from_json(buf, n, fz_shape(v)); }
+    if (t == 15) { return PvRigidBody_from_json(buf, n, fz_body(v)); }
+    if (t == 16) { return constitutive_model_from_json(buf, n, fz_law(v)); }
+    if (t == 17) { return PvSphKernelParams_from_json(buf, n, fz_sk(v)); }
+    if (t == 18) { return PvGridKernelParams_from_json(buf, n, fz_gk(v)); }
+    if (t == 19) { return PvShallowKernelParams_from_json(buf, n, fz_hk(v)); }
+    if (t == 20) { return PvDaimonConfig_from_json(buf, n, fz_daimon(v)); }
+    return PvHooshConfig_from_json(buf, n, fz_hoosh(v));
+}
+
+# Writes the value of type t in the slot at v onto sb: 0, or -1 when the builder can't grow.
+fn fz_encode(t, v, sb): i64 {
+    if (t == 0) {
+        var m: *PvFluidMaterial = fz_material(v);
+        return m.to_json(sb);
+    }
+    if (t == 1) {
+        var p: *PvFluidParticle = fz_particle(v);
+        return p.to_json(sb);
+    }
+    if (t == 2) {
+        var c: *PvFluidConfig = fz_config(v);
+        return c.to_json(sb);
+    }
+    if (t == 3) {
+        var s: *PvParticleSoa = fz_soa(v);
+        return s.to_json(sb);
+    }
+    if (t == 4) { return flow_regime_to_json(load64(v), sb); }
+    if (t == 5) { return drag_coefficient_to_json(sb); }
+    if (t == 6) {
+        var sw: *PvShallowWater = fz_sw(v);
+        return sw.to_json(sb);
+    }
+    if (t == 7) { return boundary_condition_to_json(load64(v), sb); }
+    if (t == 8) {
+        var gc: *PvGridConfig = fz_gc(v);
+        return gc.to_json(sb);
+    }
+    if (t == 9) {
+        var g: *PvFluidGrid = fz_fg(v);
+        return g.to_json(sb);
+    }
+    if (t == 10) {
+        var mg: *PvMacGrid = fz_mac(v);
+        return mg.to_json(sb);
+    }
+    if (t == 11) {
+        var ke: *PvKEpsilon = fz_ke(v);
+        return ke.to_json(sb);
+    }
+    if (t == 12) {
+        var vf: *PvVofField = fz_vof(v);
+        return vf.to_json(sb);
+    }
+    if (t == 13) {
+        var pf: *PvPhaseField = fz_pf(v);
+        return pf.to_json(sb);
+    }
+    if (t == 14) { return body_shape_to_json(fz_shape(v), sb); }
+    if (t == 15) {
+        var b: *PvRigidBody = fz_body(v);
+        return b.to_json(sb);
+    }
+    if (t == 16) { return constitutive_model_to_json(fz_law(v), sb); }
+    if (t == 17) {
+        var sk: *PvSphKernelParams = fz_sk(v);
+        return sk.to_json(sb);
+    }
+    if (t == 18) {
+        var gk: *PvGridKernelParams = fz_gk(v);
+        return gk.to_json(sb);
+    }
+    if (t == 19) {
+        var hk: *PvShallowKernelParams = fz_hk(v);
+        return hk.to_json(sb);
+    }
+    if (t == 20) {
+        var d: *PvDaimonConfig = fz_daimon(v);
+        return d.to_json(sb);
+    }
+    var h: *PvHooshConfig = fz_hoosh(v);
+    return h.to_json(sb);
+}
+
+# Releases what the value of type t in the slot at v holds.
+fn fz_drop(t, v) {
+    if (t == 3) { PvParticleSoa_drop(fz_soa(v)); }
+    if (t == 6) { PvShallowWater_drop(fz_sw(v)); }
+    if (t == 9) { PvFluidGrid_drop(fz_fg(v)); }
+    if (t == 10) { PvMacGrid_drop(fz_mac(v)); }
+    if (t == 11) { PvKEpsilon_drop(fz_ke(v)); }
+    if (t == 12) { PvVofField_drop(fz_vof(v)); }
+    if (t == 13) { PvPhaseField_drop(fz_pf(v)); }
+    if (t == 20) { PvDaimonConfig_drop(fz_daimon(v)); }
+    if (t == 21) { PvHooshConfig_drop(fz_hoosh(v)); }
+    return 0;
+}
+
+# 1 when nx · ny is in [1, 4096]: a decoded grid small enough to step.
+fn fz_small(nx, ny): i64 {
+    if (nx < 1 || ny < 1 || nx > 4096 || ny > 4096) { return 0; }
+    if (nx * ny > 4096) { return 0; }
+    return 1;
+}
+
+# 1 when a step's Err code is one of PravashError's or the port's.
+fn fz_code_ok(code): i64 {
+    if (code >= PV_ERR_INVALID_PARTICLE_COUNT && code <= PV_ERR_OUT_OF_MEMORY) { return 1; }
+    return 0;
+}
+
+# One step of a decoded solver or field (types 6 and 9 … 13) when it is small: 1 when the step returned Ok or a
+# PV_ERR_* code, 0 otherwise.
+fn fz_step(t, v): i64 {
+    var tag = 0;
+    var code = 0;
+    var cfg: PvGridConfig = PvGridConfig_default();
+    if (t == 6) {
+        var sw: *PvShallowWater = fz_sw(v);
+        if (fz_small(sw.nx, sw.ny) == 0) { return 1; }
+        tag, code = sw.step(0.001);
+    } elif (t == 9) {
+        var g: *PvFluidGrid = fz_fg(v);
+        if (fz_small(g.nx, g.ny) == 0) { return 1; }
+        tag, code = g.step(&cfg);
+    } elif (t == 10) {
+        var mg: *PvMacGrid = fz_mac(v);
+        if (fz_small(mg.nx, mg.ny) == 0) { return 1; }
+        tag, code = mg.step(&cfg);
+    } elif (t == 11) {
+        var ke: *PvKEpsilon = fz_ke(v);
+        if (ke.k.len > 4096) { return 1; }
+        var vel: PvColumn = PvColumn_new();
+        if (vel.resize(ke.k.len, 0) == 0) { return 1; }
+        var r = ke.step(vel.data, vel.len, vel.data, vel.len, 2, ke.k.len / 2, 0.1, 0.01);
+        vel.drop();
+        return 1;
+    } elif (t == 12 || t == 13) {
+        var nx = 0;
+        var ny = 0;
+        if (t == 12) {
+            var vf: *PvVofField = fz_vof(v);
+            nx = vf.nx;
+            ny = vf.ny;
+        } else {
+            var pf: *PvPhaseField = fz_pf(v);
+            nx = pf.nx;
+            ny = pf.ny;
+        }
+        if (fz_small(nx, ny) == 0) { return 1; }
+        var u: PvColumn = PvColumn_new();
+        if (u.resize(nx * ny, _pv_bits(0.25)) == 0) { return 1; }
+        if (t == 12) {
+            var va: *PvVofField = fz_vof(v);
+            tag, code = va.advect(u.data, u.len, u.data, u.len, 0.01);
+        } else {
+            var pa: *PvPhaseField = fz_pf(v);
+            tag, code = pa.step(u.data, u.len, u.data, u.len, 0.001);
+        }
+        u.drop();
+    } else {
+        return 1;
+    }
+    if (is_err_result(tag) == 1 && fz_code_ok(code) == 0) { return 0; }
+    return 1;
+}
+
+# The seed document of type t: a fresh value's `to_json` text, into *n bytes at the returned pointer (0 for none).
+fn fz_seed(t, v, n) {
+    var sb = str_builder_new();
+    var ok = 1;
+    if (t == 0) {
+        var m: PvFluidMaterial = PV_FLUID_MATERIAL_OIL;
+        var q_m: *PvFluidMaterial = fz_material(v);
+        *q_m = m;
+    } elif (t == 1) {
+        var p: PvFluidParticle = PvFluidParticle_new_2d(0.5, 0.25, 0.001);
+        p.temperature = 350.5;
+        var q_p: *PvFluidParticle = fz_particle(v);
+        *q_p = p;
+    } elif (t == 2) {
+        var c: PvFluidConfig = PvFluidConfig_water_2d();
+        var q_c: *PvFluidConfig = fz_config(v);
+        *q_c = c;
+    } elif (t == 3) {
+        var two[400];
+        var a: PvFluidParticle = PvFluidParticle_new_2d(0.1, 0.2, 0.5);
+        var b: PvFluidParticle = PvFluidParticle_new_2d(0.3, 0.4, 0.5);
+        var pp: *PvFluidParticle = fz_particle(&two);
+        var pp1: *PvFluidParticle = pp + 1;
+        *pp = a;
+        *pp1 = b;
+        ok = PvParticleSoa_from_aos(fz_soa(v), pp, 2);
+    } elif (t == 4) {
+        store64(v, PV_FLOW_REGIME_TRANSITIONAL);
+    } elif (t == 6) {
+        var ts, es = PvShallowWater_new(3, 3, 0.5, 1.0, fz_sw(v));
+        ok = is_ok(ts);
+    } elif (t == 7) {
+        store64(v, PV_BOUNDARY_CONDITION_FREE_SLIP);
+    } elif (t == 8) {
+        var gc: PvGridConfig = PvGridConfig_default();
+        var q_gc: *PvGridConfig = fz_gc(v);
+        *q_gc = gc;
+    } elif (t == 9) {
+        var tg, eg = PvFluidGrid_new(4, 4, 0.25, fz_fg(v));
+        ok = is_ok(tg);
+    } elif (t == 10) {
+        var tm, em = PvMacGrid_new(4, 4, 0.25, fz_mac(v));
+        ok = is_ok(tm);
+    } elif (t == 11) {
+        ok = PvKEpsilon_new(2, 3, fz_ke(v));
+    } elif (t == 12) {
+        var tv, ev = PvVofField_new(4, 4, 0.1, fz_vof(v));
+        ok = is_ok(tv);
+    } elif (t == 13) {
+        var tp, ep = PvPhaseField_new(4, 4, 0.1, fz_pf(v));
+        ok = is_ok(tp);
+    } elif (t == 14) {
+        var sh: PvShape = PvShape_box(0.5, 0.25, 1.0);
+        var q_sh: *PvShape = fz_shape(v);
+        *q_sh = sh;
+    } elif (t == 15) {
+        var body: PvRigidBody = PvRigidBody_new(PvVec3_new(1.0, 2.0, 3.0), 4.5, PvShape_sphere(0.5));
+        var q_body: *PvRigidBody = fz_body(v);
+        *q_body = body;
+    } elif (t == 16) {
+        var law: PvConstitutiveLaw = PvConstitutiveLaw_drucker_prager(10000.0, 0.3, 35.0);
+        var q_law: *PvConstitutiveLaw = fz_law(v);
+        *q_law = law;
+    } elif (t == 17) {
+        var sk: PvSphKernelParams = PvSphKernelParams_default();
+        var q_sk: *PvSphKernelParams = fz_sk(v);
+        *q_sk = sk;
+    } elif (t == 18) {
+        var gk: PvGridKernelParams = PvGridKernelParams_default();
+        var q_gk: *PvGridKernelParams = fz_gk(v);
+        *q_gk = gk;
+    } elif (t == 19) {
+        var hk: PvShallowKernelParams = PvShallowKernelParams_default();
+        var q_hk: *PvShallowKernelParams = fz_hk(v);
+        *q_hk = hk;
+    } elif (t == 20) {
+        var d: PvDaimonConfig = PvDaimonConfig_default();
+        var q_d: *PvDaimonConfig = fz_daimon(v);
+        *q_d = d;
+        ok = q_d.set_api_key("sk-\"k\\ey", 8);
+    } elif (t == 21) {
+        var h: PvHooshConfig = PvHooshConfig_default();
+        var q_h: *PvHooshConfig = fz_hoosh(v);
+        *q_h = h;
+    }
+    if (ok == 0 || fz_encode(t, v, sb) != 0) { return 0; }
+    fz_drop(t, v);
+    var s = str_builder_build(sb);
+    store64(n, str_len(s));
+    return str_data(s);
+}
+
+# ── mutations ───────────────────────────────────────────────────────────────────────
+
+# Copies n bytes from src to dst, which may overlap (the stdlib has memcpy only).
+fn fz_move(dst, src, n) {
+    if (n <= 0 || dst == src) { return 0; }
+    if (dst < src) {
+        for (var i = 0; i < n; i = i + 1) { store8(dst + i, load8(src + i)); }
+    } else {
+        var j = n - 1;
+        while (j >= 0) {
+            store8(dst + j, load8(src + j));
+            j = j - 1;
+        }
+    }
+    return 0;
+}
+
+# A JSON-significant byte, or a byte that often breaks a reader.
+fn fz_special(): i64 {
+    var k = fz_u(20);
+    if (k < 10) { return load8("{}[]:,\"-.e" + k); }
+    if (k < 14) { return 48 + fz_u(10); }
+    if (k == 14) { return 92; }
+    if (k == 15) { return 0; }
+    if (k == 16) { return 0xC3; }
+    if (k == 17) { return 0xFF; }
+    if (k == 18) { return 32; }
+    return 10;
+}
+
+# A number's text to splice in: an extreme a reader must handle.
+fn fz_number(): i64 {
+    var k = fz_u(10);
+    if (k == 0) { return "1e999"; }
+    if (k == 1) { return "-0"; }
+    if (k == 2) { return "1e-400"; }
+    if (k == 3) { return "123456789012345678901234567890"; }
+    if (k == 4) { return "-9223372036854775809"; }
+    if (k == 5) { return "18446744073709551616"; }
+    if (k == 6) { return "NaN"; }
+    if (k == 7) { return "0.000000000000000000000000000001"; }
+    if (k == 8) { return "3.4028235677973366e38"; }
+    return "-1.5";
+}
+
+# 1 when byte c can be part of a JSON number.
+fn fz_numeric(c): i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c == 45 || c == 43 || c == 46 || c == 101 || c == 69) { return 1; }
+    return 0;
+}
+
+# The m bytes at dst with one number (the first at or after a random offset) replaced by an extreme from
+# `fz_number`, within cap bytes: the new length (m when there is none).
+fn fz_renumber(dst, m, cap): i64 {
+    if (m == 0) { return m; }
+    var at = fz_u(m);
+    while (at < m) {
+        var c = load8(dst + at);
+        if ((c >= 48 && c <= 57) || c == 45) { break; }
+        at = at + 1;
+    }
+    if (at >= m) { return m; }
+    while (at > 0 && fz_numeric(load8(dst + at - 1)) == 1) { at = at - 1; }
+    var end = at;
+    while (end < m && fz_numeric(load8(dst + end)) == 1) { end = end + 1; }
+    var s = fz_number();
+    var sl = strlen(s);
+    if (m - (end - at) + sl > cap) { return m; }
+    fz_move(dst + at + sl, dst + end, m - end);
+    memcpy(dst + at, s, sl);
+    return m - (end - at) + sl;
+}
+
+# A mutated copy of the n bytes at src, at most cap bytes, into dst: its length.
+fn fz_mutate(src, n, dst, cap): i64 {
+    var m = n;
+    if (m > cap) { m = cap; }
+    memcpy(dst, src, m);
+    var rounds = 1 + fz_u(3);
+    for (var r = 0; r < rounds; r = r + 1) {
+        var k = fz_u(12);
+        if (k >= 8) {
+            # Replace a whole number with an extreme, keeping the document's shape: most of these read.
+            m = fz_renumber(dst, m, cap);
+            continue;
+        }
+        var at = 0;
+        if (m > 0) { at = fz_u(m); }
+        if (k == 0 && m > 0) {
+            store8(dst + at, fz_u(256));
+        } elif (k == 1 && m > 0) {
+            store8(dst + at, fz_special());
+        } elif (k == 2) {
+            m = at;
+        } elif (k == 3 && m > 0) {
+            # Cut a span.
+            var len = 1 + fz_u(16);
+            if (at + len > m) { len = m - at; }
+            fz_move(dst + at, dst + at + len, m - at - len);
+            m = m - len;
+        } elif (k == 4 && m > 0) {
+            # Repeat a span.
+            var len2 = 1 + fz_u(24);
+            if (at + len2 > m) { len2 = m - at; }
+            if (m + len2 <= cap) {
+                fz_move(dst + at + len2, dst + at, m - at);
+                m = m + len2;
+            }
+        } elif (k == 5) {
+            # Splice in a number.
+            var s = fz_number();
+            var sl = strlen(s);
+            if (m + sl <= cap) {
+                fz_move(dst + at + sl, dst + at, m - at);
+                memcpy(dst + at, s, sl);
+                m = m + sl;
+            }
+        } elif (k == 6) {
+            # Insert a few random bytes.
+            var cnt = 1 + fz_u(4);
+            if (m + cnt <= cap) {
+                fz_move(dst + at + cnt, dst + at, m - at);
+                for (var j = 0; j < cnt; j = j + 1) { store8(dst + at + j, fz_special()); }
+                m = m + cnt;
+            }
+        } else {
+            # Nest deep: 2,000 opening brackets, then the document.
+            var depth = 2000;
+            if (m + depth <= cap) {
+                fz_move(dst + depth, dst, m);
+                var open = 91;
+                if (fz_u(2) == 1) { open = 123; }
+                for (var d = 0; d < depth; d = d + 1) { store8(dst + d, open); }
+                m = m + depth;
+            }
+        }
+    }
+    return m;
+}
+
+# ── the targets ─────────────────────────────────────────────────────────────────────
+
+# One mutated document of type t (the seed's n bytes at seed), its invariant checked.
+fn fuzz_json_one(t, seed, n, buf, cap, v, w, iter) {
+    var m = fz_mutate(seed, n, buf, cap);
+    memset(v, 0, 1024);
+    var tag, code = fz_decode(t, buf, m, v);
+    if (is_err_result(tag) == 1) {
+        if (code != PV_ERR_DESERIALIZE && code != PV_ERR_OUT_OF_MEMORY) {
+            fz_fail(fz_name(t), iter, "a refusal's code");
+        }
+        return 0;
+    }
+    var sb = str_builder_new();
+    if (fz_encode(t, v, sb) != 0) { fz_fail(fz_name(t), iter, "to_json of an accepted document"); }
+    var s1 = str_builder_build(sb);
+    memset(w, 0, 1024);
+    var tag2, code2 = fz_decode(t, str_data(s1), str_len(s1), w);
+    if (is_err_result(tag2) == 1) { fz_fail(fz_name(t), iter, "the port's own text doesn't read back"); }
+    var sb2 = str_builder_new();
+    if (fz_encode(t, w, sb2) != 0) { fz_fail(fz_name(t), iter, "to_json of the read-back value"); }
+    var s2 = str_builder_build(sb2);
+    if (str_len(s1) != str_len(s2) || memeq(str_data(s1), str_data(s2), str_len(s1)) == 0) {
+        fz_fail(fz_name(t), iter, "the text changes on a second round trip");
+    }
+    if (fz_step(t, v) == 0) { fz_fail(fz_name(t), iter, "a step's Err code"); }
+    fz_drop(t, v);
+    fz_drop(t, w);
+    return 1;
+}
+
+# Every type's reader on `per` mutated documents: the number accepted.
+fn fuzz_json(per): i64 {
+    var cap = 65536;
+    var buf = alloc(cap);
+    var v = alloc(1024);
+    var w = alloc(1024);
+    var nw[8];
+    var accepted = 0;
+    for (var t = 0; t < _FZ_TYPES; t = t + 1) {
+        memset(v, 0, 1024);
+        var seed = fz_seed(t, v, &nw);
+        if (seed == 0) { fz_fail(fz_name(t), 0, "no seed document"); }
+        var n = load64(&nw);
+        for (var i = 0; i < per; i = i + 1) { accepted = accepted + fuzz_json_one(t, seed, n, buf, cap, v, w, i); }
+    }
+    return accepted;
+}
+
+# A PRAVASH_LOG string into buf (at most cap bytes): its length.
+fn fz_filter(buf, cap): i64 {
+    var parts = 1 + fz_u(5);
+    var n = 0;
+    for (var p = 0; p < parts; p = p + 1) {
+        var piece = "";
+        var k = fz_u(14);
+        if (k == 0) { piece = "pravash"; }
+        if (k == 1) { piece = "pravash::sph"; }
+        if (k == 2) { piece = "pravash::grid::step"; }
+        if (k == 3) { piece = "="; }
+        if (k == 4) { piece = ","; }
+        if (k == 5) { piece = "trace"; }
+        if (k == 6) { piece = "WARN"; }
+        if (k == 7) { piece = "off"; }
+        if (k == 8) { piece = "[span{field=1}]"; }
+        if (k == 9) { piece = " "; }
+        if (k == 10) { piece = "{"; }
+        if (k == 11) { piece = "=debug"; }
+        var pl = strlen(piece);
+        if (k == 12) {
+            # A two-byte UTF-8 letter (e acute).
+            if (n + 2 > cap) { return n; }
+            store8(buf + n, 0xC3);
+            store8(buf + n + 1, 0xA9);
+            n = n + 2;
+        } elif (k == 13) {
+            pl = 1 + fz_u(6);
+            if (n + pl > cap) { return n; }
+            for (var j = 0; j < pl; j = j + 1) { store8(buf + n + j, 1 + fz_u(255)); }
+            n = n + pl;
+        } else {
+            if (n + pl > cap) { return n; }
+            memcpy(buf + n, piece, pl);
+            n = n + pl;
+        }
+    }
+    return n;
+}
+
+# The filter parser on `count` strings: the number the strict parse accepted.
+fn fuzz_filter(count): i64 {
+    var buf[512];
+    var a[64];
+    var b[64];
+    var strict_ok = 0;
+    for (var i = 0; i < count; i = i + 1) {
+        var n = fz_filter(&buf, 512);
+        var r1 = _pv_log_parse(&buf, n, 1, &a);
+        if (r1 != 0 && r1 != 1) { fz_fail("PRAVASH_LOG", i, "the strict parse's result"); }
+        if (r1 == 1) {
+            strict_ok = strict_ok + 1;
+            var r2 = _pv_log_parse(&buf, n, 1, &b);
+            if (r2 != 1 || memeq(&a, &b, 64) == 0) { fz_fail("PRAVASH_LOG", i, "the same text, other levels"); }
+        }
+        if (_pv_log_parse(&buf, n, 0, &a) != 1) { fz_fail("PRAVASH_LOG", i, "the lenient parse refused"); }
+        for (var t = 0; t < _PV_LOG_TARGETS; t = t + 1) {
+            var lv = load64(&a + t * 8);
+            if (lv < 0 || lv > 5) { fz_fail("PRAVASH_LOG", i, "a level outside 0 ... 5"); }
+        }
+    }
+    return strict_ok;
+}
+
+# Runs the targets.
 fn main() {
     alloc_init();
-    fuzz_main("test", 4);
-    println("fuzz: ok");
+    var quiet = sakshi_set_level(SK_ERROR);
+    var accepted = fuzz_json(600);
+    var strict = fuzz_filter(40000);
+    print("fuzz: ok (json: 22 types x 600 documents, ", 43);
+    print_num(accepted);
+    print(" accepted; PRAVASH_LOG: 40000 strings, ", 39);
+    print_num(strict);
+    println(" strict parses)");
     return 0;
 }
 

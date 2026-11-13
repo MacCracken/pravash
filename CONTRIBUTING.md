@@ -3,9 +3,11 @@
 Thank you for considering a contribution! This document covers the development
 workflow, coding standards, and review process.
 
-pravash is being ported from Rust to Cyrius. The plan of record is
-[`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md). The Rust 1.3.0 crate in
-`rust-old/` is the frozen parity oracle: don't change it.
+pravash 2.0 is a Cyrius library, the port of the Rust crate 1.3.0. The plan of record is
+[`docs/development/pravash-port-plan.md`](docs/development/pravash-port-plan.md), and
+[`docs/guides/getting-started.md`](docs/guides/getting-started.md) is the guide to working on it. The Rust 1.3.0 crate
+in `rust-old/` is the frozen parity oracle: don't change it. Its toolchain, rustc 1.99.1, is pinned by the root
+`rust-toolchain.toml`.
 
 ## Development Setup
 
