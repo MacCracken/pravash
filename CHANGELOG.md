@@ -28,6 +28,8 @@
     row's class, inputs and outputs are unchanged.
 - **CLAUDE.md, the README, CONTRIBUTING, SECURITY and the guides** drop the Rust commands. The record documents (the
   port plan, port parity, the benchmarks, the Rust-test ledger) are marked frozen at 2.0.0.
+- **The roadmap** holds only planned work. 2.0.x is a P(-1) pass and the audits' remaining findings. 2.1.x is the
+  consumers and the JSON rows pending on bayan. From 2.2.x the stand-ins convert as their libraries ship.
 
 ## [2.0.0] - 2026-11-13
 
