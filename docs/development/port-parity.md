@@ -2225,3 +2225,55 @@ It covers 58,405 rows with 0 failures.
   refusal rows and tests provoke them on purpose. Rust's tests run with no subscriber and print none. So parity
   and the common, coupling, grid and sph tests set sakshi to ERROR at their start. The trace rows set their own
   level and restore it.
+
+## 29. M8 part a: the Rust-test ledger (2026-11-12)
+
+**`scripts/rust_test_ledger.py`** writes [`rust-test-ledger.md`](rust-test-ledger.md), and its `--check` runs in CI.
+It is impetus's ledger, adapted. It lists every `#[test]` in `rust-old/src/**.rs` and `rust-old/tests/*.rs`, and every
+Rust code fence in a doc comment, and needs each one to be either:
+- **ported**: a `test_group` of the same name in the Cyrius file mapped to its Rust file (a doc fence, by its entry:
+  the fence's file and line, and its `doc_*` group);
+- **recorded**: a reason, per test or for a whole file.
+
+It also fails:
+- a test with neither;
+- a Rust file with tests and no mapping;
+- a reason for a test that is ported or doesn't exist;
+- a doc fence with no entry, or an entry naming no fence;
+- a group defined twice;
+- a test function that holds a group and that nothing in its file calls, which impetus's ledger can't see. The
+  check matters here: `tests/sph.tcyr` reaches 10 of its test functions only through other test functions.
+
+**The count.**
+- 351 unit tests and 33 integration tests, each ported under its own name.
+- The 14 tests of the `oracle` hooks, n/a: they test the hooks this port added to the frozen crate, not 1.3.0's API.
+- 7 doc tests. Rust marks every fence `ignore`, because each sketches a consumer's code and doesn't compile; the port
+  writes each against the API and runs it:
+  - `compute.rs`: a backend that supports everything, a backend whose density shader is a poly6 sum over the packed
+    buffers, an FNO corrector applied through `dyn`, and the autodiff gradient of r² (exactly 1 at r = 0.5);
+  - `logging.rs`: the profiling guard over three shallow-water steps. Its drop flushes all three steps' end entries
+    and the closing `]`;
+  - `sph.rs`: a solver step of a block, and an Arrhenius `ReactionProvider` (kimiya's, here written with the
+    activation temperature Ea/R, so no gas constant is typed) applied through `update_reaction`.
+
+  That adds 17 checks: compute 83 → 97, sph 192 → 195, logging 48 → 51.
+- No unit or integration test is `#[ignore]`d in 1.3.0. `rust-old/src/lib.rs` doesn't take the README as the crate's
+  docs, so the README's example is not a doc test. It is part c's, with the docs' examples.
+
+**Total:** 405 tests, 391 ported, 14 n/a, 0 deferred. No test was folded into golden rows instead of being ported.
+
+**Mutations of the ledger** (a scratch copy per mutation, `--check` expected to fail): 17 of 17 caught.
+- a ported group renamed, or present only in another module's file;
+- a group defined twice (a Rust name, and a Cyrius-only one);
+- a test function's call removed (two files);
+- a doc fence's entry wrong, a doc group missing, a new doc fence;
+- the README taken as the crate's docs;
+- a Rust file unmapped, a new Rust test, the oracle file's reason dropped;
+- a reason for a ported test or for no test;
+- the generated document edited.
+
+The first run of the mutations missed the duplicate case: the script only flagged a duplicate of a Rust test name,
+and the mutation duplicated a name no Rust test has. Any group defined twice in a file now fails.
+
+**A correction to the plan.** M8's row named 23 Rust benchmarks. `rust-old/benches/benchmarks.rs` registers 21
+criterion groups, which give 57 rows, as `rust-old/bench-history.csv` records. Part b covers those 21.

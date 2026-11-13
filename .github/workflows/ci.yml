@@ -64,6 +64,9 @@ jobs:
       - name: Surface parity (every public Rust item of the ported modules has its Cyrius counterpart)
         run: python3 -I -B scripts/surface_parity.py .
 
+      - name: Rust-test ledger (every Rust test ported to a same-named group, or recorded with its reason)
+        run: python3 -I -B scripts/rust_test_ledger.py . --check
+
   rust-oracle:
     # The frozen Rust 1.3.0 crate in rust-old/ is the parity oracle. It is
     # never edited; this job only proves it still builds and passes, with and

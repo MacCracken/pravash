@@ -11,7 +11,11 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M7 complete** (2026-11-12); M8 (release 2.0.0) is next. Part b ported `ai.rs` (`src/ai.cyr`, Rust's
+> ⏳ **Status: M8 (release 2.0.0) in progress.** Part a (2026-11-12) wrote the Rust-test ledger
+> (`scripts/rust_test_ledger.py`, gated in CI). All 405 Rust tests are accounted for: 391 are ported to same-named
+> Cyrius groups, among them Rust's 7 `ignore`d doc examples, written against the API and run. The 14 oracle-hook
+> tests are n/a (port-parity §29). Parts b–d follow: the benchmark record, the docs and the surface diff, then the
+> release. M7 is complete (2026-11-12). Part b ported `ai.rs` (`src/ai.cyr`, Rust's
 > Debug through a table generated from rustc's core) and `logging.rs` (`src/logging.cyr`: tracing on sakshi, the
 > PRAVASH_LOG filter as EnvFilter decides it, the Trace Event writer of L11), with every Rust span and warning across
 > the modules: 830 rows in two new golden modules, 152 of them traces recorded from the oracle, all matching on the
@@ -679,7 +683,7 @@ Large milestones go in parts, each part gated (CLAUDE.md's task sizing).
 | **M5 SPH solvers** (parts per step variant, then parallel) | sph, sph_pcisph, sph_dfsph, sph_multiphase | `SphSolver`: WCSPH with symplectic Euler or velocity Verlet (`reset_integrator`); PCISPH (at least one iteration, compression only); DFSPH (Bender & Koschier's order, κ/ρ); multiphase (one colour field per phase); phase change; secondary particles (foam, spray, bubbles). The last part covers the three parallel SPH loops on `src/par.cyr`, then the D3 switch to f64 keys, with the rows remapped | step corpus: a hydrostatic tank, a dam break, a droplet, a two-phase layer, each run through every solver variant; class S at frames {1, 2, 10, 60, 300}; class R from the 79 tests and the SPH integration tests; every row at each thread count |
 | **M6 Coupling and MPM** | coupling, mpm | `FlipSolver`: the FLIP/APIC ratio, mass-weighted P2G, projection, `apic_c` auto-resize, `particle_level_set`. Rigid-body coupling: `BodyShape`, quadratic drag, added mass, nearby particles through the neighbour hash. `MpmSolver`: each `ConstitutiveModel` (fluid, elastic, Drucker–Prager in degrees), `validate`, the det(F) clamp, separating walls. Hand codecs for `BodyShape` and `ConstitutiveModel` (data-carrying), derived JSON for `RigidBody` | FLIP: a sloshing tank and a falling block; coupling: a sphere and a box in a flow; MPM: an elastic block, a sand column and a fluid column; the refusals |
 | **M7 Compute, logging and ai** | compute, logging, ai | `ComputeOp`; `PackedParticles` with f32 packing (probe 3); `KernelDerivatives`, including `autodiff_gradient` on hisab's tape with a closure; JSON for the three kernel-parameter types. logging: the sakshi init (and the Chrome-trace check, §1.1). ai: `PvDaimonConfig` and `PvHooshConfig` with their defaults (`http://localhost:8090`, `http://localhost:8088`), their JSON, and a debug print that redacts the API key | packing round trips; derivatives against the oracle (class C) and against finite differences (class R); config defaults and JSON (class A); the redaction |
-| **M8 Release 2.0.0** | all | The Rust-test ledger: each of the 351 unit tests, 33 integration tests and 7 ignored doc tests is ported, folded into golden rows, or marked n/a with a reason. The full surface-parity diff. `docs/benchmarks-rust-v-cyrius.md` with the 23 Rust benchmarks in both columns, plus thread-count rows. The README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' code examples compiled and run. VERSION 2.0.0 | the full corpus green on x86_64 ELF, x86_64 PE and aarch64 |
+| **M8 Release 2.0.0** | all | The Rust-test ledger: each of the 351 unit tests, 33 integration tests and 7 ignored doc tests is ported, folded into golden rows, or marked n/a with a reason. The full surface-parity diff. `docs/benchmarks-rust-v-cyrius.md` with Rust's 21 criterion groups (57 rows; first written as 23, corrected at M8 part a from `rust-old/benches/benchmarks.rs` and `bench-history.csv`) in both columns, plus thread-count rows. The README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' code examples compiled and run. VERSION 2.0.0 | the full corpus green on x86_64 ELF, x86_64 PE and aarch64 |
 
 Order: M0 → M1 → … → M8.
 - Shallow water is self-contained (no hisab, no f32, no particles), so it is the cheapest place to build the
@@ -993,4 +997,6 @@ port-parity §24 (part a): `src/coupling.cyr`; ADR 0002 #23 (the payload enum `P
 port-parity §27 (part a): `src/compute.cyr`, `src/compute_ad.cyr`; ADR 0002 #26 (`PvF32Column`, the gravity fields, the traits' status words, the autodiff outside the bundle); ledger L15 (the f32 reads); the mutation tests found two gaps in the port (the op names, a midpoint ending in 0) and one in the transcription (pow's sweep order), closed by a test, two rows and a sixth catalogue function.
 
 **Next:** M8, release 2.0.0 |
-| M8 Release 2.0.0 | — | — | — | — | |
+| M8 Release 2.0.0 | part a ✅ 2026-11-12 | no new rows | part a: the Rust-test ledger, `scripts/rust_test_ledger.py --check` in CI ([`rust-test-ledger.md`](rust-test-ledger.md)). All 405 Rust tests accounted for: 351 unit, 33 integration and the 7 `ignore`d doc tests ported (the doc examples written against the API and run: two backends, an FNO corrector, the autodiff of r², the profiling guard, a solver step, an Arrhenius `ReactionProvider`; 17 more checks); the 14 oracle-hook tests n/a. Its 17 mutations all caught | part a: no library code changed | port-parity §29 (part a): the ledger also fails a duplicated group and a test function nothing calls; the plan's 23 Rust benchmarks corrected to 21 criterion groups (57 rows).
+
+**Next:** M8 part b, the benchmark record |

@@ -25,7 +25,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
 | M5 SPH solvers | ✅ **done 2026-11-12.** Part e: the solver's thread count (`set_threads`; Rust's three `parallel` loops on the pool, every step row at 2, 3, 4 and 8 threads giving the serial bits; ADR 0002 #4) and the D3 switch to f64 neighbour keys (hisab 3.4.1's cell, integer neighbour cells; 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription; ADR 0002 #2). Part d ✅ 2026-11-12: `src/sph_multiphase.cyr`, the multiphase step with `PvPhaseProperties` and `PvMultiPhaseConfig`; 26 rows, the first 25 bit-exact on the first replay and the 26th closing the mutation tests' one gap; the last 5 Rust tests of `sph.rs`; ADR 0002 #22. Part c ✅ 2026-11-12: `src/sph_dfsph.cyr`, the DFSPH step; 35 rows, bit-exact on the first replay; 6 Rust tests; ADR 0002 #21. Part b ✅ 2026-11-12: `src/sph_pcisph.cyr`, the PCISPH step; 37 rows, bit-exact on the first replay; 4 Rust tests; ADR 0002 #20. Part a ✅ 2026-11-12: `src/sph.cyr`, `PvSphSolver` and its WCSPH step (Euler and Verlet, CSF surface tension, the f32 lists of M4 part b) and `adaptive_dt`; 66 rows, every one bit-exact on the first replay; 19 Rust tests and 5 integration tests; ADR 0002 #19. |
 | M6 Coupling and MPM | ✅ **done 2026-11-12.** Part a ✅ 2026-11-12: `src/coupling.cyr`, the rigid bodies (`PvBodyShape` / `PvShape`, `PvRigidBody`, the two-way coupling, integration with and without added mass, both drags, the particle level set; JSON for `BodyShape` and `RigidBody`). `drag_from_particles_indexed` takes the caller's cells-only `PvNeighborGrid` (`PvNeighborGrid_build`, f64 keys; ADR 0002 #23). A new golden module, `coupling.tsv`: 4,798 rows, every one bit-exact on the first replay but an indexed drag at 10⁶, which `coupling.d3.tsv` maps (ADR 2); 22 of the 33 Rust tests. Part b ✅ 2026-11-12: `src/flip.cyr`, the `FlipSolver` (P2G, the projection, FLIP/PIC and APIC G2P, the APIC resize; ADR 0002 #24): 245 rows, every one bit-exact on the first replay, among them 210 class S trajectories and scenarios; all 33 Rust tests of `coupling.rs` and all 33 integration tests. Part c ✅ 2026-11-12: `src/mpm.cyr` (`PvConstitutiveModel` / `PvConstitutiveLaw` and its JSON, `PvMat2`, `PvMpmParticle`, `PvMpmSolver`; the 2 × 2 SVD and Drucker–Prager on the correctly rounded primitives; ADR 0002 #25): a new golden module, `mpm.tsv`, 1,336 rows, 1,319 bit-exact against the oracle and 17 against the corrected oracle `mpm.cr.tsv` where glibc misrounds; all 13 Rust tests |
 | M7 Compute, logging and ai | ✅ **done 2026-11-12.** Part b ✅ 2026-11-12: `src/ai.cyr` (`PvDaimonConfig`, `PvHooshConfig`: the defaults, the setters with their ownership bits, JSON, Rust's `{:?}` and `{:#?}` with the key redacted, `<str as Debug>`'s escapes from `src/str_debug_data.cyr`, generated from rustc 1.99.1's core; ADR 0002 #27) and `src/logging.cyr` (the three inits, the PRAVASH_LOG filter as tracing-subscriber's EnvFilter decides it, and the Trace Event file through a sakshi hook, ledger L11; ADR 0002 #28), with every one of Rust's 60 spans and 12 warnings at its point in every module. Two new golden modules, `ai.tsv` 579 rows and `logging.tsv` 251 (99 filter rows, 152 trace rows over 37 calls), all matching on the first replay; the instrumentation changed no other row; all 3 Rust tests. Part a ✅ 2026-11-12: `src/compute.cyr` (`PvF32Column`, `PvPackedParticles` and its packing, the three kernel-parameter records and their JSON, `PvComputeOp`, the traits `PvComputeBackend` and `PvNeuralCorrector`, the `KernelDerivatives` functions) and `src/compute_ad.cyr` (`autodiff_gradient` on hisab's tape, outside the bundle; ADR 0002 #26); the f32 JSON reads as serde_json's `float_roundtrip` (ledger L15). A new golden module, `compute.tsv`: 1,228 rows, every one matching on the first replay but three f32 reads, which the stand-in fixed; all 11 Rust tests |
-| M8 Release 2.0.0 | next |
+| M8 Release 2.0.0 | in progress. Part a ✅ 2026-11-12: the Rust-test ledger (`scripts/rust_test_ledger.py`, gated in CI; [`rust-test-ledger.md`](rust-test-ledger.md)): all 405 Rust tests accounted for, 391 ported and 14 n/a (the oracle hooks' own); Rust's 7 `ignore`d doc examples written against the API and run as `doc_*` groups |
 
 ## Toolchain
 
@@ -71,7 +71,7 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
     - `tests/par.tcyr` (Cyrius-only): the worker pool, the grid's thread count and the solver's (50 checks);
     - `tests/sph.tcyr`: all 79 of `sph.rs`, and ten Cyrius-only groups (the merge sort, the lists against a
       brute-force search, at 10⁶ and 10¹², and at saturated keys, the grid's and the solver's layouts, part c's
-      no-panic paths, `reset_integrator`): 192 checks;
+      no-panic paths, `reset_integrator`), and Rust's two `ignore`d doc examples, run (M8 part a): 195 checks;
     - `tests/coupling.tcyr`: all 33 of `coupling.rs`, and nine Cyrius-only groups (the layouts, the grid's
       cell-size rule, the block walk, the indexed drag against the brute force at 10⁶ and 10¹², the level set's
       refusals, the FLIP solver's construction, APIC resizing, divergence path and flat heap): 106 checks;
@@ -79,14 +79,18 @@ Plan of record: [`pravash-port-plan.md`](pravash-port-plan.md).
       changed, the det(F) clamp, the flat heap): 42 checks;
     - `tests/compute.tcyr`: all 11 of `compute.rs`, and seven Cyrius-only groups (the layouts, f32 rounding, the op
       names, a backend through `dyn`, autodiff against analytical gradients and on a growing tape, finite differences,
-      the L15 f32 reads): 83 checks;
+      the L15 f32 reads), and Rust's four `ignore`d doc examples, run (M8 part a): 97 checks;
     - `tests/ai.tcyr`: both of `ai.rs`, and Cyrius-only groups (the layouts, ownership, the escape table's edges,
       every malformed UTF-8 form, both Debug shapes, the JSON text checks): 42 checks;
     - `tests/logging.tcyr`: the 1 of `logging.rs`, and Cyrius-only groups (the span and event texts through a sakshi
-      hook, the level gates, a full 16-deep stack, the parser's corners, the trace file): 48 checks;
+      hook, the level gates, a full 16-deep stack, the parser's corners, the trace file), and Rust's `ignore`d doc
+      example of `init_profiling`, run (M8 part a): 51 checks;
     - `tests/integration.tcyr`: all 33 of `rust-old/tests/integration.rs` (79 checks).
   - `scripts/surface_parity.py`: error, common, buoyancy, vortex, bridge, shallow, grid, vof, phase_field, sph,
     coupling, mpm, compute, ai and logging, 461 items ok (0 pending), 0 missing.
+  - `scripts/rust_test_ledger.py --check` ([`rust-test-ledger.md`](rust-test-ledger.md), M8 part a): all 405 Rust
+    tests accounted for. 391 are ported to same-named groups (351 unit, 33 integration, and the 7 `ignore`d doc
+    tests written against the API and run). The 14 oracle-hook tests are n/a.
   - The scaffold's `tests/pravash.{tcyr,fcyr}` stubs.
 - **Golden corpus** (`tests/golden/`): ai 579, bridge 3,964, buoyancy 1,716, common 3,683, compute 1,228, constants 35, coupling 5,043 (210 class S), grid 1,120 (511 class
   S step rows), json 302, logging 251, math 34,049, mpm 1,336 (192 class S), phase_field 160 (75 class S), shallow 888 (142 class S step rows), sph 1,534 (190 class S), vof
@@ -214,11 +218,8 @@ Direct (declared in `cyrius.cyml`):
 
 ## Next
 
-M8, release 2.0.0 (the port plan's M8 row). It covers four things:
-- the Rust-test ledger, which accounts for each of the 351 unit, 33 integration and 7 ignored doc tests;
-- the full surface-parity diff;
-- the 23 Rust benchmarks in both columns, with thread-count rows;
-- the README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section, the docs' examples compiled and run,
-  and VERSION 2.0.0.
-
-The release gate is the full corpus green on x86_64 ELF, x86_64 PE and aarch64.
+M8 part b: the benchmark record. All 21 of Rust's criterion groups (57 rows) get both columns in
+[`../benchmarks-rust-v-cyrius.md`](../benchmarks-rust-v-cyrius.md), plus the thread-count rows. After it:
+- part c: the full surface-parity diff, the README, `docs/guides/migration-2.0.md`, the CHANGELOG's Breaking section,
+  and the docs' examples compiled and run;
+- part d: VERSION 2.0.0 and the release gate (the full corpus green on x86_64 ELF, x86_64 PE and aarch64).

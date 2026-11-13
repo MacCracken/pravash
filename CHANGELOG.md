@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **The Rust-test ledger** (M8 part a): `scripts/rust_test_ledger.py` writes
+  [`docs/development/rust-test-ledger.md`](docs/development/rust-test-ledger.md), and its `--check` runs in CI. Every
+  test of the frozen 1.3.0 crate is ported to a Cyrius test group of the same name, or recorded with its reason.
+  - **405 tests:** 391 ported (351 unit, 33 integration, 7 doc) and 14 n/a (the `oracle` hooks' own tests).
+  - **Rust's 7 doc examples** are `ignore`d fences that don't compile. Each is now a runnable `doc_*` group written
+    against the 2.0 API:
+    - `compute.rs`: two `PvComputeBackend`s, an FNO `PvNeuralCorrector` and the autodiff gradient of r²;
+    - `logging.rs`: the profiling guard;
+    - `sph.rs`: a solver step, and an Arrhenius `PvReactionProvider`.
+
+    They add 17 checks: compute 97, sph 195, logging 51.
+  - **What it rejects:** a test with no port and no reason, a stale reason, a doc fence with no entry, a group
+    defined twice, and a test function nothing calls (a group that would never run). 17 mutations, all caught.
+  - CLAUDE.md's cleanliness check gains the gate.
+
+### Added (Cyrius)
 - **ai** (M7 part b): `src/ai.cyr`, the `ai.rs` surface. ADR 0002 #27.
   - **`PvDaimonConfig` and `PvHooshConfig`** hold each string as bytes and a length, where a 0 API key is Rust's
     `None`. Ownership bits say which strings the record copied.

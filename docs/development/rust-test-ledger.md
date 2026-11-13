@@ -1,0 +1,59 @@
+# Rust-test ledger
+
+> **Generated** by `python3 -I -B scripts/rust_test_ledger.py .`; `--check` gates it in CI (port plan M8,
+> after impetus's ledger). Every test of the frozen Rust oracle (`rust-old/`, pravash 1.3.0 with the `oracle`
+> hooks) is ported to a Cyrius test group of the same name, or recorded here with its reason. The golden corpus
+> (`tests/golden/`) checks every ported function on its grid besides; this ledger is about the oracle's own
+> assertions.
+
+**405 Rust tests** (351 unit, 33 integration, 14 of the oracle hooks, 7 doc tests):
+391 ported, 14 not applicable, 0 deferred.
+
+| Rust file | Cyrius tests | Rust tests | Ported | N/A | Deferred |
+|---|---|---:|---:|---:|---:|
+| `src/ai.rs` | `tests/ai.tcyr` | 2 | 2 | 0 | 0 |
+| `src/bridge.rs` | `tests/bridge.tcyr` | 17 | 17 | 0 | 0 |
+| `src/buoyancy.rs` | `tests/buoyancy.tcyr` | 16 | 16 | 0 | 0 |
+| `src/common.rs` | `tests/common.tcyr` | 49 | 49 | 0 | 0 |
+| `src/compute.rs` | `tests/compute.tcyr` | 11 | 11 | 0 | 0 |
+| `src/coupling.rs` | `tests/coupling.tcyr` | 33 | 33 | 0 | 0 |
+| `src/error.rs` | `tests/error.tcyr` | 6 | 6 | 0 | 0 |
+| `src/grid.rs` | `tests/grid.tcyr` | 49 | 49 | 0 | 0 |
+| `src/logging.rs` | `tests/logging.tcyr` | 1 | 1 | 0 | 0 |
+| `src/mpm.rs` | `tests/mpm.tcyr` | 13 | 13 | 0 | 0 |
+| `src/phase_field.rs` | `tests/phase_field.tcyr` | 11 | 11 | 0 | 0 |
+| `src/shallow.rs` | `tests/shallow.tcyr` | 44 | 44 | 0 | 0 |
+| `src/sph.rs` | `tests/sph.tcyr` | 79 | 79 | 0 | 0 |
+| `src/vof.rs` | `tests/vof.tcyr` | 8 | 8 | 0 | 0 |
+| `src/vortex.rs` | `tests/vortex.tcyr` | 12 | 12 | 0 | 0 |
+| `tests/integration.rs` | `tests/integration.tcyr` | 33 | 33 | 0 | 0 |
+| `tests/oracle.rs` | — | 14 | 0 | 14 | 0 |
+| doc tests | `tests/compute.tcyr`<br>`tests/logging.tcyr`<br>`tests/sph.tcyr` | 7 | 7 | 0 | 0 |
+| **Total** | | **405** | **391** | **14** | **0** |
+
+## Doc tests
+
+Rust's doc comments hold seven code fences, all marked `ignore`: each sketches a consumer's code (a GPU
+backend, a learned corrector, a chemistry provider) and doesn't compile, so rustdoc lists them as ignored. The
+port writes each against the 2.0 API and runs it. `rust-old/src/lib.rs` doesn't take `README.md` as the
+crate's docs, so the README's examples aren't doc tests.
+
+| Rust fence | What it shows | Cyrius test |
+|---|---|---|
+| `rust-old/src/compute.rs:12` (`ignore`) | the module doc's GPU backend | `tests/compute.tcyr`, `doc_compute_module_backend` |
+| `rust-old/src/compute.rs:217` (`ignore`) | `ComputeBackend`: compiled shaders, upload, dispatch, read back | `tests/compute.tcyr`, `doc_compute_backend` |
+| `rust-old/src/compute.rs:275` (`ignore`) | `NeuralCorrector`: an FNO corrector | `tests/compute.tcyr`, `doc_neural_corrector` |
+| `rust-old/src/compute.rs:364` (`ignore`) | `KernelDerivatives::autodiff_gradient` of r² | `tests/compute.tcyr`, `doc_autodiff_gradient` |
+| `rust-old/src/logging.rs:39` (`ignore`) | `init_profiling` and its guard | `tests/logging.tcyr`, `doc_init_profiling` |
+| `rust-old/src/sph.rs:12` (`ignore`) | the module doc's `SphSolver::step` | `tests/sph.tcyr`, `doc_sph_module` |
+| `rust-old/src/sph.rs:700` (`ignore`) | `ReactionProvider`: an Arrhenius reactor (kimiya's) | `tests/sph.tcyr`, `doc_reaction_provider` |
+
+## Rust's `#[ignore]`d tests
+
+None: pravash 1.3.0 ignores no unit or integration test.
+
+## Tests without a port
+
+| Rust file | Test | Status |
+|---|---|---|
+| `tests/oracle.rs` | all 14 | n/a: the tests of the `oracle` hooks added to the frozen crate for this port (port plan §4 step 0), not of pravash 1.3.0's API. `scripts/oracle/` drives the hooks, and the golden corpus checks what they dump |

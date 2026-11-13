@@ -2,6 +2,7 @@
 # event texts through a sakshi hook, the level gates (pravash's filter, and sakshi's level before any init), a full
 # span stack, the directive parser's corners, and the Trace Event file (ledger L11): written, read back, checked and
 # removed, under build/ (the trace goes to the working directory, as Rust's does).
+# Last, Rust's `ignore`d doc example of `init_profiling`, written against the API and run (M8 part a).
 
 include "tests/lib.cyr"
 
@@ -207,6 +208,38 @@ fn test_trace_file() {
     return 0;
 }
 
+# Rust's doc example in logging.rs (an `ignore`d fence there, run here): `let _guard = init_profiling();`, a
+# simulation, and the guard's drop, which flushes the trace file.
+fn test_doc() {
+    test_group("doc_init_profiling");
+    var m = sys_mkdir("build", 493);
+    assert_eq(sys_chdir("build"), 0, "in build/");
+    _pv_log_init_done = 0;
+    var guard: PvFlushGuard;
+    var started = logging_init_profiling(&guard);
+    var sw: PvShallowWater;
+    var st, sv = PvShallowWater_new(4, 4, 0.1, 1.0, &sw);
+    for (var k = 0; k < 3; k = k + 1) {
+        var s2, v2 = sw.step(0.001);
+    }
+    PvShallowWater_drop(&sw);
+    PvFlushGuard_drop(&guard);
+    var buf = fl_alloc(65536);
+    var n = file_read_all(_pv_trace_path(), buf, 65535);
+    var end = "\"name\":\"shallow::step\",\"ph\":\"E\"";
+    var el = strlen(end);
+    var steps = 0;
+    for (var i = 0; i + el <= n; i = i + 1) {
+        if (memeq(buf + i, end, el) == 1) { steps = steps + 1; }
+    }
+    assert(started == 1 && guard.active == 0, "the trace started, and the guard's drop closed it");
+    assert(steps == 3 && load8(buf + n - 1) == 93, "flushed: the three steps, and the closing `]`");
+    var del = sys_unlink(_pv_trace_path());
+    fl_free(buf);
+    var back = sys_chdir("..");
+    return 0;
+}
+
 # Runs the logging tests.
 fn main() {
     alloc_init();
@@ -214,6 +247,7 @@ fn main() {
     test_spans();
     test_filter();
     test_trace_file();
+    test_doc();
     return assert_summary();
 }
 

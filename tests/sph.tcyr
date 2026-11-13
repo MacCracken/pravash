@@ -9,6 +9,7 @@
 # Cyrius-only groups check what part b adds without an oracle: the merge sort's stability, the neighbour lists
 # against a brute-force search, and the record layout `_pv_nb_col` assumes. Three more check part c's no-panic paths
 # (ADR 0002 #8): the out-of-range reads, the refused sizes, and the state a diverging step leaves.
+# Last, Rust's two `ignore`d doc examples, written against the API and run (`doc_*`, M8 part a).
 #
 # Re-expressed for the Cyrius shapes (ADR 0002 #1, #8, #9): a particle slice is (pointer, count); a
 # `NonNewtonianViscosity` variant is a `PvNonNewtonianModel` made by its constructor, its method
@@ -1496,6 +1497,66 @@ fn test_layout() {
     return 0;
 }
 
+# ── Rust's doc examples: `ignore`d fences in sph.rs, written against the API and run here ──────────────────────────
+
+# The `ReactionProvider` doc's reactor, in kimiya's terms: an Arrhenius rate k = A·exp(−Ta/T) (Ta = Ea/R, the
+# activation temperature), the fuel consumed over dt, fuel·(1 − exp(−k·dt)), and the heat, consumed·ΔH.
+struct DocArrheniusReactor {
+    a: f64;
+    ta: f64;
+    delta_h: f64;
+}
+
+impl PvReactionProvider for DocArrheniusReactor {
+    # One particle's reaction.
+    fn react(self, temperature: f64, fuel: f64, dt: f64): PvReaction {
+        var x: f64 = -(self.ta / temperature);
+        var e: f64 = _pv_exp(x);
+        var rate: f64 = self.a * e;
+        var y: f64 = -(rate * dt);
+        var f: f64 = _pv_exp(y);
+        var r: PvReaction;
+        r.consumed = fuel * (1.0 - f);
+        r.heat = r.consumed * self.delta_h;
+        return r;
+    }
+}
+
+# Rust's doc examples in sph.rs, run.
+fn test_docs() {
+    test_group("doc_sph_module");
+    var cfg: PvFluidConfig = PvFluidConfig_water_2d();
+    var bp, bn = create_particle_block(0.2, 0.5, 0.3, 0.3, 0.02, 0.001);
+    var ps: *PvFluidParticle = _pv_as_particles(bp);
+    var solver: PvSphSolver = PvSphSolver_new();
+    var t, v = solver.step(ps, bn, &cfg, 0.001);
+    assert(is_ok(t) == 1 && bn > 0 && positions_finite(ps, bn) == 1, "a step of a block: Ok, every position finite");
+    PvSphSolver_drop(&solver);
+    fl_free(bp);
+
+    test_group("doc_reaction_provider");
+    var reactor: DocArrheniusReactor;
+    reactor.a = 1000.0;
+    reactor.ta = 2000.0;
+    reactor.delta_h = 500.0;
+    var p: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    p.fuel = 1.0;
+    p.temperature = 1000.0;
+    var cold: PvFluidParticle = PvFluidParticle_new_2d(0.0, 0.0, 1.0);
+    cold.fuel = 1.0;
+    cold.temperature = 300.0;
+    var want: PvReaction = reactor.react(1000.0, 1.0, 0.001);
+    update_reaction(&p, 1, &reactor, 0.001);
+    update_reaction(&cold, 1, &reactor, 0.001);
+    var left: f64 = 1.0 - want.consumed;
+    var hot: f64 = 1000.0 + want.heat;
+    assert(p.fuel == left && p.temperature == hot, "the reactor's fuel and heat applied through `dyn`");
+    var burnt_hot: f64 = 1.0 - p.fuel;
+    var burnt_cold: f64 = 1.0 - cold.fuel;
+    assert(want.consumed > 0.0 && burnt_cold < burnt_hot, "a cold particle burns slower");
+    return 0;
+}
+
 # Runs the ported SPH tests.
 fn main() {
     alloc_init();
@@ -1515,6 +1576,7 @@ fn main() {
     test_layout();
     test_part_c_paths();
     test_solver_layout();
+    test_docs();
     return assert_summary();
 }
 

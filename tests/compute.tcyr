@@ -4,7 +4,8 @@
 # file also includes src/compute_ad.cyr, which ships outside the `[lib]` bundle (hisab is test-scope here). Cyrius-only
 # groups follow: the layouts, f32 rounding to nearest even, a backend implemented and called through `dyn`, the
 # autodiff gradient against analytical gradients and on a tape it has to grow, the derivatives against finite
-# differences (class R), and the f32 JSON reads' stand-in (ledger L15).
+# differences (class R), and the f32 JSON reads' stand-in (ledger L15). Last, Rust's four `ignore`d doc examples,
+# written against the API and run (`doc_*`, M8 part a).
 
 include "tests/lib.cyr"
 include "src/compute_ad.cyr"
@@ -496,6 +497,231 @@ fn test_f32_reads() {
     return 0;
 }
 
+# ── Rust's doc examples: `ignore`d fences in compute.rs, written against the API and run here ────────────────────
+
+# The module doc's skeleton of a GPU backend (soorat's, say): every operation supported, and an SPH density that
+# uploads, dispatches a compute shader and reads back, all `Ok(())`.
+struct DocModuleBackend {
+    density_calls;
+}
+
+impl PvComputeBackend for DocModuleBackend {
+    # Every operation (the doc's `true`).
+    fn supports(self, op): i64 {
+        return 1;
+    }
+
+    # Upload, dispatch, read back: Ok.
+    fn sph_density(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        self.density_calls = self.density_calls + 1;
+        return PV_ERR_NONE;
+    }
+
+    # The doc's `// ...`: Ok.
+    fn sph_step(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        return PV_ERR_NONE;
+    }
+
+    # Ok.
+    fn grid_advect(self, dst, src, vx, vy, n, params: *PvGridKernelParams): i64 {
+        return PV_ERR_NONE;
+    }
+
+    # Ok.
+    fn shallow_step(self, height, vx, vy, ground, n, params: *PvShallowKernelParams): i64 {
+        return PV_ERR_NONE;
+    }
+}
+
+# The `ComputeBackend` doc's backend: `supports` checks the compiled shaders, and the density uploads
+# `position_mass` to a storage buffer, dispatches the density shader and reads `density_pressure` back. The device
+# here is the backend's own f32 buffer, and the shader the poly6 sum ρᵢ = Σⱼ mⱼ·W(|xᵢ − xⱼ|, h) over every pair.
+struct DocShaderBackend {
+    compiled;
+    storage: PvF32Column;
+}
+
+impl PvComputeBackend for DocShaderBackend {
+    # 1 when the op's shader is compiled (a bit per `PvComputeOp`).
+    fn supports(self, op): i64 {
+        return (self.compiled >> op) & 1;
+    }
+
+    # Upload, dispatch, read back.
+    fn sph_density(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        if (self.supports(PV_COMPUTE_OP_SPH_DENSITY) == 0) { return PV_ERR_INVALID_PARAMETER; }
+        var n = particles.count;
+        var src: *PvF32Column = _pv_packed_col(particles, 0);
+        if (self.storage.reserve(4 * n) == 0) { return PV_ERR_OUT_OF_MEMORY; }
+        self.storage.truncate(0);
+        for (var k = 0; k < 4 * n; k = k + 1) {
+            var v: f64 = src.at(k);
+            self.storage.push_rounded(v);
+        }
+        var hf: f32 = params.smoothing_radius;
+        var h: f64 = f32_to(hf);
+        var dp: *PvF32Column = _pv_packed_col(particles, 2);
+        for (var i = 0; i < n; i = i + 1) {
+            var rho: f64 = 0.0;
+            for (var j = 0; j < n; j = j + 1) {
+                var dx: f64 = self.storage.at(4 * i) - self.storage.at(4 * j);
+                var dy: f64 = self.storage.at(4 * i + 1) - self.storage.at(4 * j + 1);
+                var dz: f64 = self.storage.at(4 * i + 2) - self.storage.at(4 * j + 2);
+                var r2: f64 = (dx * dx + dy * dy) + dz * dz;
+                var r: f64 = f64_sqrt(r2);
+                var w: f64 = kernel_poly6(r, h);
+                var m: f64 = self.storage.at(4 * j + 3);
+                rho = rho + m * w;
+            }
+            var stored = dp.set(2 * i, rho);
+        }
+        return PV_ERR_NONE;
+    }
+
+    # Not compiled.
+    fn sph_step(self, particles: *PvPackedParticles, params: *PvSphKernelParams): i64 {
+        return PV_ERR_INVALID_PARAMETER;
+    }
+
+    # Not compiled.
+    fn grid_advect(self, dst, src, vx, vy, n, params: *PvGridKernelParams): i64 {
+        return PV_ERR_INVALID_PARAMETER;
+    }
+
+    # Not compiled.
+    fn shallow_step(self, height, vx, vy, ground, n, params: *PvShallowKernelParams): i64 {
+        return PV_ERR_INVALID_PARAMETER;
+    }
+}
+
+# The `NeuralCorrector` doc's FNO corrector: inference on the coarse state gives the velocity and pressure
+# corrections. Its model here is a fixed linear one: Δv = −damping·v, Δp = 0.
+struct DocFnoCorrector {
+    damping: f64;
+}
+
+impl PvNeuralCorrector for DocFnoCorrector {
+    # Runs the model and fills *out.
+    fn correct(self, velocities, nv, pressures, np, params: *PvGridKernelParams, out: *PvNeuralCorrection): i64 {
+        var dv: *PvF32Column = _pv_as_f32_column(_pv_addr(out));
+        var dp: *PvF32Column = _pv_as_f32_column(_pv_addr(out) + 24);
+        if (dv.reserve(nv) == 0 || dp.reserve(np) == 0) { return PV_ERR_OUT_OF_MEMORY; }
+        var vs: *f32 = _pv_as_f32s(velocities);
+        var k: f64 = self.damping;
+        for (var i = 0; i < nv; i = i + 1) {
+            var vf: f32 = vs[i];
+            var v: f64 = f32_to(vf);
+            var d: f64 = -(k * v);
+            dv.push_rounded(d);
+        }
+        for (var j = 0; j < np; j = j + 1) { dp.push_rounded(0.0); }
+        return PV_ERR_NONE;
+    }
+}
+
+# Runs a corrector through `dyn`, as a consumer's solver loop would.
+fn doc_run_corrector(c: dyn PvNeuralCorrector, v, nv, p, np, g: *PvGridKernelParams, out: *PvNeuralCorrection): i64 {
+    return c.correct(v, nv, p, np, g, out);
+}
+
+# The `autodiff_gradient` doc's function: r² from the input r.
+fn doc_r2(t, vars, n): i64 {
+    var r = load64(vars);
+    return ad_mul(t, r, r);
+}
+
+# Rust's doc examples in compute.rs, run.
+fn test_docs() {
+    test_group("doc_compute_module_backend");
+    var mb: DocModuleBackend;
+    mb.density_calls = 0;
+    var all = 1;
+    for (var op = PV_COMPUTE_OP_SPH_DENSITY; op <= PV_COMPUTE_OP_SHALLOW_STEP; op = op + 1) {
+        all = all & mb.supports(op);
+    }
+    var pb = particles(3, 0.1, 0.2, 0.0, 0.5);
+    var soa: PvParticleSoa;
+    soa_of(&soa, _pv_as_particles(pb), 3);
+    var pk: PvPackedParticles;
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var params: PvSphKernelParams = PvSphKernelParams_default();
+    var rc = run_density(&mb, &pk, &params);
+    assert(all == 1 && rc == PV_ERR_NONE && mb.density_calls == 1, "every op supported, the density Ok");
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(pb);
+
+    test_group("doc_compute_backend");
+    var two = fl_alloc(2 * sizeof(PvFluidParticle) + 8);
+    var ps: *PvFluidParticle = _pv_as_particles(two);
+    var p0: PvFluidParticle = PvFluidParticle_new(PvVec3_new(0.0, 0.0, 0.0), 0.5);
+    var p1: PvFluidParticle = PvFluidParticle_new(PvVec3_new(0.25, 0.0, 0.0), 0.5);
+    memcpy(ps, &p0, sizeof(PvFluidParticle));
+    memcpy(ps + 1, &p1, sizeof(PvFluidParticle));
+    soa_of(&soa, ps, 2);
+    assert_eq(PvPackedParticles_from_soa(&soa, &pk), 1, "packed");
+    var sb: DocShaderBackend;
+    memset(&sb, 0, sizeof(DocShaderBackend));
+    sb.compiled = 1 << PV_COMPUTE_OP_SPH_DENSITY;
+    params.smoothing_radius = 0.5;
+    var sup = sb.supports(PV_COMPUTE_OP_SPH_DENSITY) * 2 + sb.supports(PV_COMPUTE_OP_GRID_ADVECT);
+    assert_eq(sup, 2, "only the density shader is compiled");
+    assert_eq(run_density(&sb, &pk, &params), PV_ERR_NONE, "the density dispatched");
+    var w0: f64 = kernel_poly6(0.0, 0.5);
+    var w1: f64 = kernel_poly6(0.25, 0.5);
+    var want: f64 = 0.5 * w0 + 0.5 * w1;
+    var check: PvF32Column;
+    memset(&check, 0, sizeof(PvF32Column));
+    assert_eq(check.reserve(1), 1, "room");
+    check.push_rounded(want);
+    var want32: f64 = check.at(0);
+    var d0: f64 = pk.density_pressure.at(0);
+    var d1: f64 = pk.density_pressure.at(2);
+    assert(d0 == want32 && d1 == want32, "each density m·W(0) + m·W(0.25), read back as f32");
+    assert_eq(sb.sph_step(&pk, &params), PV_ERR_INVALID_PARAMETER, "a shader not compiled is an error");
+    check.drop();
+    sb.storage.drop();
+    PvPackedParticles_drop(&pk);
+    PvParticleSoa_drop(&soa);
+    fl_free(two);
+
+    test_group("doc_neural_corrector");
+    var vel: PvF32Column;
+    var pre: PvF32Column;
+    memset(&vel, 0, sizeof(PvF32Column));
+    memset(&pre, 0, sizeof(PvF32Column));
+    assert(vel.reserve(4) == 1 && pre.reserve(2) == 1, "room");
+    vel.push_rounded(1.0);
+    vel.push_rounded(-2.0);
+    vel.push_rounded(0.5);
+    vel.push_rounded(0.0);
+    pre.push_rounded(101325.0);
+    pre.push_rounded(101300.0);
+    var fno: DocFnoCorrector;
+    fno.damping = 0.25;
+    var gk: PvGridKernelParams = PvGridKernelParams_default();
+    var corr: PvNeuralCorrection;
+    memset(&corr, 0, sizeof(PvNeuralCorrection));
+    var cr = doc_run_corrector(&fno, vel.data, vel.len, pre.data, pre.len, &gk, &corr);
+    assert(cr == PV_ERR_NONE && corr.velocity_delta.len == 4 && corr.pressure_delta.len == 2, "a delta per value");
+    var a0: f64 = vel.at(0) + corr.velocity_delta.at(0);
+    var a1: f64 = vel.at(1) + corr.velocity_delta.at(1);
+    var q0: f64 = pre.at(0) + corr.pressure_delta.at(0);
+    assert(a0 == 0.75 && a1 == -1.5 && q0 == 101325.0, "added to the state: v·(1 − 0.25), p unchanged");
+    PvNeuralCorrection_drop(&corr);
+    vel.drop();
+    pre.drop();
+
+    test_group("doc_autodiff_gradient");
+    var x[8];
+    store64(&x, _pv_bits(0.5));
+    var gp, gn = PvKernelDerivatives_autodiff_gradient(&doc_r2, &x, 1);
+    var g: f64 = load64(gp);
+    assert(gn == 1 && g == 1.0, "d(r²)/dr at r = 0.5 is 1");
+    fl_free(gp);
+    return 0;
+}
+
 # Runs the ported compute tests.
 fn main() {
     alloc_init();
@@ -504,6 +730,7 @@ fn main() {
     test_cyrius();
     test_derivatives();
     test_f32_reads();
+    test_docs();
     return assert_summary();
 }
 
