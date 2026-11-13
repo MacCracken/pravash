@@ -3,6 +3,52 @@
 ## [Unreleased]
 
 ### Added (Cyrius)
+- **coupling** (M6 part b): `src/flip.cyr`, the `FlipSolver` of `coupling.rs`. ADR 0002 #24.
+  - **`PvFlipSolver`:** the public `flip_ratio`, `use_apic` and `narrow_band_cells` (reserved, unread as in Rust),
+    then the seven grid fields and the APIC matrices as solver-owned columns.
+    - `PvFlipSolver_new(nx, ny, dx, flip_ratio, out)` refuses what Rust refuses, in Rust's order, and returns
+      `PV_ERR_OUT_OF_MEMORY` where Rust's `vec!` aborts. `PvFlipSolver_drop` releases it.
+    - `grid_nx`, `grid_ny` and `grid_dx` are the accessors.
+  - **`s.step(ps, n, gravity, dt)`** runs Rust's step in Rust's order: mass-weighted P2G, gravity, the projection
+    (at most 40 warm-started Gauss–Seidel sweeps; the count is generated as `_PV_COUPLING_PRESSURE_ITERATIONS`), the
+    divergence check, FLIP/PIC or APIC G2P, then advection and the walls.
+    - The APIC matrices follow the particle count: truncated, grown with zeros, kept across FLIP steps.
+    - A step allocates nothing once they have grown.
+  - **Parity:** 245 rows on a new seed (5,043 coupling rows), every one bit-exact on the first replay. Most are class S
+    trajectories (`FlipSolver::step`) of the plan's sloshing tank and falling block, by PIC, FLIP 0.95, FLIP 1.0 and
+    APIC, to 300 steps. The rest:
+    - the Rust tests' scenes;
+    - the specials in every input and particle slot;
+    - 40 seeded scenes;
+    - 13 `FlipSolver::scenario` rows, whose segments change the blend, APIC and the particle count;
+    - the constructor's refusals.
+
+    Each row gives the particles and the solver's private state. validate.py transcribes the solver and recomputes
+    every row.
+  - **Tests:** all 33 of `coupling.rs` now (the FLIP solver's 11), and all 33 integration tests (the two FLIP ones).
+    Cyrius-only groups cover the layout, the refusals, APIC resizing, the divergence path and the flat heap:
+    `tests/coupling.tcyr` has 106 checks.
+  - **Mutations:** 25 of 27 port mutations fail rows on the first run, and all 7 of validate.py's are caught.
+    - One gap, closed by a row that draws no random numbers: a divergence check reading only vx. In every row a
+      non-finite vy reached vx through the pressure. The new row puts the only overflowing value on a corner node,
+      which no interior cell reads.
+    - A G2P that skips its own APIC resize is caught by the tests only. `step` resizes first, so no row can see it.
+
+### Performance
+- **The FLIP step** ([`docs/benchmarks-rust-v-cyrius.md`](docs/benchmarks-rust-v-cyrius.md), M6 part b; pinned,
+  against Rust's criterion `flip_step`): 4.1–4.2× Rust at 25 particles, 3.7–3.8× at 100, 3.5× at 225. The A/B, each
+  step bit-neutral:
+  - **One cell lookup per particle:** G2P samples its four fields from one cell and fraction instead of recomputing
+    them for each.
+  - **Written out:** the lookup's NaN-ignoring max and min, the sweeps' running maximum, and the divergence check's
+    finite test. Cyrius declines `#inline` for each of these.
+
+  Together: 1.46× (25 particles) to 1.6× (225) faster than the first version.
+- **`_pv_bits`** is now `#inline` (`src/mathx.cyr`): every f64 store through `store64` passes through it. That's
+  1.15–1.17× on the FLIP step and 5–7% on the shallow-water step. The grid step's change is within the shared box's
+  noise. The bits are the same: the whole corpus replays unchanged on three targets.
+
+### Added (Cyrius)
 - **coupling** (M6 part a): `src/coupling.cyr`, the rigid bodies of `coupling.rs`. The FLIP solver follows in part b.
   ADR 0002 #23.
   - **`BodyShape`** is the kind enum `PvBodyShape` and the payload struct `PvShape` (`PvShape_sphere(r)`,

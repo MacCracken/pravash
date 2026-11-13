@@ -11,10 +11,12 @@
 >
 > ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, once the oracle hooks are in and 1.3.0 is tagged (M0 step 0).
 >
-> ⏳ **Status: M6 part a done** (2026-11-12): the rigid bodies of `coupling.rs` (`src/coupling.cyr`), 4,798 rows in a new
+> ⏳ **Status: M6 part b done** (2026-11-12): the `FlipSolver` (`src/flip.cyr`), 245 rows, every one bit-exact on the
+> first replay, 300-step trajectories by PIC, FLIP and APIC included (ADR 0002 #24, port-parity §25). Part c, MPM,
+> is next. Part a ported the rigid bodies of `coupling.rs` (`src/coupling.cyr`), 4,798 rows in a new
 > golden module, every one bit-exact on the first replay but an indexed drag at 10⁶, which the f64-key oracle maps;
-> `drag_from_particles_indexed` takes a cells-only neighbour grid (ADR 0002 #23, port-parity §24). Part b, the
-> `FlipSolver`, is next. M5 is complete (2026-11-12). Part e put the solver's three `parallel`
+> `drag_from_particles_indexed` takes a cells-only neighbour grid (ADR 0002 #23, port-parity §24). M5 is complete
+> (2026-11-12). Part e put the solver's three `parallel`
 > loops on the worker pool (every step row gives the serial bits at 2–8 threads) and switched the neighbour keys to f64
 > (D3): 596 rows mapped by name to `math.d3.tsv` and `sph.d3.tsv`, all passing against validate.py's f64 transcription
 > (port-parity §23). Part d ported the multiphase step (`src/sph_multiphase.cyr`): 26 rows, the first 25 bit-exact on the first replay, and with
@@ -231,7 +233,7 @@ functions, so six things change.
 | M4 | `sph.rs`: kernels, equation of state, neighbour hash, free functions, configs | ≈ 900 | ≈ 30 | ≈ 35 | `src/sph_kernels.cyr`, `src/neighbor.cyr`, `src/sph_fns.cyr` | ganita `mat_inv` or a transcription for the MLS 3×3 inverse (§7.2) |
 | M5 | `sph.rs`: `SphSolver` and its four steps, phase change, secondary particles | ≈ 1,270 | ≈ 19 | ≈ 44 | `src/sph.cyr`, `src/sph_pcisph.cyr`, `src/sph_dfsph.cyr`, `src/sph_multiphase.cyr` | — |
 | M5 | `parallel` in `sph.rs` (`par_iter_mut`, 2 `into_par_iter` maps) | — | — | — | `src/par.cyr` | `thread.cyr` |
-| M6 | `coupling.rs` | 590 | 19 | 33 | `src/coupling.cyr` | the M4 neighbour hash |
+| M6 | `coupling.rs` | 590 | 19 | 33 | `src/coupling.cyr` (the rigid bodies), `src/flip.cyr` (the `FlipSolver`) | the M4 neighbour hash |
 | M6 | `mpm.rs` | 424 | 6 | 13 | `src/mpm.cyr` | — |
 | M7 | `compute.rs` | 201 | 9 | 11 | `src/compute.cyr` | hisab `ad_tape_*` for `autodiff_gradient` (not per-step) |
 | M7 | `logging.rs` | 20 | 3 | 1 | `src/logging.cyr` | sakshi |
@@ -971,8 +973,9 @@ port-parity §19 (part a):
 - the mutation tests found one gap (a one-axis divergence), closed by a row drawing no random numbers.
 
 **Next:** M6, coupling and MPM |
-| M6 Coupling and MPM | ⏳ part a done 2026-11-12 | coupling 4,798, with `coupling.d3.tsv` 1. Part a: the shapes over the specials and degenerate sizes, sizes k/7 (no random numbers); the bodies' normals at the centre, a box's centre and the surface; the coupling on the Rust tests' scenes, the benchmark block and seeded clouds about one to four bodies; integration over odd masses and every added-mass coefficient; both drags on 40 clouds at five cell sizes, half slices, bodies at 10⁴–3·10⁶ and a 9 × 9 × 9 lattice; the level set and its refusals; a stream past a sphere and a box (frames 0–40); 133 JSON documents. All bit-exact on the first replay but one indexed drag at 10⁶ (the f32 hash's order), mapped to `coupling.d3.tsv` | 22 of the 33 Rust tests of `coupling.rs` (the FLIP solver's 11 with part b) and the 2 coupling integration tests (31 of 33); the layouts, the cell-size rule, the block walk against a brute-force enumeration, the indexed drag at 10⁶, 10¹² and an infinite radius | part a: criterion `couple_sph_bodies` 5.5–5.8× (after a per-body distance context and bodies outermost, 1.27× faster), `drag_from_particles` 7.9× (1.53× faster), `particle_level_set` 4.2–4.3×; twins: the indexed drag 0.70× (625) and 2.2× (10,000), the cells-only grid build 3.4–5.1× | port-parity §24 (part a): `src/coupling.cyr`; ADR 0002 #23 (the payload enum `PvShape`, the cells-only grid for the hash, the level set's return); the mutation tests found two gaps (the walk past the block in z, a level set longer than nx·ny), closed by rows drawing no random numbers.
+| M6 Coupling and MPM | ⏳ parts a–b done 2026-11-12 | coupling 5,043, with `coupling.d3.tsv` 1. Part b: 35 `FlipSolver::new` rows (every refusal, the blend's clamp and default); 197 class S `FlipSolver::step` trajectories (the Rust tests' scenes, the sloshing tank by PIC, FLIP 0.95, FLIP 1.0 and APIC and the falling block by FLIP and APIC to 300 steps, a pool at rest and under gravity, the specials in every input and particle slot, a corner node whose vy alone overflows, 40 seeded scenes) and 13 `FlipSolver::scenario` rows (the APIC matrices truncated, grown, kept across a FLIP segment); all bit-exact on the first replay. Part a: the shapes over the specials and degenerate sizes, sizes k/7 (no random numbers); the bodies' normals at the centre, a box's centre and the surface; the coupling on the Rust tests' scenes, the benchmark block and seeded clouds about one to four bodies; integration over odd masses and every added-mass coefficient; both drags on 40 clouds at five cell sizes, half slices, bodies at 10⁴–3·10⁶ and a 9 × 9 × 9 lattice; the level set and its refusals; a stream past a sphere and a box (frames 0–40); 133 JSON documents. All bit-exact on the first replay but one indexed drag at 10⁶ (the f32 hash's order), mapped to `coupling.d3.tsv` | all 33 Rust tests of `coupling.rs` and all 33 integration tests; the FLIP solver's layout, refusals, APIC resizing, divergence path and flat heap; the layouts, the cell-size rule, the block walk against a brute-force enumeration, the indexed drag at 10⁶, 10¹² and an infinite radius | part b: criterion `flip_step` 3.5–4.2× (after one cell lookup a particle and the helpers written out, 1.46–1.6× faster; `_pv_bits` `#inline`); part a: criterion `couple_sph_bodies` 5.5–5.8× (after a per-body distance context and bodies outermost, 1.27× faster), `drag_from_particles` 7.9× (1.53× faster), `particle_level_set` 4.2–4.3×; twins: the indexed drag 0.70× (625) and 2.2× (10,000), the cells-only grid build 3.4–5.1× | port-parity §25 (part b): `src/flip.cyr`; ADR 0002 #24 (the solver-owned columns, the APIC resize, the constructor); one gap (a divergence check reading vx alone), closed by a row drawing no random numbers.
+port-parity §24 (part a): `src/coupling.cyr`; ADR 0002 #23 (the payload enum `PvShape`, the cells-only grid for the hash, the level set's return); the mutation tests found two gaps (the walk past the block in z, a level set longer than nx·ny), closed by rows drawing no random numbers.
 
-**Next:** M6 part b, the `FlipSolver` |
+**Next:** M6 part c, MPM |
 | M7 Compute, logging and ai | — | — | — | — | |
 | M8 Release 2.0.0 | — | — | — | — | |

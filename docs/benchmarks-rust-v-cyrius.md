@@ -774,3 +774,28 @@ Pinned to core 15, two interleaved runs.
   the second sort into x order. It is built once per call site; Rust's test and benchmark rebuild nothing either.
 - **The level set** is the same per-pair cost as part c's brute-force sums: 10 ns a cell–particle pair against Rust's
   2.4. Walking the particles by address instead of by typed pointer gained nothing.
+
+## M6 part b: the FLIP solver (2026-11-12)
+
+Pinned to core 15, interleaved. Rust is its criterion group `flip_step/<n>_particles`: one 16 × 16 solver (dx 0.1,
+blend 0.95) kept across iterations, n particles on a √n-wide lattice from (0.3, 0.3) at spacing 1/√n, one step under
+gravity at dt 0.01. Criterion clones the particles outside the timing (`iter_batched`); the Cyrius rows
+(`tests/pravash.bcyr`'s `bench_coupling_b`) copy them in each iteration, about 12 ns a particle. Both keep the
+solver, whose warm-started pressure makes the sweeps stop early once the first iterations have run.
+
+| Bench | Rust | Cyrius, first version | + one lookup, max inline | + the lookup written out | + `_pv_bits` and the finite check | Cyrius / Rust |
+|---|---|---|---|---|---|---|
+| `flip_step/25_particles` | 4.65–4.69 µs | 28.4–28.6 µs | 24.7 µs | 23.8 µs | 19.4–19.6 µs | 4.1–4.2× |
+| `flip_step/100_particles` | 10.8–11.0 µs | 62.9–63.0 µs | 50.4–50.5 µs | 47.1–47.5 µs | 40.7–40.8 µs | 3.7–3.8× |
+| `flip_step/225_particles` | 21.5–21.7 µs | 119.6–120.0 µs | 93.2–93.8 µs | 84.1–84.7 µs | 75.0–75.1 µs | 3.5× |
+
+**Reading it.**
+- **The cell lookup dominated.** The first version found the cell and fractions of each of G2P's four samples from
+  the position, as Rust's `sample_field` does: four helper calls a lookup, eight lookups a particle. Rust inlines
+  them. One lookup a particle, with the max and min written out (Cyrius declines `#inline` for a branch or more than
+  two parameters), took the step 1.25–1.42× faster.
+- **`_pv_bits`** (the f64-to-word pass-through every `store64` of an f64 uses) is the one helper `#inline` accepts.
+  Inlining it took the FLIP step 1.15–1.17× and the shallow-water step 5–7% (`shallow_step/32x32` 237–256 µs →
+  225–239 µs, `128x128` 4.15–4.45 ms → 3.89–4.16 ms). The grid step moved within the box's noise.
+- **What remains** is the per-cell grid passes (the splat's zeroing, the copies, gravity, the divergence, the sweeps,
+  the gradient, the check), 256 cells each, plus the particles: the per-element cost the grid modules measured.

@@ -159,6 +159,8 @@ oracle:
   - the indexed drag on a transcription of hisab 1.4.0's f32 `SpatialHash` and its `query_radius`, and again for
     `coupling.d3.tsv` on the port's f64 grid;
   - the two decoders under serde's externally tagged struct-variant semantics;
+  - (M6 part b) the `FlipSolver`: P2G, the projection's Gauss–Seidel sweeps with their early stop, both G2P forms and
+    the advection, each trajectory cached across its frames, and the scenarios' segments;
 - it recomputes every glibc class-C row by calling the same glibc functions through ctypes;
 - it proves every `cbrt` row correctly rounded, with exact rationals;
 - it recomputes the corrected oracle, the f64-key oracle and the two table files, and fails if any differs from what

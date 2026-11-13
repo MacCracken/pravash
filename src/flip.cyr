@@ -1,0 +1,506 @@
+# flip.cyr — the FLIP/PIC solver of rust-old/src/coupling.rs (M6 part b): particles advected on a background grid,
+# their velocities splatted to it (P2G), the grid projected by Gauss–Seidel, and the grid velocity carried back
+# (G2P) as a FLIP/PIC blend or, with `use_apic`, as APIC's affine transfer.
+#
+# `PvFlipSolver` holds Rust's private `Vec` fields as solver-owned columns, reused from step to step: the grid
+# fields (nx·ny each) and the APIC matrices, four words a particle, which `step` resizes to the particle count as Rust
+# does (ADR 0002 #24). Every formula is Rust's in its operation order: each cell index and fraction is
+# floor(g).max(0).min(n − 2) and (g − x0).clamp(0, 1) with Rust's NaN-ignoring max and min; the splat's weights are
+# products of the fractions times the mass; the sampler's are the value times one fraction then the other. A step
+# allocates nothing once the APIC column has grown. Rust's `trace_span!`s arrive with M7's logging. Slices are
+# (pointer, count) (ADR 0002 #9).
+
+# The FLIP/PIC solver: the grid (nx × ny cells of size dx), the blend `flip_ratio` (0 PIC, 1 FLIP; re-clamped at use),
+# `use_apic` (0 / 1, overriding the blend), `narrow_band_cells` (a usize, reserved: Rust reads it nowhere), then the
+# grid fields and the APIC matrices [c00, c01, c10, c11] of each particle. Mirrors `FlipSolver`.
+struct PvFlipSolver {
+    nx;
+    ny;
+    dx: f64;
+    flip_ratio: f64;
+    use_apic;
+    narrow_band_cells;
+    vx: PvColumn;
+    vy: PvColumn;
+    vx_old: PvColumn;
+    vy_old: PvColumn;
+    weight: PvColumn;
+    pressure: PvColumn;
+    div: PvColumn;
+    apic_c: PvColumn;
+}
+
+# The solver's column count: the seven grid fields, then `apic_c`.
+const _PV_FLIP_COLUMNS = 8;
+
+# Column k of a solver (0 vx, 1 vy, 2 vx_old, 3 vy_old, 4 weight, 5 pressure, 6 div, 7 apic_c), by its byte offset
+# (tests/coupling.tcyr pins the layout, 240 bytes).
+#must_use
+fn _pv_flip_col(s, k): *PvColumn {
+    return _pv_as_columns(_pv_addr(s) + 48 + k * 24);
+}
+
+# Empties every column of *s without releasing anything, for a record about to be filled.
+fn _pv_flip_zero(s: *PvFlipSolver) {
+    for (var k = 0; k < _PV_FLIP_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_flip_col(s, k);
+        c.data = 0;
+        c.len = 0;
+        c.cap = 0;
+    }
+    s.use_apic = 0;
+    s.narrow_band_cells = 0;
+    return 0;
+}
+
+# Releases every column; the solver holds no storage after. Mirrors dropping the `FlipSolver`.
+fn PvFlipSolver_drop(s: *PvFlipSolver) {
+    for (var k = 0; k < _PV_FLIP_COLUMNS; k = k + 1) {
+        var c: *PvColumn = _pv_flip_col(s, k);
+        c.drop();
+    }
+    return 0;
+}
+
+# A solver of zeros into *out: Ok(0), or the first failure in Rust's order: PV_ERR_INVALID_GRID_RESOLUTION for nx or
+# ny below 4, PV_ERR_INVALID_PARAMETER for a cell size not finite and > 0, PV_ERR_INVALID_GRID_RESOLUTION for nx·ny
+# overflowing a usize; PV_ERR_OUT_OF_MEMORY for a size no allocation reaches (Rust's `vec!` aborts) or when the fields
+# can't be allocated. On an error *out holds no storage. The blend is flip_ratio clamped to [0, 1], or 0.95 when it
+# isn't finite; APIC off, no narrow band, the APIC column empty. Mirrors `FlipSolver::new`.
+#must_use
+fn PvFlipSolver_new(nx, ny, dx: f64, flip_ratio: f64, out: *PvFlipSolver): Result {
+    _pv_flip_zero(out);
+    # nx and ny are usizes: a word at or above 2^63 reads negative, and is a size Rust accepts until nx·ny.
+    if ((nx >= 0 && nx < 4) || (ny >= 0 && ny < 4)) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (dx <= 0.0 || _pv_is_finite(dx) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+    var ov = _pv_fg_mul_class(nx, ny);
+    if (ov == 2) { return Err(PV_ERR_INVALID_GRID_RESOLUTION); }
+    if (ov == 1) { return Err(PV_ERR_OUT_OF_MEMORY); }
+    var size = nx * ny;
+    var ok = 1;
+    for (var k = 0; k < 7; k = k + 1) {
+        var c: *PvColumn = _pv_flip_col(out, k);
+        ok = ok & c.resize(size, 0);
+    }
+    if (ok == 0) {
+        PvFlipSolver_drop(out);
+        return Err(PV_ERR_OUT_OF_MEMORY);
+    }
+    out.nx = nx;
+    out.ny = ny;
+    out.dx = dx;
+    var r: f64 = 0.95;
+    if (_pv_is_finite(flip_ratio) == 1) { r = _pv_clamp(flip_ratio, 0.0, 1.0); }
+    out.flip_ratio = r;
+    return Ok(0);
+}
+
+# One axis of a grid position g (in cells) on an n-cell axis: the lower node floor(g).max(0).min(n − 2) as an index
+# and the fraction (g − x0).clamp(0, 1), which is NaN for a NaN g (Rust's clamp keeps it). Rust's NaN-ignoring max
+# and min are written out (src/mathx.cyr's semantics): max(fl, 0) is fl when fl > 0 and +0 otherwise (a NaN, ±0 and
+# the negatives); the result is never NaN, so min(·, n − 2) is a comparison; and x0 as f64 is that value exactly.
+fn _pv_flip_axis(g: f64, n) {
+    var fl: f64 = f64_floor(g);
+    var c: f64 = 0.0;
+    if (fl > 0.0) { c = fl; }
+    var top: f64 = f64_from(n - 2);
+    if (c >= top) { c = top; }
+    var x0 = f64_to(c);
+    var d: f64 = g - c;
+    var sx: f64 = d;
+    if (d < 0.0) { sx = 0.0; }
+    if (d > 1.0) { sx = 1.0; }
+    return (x0, sx);
+}
+
+# Resizes the APIC column to n particles, new ones the zero matrix: 1, or 0 when it can't grow (unchanged).
+#must_use
+fn _pv_flip_apic_resize(s: *PvFlipSolver, n): i64 {
+    var c: *PvColumn = _pv_flip_col(s, 7);
+    return c.resize(4 * n, 0);
+}
+
+# Particle-to-grid: the mass-weighted splat of the n particles at ps. Each particle's four nodes get w = (its
+# bilinear weight)·m (m its mass when positive and finite, else 0) times v + C·(xᵢ − xₚ), C its APIC matrix when
+# `use_apic` and it has one, else zero; then each node with a weight above 1e-20 is divided by it. Mirrors the private
+# `particles_to_grid`.
+fn _pv_flip_p2g(s: *PvFlipSolver, ps: *PvFluidParticle, n) {
+    var nx = s.nx;
+    var ny = s.ny;
+    var dx: f64 = s.dx;
+    var one: f64 = 1.0;
+    var inv_dx: f64 = one / dx;
+    var vx = s.vx.data;
+    var vy = s.vy.data;
+    var wt = s.weight.data;
+    var cells = nx * ny;
+    for (var z = 0; z < cells; z = z + 1) {
+        store64(vx + z * 8, 0);
+        store64(vy + z * 8, 0);
+        store64(wt + z * 8, 0);
+    }
+    var ac = s.apic_c.data;
+    var na = s.apic_c.len / 4;
+    var zero: f64 = 0.0;
+    for (var pi = 0; pi < n; pi = pi + 1) {
+        var p: *PvFluidParticle = ps + pi;
+        var px: f64 = p.position.x;
+        var py: f64 = p.position.y;
+        var gx: f64 = px * inv_dx;
+        var gy: f64 = py * inv_dx;
+        var x0, sxv = _pv_flip_axis(gx, nx);
+        var y0, syv = _pv_flip_axis(gy, ny);
+        var sx: f64 = sxv;
+        var sy: f64 = syv;
+        var ux: f64 = one - sx;
+        var uy: f64 = one - sy;
+        var c0: f64 = zero;
+        var c1: f64 = zero;
+        var c2: f64 = zero;
+        var c3: f64 = zero;
+        if (s.use_apic == 1 && pi < na) {
+            c0 = load64(ac + pi * 32);
+            c1 = load64(ac + pi * 32 + 8);
+            c2 = load64(ac + pi * 32 + 16);
+            c3 = load64(ac + pi * 32 + 24);
+        }
+        var mass: f64 = zero;
+        if (p.mass > 0.0 && _pv_is_finite(p.mass) == 1) { mass = p.mass; }
+        var pvx: f64 = p.velocity.x;
+        var pvy: f64 = p.velocity.y;
+        for (var k = 0; k < 4; k = k + 1) {
+            var wk: f64 = ux * uy;
+            var ix = x0;
+            var iy = y0;
+            if (k == 1) {
+                wk = sx * uy;
+                ix = x0 + 1;
+            } elif (k == 2) {
+                wk = ux * sy;
+                iy = y0 + 1;
+            } elif (k == 3) {
+                wk = sx * sy;
+                ix = x0 + 1;
+                iy = y0 + 1;
+            }
+            var w: f64 = wk * mass;
+            var idx = iy * nx + ix;
+            var fix: f64 = f64_from(ix);
+            var fiy: f64 = f64_from(iy);
+            var gxi: f64 = fix * dx;
+            var gyi: f64 = fiy * dx;
+            var dxi: f64 = gxi - px;
+            var dyi: f64 = gyi - py;
+            var sxp: f64 = (pvx + c0 * dxi) + c1 * dyi;
+            var syp: f64 = (pvy + c2 * dxi) + c3 * dyi;
+            var ovx: f64 = load64(vx + idx * 8);
+            var ovy: f64 = load64(vy + idx * 8);
+            var ow: f64 = load64(wt + idx * 8);
+            var nvx: f64 = ovx + w * sxp;
+            var nvy: f64 = ovy + w * syp;
+            var nw: f64 = ow + w;
+            store64(vx + idx * 8, _pv_bits(nvx));
+            store64(vy + idx * 8, _pv_bits(nvy));
+            store64(wt + idx * 8, _pv_bits(nw));
+        }
+    }
+    var tiny: f64 = 0x3BC79CA10C924223;   # 1e-20
+    for (var i = 0; i < cells; i = i + 1) {
+        var wi: f64 = load64(wt + i * 8);
+        if (wi > tiny) {
+            var a: f64 = load64(vx + i * 8);
+            var b: f64 = load64(vy + i * 8);
+            var qa: f64 = a / wi;
+            var qb: f64 = b / wi;
+            store64(vx + i * 8, _pv_bits(qa));
+            store64(vy + i * 8, _pv_bits(qb));
+        }
+    }
+    return 0;
+}
+
+# The bilinear sample of the nx-wide field at f at the cell (x0, y0) and fractions (sx, sy) of a grid position:
+# ((v00·(1 − sx))·(1 − sy) + (v10·sx)·(1 − sy)) + (v01·(1 − sx))·sy + (v11·sx)·sy. Rust's private `sample_field`
+# finds the cell and fractions from the position at each call; G2P samples four fields at one position, so it finds
+# them once (`_pv_flip_axis` is a function of the position alone: the same bits).
+#must_use
+fn _pv_flip_sample(f, nx, x0, y0, sx: f64, sy: f64): f64 {
+    var one: f64 = 1.0;
+    var ux: f64 = one - sx;
+    var uy: f64 = one - sy;
+    var at = f + (y0 * nx + x0) * 8;
+    var v00: f64 = load64(at);
+    var v10: f64 = load64(at + 8);
+    var v01: f64 = load64(at + nx * 8);
+    var v11: f64 = load64(at + nx * 8 + 8);
+    var r: f64 = (((v00 * ux) * uy + (v10 * sx) * uy) + (v01 * ux) * sy) + (v11 * sx) * sy;
+    return r;
+}
+
+# Grid-to-particle for the n particles at ps. With `use_apic`: the APIC column resized to n, each particle's velocity
+# Σ w·vᵢ over its four nodes and its matrix Σ vᵢ ⊗ ∇wᵢ (the weight gradients over dx); otherwise the FLIP/PIC blend
+# f·(v + Δv) + (1 − f)·v_new with f the blend clamped to [0, 1] and Δv the sampled change v_new − v_old. Only x and y
+# change. 1, or 0 when the APIC column can't grow (nothing changed). Mirrors the private `grid_to_particles`.
+#must_use
+fn _pv_flip_g2p(s: *PvFlipSolver, ps: *PvFluidParticle, n): i64 {
+    var nx = s.nx;
+    var ny = s.ny;
+    var dx: f64 = s.dx;
+    var one: f64 = 1.0;
+    var inv_dx: f64 = one / dx;
+    var vx = s.vx.data;
+    var vy = s.vy.data;
+    if (s.use_apic == 1) {
+        if (_pv_flip_apic_resize(s, n) == 0) { return 0; }
+        var ac = s.apic_c.data;
+        for (var pi = 0; pi < n; pi = pi + 1) {
+            var p: *PvFluidParticle = ps + pi;
+            var gx: f64 = p.position.x * inv_dx;
+            var gy: f64 = p.position.y * inv_dx;
+            var x0, sxv = _pv_flip_axis(gx, nx);
+            var y0, syv = _pv_flip_axis(gy, ny);
+            var sx: f64 = sxv;
+            var sy: f64 = syv;
+            var ux: f64 = one - sx;
+            var uy: f64 = one - sy;
+            var vx_new: f64 = 0.0;
+            var vy_new: f64 = 0.0;
+            var c00: f64 = 0.0;
+            var c01: f64 = 0.0;
+            var c10: f64 = 0.0;
+            var c11: f64 = 0.0;
+            for (var k = 0; k < 4; k = k + 1) {
+                # (node, weight, ∂w/∂x, ∂w/∂y)
+                var ix = x0;
+                var iy = y0;
+                var w: f64 = ux * uy;
+                var gwx: f64 = -uy;
+                var gwy: f64 = -ux;
+                if (k == 1) {
+                    ix = x0 + 1;
+                    w = sx * uy;
+                    gwx = uy;
+                    gwy = -sx;
+                } elif (k == 2) {
+                    iy = y0 + 1;
+                    w = ux * sy;
+                    gwx = -sy;
+                    gwy = ux;
+                } elif (k == 3) {
+                    ix = x0 + 1;
+                    iy = y0 + 1;
+                    w = sx * sy;
+                    gwx = sy;
+                    gwy = sx;
+                }
+                var idx = iy * nx + ix;
+                var gvx: f64 = load64(vx + idx * 8);
+                var gvy: f64 = load64(vy + idx * 8);
+                vx_new = vx_new + w * gvx;
+                vy_new = vy_new + w * gvy;
+                var gx2: f64 = gwx * inv_dx;
+                var gy2: f64 = gwy * inv_dx;
+                c00 = c00 + gvx * gx2;
+                c01 = c01 + gvx * gy2;
+                c10 = c10 + gvy * gx2;
+                c11 = c11 + gvy * gy2;
+            }
+            p.velocity.x = vx_new;
+            p.velocity.y = vy_new;
+            store64(ac + pi * 32, _pv_bits(c00));
+            store64(ac + pi * 32 + 8, _pv_bits(c01));
+            store64(ac + pi * 32 + 16, _pv_bits(c10));
+            store64(ac + pi * 32 + 24, _pv_bits(c11));
+        }
+        return 1;
+    }
+    var flip: f64 = _pv_clamp(s.flip_ratio, 0.0, 1.0);
+    var pic: f64 = one - flip;
+    var ox = s.vx_old.data;
+    var oy = s.vy_old.data;
+    for (var q = 0; q < n; q = q + 1) {
+        var pq: *PvFluidParticle = ps + q;
+        var hx: f64 = pq.position.x * inv_dx;
+        var hy: f64 = pq.position.y * inv_dx;
+        var ax0, asx = _pv_flip_axis(hx, nx);
+        var ay0, asy = _pv_flip_axis(hy, ny);
+        var fsx: f64 = asx;
+        var fsy: f64 = asy;
+        var new_vx: f64 = _pv_flip_sample(vx, nx, ax0, ay0, fsx, fsy);
+        var new_vy: f64 = _pv_flip_sample(vy, nx, ax0, ay0, fsx, fsy);
+        var old_vx: f64 = _pv_flip_sample(ox, nx, ax0, ay0, fsx, fsy);
+        var old_vy: f64 = _pv_flip_sample(oy, nx, ax0, ay0, fsx, fsy);
+        var dvx: f64 = new_vx - old_vx;
+        var dvy: f64 = new_vy - old_vy;
+        var bx: f64 = flip * (pq.velocity.x + dvx) + pic * new_vx;
+        var by: f64 = flip * (pq.velocity.y + dvy) + pic * new_vy;
+        pq.velocity.x = bx;
+        pq.velocity.y = by;
+    }
+    return 1;
+}
+
+impl PvFlipSolver {
+    # The grid width in cells. Mirrors `FlipSolver::grid_nx`.
+    #must_use
+    fn grid_nx(self): i64 {
+        return self.nx;
+    }
+
+    # The grid height in cells. Mirrors `FlipSolver::grid_ny`.
+    #must_use
+    fn grid_ny(self): i64 {
+        return self.ny;
+    }
+
+    # The cell size. Mirrors `FlipSolver::grid_dx`.
+    #must_use
+    fn grid_dx(self): f64 {
+        return self.dx;
+    }
+
+    # One FLIP/PIC step of the n particles at ps under `gravity` over dt, in Rust's order:
+    # 1. the checks: dt finite and > 0 (PV_ERR_INVALID_TIMESTEP), the blend finite (PV_ERR_INVALID_PARAMETER);
+    # 2. with `use_apic`, the APIC column resized to n (PV_ERR_OUT_OF_MEMORY, nothing changed, when it can't grow);
+    # 3. P2G, then the pre-solve copy of vx and vy, then gravity·dt on every node (x and y);
+    # 4. the projection: the divergence −((vx[i+1] − vx[i−1]) + (vy[i+nx] − vy[i−nx]))·((0.5/dx)/dt) on the interior,
+    #    at most 40 Gauss–Seidel sweeps of p = (div·dx² + Σ neighbours)·0.25 (warm-started from the last step; done
+    #    when no cell changes by 1e-6), and the gradient times dt·(0.5/dx) subtracted;
+    # 5. PV_ERR_DIVERGED if any node's velocity isn't finite (the grid is left as computed, the particles as they were);
+    # 6. G2P, then each position advanced by v·dt (z included) and clamped to [0, (n − 1)·dx] on x and y, the clamped
+    #    axis's velocity set to 0.
+    # Ok(0). Mirrors `FlipSolver::step`.
+    #must_use
+    fn step(self, ps: *PvFluidParticle, n, gravity: PvVec3, dt: f64): Result {
+        if (_pv_is_finite(dt) == 0 || dt <= 0.0) { return Err(PV_ERR_INVALID_TIMESTEP); }
+        if (_pv_is_finite(self.flip_ratio) == 0) { return Err(PV_ERR_INVALID_PARAMETER); }
+        var nx = self.nx;
+        var ny = self.ny;
+        if (self.use_apic == 1 && self.apic_c.len != 4 * n) {
+            if (_pv_flip_apic_resize(self, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        }
+        _pv_flip_p2g(self, ps, n);
+        var cells = nx * ny;
+        var vx = self.vx.data;
+        var vy = self.vy.data;
+        var ox = self.vx_old.data;
+        var oy = self.vy_old.data;
+        for (var c = 0; c < cells; c = c + 1) {
+            store64(ox + c * 8, load64(vx + c * 8));
+            store64(oy + c * 8, load64(vy + c * 8));
+        }
+        var gx: f64 = gravity.x;
+        var gy: f64 = gravity.y;
+        var gdx: f64 = gx * dt;
+        var gdy: f64 = gy * dt;
+        for (var i = 0; i < cells; i = i + 1) {
+            var a: f64 = load64(vx + i * 8);
+            var b: f64 = load64(vy + i * 8);
+            var na: f64 = a + gdx;
+            var nb: f64 = b + gdy;
+            store64(vx + i * 8, _pv_bits(na));
+            store64(vy + i * 8, _pv_bits(nb));
+        }
+        # The projection.
+        var half: f64 = 0.5;
+        var inv_2dx: f64 = half / self.dx;
+        var dv = self.div.data;
+        var pr = self.pressure.data;
+        for (var z = 0; z < cells; z = z + 1) { store64(dv + z * 8, 0); }
+        var div_scale: f64 = inv_2dx / dt;
+        for (var y = 1; y < ny - 1; y = y + 1) {
+            for (var x = 1; x < nx - 1; x = x + 1) {
+                var j = y * nx + x;
+                var xr: f64 = load64(vx + (j + 1) * 8);
+                var xl: f64 = load64(vx + (j - 1) * 8);
+                var yu: f64 = load64(vy + (j + nx) * 8);
+                var yd: f64 = load64(vy + (j - nx) * 8);
+                var sum: f64 = (xr - xl) + (yu - yd);
+                var neg: f64 = -sum;
+                var d: f64 = neg * div_scale;
+                store64(dv + j * 8, _pv_bits(d));
+            }
+        }
+        var dx2: f64 = self.dx * self.dx;
+        var quarter: f64 = 0.25;
+        var tol: f64 = 0x3EB0C6F7A0B5ED8D;   # 1e-6
+        for (var it = 0; it < _PV_COUPLING_PRESSURE_ITERATIONS; it = it + 1) {
+            var max_change: f64 = 0.0;
+            for (var y2 = 1; y2 < ny - 1; y2 = y2 + 1) {
+                for (var x2 = 1; x2 < nx - 1; x2 = x2 + 1) {
+                    var k = y2 * nx + x2;
+                    var pl: f64 = load64(pr + (k - 1) * 8);
+                    var prt: f64 = load64(pr + (k + 1) * 8);
+                    var pd: f64 = load64(pr + (k - nx) * 8);
+                    var pu: f64 = load64(pr + (k + nx) * 8);
+                    var nbr: f64 = ((pl + prt) + pd) + pu;
+                    var dk: f64 = load64(dv + k * 8);
+                    var new_p: f64 = (dk * dx2 + nbr) * quarter;
+                    var pk: f64 = load64(pr + k * 8);
+                    var ch: f64 = new_p - pk;
+                    var ach: f64 = f64_abs(ch);
+                    # Rust's max(max_change, |Δ|): |Δ| is ≥ 0 or NaN and max_change starts at 0, so the NaN-ignoring
+                    # max is this comparison.
+                    if (ach > max_change) { max_change = ach; }
+                    store64(pr + k * 8, _pv_bits(new_p));
+                }
+            }
+            if (max_change < tol) { it = _PV_COUPLING_PRESSURE_ITERATIONS; }
+        }
+        var grad_scale: f64 = dt * inv_2dx;
+        for (var y3 = 1; y3 < ny - 1; y3 = y3 + 1) {
+            for (var x3 = 1; x3 < nx - 1; x3 = x3 + 1) {
+                var m = y3 * nx + x3;
+                var pa: f64 = load64(pr + (m + 1) * 8);
+                var pb: f64 = load64(pr + (m - 1) * 8);
+                var pc: f64 = load64(pr + (m + nx) * 8);
+                var pdn: f64 = load64(pr + (m - nx) * 8);
+                var ux: f64 = load64(vx + m * 8);
+                var uy: f64 = load64(vy + m * 8);
+                var nux: f64 = ux - (pa - pb) * grad_scale;
+                var nuy: f64 = uy - (pc - pdn) * grad_scale;
+                store64(vx + m * 8, _pv_bits(nux));
+                store64(vy + m * 8, _pv_bits(nuy));
+            }
+        }
+        # Every node finite: x − x is 0 for a finite x and NaN otherwise (`_pv_is_finite`, written out: `#inline`
+        # declines it).
+        for (var q = 0; q < cells; q = q + 1) {
+            var fx: f64 = load64(vx + q * 8);
+            var fy: f64 = load64(vy + q * 8);
+            var zx: f64 = fx - fx;
+            var zy: f64 = fy - fy;
+            if (!(zx == 0.0) || !(zy == 0.0)) { return Err(PV_ERR_DIVERGED); }
+        }
+        if (_pv_flip_g2p(self, ps, n) == 0) { return Err(PV_ERR_OUT_OF_MEMORY); }
+        # Advection, and the clamp to the grid.
+        var nxf: f64 = f64_from(nx - 1);
+        var nyf: f64 = f64_from(ny - 1);
+        var max_x: f64 = nxf * self.dx;
+        var max_y: f64 = nyf * self.dx;
+        for (var r = 0; r < n; r = r + 1) {
+            var p: *PvFluidParticle = ps + r;
+            var px: f64 = p.position.x + p.velocity.x * dt;
+            var py: f64 = p.position.y + p.velocity.y * dt;
+            var pz: f64 = p.position.z + p.velocity.z * dt;
+            p.position.x = px;
+            p.position.y = py;
+            p.position.z = pz;
+            if (px < 0.0) {
+                p.position.x = 0.0;
+                p.velocity.x = 0.0;
+            } elif (px > max_x) {
+                p.position.x = max_x;
+                p.velocity.x = 0.0;
+            }
+            if (py < 0.0) {
+                p.position.y = 0.0;
+                p.velocity.y = 0.0;
+            } elif (py > max_y) {
+                p.position.y = max_y;
+                p.velocity.y = 0.0;
+            }
+        }
+        return Ok(0);
+    }
+}

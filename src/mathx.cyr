@@ -21,8 +21,10 @@
 # π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
 var _PV_RADS_PER_DEG: f64 = 0.017453292519943295;
 
-# The bits of an f64 as an integer word: an untyped parameter, an i64 return.
+# The bits of an f64 as an integer word: an untyped parameter, an i64 return. Inlined: every store of an f64 through
+# `store64` passes through it (M6 part b: 1.15× on the FLIP step).
 #must_use
+#inline
 fn _pv_bits(x): i64 {
     return x;
 }

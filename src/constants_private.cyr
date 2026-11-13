@@ -28,3 +28,8 @@ var _PV_SPH_CSF_NORMAL_THRESHOLD: f64 = 0.1;
 
 # Rust: `CONVERGENCE_THRESHOLD: f64 = 1e-8`
 var _PV_SPH_CONVERGENCE_THRESHOLD: f64 = 0.00000001;
+
+# ── rust-old/src/coupling.rs ──
+
+# Rust: `PRESSURE_ITERATIONS: usize = 40`
+const _PV_COUPLING_PRESSURE_ITERATIONS = 40;

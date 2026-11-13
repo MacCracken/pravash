@@ -4612,6 +4612,231 @@ def cp_json(func, doc):
         return ["E:Deserialize"]
 
 
+# ── coupling part b: the FLIP solver ──
+# rust-old/src/coupling.rs's FlipSolver transcribed on a dict; each scene's trajectory cached across its frames.
+FLIP_CACHE = {}
+
+
+def fl_axis(g, n):
+    c = r_min(r_max(_libm.floor(g), 0.0), float(n - 2))
+    x0 = int(c)
+    return x0, r_clamp(g - float(x0), 0.0, 1.0)
+
+
+def fl_new(nx, ny, dx, ratio):
+    nxu, nyu = nx % 2 ** 64, ny % 2 ** 64
+    if nxu < 4 or nyu < 4:
+        return "E:InvalidGridResolution"
+    if not (dx > 0.0) or not fin(dx):
+        return "E:InvalidParameter"
+    if nxu * nyu >= 2 ** 64:
+        return "E:InvalidGridResolution"
+    n = nxu * nyu
+    s = {"nx": nxu, "ny": nyu, "dx": dx, "ratio": r_clamp(ratio, 0.0, 1.0) if fin(ratio) else 0.95, "apic": 0,
+         "apic_c": []}
+    for f in ("vx", "vy", "vx_old", "vy_old", "weight", "pressure", "div"):
+        s[f] = [0.0] * n
+    return s
+
+
+def fl_p2g(s, ps):
+    nx, ny, dx = s["nx"], s["ny"], s["dx"]
+    inv_dx = fdiv(1.0, dx)
+    n = nx * ny
+    vx, vy, wt = [0.0] * n, [0.0] * n, [0.0] * n
+    ac = s["apic_c"]
+    for pi, p in enumerate(ps):
+        px, py = p[0], p[1]
+        x0, sx = fl_axis(px * inv_dx, nx)
+        y0, sy = fl_axis(py * inv_dx, ny)
+        c = ac[pi] if s["apic"] and pi < len(ac) else [0.0, 0.0, 0.0, 0.0]
+        mass = p[11] if p[11] > 0.0 and fin(p[11]) else 0.0
+        ws = ((1.0 - sx) * (1.0 - sy), sx * (1.0 - sy), (1.0 - sx) * sy, sx * sy)
+        for k, (ix, iy) in enumerate(((x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1))):
+            w = ws[k] * mass
+            idx = iy * nx + ix
+            dxi = float(ix) * dx - px
+            dyi = float(iy) * dx - py
+            vx[idx] = vx[idx] + w * (p[3] + c[0] * dxi + c[1] * dyi)
+            vy[idx] = vy[idx] + w * (p[4] + c[2] * dxi + c[3] * dyi)
+            wt[idx] = wt[idx] + w
+    for i in range(n):
+        if wt[i] > 1e-20:
+            vx[i] = vx[i] / wt[i]
+            vy[i] = vy[i] / wt[i]
+    s["vx"], s["vy"], s["weight"] = vx, vy, wt
+
+
+def fl_sample(f, nx, ny, gx, gy):
+    x0, sx = fl_axis(gx, nx)
+    y0, sy = fl_axis(gy, ny)
+    i = y0 * nx + x0
+    return f[i] * (1.0 - sx) * (1.0 - sy) + f[i + 1] * sx * (1.0 - sy) + f[i + nx] * (1.0 - sx) * sy + \
+        f[i + nx + 1] * sx * sy
+
+
+def fl_g2p(s, ps):
+    nx, ny, dx = s["nx"], s["ny"], s["dx"]
+    inv_dx = fdiv(1.0, dx)
+    vx, vy = s["vx"], s["vy"]
+    if s["apic"]:
+        ac = s["apic_c"]
+        del ac[len(ps):]
+        ac.extend([[0.0, 0.0, 0.0, 0.0] for _ in range(len(ps) - len(ac))])
+        for pi, p in enumerate(ps):
+            x0, sx = fl_axis(p[0] * inv_dx, nx)
+            y0, sy = fl_axis(p[1] * inv_dx, ny)
+            vxn = vyn = c00 = c01 = c10 = c11 = 0.0
+            for (ix, iy), w, gwx, gwy in (((x0, y0), (1.0 - sx) * (1.0 - sy), -(1.0 - sy), -(1.0 - sx)),
+                                          ((x0 + 1, y0), sx * (1.0 - sy), 1.0 - sy, -sx),
+                                          ((x0, y0 + 1), (1.0 - sx) * sy, -sy, 1.0 - sx),
+                                          ((x0 + 1, y0 + 1), sx * sy, sy, sx)):
+                idx = iy * nx + ix
+                gvx, gvy = vx[idx], vy[idx]
+                vxn = vxn + w * gvx
+                vyn = vyn + w * gvy
+                gwx, gwy = gwx * inv_dx, gwy * inv_dx
+                c00 = c00 + gvx * gwx
+                c01 = c01 + gvx * gwy
+                c10 = c10 + gvy * gwx
+                c11 = c11 + gvy * gwy
+            p[3], p[4] = vxn, vyn
+            ac[pi] = [c00, c01, c10, c11]
+        return
+    flip = r_clamp(s["ratio"], 0.0, 1.0)
+    pic = 1.0 - flip
+    for p in ps:
+        gx, gy = p[0] * inv_dx, p[1] * inv_dx
+        nvx = fl_sample(vx, nx, ny, gx, gy)
+        nvy = fl_sample(vy, nx, ny, gx, gy)
+        ovx = fl_sample(s["vx_old"], nx, ny, gx, gy)
+        ovy = fl_sample(s["vy_old"], nx, ny, gx, gy)
+        p[3] = flip * (p[3] + (nvx - ovx)) + pic * nvx
+        p[4] = flip * (p[4] + (nvy - ovy)) + pic * nvy
+
+
+def fl_step(s, ps, g, dt):
+    if not fin(dt) or dt <= 0.0:
+        return "E:InvalidTimestep"
+    if not fin(s["ratio"]):
+        return "E:InvalidParameter"
+    nx, ny, dx = s["nx"], s["ny"], s["dx"]
+    if s["apic"] and len(s["apic_c"]) != len(ps):
+        ac = s["apic_c"]
+        del ac[len(ps):]
+        ac.extend([[0.0, 0.0, 0.0, 0.0] for _ in range(len(ps) - len(ac))])
+    fl_p2g(s, ps)
+    s["vx_old"], s["vy_old"] = list(s["vx"]), list(s["vy"])
+    vx, vy = s["vx"], s["vy"]
+    gdx, gdy = g[0] * dt, g[1] * dt
+    for i in range(nx * ny):
+        vx[i] = vx[i] + gdx
+        vy[i] = vy[i] + gdy
+    inv_2dx = fdiv(0.5, dx)
+    div = [0.0] * (nx * ny)
+    div_scale = fdiv(inv_2dx, dt)
+    for y in range(1, ny - 1):
+        for x in range(1, nx - 1):
+            i = y * nx + x
+            div[i] = -((vx[i + 1] - vx[i - 1]) + (vy[i + nx] - vy[i - nx])) * div_scale
+    s["div"] = div
+    pr = s["pressure"]
+    dx2 = dx * dx
+    interior = [y * nx + x for y in range(1, ny - 1) for x in range(1, nx - 1)]
+    for _ in range(40):
+        mc = 0.0
+        for i in interior:
+            new_p = (div[i] * dx2 + (pr[i - 1] + pr[i + 1] + pr[i - nx] + pr[i + nx])) * 0.25
+            mc = r_max(mc, abs(new_p - pr[i]))
+            pr[i] = new_p
+        if mc < 1e-6:
+            break
+    gs = dt * inv_2dx
+    for i in interior:
+        vx[i] = vx[i] - (pr[i + 1] - pr[i - 1]) * gs
+        vy[i] = vy[i] - (pr[i + nx] - pr[i - nx]) * gs
+    if not all(fin(v) for v in vx) or not all(fin(v) for v in vy):
+        return "E:Diverged"
+    fl_g2p(s, ps)
+    max_x = float(nx - 1) * dx
+    max_y = float(ny - 1) * dx
+    for p in ps:
+        p[0] = p[0] + p[3] * dt
+        p[1] = p[1] + p[4] * dt
+        p[2] = p[2] + p[5] * dt
+        if p[0] < 0.0:
+            p[0], p[3] = 0.0, 0.0
+        elif p[0] > max_x:
+            p[0], p[3] = max_x, 0.0
+        if p[1] < 0.0:
+            p[1], p[4] = 0.0, 0.0
+        elif p[1] > max_y:
+            p[1], p[4] = max_y, 0.0
+    return None
+
+
+def fl_dump(s):
+    out = []
+    for f in ("vx", "vy", "vx_old", "vy_old", "weight", "pressure", "div"):
+        out += [("v", len(s[f]))] + s[f]
+    flat = [c for m in s["apic_c"] for c in m]
+    return out + [("v", len(flat))] + flat
+
+
+def fl_copy(s):
+    c = dict(s)
+    for f in ("vx", "vy", "vx_old", "vy_old", "weight", "pressure", "div"):
+        c[f] = list(s[f])
+    c["apic_c"] = [list(m) for m in s["apic_c"]]
+    return c
+
+
+def fl_want(func, x):
+    """A FLIP row's recomputed outputs, or None for another function."""
+    if func == "FlipSolver::new":
+        s = fl_new(x[0], x[1], x[2], x[3])
+        if isinstance(s, str):
+            return [s]
+        return [s["nx"], s["ny"], s["dx"], s["ratio"], 0, 0] + [len(s[f]) for f in (
+            "vx", "vy", "vx_old", "vy_old", "weight", "pressure", "div")] + [0]
+    if func == "FlipSolver::step":
+        steps = x[9]
+        key = tuple(map(bits, x[2:9])) + tuple(x[0:2]) + tuple(
+            bits(v) if isinstance(v, float) else v for v in x[10:])
+        start, s, ps, e = 0, None, None, None
+        for done, st in FLIP_CACHE.get(key, []):
+            if done <= steps and done >= start:
+                start, s, ps, e = done, fl_copy(st[0]), [list(p) for p in st[1]], st[2]
+        if s is None:
+            s = fl_new(x[0], x[1], x[2], 0.95)
+            s["ratio"], s["apic"] = x[3], x[4]
+            ps, _ = cp_parts(x, 10)
+        for _ in range(start, steps):
+            if e:
+                break
+            e = fl_step(s, ps, x[5:8], x[8])
+        FLIP_CACHE.setdefault(key, []).append((steps, (fl_copy(s), [list(p) for p in ps], e)))
+        if e:
+            return [e]
+        return [len(ps)] + [v for p in ps for v in p] + fl_dump(s)
+    if func == "FlipSolver::scenario":
+        s = fl_new(x[0], x[1], x[2], 0.95)
+        g, dt, k = x[3:6], x[6], 8
+        ps = []
+        for _ in range(x[7]):
+            s["ratio"], s["apic"], keep = x[k], x[k + 1], x[k + 2]
+            add, k = cp_parts(x, k + 3)
+            del ps[keep:]
+            ps += add
+            for _ in range(x[k]):
+                e = fl_step(s, ps, g, dt)
+                if e:
+                    return [e]
+            k += 1
+        return [len(ps)] + [v for p in ps for v in p] + fl_dump(s)
+    return None
+
+
 def cp_want(func, x):
     """A coupling row's recomputed outputs, or None for a function without a check."""
     if func in ("BodyShape::from_json", "RigidBody::from_json"):
@@ -4658,6 +4883,8 @@ def cp_want(func, x):
     if func == "particle_level_set":
         ps, _ = cp_parts(x, 5)
         return [("v", x[2])] + cp_level_set(x[0], x[1], x[2], x[3], x[4], ps)
+    if func.startswith("FlipSolver::"):
+        return fl_want(func, x)
     return None
 
 

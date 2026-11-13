@@ -1829,6 +1829,58 @@ fn bench_coupling_a() {
     return 0;
 }
 
+# ── coupling (M6 part b): the FLIP solver ──
+# Rust's criterion group `flip_step/<n>_particles`: one 16 × 16 solver (dx 0.1, blend 0.95) kept across iterations, n
+# particles on a √n-wide lattice from (0.3, 0.3) at spacing 1/√n, mass 0.001, one step under (0, −9.81, 0) at dt 0.01.
+# Criterion's `iter_batched` clones the particles outside the timing; here each iteration copies them in by assignment
+# (about 12 ns a particle). The kept solver warm-starts its pressure, so after the first iterations the Gauss–Seidel
+# sweeps stop early in both.
+fn _bench_flip(n, iters) {
+    var nf: f64 = f64_from(n);
+    var rt: f64 = f64_sqrt(nf);
+    var side = f64_to(rt);
+    var sp: f64 = 1.0 / rt;
+    var src: *PvFluidParticle = _pv_as_particles(fl_alloc(n * sizeof(PvFluidParticle)));
+    var work: *PvFluidParticle = _pv_as_particles(fl_alloc(n * sizeof(PvFluidParticle)));
+    for (var i = 0; i < n; i = i + 1) {
+        var cx: f64 = f64_from(i % side);
+        var cy: f64 = f64_from(i / side);
+        var x: f64 = 0.3 + cx * sp;
+        var y: f64 = 0.3 + cy * sp;
+        var q: PvFluidParticle = PvFluidParticle_new_2d(x, y, 0.001);
+        var d: *PvFluidParticle = src + i;
+        *d = q;
+    }
+    var s: PvFlipSolver;
+    var nt, nv = PvFlipSolver_new(16, 16, 0.1, 0.95, &s);
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var b = bench_new(_bench_name_n("flip_step/", n, "_particles"));
+    bench_batch_start(b);
+    for (var k = 0; k < iters; k = k + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var w: *PvFluidParticle = work + c;
+            var e: *PvFluidParticle = src + c;
+            *w = *e;
+        }
+        var t, v = s.step(work, n, g, 0.01);
+        g_sink = g_sink ^ t;
+    }
+    bench_batch_stop(b, iters);
+    bench_report(b);
+    PvFlipSolver_drop(&s);
+    fl_free(work);
+    fl_free(src);
+    return 0;
+}
+
+# The FLIP rows: criterion's three sizes.
+fn bench_coupling_b() {
+    _bench_flip(25, 2000);
+    _bench_flip(100, 2000);
+    _bench_flip(225, 2000);
+    return 0;
+}
+
 # Runs every bench, after the timer's noop baseline.
 fn main(): i64 {
     alloc_init();
@@ -1858,6 +1910,7 @@ fn main(): i64 {
     bench_sph_m5d();
     bench_sph_m5e();
     bench_coupling_a();
+    bench_coupling_b();
     return 0;
 }
 

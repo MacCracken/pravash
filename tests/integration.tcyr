@@ -6,8 +6,7 @@
 # returns), and serde_roundtrip_all_types, whose four types all read and write JSON now (serde_json is `to_json` /
 # `Pv*_from_json`). M4 part c: the four free-function SPH tests, in `test_sph` (Rust's `sph::step` is `sph_step`,
 # ADR 0002 #17; `.unwrap()` asserts every step was Ok). M5 part a: the five solver tests, in `test_solver`. M6 part a:
-# the two coupling tests, in `test_coupling`. The rest arrive with their milestones:
-# - the two FLIP tests: M6 part b.
+# the two coupling tests, in `test_coupling`; part b the two FLIP tests, which close the file (all 33).
 
 include "tests/lib.cyr"
 
@@ -418,7 +417,7 @@ fn test_shallow() {
     return 0;
 }
 
-# M6 part a: the coupling tests. Rust's first couples a clone of the body (`&mut [body.clone()]`), so the body's own
+# M6: the coupling and FLIP tests. Rust's first couples a clone of the body (`&mut [body.clone()]`), so the body's own
 # force stays zero and it falls under gravity alone while the particles feel it; the port couples a copy too.
 fn test_coupling() {
     var cfg: PvFluidConfig = PvFluidConfig_water_2d();
@@ -450,6 +449,60 @@ fn test_coupling() {
     couple_sph_bodies(&one, 1, &b2, 1, 0.15, 1000.0, 10.0);
     var fm: f64 = b2.force.length();
     assert(fm > 0.0, "the body receives a force from the particle");
+
+    test_group("flip_particles_fall_under_gravity");
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var fs: PvFlipSolver;
+    var nt, nv = PvFlipSolver_new(16, 16, 0.1, 0.95, &fs);
+    var fbuf = fl_alloc(3 * sizeof(PvFluidParticle));
+    var fp: *PvFluidParticle = _pv_as_particles(fbuf);
+    for (var i = 0; i < 3; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var x: f64 = 0.5 + fi * 0.1;
+        var q: PvFluidParticle = PvFluidParticle_new_2d(x, 0.8, 0.01);
+        memcpy(fp + i, &q, sizeof(PvFluidParticle));
+    }
+    var ferr = 0;
+    for (var k2 = 0; k2 < 10; k2 = k2 + 1) {
+        var ft, fv = fs.step(fp, 3, g, 0.01);
+        if (is_err_result(ft) == 1) { ferr = ferr + 1; }
+    }
+    var fell = 1;
+    for (var j = 0; j < 3; j = j + 1) {
+        var pj: *PvFluidParticle = fp + j;
+        if (!(pj.position.y < 0.8) || _pv_is_finite(pj.position.y) == 0) { fell = 0; }
+    }
+    assert(is_ok(nt) == 1 && ferr == 0 && fell == 1, "every particle falls, and stays finite");
+    fl_free(fbuf);
+    PvFlipSolver_drop(&fs);
+
+    test_group("flip_multi_step_stable");
+    var ms: PvFlipSolver;
+    var mt, mv = PvFlipSolver_new(16, 16, 0.1, 0.9, &ms);
+    var mbuf = fl_alloc(20 * sizeof(PvFluidParticle));
+    var mp: *PvFluidParticle = _pv_as_particles(mbuf);
+    for (var i2 = 0; i2 < 20; i2 = i2 + 1) {
+        var cx: f64 = f64_from(i2 % 5);
+        var cy: f64 = f64_from(i2 / 5);
+        var mx: f64 = 0.3 + cx * 0.05;
+        var my: f64 = 0.3 + cy * 0.05;
+        var r: PvFluidParticle = PvFluidParticle_new_2d(mx, my, 0.01);
+        memcpy(mp + i2, &r, sizeof(PvFluidParticle));
+    }
+    var g1: PvVec3 = PvVec3_new(0.0, -1.0, 0.0);
+    var merr = 0;
+    for (var k3 = 0; k3 < 100; k3 = k3 + 1) {
+        var st, sv = ms.step(mp, 20, g1, 0.01);
+        if (is_err_result(st) == 1) { merr = merr + 1; }
+    }
+    var fin = 1;
+    for (var j2 = 0; j2 < 20; j2 = j2 + 1) {
+        var pm: *PvFluidParticle = mp + j2;
+        if (_pv_is_finite(pm.position.x) == 0 || _pv_is_finite(pm.position.y) == 0) { fin = 0; }
+    }
+    assert(is_ok(mt) == 1 && merr == 0 && fin == 1, "100 steps, every one Ok, every position finite");
+    fl_free(mbuf);
+    PvFlipSolver_drop(&ms);
     return 0;
 }
 

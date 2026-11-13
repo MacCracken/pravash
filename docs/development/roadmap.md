@@ -78,7 +78,8 @@
 - [x] M6 part a: the rigid bodies of `coupling.rs` (`BodyShape`, `RigidBody`, the two-way coupling, added mass, both
   drags, the indexed one through a cells-only neighbour grid, the particle level set, JSON; 4,798 rows in a new golden
   module, all but one bit-exact on the first replay and that one mapped to `coupling.d3.tsv`; 22 Rust tests)
-- [ ] M6 part b: the `FlipSolver` (FLIP/PIC, APIC, the projection, `apic_c`'s resize; the 11 FLIP tests)
+- [x] M6 part b: the `FlipSolver` (FLIP/PIC, APIC, the projection, `apic_c`'s resize; 245 rows, every one bit-exact
+  on the first replay; the 11 FLIP tests and the 2 FLIP integration tests)
 - [ ] M6 part c: MPM (`ConstitutiveModel` and its codec, `MpmParticle`, the 2×2 SVD, Drucker–Prager, `MpmSolver`; 13
   Rust tests)
 

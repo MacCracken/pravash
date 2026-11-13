@@ -69,6 +69,10 @@ fn sources() -> Vec<Source> {
                 "the `PhaseProperties` literal local to `MultiPhaseConfig::get`, written in place",
             )],
         },
+        Source {
+            file: "coupling.rs",
+            excused: &[],
+        },
     ]
 }
 

@@ -25,6 +25,17 @@
 //! - `BodyShape::from_json` and `RigidBody::from_json` decode a serde_json document to `<shape>` or `<body>`, or
 //!   `E:Deserialize` (class A). No document needs one of bayan's stricter policies (json.tsv's `_bayan_` rows cover
 //!   them).
+//!
+//! Part b (from its own seed, 0x60_c0_0b, after part a's rows): the `FlipSolver`. `<dump>` is its private state
+//! (`oracle_dump`): `v:<nx·ny>` vx, vy, vx_old, vy_old, weight, pressure and div, then `v:<4m>` the APIC matrices.
+//! - `FlipSolver::new` takes `i:` nx, ny, dx and the blend, and gives `i:` nx and ny, dx, the blend, `i:` use_apic and
+//!   narrow_band_cells, and `i:` the eight vectors' lengths (class A), or `E:`;
+//! - `FlipSolver::step` takes `i:` nx and ny, dx, the blend (set after `new(.., 0.95)`), `i:` use_apic, gravity, dt,
+//!   `i:<steps>` and `<ps>`, and gives the particles and `<dump>` after that many steps of one fresh solver, or the
+//!   first error (class S trajectories);
+//! - `FlipSolver::scenario` takes `i:` nx and ny, dx, gravity, dt and `i:<k>` segments, each the blend, `i:` use_apic,
+//!   `i:<keep>` (the particles truncated to that many), `<ps>` (appended) and `i:<steps>`, and gives the particles and
+//!   `<dump>` after the last, or the first error (class S): the APIC matrices resized as the particle count changes.
 
 use hisab::{DVec3, SpatialHash, Vec3};
 use pravash::FluidParticle;
@@ -33,10 +44,12 @@ use pravash::coupling::{
     effective_mass, integrate_bodies, integrate_bodies_with_added_mass, particle_level_set,
 };
 
+use pravash::coupling::FlipSolver;
+
 use crate::grids::{Rng, specials};
 use crate::m_common::particle;
-use crate::m_grid::usz;
-use crate::tsv::{Class, Module, Tok, f, s};
+use crate::m_grid::{col, usz};
+use crate::tsv::{Class, Module, Tok, err, f, s};
 
 fn shape(sh: &BodyShape) -> Vec<Tok> {
     match *sh {
@@ -1069,6 +1082,393 @@ fn json_rows(m: &mut Module, rng: &mut Rng) {
     }
 }
 
+// ── part b: the FLIP solver ─────────────────────────────────────────────────────────
+
+fn dump(out: &mut Vec<Tok>, s: &FlipSolver) {
+    let d = s.oracle_dump();
+    for v in [&d.vx, &d.vy, &d.vx_old, &d.vy_old, &d.weight, &d.pressure, &d.div] {
+        col(out, v);
+    }
+    let flat: Vec<f64> = d.apic_c.iter().flat_map(|c| c.iter().copied()).collect();
+    col(out, &flat);
+}
+
+fn flip_new_row(m: &mut Module, nx: usize, ny: usize, dx: f64, ratio: f64) {
+    let ins = [usz(nx), usz(ny), f(dx), f(ratio)];
+    let out = match FlipSolver::new(nx, ny, dx, ratio) {
+        Ok(s) => {
+            let d = s.oracle_dump();
+            let mut o = vec![
+                usz(s.grid_nx()),
+                usz(s.grid_ny()),
+                f(s.grid_dx()),
+                f(s.flip_ratio),
+                Tok::I(i64::from(s.use_apic)),
+                usz(s.narrow_band_cells),
+            ];
+            for len in [
+                d.vx.len(),
+                d.vy.len(),
+                d.vx_old.len(),
+                d.vy_old.len(),
+                d.weight.len(),
+                d.pressure.len(),
+                d.div.len(),
+                d.apic_c.len(),
+            ] {
+                o.push(usz(len));
+            }
+            o
+        }
+        Err(x) => vec![err(&x)],
+    };
+    m.row("FlipSolver::new", Class::A, &ins, &out);
+}
+
+/// One FLIP step row: a fresh `new(nx, ny, dx, 0.95)` with the blend and APIC set, `steps` steps.
+#[allow(clippy::too_many_arguments)]
+fn flip_step_row(
+    m: &mut Module,
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    ratio: f64,
+    apic: bool,
+    g: DVec3,
+    dt: f64,
+    steps: usize,
+    ps: &[FluidParticle],
+) {
+    let mut ins = vec![usz(nx), usz(ny), f(dx), f(ratio), Tok::I(i64::from(apic))];
+    v3(&mut ins, g);
+    ins.extend([f(dt), usz(steps)]);
+    ps_toks(&mut ins, ps);
+    let mut s = FlipSolver::new(nx, ny, dx, 0.95).expect("a valid grid");
+    s.flip_ratio = ratio;
+    s.use_apic = apic;
+    let mut p = ps.to_vec();
+    let mut out = Vec::new();
+    for _ in 0..steps {
+        if let Err(x) = s.step(&mut p, g, dt) {
+            out = vec![err(&x)];
+            break;
+        }
+    }
+    if out.is_empty() {
+        ps_toks(&mut out, &p);
+        dump(&mut out, &s);
+    }
+    m.row("FlipSolver::step", Class::S, &ins, &out);
+}
+
+/// One segment of a scenario: the blend, APIC, the particles kept, those appended, the steps.
+struct Seg {
+    ratio: f64,
+    apic: bool,
+    keep: usize,
+    add: Vec<FluidParticle>,
+    steps: usize,
+}
+
+fn flip_scenario_row(m: &mut Module, nx: usize, ny: usize, dx: f64, g: DVec3, dt: f64, segs: &[Seg]) {
+    let mut ins = vec![usz(nx), usz(ny), f(dx)];
+    v3(&mut ins, g);
+    ins.extend([f(dt), usz(segs.len())]);
+    let mut s = FlipSolver::new(nx, ny, dx, 0.95).expect("a valid grid");
+    let mut p: Vec<FluidParticle> = Vec::new();
+    let mut out = Vec::new();
+    for sg in segs {
+        ins.extend([f(sg.ratio), Tok::I(i64::from(sg.apic)), usz(sg.keep)]);
+        ps_toks(&mut ins, &sg.add);
+        ins.push(usz(sg.steps));
+        if !out.is_empty() {
+            continue;
+        }
+        s.flip_ratio = sg.ratio;
+        s.use_apic = sg.apic;
+        p.truncate(sg.keep);
+        p.extend(sg.add.iter().copied());
+        for _ in 0..sg.steps {
+            if let Err(x) = s.step(&mut p, g, dt) {
+                out = vec![err(&x)];
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        ps_toks(&mut out, &p);
+        dump(&mut out, &s);
+    }
+    m.row("FlipSolver::scenario", Class::S, &ins, &out);
+}
+
+/// A block of 2D particles over [x0, x1] × [y0, y1] at spacing sp, mass m, moving at (vx, vy).
+#[allow(clippy::too_many_arguments)]
+fn flip_block(x0: f64, x1: f64, y0: f64, y1: f64, sp: f64, m: f64, vx: f64, vy: f64) -> Vec<FluidParticle> {
+    let mut out = Vec::new();
+    let mut j = 0.0;
+    while y0 + j * sp <= y1 + 1e-12 {
+        let mut i = 0.0;
+        while x0 + i * sp <= x1 + 1e-12 {
+            let mut p = FluidParticle::new_2d(x0 + i * sp, y0 + j * sp, m);
+            p.velocity = DVec3::new(vx, vy, 0.0);
+            out.push(p);
+            i += 1.0;
+        }
+        j += 1.0;
+    }
+    out
+}
+
+/// n seeded particles in [lo, hi]² (3D when `deep`), moving up to v per axis, masses log-uniform.
+fn flip_cloud(rng: &mut Rng, n: usize, lo: f64, hi: f64, v: f64, deep: bool) -> Vec<FluidParticle> {
+    (0..n)
+        .map(|_| {
+            let mut p = FluidParticle::new(
+                DVec3::new(
+                    rng.uniform(lo, hi),
+                    rng.uniform(lo, hi),
+                    if deep { rng.uniform(-0.2, 0.2) } else { 0.0 },
+                ),
+                rng.log_uniform(-4.0, -1.0),
+            );
+            p.velocity = DVec3::new(
+                rng.uniform(-v, v),
+                rng.uniform(-v, v),
+                if deep { rng.uniform(-v, v) } else { 0.0 },
+            );
+            p
+        })
+        .collect()
+}
+
+fn flip_rows(m: &mut Module, rng: &mut Rng) {
+    let o = DVec3::ZERO;
+    let g = DVec3::new(0.0, -9.81, 0.0);
+    // new: the Rust tests', the refusals in Rust's order, the blend's clamp and default, sizes.
+    flip_new_row(m, 16, 16, 0.1, 0.95);
+    flip_new_row(m, 2, 16, 0.1, 0.95);
+    flip_new_row(m, 16, 16, 0.0, 0.95);
+    flip_new_row(m, 3, 3, f64::NAN, 0.5);
+    flip_new_row(m, 16, 3, 0.1, 0.5);
+    flip_new_row(m, 4, 4, 1.0, 0.0);
+    flip_new_row(m, 4, 7, 0.2, 1.0);
+    flip_new_row(m, 50, 7, 0.02, 0.3);
+    flip_new_row(m, usize::MAX, 4, 0.1, 0.5);
+    flip_new_row(m, 4, usize::MAX, 0.1, 0.5);
+    for &x in &specials() {
+        flip_new_row(m, 8, 8, x, 0.5);
+        flip_new_row(m, 8, 8, 0.1, x);
+    }
+    for x in [1.5, -0.5, 2.0, -0.0, 0.5] {
+        flip_new_row(m, 6, 5, 0.25, x);
+    }
+    // The Rust tests' scenes.
+    let one = |x: f64, y: f64, vx: f64, vy: f64| {
+        let mut p = FluidParticle::new_2d(x, y, 0.01);
+        p.velocity = DVec3::new(vx, vy, 0.0);
+        vec![p]
+    };
+    flip_step_row(m, 8, 8, 0.1, 0.95, false, g, 0.01, 1, &[]);
+    flip_step_row(m, 16, 16, 0.1, 0.95, false, o, 0.1, 1, &one(0.8, 0.8, 1.0, 0.0));
+    flip_step_row(m, 16, 16, 0.1, 0.0, false, g, 0.01, 1, &one(0.8, 0.8, 0.0, 0.0));
+    flip_step_row(m, 8, 8, 0.1, 1.0, false, o, 0.01, 1, &one(0.4, 0.4, 1.0, 0.0));
+    flip_step_row(m, 8, 8, 0.1, 0.0, false, o, 0.01, 1, &one(0.4, 0.4, 1.0, 0.0));
+    flip_step_row(m, 8, 8, 0.1, 0.95, false, o, 0.1, 1, &one(0.05, 0.05, -10.0, -10.0));
+    flip_step_row(m, 8, 8, 0.1, f64::NAN, false, o, 0.01, 1, &one(0.3, 0.3, 0.0, 0.0));
+    let mut radial = Vec::new();
+    for j in 2..14 {
+        for i in 2..14 {
+            for (ox, oy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                let x = (f64::from(i) + ox) * 0.1;
+                let y = (f64::from(j) + oy) * 0.1;
+                let mut p = FluidParticle::new_2d(x, y, 0.001);
+                p.velocity = DVec3::new(x - 0.8, y - 0.8, 0.0);
+                radial.push(p);
+            }
+        }
+    }
+    flip_step_row(m, 16, 16, 0.1, 0.0, false, o, 1e-3, 1, &radial);
+    flip_step_row(m, 16, 16, 0.1, 0.0, true, o, 1e-3, 1, &radial);
+    let falling: Vec<FluidParticle> = [(0.5, 0.8), (0.6, 0.8), (0.7, 0.8)]
+        .iter()
+        .map(|&(x, y)| FluidParticle::new_2d(x, y, 0.01))
+        .collect();
+    flip_step_row(m, 16, 16, 0.1, 0.95, false, g, 0.01, 10, &falling);
+    let twenty: Vec<FluidParticle> = (0..20)
+        .map(|i| FluidParticle::new_2d(0.3 + f64::from(i % 5) * 0.05, 0.3 + f64::from(i / 5) * 0.05, 0.01))
+        .collect();
+    flip_step_row(m, 16, 16, 0.1, 0.9, false, DVec3::new(0.0, -1.0, 0.0), 0.01, 100, &twenty);
+    // The sloshing tank (a block moving right in the left of the tank) and the falling block, by PIC, FLIP 0.95,
+    // FLIP 1.0 and APIC, at frames 1, 2, 10, 60 and 300.
+    let tank = flip_block(0.15, 0.55, 0.15, 0.85, 0.05, 0.001, 0.5, 0.0);
+    let block = flip_block(0.3, 0.5, 0.8, 1.0, 0.025, 0.001, 0.0, 0.0);
+    for (ratio, apic) in [(0.0, false), (0.95, false), (1.0, false), (0.0, true)] {
+        for steps in [1, 2, 10, 60, 300] {
+            flip_step_row(m, 16, 16, 0.1, ratio, apic, g, 0.005, steps, &tank);
+        }
+    }
+    for (ratio, apic) in [(0.95, false), (0.0, true)] {
+        for steps in [1, 2, 10, 60, 300] {
+            flip_step_row(m, 16, 24, 0.05, ratio, apic, g, 0.01, steps, &block);
+        }
+    }
+    // A pool at rest without gravity (one sweep converges), and a deep pool under gravity (every sweep runs).
+    let pool = flip_block(0.1, 0.9, 0.1, 0.5, 0.05, 0.001, 0.0, 0.0);
+    flip_step_row(m, 12, 12, 0.1, 0.95, false, o, 0.01, 3, &pool);
+    flip_step_row(m, 12, 12, 0.1, 0.95, false, g, 0.01, 3, &pool);
+    // The specials as dt, the blend and each gravity component; as a particle's position, velocity and mass, among
+    // others; and a particle outside the grid on each side, and in 3D.
+    let five = flip_block(0.2, 0.4, 0.2, 0.3, 0.1, 0.01, 0.3, -0.2);
+    for &x in &specials() {
+        flip_step_row(m, 8, 8, 0.1, 0.95, false, g, x, 1, &five);
+        flip_step_row(m, 8, 8, 0.1, x, false, g, 0.01, 2, &five);
+        flip_step_row(m, 8, 8, 0.1, 0.95, false, DVec3::new(x, -9.81, 0.0), 0.01, 1, &five);
+        flip_step_row(m, 8, 8, 0.1, 0.95, true, DVec3::new(0.0, x, 0.0), 0.01, 1, &five);
+        for slot in 0..7 {
+            let mut ps = five.clone();
+            let p = &mut ps[2];
+            match slot {
+                0 => p.position.x = x,
+                1 => p.position.y = x,
+                2 => p.position.z = x,
+                3 => p.velocity.x = x,
+                4 => p.velocity.y = x,
+                5 => p.velocity.z = x,
+                _ => p.mass = x,
+            }
+            flip_step_row(m, 8, 8, 0.1, 0.95, slot % 2 == 1, g, 0.01, 2, &ps);
+        }
+    }
+    let mut outside = five.clone();
+    outside[0].position = DVec3::new(-0.05, 0.3, 0.0);
+    outside[1].position = DVec3::new(0.3, 0.9, 0.0);
+    outside[2].position = DVec3::new(1.5, -0.4, 0.0);
+    outside[3].position = DVec3::new(0.7, 0.7, 0.0);
+    outside[4].position = DVec3::new(0.3, 0.3, 0.25);
+    outside[4].velocity.z = 1.0;
+    flip_step_row(m, 8, 8, 0.1, 0.95, false, g, 0.01, 3, &outside);
+    flip_step_row(m, 8, 8, 0.1, 0.0, true, g, 0.01, 3, &outside);
+    flip_step_row(m, 8, 8, 0.1, 0.95, false, g, 1.0, 2, &five);
+    // A particle on the corner node moving at f64::MAX in y, under gravity f64::MAX: only that node's vy overflows, and
+    // no interior divergence reads it, so vx stays finite and the check must see vy (no random numbers drawn).
+    let mut corner = FluidParticle::new_2d(0.0, 0.0, 1.0);
+    corner.velocity = DVec3::new(0.0, f64::MAX, 0.0);
+    flip_step_row(m, 8, 8, 0.1, 0.95, false, DVec3::new(0.0, f64::MAX, 0.0), 1.0, 1, &[corner]);
+    // Seeded scenes: grid shapes, cell sizes, blends, APIC, gravities, time steps, clouds in 2D and 3D, some past
+    // the walls.
+    for k in 0..40 {
+        let nx = 4 + usize::try_from(rng.int(0, 16)).unwrap_or(0);
+        let ny = 4 + usize::try_from(rng.int(0, 16)).unwrap_or(0);
+        let dx = rng.log_uniform(-2.0, 0.0);
+        let ratio = if k % 5 == 0 { rng.uniform(-0.5, 1.5) } else { rng.unit() };
+        let apic = k % 3 == 0;
+        let gv = DVec3::new(rng.uniform(-3.0, 3.0), rng.uniform(-12.0, 0.0), 0.0);
+        let dt = rng.log_uniform(-4.0, -1.3);
+        let steps = 1 + usize::try_from(rng.int(0, 4)).unwrap_or(0);
+        let ext = dx * (nx.min(ny) as f64 - 1.0);
+        let n = usize::try_from(rng.int(0, 60)).unwrap_or(0);
+        let lo = if k % 7 == 6 { -0.2 * ext } else { 0.05 * ext };
+        let cl = flip_cloud(rng, n, lo, 0.95 * ext, 2.0 * ext, k % 4 == 3);
+        flip_step_row(m, nx, ny, dx, ratio, apic, gv, dt, steps, &cl);
+    }
+    // Scenarios: the APIC matrices truncated, grown, kept across a FLIP segment; all particles dropped and new ones
+    // added; a NaN blend in a later segment.
+    let c40 = flip_cloud(rng, 40, 0.1, 1.3, 0.5, false);
+    let c15 = flip_cloud(rng, 15, 0.1, 1.3, 0.5, false);
+    let seg = |ratio: f64, apic: bool, keep: usize, add: &[FluidParticle], steps: usize| Seg {
+        ratio,
+        apic,
+        keep,
+        add: add.to_vec(),
+        steps,
+    };
+    flip_scenario_row(
+        m,
+        16,
+        16,
+        0.1,
+        g,
+        0.005,
+        &[
+            seg(0.0, true, 0, &c40, 3),
+            seg(0.0, true, 25, &[], 3),
+            seg(0.0, true, 25, &c15, 3),
+        ],
+    );
+    flip_scenario_row(
+        m,
+        16,
+        16,
+        0.1,
+        g,
+        0.005,
+        &[
+            seg(0.0, true, 0, &c40, 2),
+            seg(0.9, false, 40, &[], 2),
+            seg(0.0, true, 40, &[], 2),
+        ],
+    );
+    flip_scenario_row(
+        m,
+        16,
+        16,
+        0.1,
+        g,
+        0.005,
+        &[
+            seg(0.0, true, 0, &c40, 2),
+            seg(0.9, false, 30, &[], 2),
+            seg(0.0, true, 30, &c15, 2),
+        ],
+    );
+    flip_scenario_row(
+        m,
+        12,
+        10,
+        0.1,
+        g,
+        0.01,
+        &[
+            seg(0.95, false, 0, &c15, 2),
+            seg(f64::NAN, false, 15, &[], 2),
+            seg(0.95, false, 15, &[], 2),
+        ],
+    );
+    flip_scenario_row(
+        m,
+        16,
+        16,
+        0.1,
+        g,
+        0.005,
+        &[
+            seg(0.0, true, 0, &c40, 2),
+            seg(0.0, true, 0, &[], 2),
+            seg(0.0, true, 0, &c15, 2),
+        ],
+    );
+    for _ in 0..8 {
+        let nsegs = 2 + usize::try_from(rng.int(0, 2)).unwrap_or(0);
+        let mut segs = Vec::new();
+        let mut have = 0usize;
+        for _ in 0..nsegs {
+            let keep = usize::try_from(rng.int(0, i64::try_from(have).unwrap_or(0))).unwrap_or(0);
+            let na = usize::try_from(rng.int(0, 20)).unwrap_or(0);
+            let add = flip_cloud(rng, na, 0.1, 1.3, 0.8, false);
+            have = keep + na;
+            segs.push(Seg {
+                ratio: rng.unit(),
+                apic: rng.unit() < 0.5,
+                keep,
+                add,
+                steps: 1 + usize::try_from(rng.int(0, 3)).unwrap_or(0),
+            });
+        }
+        flip_scenario_row(m, 16, 16, 0.1, g, 0.005, &segs);
+    }
+}
+
 pub fn emit() -> Module {
     let mut m = Module::new("coupling");
     let mut rng = Rng::new(0x60_c0_0a);
@@ -1079,5 +1479,7 @@ pub fn emit() -> Module {
     level_set_rows(&mut m, &mut rng);
     flow_rows(&mut m, &mut rng);
     json_rows(&mut m, &mut rng);
+    let mut rng_b = Rng::new(0x60_c0_0b);
+    flip_rows(&mut m, &mut rng_b);
     m
 }

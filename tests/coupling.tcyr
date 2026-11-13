@@ -1,11 +1,13 @@
-# coupling.tcyr — the ported Rust tests of rust-old/src/coupling.rs (M6 part a: the 22 tests of the shapes, the
-# bodies, the coupling, added mass, drag and the level set, in Rust's order; part b adds the FLIP solver's 11).
+# coupling.tcyr — the ported Rust tests of rust-old/src/coupling.rs: all 33, in Rust's order (M6 part a: the 22 of
+# the shapes, the bodies, the coupling, added mass, drag and the level set; part b: the FLIP solver's 11).
 #
 # Slices are (pointer, count) (ADR 0002 #9). Rust's hisab `SpatialHash` is the caller's cells-only
-# `PvNeighborGrid` (ADR 0002 #23). Five Cyrius-only groups follow: the record layouts, the grid's cell-size rule,
-# the block walk against a brute-force enumeration, the indexed drag against the brute force on clouds (at 10⁶ and
-# 10¹² too, and with an infinite radius, where Rust's f32 hash misses particles or never returns), and the level
-# set's refusals.
+# `PvNeighborGrid` (ADR 0002 #23). The FLIP tests that read or set the solver's private fields read its columns, and
+# call its private transfers by their Cyrius names (`_pv_flip_p2g`, `_pv_flip_g2p`). Cyrius-only groups follow: the
+# record layouts, the grid's cell-size rule, the block walk against a brute-force enumeration, the indexed drag
+# against the brute force on clouds (at 10⁶ and 10¹² too, and with an infinite radius, where Rust's f32 hash misses
+# particles or never returns), the level set's refusals, and the FLIP solver's construction, APIC resizing, error
+# paths and flat heap.
 
 include "tests/lib.cyr"
 
@@ -18,6 +20,7 @@ fn near(a: f64, b: f64, tol: f64): i64 {
 }
 
 var EPS: f64 = 0.0000000001;   # the Rust tests' 1e-10
+var F64_EPS: f64 = 0.0000000000000002220446049250313;   # f64::EPSILON
 
 # A buffer of n particles, each `FluidParticle::new(position, mass)` at the origin.
 fn particles(n): i64 {
@@ -129,6 +132,222 @@ fn test_bodies() {
     bs.force = PvVec3_zero();
     integrate_bodies(bs, 1, PvVec3_new(0.0, -9.81, 0.0), 0.01);
     assert(bs.velocity.y < 0.0 && bs.position.y < 1.0, "falls");
+    return 0;
+}
+
+# A new solver into *s that must succeed.
+fn flip_new(s: *PvFlipSolver, nx, ny, dx: f64, ratio: f64) {
+    var t, v = PvFlipSolver_new(nx, ny, dx, ratio, s);
+    assert_eq(is_ok(t), 1, "FlipSolver::new");
+    return 0;
+}
+
+# A buffer of one `FluidParticle::new_2d(x, y, m)` moving at (vx, vy, 0).
+fn one_2d(x: f64, y: f64, m: f64, vx: f64, vy: f64): i64 {
+    var buf = particles(1);
+    place(buf, 0, x, y, 0.0, m);
+    move(buf, 0, vx, vy, 0.0);
+    return buf;
+}
+
+# The FLIP tests of the first block: construction, the empty step, motion, gravity, the blend, the walls.
+fn test_flip() {
+    var o: PvVec3 = PvVec3_zero();
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var s: PvFlipSolver;
+
+    test_group("test_flip_solver_new");
+    flip_new(&s, 16, 16, 0.1, 0.95);
+    var dr: f64 = s.flip_ratio - 0.95;
+    var adr: f64 = f64_abs(dr);
+    assert(s.grid_nx() == 16 && adr < F64_EPS, "16 cells, the blend 0.95");
+    PvFlipSolver_drop(&s);
+
+    test_group("test_flip_solver_invalid");
+    var t1, v1 = PvFlipSolver_new(2, 16, 0.1, 0.95, &s);
+    var t2, v2 = PvFlipSolver_new(16, 16, 0.0, 0.95, &s);
+    assert(is_err_result(t1) == 1 && is_err_result(t2) == 1, "2 cells and dx 0 refused");
+
+    test_group("test_flip_step_empty");
+    flip_new(&s, 8, 8, 0.1, 0.95);
+    var et, ev = s.step(0, 0, g, 0.01);
+    assert_eq(is_ok(et), 1, "no particles: Ok");
+    PvFlipSolver_drop(&s);
+
+    test_group("test_flip_step_particles_move");
+    flip_new(&s, 16, 16, 0.1, 0.95);
+    var mb = one_2d(0.8, 0.8, 0.01, 1.0, 0.0);
+    var mp: *PvFluidParticle = _pv_as_particles(mb);
+    var x_before: f64 = mp.position.x;
+    var mt, mv = s.step(mp, 1, o, 0.1);
+    var moved: f64 = mp.position.x - x_before;
+    var am: f64 = f64_abs(moved);
+    assert(is_ok(mt) == 1 && am > 0.000001, "the particle moves");
+    fl_free(mb);
+    PvFlipSolver_drop(&s);
+
+    test_group("test_flip_gravity");
+    flip_new(&s, 16, 16, 0.1, 0.0);
+    var gb = one_2d(0.8, 0.8, 0.01, 0.0, 0.0);
+    var gp: *PvFluidParticle = _pv_as_particles(gb);
+    var gt, gv = s.step(gp, 1, g, 0.01);
+    assert(is_ok(gt) == 1 && gp.velocity.y < 0.0, "PIC: the particle falls");
+    fl_free(gb);
+    PvFlipSolver_drop(&s);
+
+    test_group("test_flip_pic_blend");
+    var sf: PvFlipSolver;
+    var sp: PvFlipSolver;
+    flip_new(&sf, 8, 8, 0.1, 1.0);
+    flip_new(&sp, 8, 8, 0.1, 0.0);
+    var fb = one_2d(0.4, 0.4, 0.01, 1.0, 0.0);
+    var pb = one_2d(0.4, 0.4, 0.01, 1.0, 0.0);
+    var fpp: *PvFluidParticle = _pv_as_particles(fb);
+    var ppp: *PvFluidParticle = _pv_as_particles(pb);
+    var ft, fv = sf.step(fpp, 1, o, 0.01);
+    var pt, pv = sp.step(ppp, 1, o, 0.01);
+    assert(is_ok(ft) == 1 && is_ok(pt) == 1, "both Ok");
+    assert(_pv_is_finite(fpp.velocity.x) == 1 && _pv_is_finite(ppp.velocity.x) == 1, "both finite");
+    fl_free(fb);
+    fl_free(pb);
+    PvFlipSolver_drop(&sf);
+    PvFlipSolver_drop(&sp);
+
+    test_group("test_flip_boundary_clamping");
+    flip_new(&s, 8, 8, 0.1, 0.95);
+    var cb = one_2d(0.05, 0.05, 0.01, -10.0, -10.0);
+    var cp: *PvFluidParticle = _pv_as_particles(cb);
+    var ct, cv = s.step(cp, 1, o, 0.1);
+    var avx: f64 = f64_abs(cp.velocity.x);
+    assert(is_ok(ct) == 1 && cp.position.x >= 0.0 && cp.position.y >= 0.0, "kept in the domain");
+    assert(avx < EPS, "vx is 0 at the wall");
+    fl_free(cb);
+    PvFlipSolver_drop(&s);
+    return 0;
+}
+
+# √Σ d² over the cells 3..12 of a 16-wide grid of the central divergence of (vx, vy) at dx.
+fn div_norm(vx, vy, dx: f64): f64 {
+    var s: f64 = 0.0;
+    var two_dx: f64 = 2.0 * dx;
+    for (var y = 3; y < 13; y = y + 1) {
+        for (var x = 3; x < 13; x = x + 1) {
+            var i = y * 16 + x;
+            var a: f64 = load64(vx + (i + 1) * 8);
+            var b: f64 = load64(vx + (i - 1) * 8);
+            var c: f64 = load64(vy + (i + 16) * 8);
+            var d: f64 = load64(vy + (i - 16) * 8);
+            var dd: f64 = (a - b + c - d) / two_dx;
+            s = s + dd * dd;
+        }
+    }
+    var r: f64 = f64_sqrt(s);
+    return r;
+}
+
+# The FLIP regressions of the 1.3.0 audit, in Rust's order.
+fn test_flip_regressions() {
+    var o: PvVec3 = PvVec3_zero();
+    var s: PvFlipSolver;
+
+    test_group("test_flip_projection_reduces_divergence_small_dx");
+    var dx: f64 = 0.1;
+    flip_new(&s, 16, 16, dx, 0.0);
+    var buf = particles(576);
+    var k = 0;
+    var offs[64];
+    store64(&offs, _pv_bits(0.25));
+    store64(&offs + 8, _pv_bits(0.25));
+    store64(&offs + 16, _pv_bits(0.75));
+    store64(&offs + 24, _pv_bits(0.25));
+    store64(&offs + 32, _pv_bits(0.25));
+    store64(&offs + 40, _pv_bits(0.75));
+    store64(&offs + 48, _pv_bits(0.75));
+    store64(&offs + 56, _pv_bits(0.75));
+    for (var j = 2; j < 14; j = j + 1) {
+        for (var i = 2; i < 14; i = i + 1) {
+            for (var q = 0; q < 4; q = q + 1) {
+                var ox: f64 = load64(&offs + q * 16);
+                var oy: f64 = load64(&offs + q * 16 + 8);
+                var fi: f64 = f64_from(i);
+                var fj: f64 = f64_from(j);
+                var x: f64 = (fi + ox) * dx;
+                var y: f64 = (fj + oy) * dx;
+                place(buf, k, x, y, 0.0, 0.001);
+                var vx: f64 = x - 0.8;
+                var vy: f64 = y - 0.8;
+                move(buf, k, vx, vy, 0.0);
+                k = k + 1;
+            }
+        }
+    }
+    var st, sv = s.step(_pv_as_particles(buf), 576, o, 0.001);
+    var before: f64 = div_norm(s.vx_old.data, s.vy_old.data, dx);
+    var after: f64 = div_norm(s.vx.data, s.vy.data, dx);
+    var half: f64 = 0.5 * before;
+    assert(is_ok(st) == 1 && after < half, "the projection halves the divergence");
+    fl_free(buf);
+    PvFlipSolver_drop(&s);
+
+    test_group("test_p2g_weights_non_negative_outside_grid");
+    flip_new(&s, 8, 8, 0.1, 0.95);
+    var wb = particles(2);
+    place(wb, 0, -0.05, 0.3, 0.0, 0.001);
+    place(wb, 1, 0.3, 0.9, 0.0, 0.001);
+    _pv_flip_p2g(&s, _pv_as_particles(wb), 2);
+    var nonneg = 1;
+    for (var w = 0; w < s.weight.len; w = w + 1) {
+        var wv: f64 = s.weight.at(w);
+        if (wv < 0.0) { nonneg = 0; }
+    }
+    assert_eq(nonneg, 1, "every weight ≥ 0");
+    fl_free(wb);
+    PvFlipSolver_drop(&s);
+
+    test_group("test_apic_c_exact_for_rigid_rotation");
+    var omega: f64 = 2.0;
+    flip_new(&s, 8, 8, 0.1, 0.0);
+    s.use_apic = 1;
+    for (var y2 = 0; y2 < 8; y2 = y2 + 1) {
+        for (var x2 = 0; x2 < 8; x2 = x2 + 1) {
+            var c = y2 * 8 + x2;
+            var fy: f64 = f64_from(y2);
+            var fx: f64 = f64_from(x2);
+            var nom: f64 = -omega;
+            var gvx: f64 = nom * fy * 0.1;
+            var gvy: f64 = omega * fx * 0.1;
+            s.vx.set_f(c, gvx);
+            s.vy.set_f(c, gvy);
+        }
+    }
+    var rb = particles(1);
+    place(rb, 0, 0.33, 0.41, 0.0, 0.001);
+    assert_eq(_pv_flip_g2p(&s, _pv_as_particles(rb), 1), 1, "transferred");
+    var c00: f64 = s.apic_c.at(0);
+    var c01: f64 = s.apic_c.at(1);
+    var c10: f64 = s.apic_c.at(2);
+    var c11: f64 = s.apic_c.at(3);
+    var a00: f64 = f64_abs(c00);
+    var a11: f64 = f64_abs(c11);
+    var e01: f64 = c01 + omega;
+    var e10: f64 = c10 - omega;
+    var a01: f64 = f64_abs(e01);
+    var a10: f64 = f64_abs(e10);
+    var tiny: f64 = 0.000000000001;
+    assert(a00 < tiny && a11 < tiny, "no stretch");
+    assert(a01 < tiny && a10 < tiny, "C = [[0, −ω], [ω, 0]]");
+    fl_free(rb);
+    PvFlipSolver_drop(&s);
+
+    test_group("test_flip_rejects_nan_ratio");
+    flip_new(&s, 8, 8, 0.1, 0.95);
+    var nan: f64 = PV_F64_NAN;
+    s.flip_ratio = nan;
+    var nb = one_2d(0.3, 0.3, 0.001, 0.0, 0.0);
+    var nt, nv = s.step(_pv_as_particles(nb), 1, o, 0.01);
+    assert(is_err_result(nt) == 1 && nv == PV_ERR_INVALID_PARAMETER, "a NaN blend is refused");
+    fl_free(nb);
+    PvFlipSolver_drop(&s);
     return 0;
 }
 
@@ -292,6 +511,7 @@ fn test_regressions() {
     var ea: f64 = acc + g15;
     var aea: f64 = f64_abs(ea);
     assert(aea < 0.000000001, "a = g/1.5");
+    test_flip_regressions();
 
     test_group("test_level_set_size_mismatch_no_panic");
     var ls[80];
@@ -562,11 +782,131 @@ fn test_level_set_refusals() {
     return 0;
 }
 
+# Cyrius-only: the FLIP solver's layout and construction (Rust's order of refusals, the blend's clamp and default),
+# APIC's resize to the particle count (kept matrices, zero new ones), a diverging step leaving the particles as they
+# were, and 30 steps of a block taking no heap.
+fn test_flip_cyrius() {
+    test_group("flip_layout_and_new");
+    assert_eq(sizeof(PvFlipSolver), 240, "240 bytes");
+    var s: PvFlipSolver;
+    flip_new(&s, 5, 7, 0.2, 0.5);
+    var lay = 1;
+    for (var k = 0; k < 8; k = k + 1) {
+        var c: *PvColumn = _pv_flip_col(&s, k);
+        var want = 35;
+        if (k == 7) { want = 0; }
+        if (c.len != want) { lay = 0; }
+    }
+    assert_eq(lay, 1, "seven fields of nx·ny, the APIC column empty");
+    var c0: *PvColumn = _pv_flip_col(&s, 0);
+    var c7: *PvColumn = _pv_flip_col(&s, 6);
+    assert(c0.data == s.vx.data && c7.data == s.div.data, "columns 0 (vx) and 6 (div) by offset");
+    var gdx: f64 = s.grid_dx();
+    assert(s.grid_ny() == 7 && gdx == 0.2 && s.use_apic == 0 && s.narrow_band_cells == 0, "the accessors");
+    PvFlipSolver_drop(&s);
+    var inf: f64 = PV_F64_INFINITY;
+    var nan: f64 = PV_F64_NAN;
+    flip_new(&s, 4, 4, 1.0, 1.5);
+    var r1: f64 = s.flip_ratio;
+    PvFlipSolver_drop(&s);
+    flip_new(&s, 4, 4, 1.0, -0.5);
+    var r2: f64 = s.flip_ratio;
+    PvFlipSolver_drop(&s);
+    flip_new(&s, 4, 4, 1.0, nan);
+    var r3: f64 = s.flip_ratio;
+    PvFlipSolver_drop(&s);
+    flip_new(&s, 4, 4, 1.0, inf);
+    var r4: f64 = s.flip_ratio;
+    PvFlipSolver_drop(&s);
+    assert(r1 == 1.0 && r2 == 0.0 && r3 == 0.95 && r4 == 0.95, "clamped, and 0.95 when not finite");
+    var t1, v1 = PvFlipSolver_new(3, 3, nan, 0.5, &s);
+    var t2, v2 = PvFlipSolver_new(4, 4, nan, 0.5, &s);
+    var t3, v3 = PvFlipSolver_new(0 - 1, 4, 1.0, 0.5, &s);
+    var t4, v4 = PvFlipSolver_new(2305843009213693952, 4, 1.0, 0.5, &s);
+    var t5, v5 = PvFlipSolver_new(4611686018427387904, 4, 1.0, 0.5, &s);
+    assert(v1 == PV_ERR_INVALID_GRID_RESOLUTION && v2 == PV_ERR_INVALID_PARAMETER, "the size first, then dx");
+    assert(v3 == PV_ERR_INVALID_GRID_RESOLUTION && v5 == PV_ERR_INVALID_GRID_RESOLUTION, "nx·ny past a usize");
+    assert(v4 == PV_ERR_OUT_OF_MEMORY && s.vx.data == 0, "2^63 cells: no memory, nothing held");
+
+    test_group("flip_apic_resizes_to_the_particle_count");
+    flip_new(&s, 10, 10, 0.1, 0.0);
+    s.use_apic = 1;
+    var buf = particles(6);
+    for (var i = 0; i < 6; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var x: f64 = 0.3 + fi * 0.07;
+        var vy: f64 = fi * 0.1;
+        place(buf, i, x, 0.4, 0.0, 0.01);
+        move(buf, i, 0.5, vy, 0.0);
+    }
+    var ps: *PvFluidParticle = _pv_as_particles(buf);
+    var g: PvVec3 = PvVec3_new(0.0, -9.81, 0.0);
+    var at, av = s.step(ps, 6, g, 0.01);
+    assert(is_ok(at) == 1 && s.apic_c.len == 24, "six matrices");
+    var bt, bv = s.step(ps, 4, g, 0.01);
+    assert(is_ok(bt) == 1 && s.apic_c.len == 16, "truncated to four");
+    _pv_flip_p2g(&s, ps, 6);
+    var ct, cv = s.step(ps, 6, g, 0.01);
+    assert(is_ok(ct) == 1 && s.apic_c.len == 24, "grown to six again");
+    s.use_apic = 0;
+    var dt, dv = s.step(ps, 3, g, 0.01);
+    assert(is_ok(dt) == 1 && s.apic_c.len == 24, "FLIP leaves the matrices alone");
+    fl_free(buf);
+    PvFlipSolver_drop(&s);
+
+    test_group("flip_divergence_leaves_the_particles");
+    flip_new(&s, 8, 8, 0.1, 0.95);
+    var nb = particles(2);
+    place(nb, 0, 0.3, 0.3, 0.0, 0.01);
+    place(nb, 1, 0.4, 0.3, 0.0, 0.01);
+    move(nb, 1, nan, 0.0, 0.0);
+    var np: *PvFluidParticle = _pv_as_particles(nb);
+    var et, ev = s.step(np, 2, g, 0.01);
+    assert(is_err_result(et) == 1 && ev == PV_ERR_DIVERGED, "a NaN velocity diverges");
+    var q: *PvFluidParticle = np + 1;
+    assert(np.position.x == 0.3 && q.position.x == 0.4 && np.velocity.y == 0.0, "the particles as they were");
+    var bad[32];
+    var zero: f64 = 0.0;
+    var neg: f64 = -1.0;
+    store64(&bad, _pv_bits(zero));
+    store64(&bad + 8, _pv_bits(neg));
+    store64(&bad + 16, _pv_bits(nan));
+    store64(&bad + 24, _pv_bits(inf));
+    var refused = 0;
+    for (var b = 0; b < 4; b = b + 1) {
+        var d: f64 = load64(&bad + b * 8);
+        var ft, fv = s.step(np, 2, g, d);
+        if (is_err_result(ft) == 1 && fv == PV_ERR_INVALID_TIMESTEP) { refused = refused + 1; }
+    }
+    assert_eq(refused, 4, "dt 0, −1, NaN and ∞ refused");
+    fl_free(nb);
+    PvFlipSolver_drop(&s);
+
+    test_group("flip_steps_take_no_heap");
+    flip_new(&s, 16, 16, 0.1, 0.95);
+    s.use_apic = 1;
+    var bp, bn = create_particle_block(0.3, 0.3, 0.4, 0.4, 0.05, 0.001);
+    var bps: *PvFluidParticle = _pv_as_particles(bp);
+    var ft0, fv0 = s.step(bps, bn, g, 0.01);
+    var used = alloc_used();
+    var errs = 0;
+    for (var k2 = 0; k2 < 30; k2 = k2 + 1) {
+        var kt, kv = s.step(bps, bn, g, 0.01);
+        if (is_err_result(kt) == 1) { errs = errs + 1; }
+    }
+    assert_eq(alloc_used() - used, 0, "30 more steps take no heap");
+    assert_eq(errs, 0, "every step Ok");
+    fl_free(bp);
+    PvFlipSolver_drop(&s);
+    return 0;
+}
+
 # Runs the ported coupling tests.
 fn main() {
     alloc_init();
     test_shapes();
     test_bodies();
+    test_flip();
     test_added_mass_and_drag();
     test_level_sets();
     test_regressions();
@@ -575,6 +915,7 @@ fn main() {
     test_block_walk();
     test_indexed_drag();
     test_level_set_refusals();
+    test_flip_cyrius();
     return assert_summary();
 }
 

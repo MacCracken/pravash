@@ -2588,8 +2588,106 @@ fn _par_coupling_json(fp, fl): i64 {
     return 1;
 }
 
+# Appends a FLIP solver's dump: its seven grid fields, then the APIC matrices (scripts/oracle/src/m_coupling.rs).
+fn _par_flip_dump(s: *PvFlipSolver) {
+    for (var k = 0; k < 8; k = k + 1) { _par_col_out(_pv_flip_col(s, k)); }
+    return 0;
+}
+
+# The FLIP solver's rows (M6 part b): 1 replayed, 0 for another function, -1 for a row the harness can't use.
+fn _par_flip(fp, fl): i64 {
+    var s: PvFlipSolver;
+    if (_par_eq(fp, fl, "FlipSolver::new") == 1) {
+        var t, v = PvFlipSolver_new(_par_in(0), _par_in(1), _par_in(2), _par_in(3), &s);
+        if (is_err_result(t) == 1) { _par_got_err(v); return 1; }
+        _par_got_i(s.grid_nx());
+        _par_got_i(s.grid_ny());
+        var gdx: f64 = s.grid_dx();
+        _par_got_f(_pv_bits(gdx));
+        _par_got_f(_pv_bits(s.flip_ratio));
+        _par_got_i(s.use_apic);
+        _par_got_i(s.narrow_band_cells);
+        for (var k = 0; k < 8; k = k + 1) {
+            var c: *PvColumn = _pv_flip_col(&s, k);
+            var len = c.len;
+            if (k == 7) { len = len / 4; }
+            _par_got_i(len);
+        }
+        PvFlipSolver_drop(&s);
+        return 1;
+    }
+    var scen = _par_eq(fp, fl, "FlipSolver::scenario");
+    if (_par_eq(fp, fl, "FlipSolver::step") == 0 && scen == 0) { return 0; }
+    var ratio0: f64 = 0.95;
+    var nt, nv = PvFlipSolver_new(_par_in(0), _par_in(1), _par_in(2), ratio0, &s);
+    if (is_err_result(nt) == 1) { return 0 - 1; }
+    var buf = 0;
+    var n = 0;
+    var failed = 0;
+    if (scen == 0) {
+        s.flip_ratio = _par_in(3);
+        s.use_apic = _par_in(4);
+        var g: PvVec3 = PvVec3_new(_par_in(5), _par_in(6), _par_in(7));
+        var dt: f64 = _par_in(8);
+        var steps = _par_in(9);
+        var pb, pn, pk = _par_particles_in(10);
+        buf = pb;
+        n = pn;
+        for (var i = 0; failed == 0 && i < steps; i = i + 1) {
+            var st, sv = s.step(_pv_as_particles(buf), n, g, dt);
+            if (is_err_result(st) == 1) {
+                _par_got_err(sv);
+                failed = 1;
+            }
+        }
+    } else {
+        var sg: PvVec3 = PvVec3_new(_par_in(3), _par_in(4), _par_in(5));
+        var sdt: f64 = _par_in(6);
+        var nseg = _par_in(7);
+        # The capacity: every segment's appended particles.
+        var cap = 0;
+        var k2 = 8;
+        for (var a = 0; a < nseg; a = a + 1) {
+            var na = _par_in(k2 + 3);
+            cap = cap + na;
+            k2 = k2 + 5 + na * 18;
+        }
+        buf = fl_alloc(cap * sizeof(PvFluidParticle) + 8);
+        if (buf == 0) { return 0 - 1; }
+        var ps: *PvFluidParticle = _pv_as_particles(buf);
+        var k3 = 8;
+        for (var b = 0; failed == 0 && b < nseg; b = b + 1) {
+            s.flip_ratio = _par_in(k3);
+            s.use_apic = _par_in(k3 + 1);
+            var keep = _par_in(k3 + 2);
+            if (keep < n) { n = keep; }
+            var add = _par_in(k3 + 3);
+            for (var j = 0; j < add; j = j + 1) { _par_particle_in(k3 + 4 + j * 18, ps + n + j); }
+            n = n + add;
+            var ssteps = _par_in(k3 + 4 + add * 18);
+            for (var q = 0; failed == 0 && q < ssteps; q = q + 1) {
+                var qt, qv = s.step(ps, n, sg, sdt);
+                if (is_err_result(qt) == 1) {
+                    _par_got_err(qv);
+                    failed = 1;
+                }
+            }
+            k3 = k3 + 5 + add * 18;
+        }
+    }
+    if (failed == 0) {
+        _par_ps_out(buf, n);
+        _par_flip_dump(&s);
+    }
+    fl_free(buf);
+    PvFlipSolver_drop(&s);
+    return 1;
+}
+
 # The coupling rows: 1 replayed, 0 for a function the port doesn't dispatch, -1 for a row it can't use.
 fn _par_coupling(fp, fl): i64 {
+    var fr = _par_flip(fp, fl);
+    if (fr != 0) { return fr; }
     if (_par_eq(fp, fl, "BodyShape::from_json") == 1 || _par_eq(fp, fl, "RigidBody::from_json") == 1) {
         return _par_coupling_json(fp, fl);
     }
@@ -2889,6 +2987,10 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "SphSolver::step_dfsph") == 1) { return 0; }
     # M5 part d: the multiphase step (class S), likewise.
     if (_par_eq(fp, fl, "SphSolver::step_multiphase") == 1) { return 0; }
+    # M6 part b: the FLIP step (class S) is +, −, ×, ÷, floor, |x| and Rust's min, max and clamp in Rust's order, so
+    # every particle and grid value of every row is the oracle's bit for bit.
+    if (_par_eq(fp, fl, "FlipSolver::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "FlipSolver::scenario") == 1) { return 0; }
     return 0 - 1;
 }
 

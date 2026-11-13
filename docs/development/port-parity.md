@@ -1825,3 +1825,97 @@ Surface parity: 386 items ok (the FLIP solver's 9 pending part b), 0 missing.
 | criterion `particle_level_set`, the three sizes | 4.2–4.3× |
 | the indexed drag, 625 / 10,000 particles (a twin) | 0.70–0.72× / 2.2–2.3× |
 | the grid build against hisab's hash, 625 / 10,000 | 3.4× / 5.1× |
+
+## 25. M6 part b: the FLIP solver (2026-11-12)
+
+**`src/flip.cyr`** ports `FlipSolver` (ADR 0002 #24):
+- **The record.** `PvFlipSolver` has the public `flip_ratio`, `use_apic` and `narrow_band_cells` first. The last is
+  reserved, read nowhere, as in Rust. The seven grid fields and the APIC matrices follow as solver-owned columns,
+  the matrices four words a particle.
+- **The constructor.** `PvFlipSolver_new` refuses what Rust refuses, in Rust's order: below 4 cells, a bad dx, nx·ny
+  past a usize. A size Rust's `vec!` would abort on is `PV_ERR_OUT_OF_MEMORY`. The blend is clamped to [0, 1], or
+  0.95 when it isn't finite.
+- **The step,** in Rust's order:
+  - the checks (dt, a finite blend), then the APIC resize to the particle count;
+  - P2G: the mass-weighted splat of v + C·(xᵢ − xₚ), with C zero unless APIC, then each node divided by a weight
+    above 1e-20;
+  - the pre-solve copy, then gravity·dt on every node;
+  - the projection: the divergence, at most 40 warm-started Gauss–Seidel sweeps that stop when no cell moves by 1e-6,
+    and the gradient;
+  - the finite check (`PV_ERR_DIVERGED` leaves the grid as computed and the particles untouched);
+  - G2P: APIC's affine transfer, or the FLIP/PIC blend with the blend re-clamped;
+  - advection, z included, then the walls.
+
+Each cell lookup is floor(g).max(0).min(n − 2) and (g − x0).clamp(0, 1). The splat's weights are products of the
+fractions times the mass; the sampler's are the value times one fraction, then the other. Rust's fn-local
+`PRESSURE_ITERATIONS` is generated (`t_private.rs` now scans `coupling.rs`).
+
+**The rows** (`m_coupling.rs` part b, seed 0x60_c0_0b, after part a's rows, which stay byte for byte): 245.
+- **`FlipSolver::new`** (35, class A): the Rust tests' sizes; every refusal in order (2 and 3 cells, dx 0, NaN and the
+  specials, usize::MAX × 4); the blend's clamp and default over the specials and 1.5, −0.5, 2, −0.0. Each row gives
+  the sizes of the eight vectors.
+- **`FlipSolver::step`** (197, class S, bound 0): trajectories of one fresh solver, each row giving the particles and
+  the private state (`oracle_dump`).
+  - The scenes:
+    - the Rust tests' (the empty step, a moving particle, gravity under PIC, both blends, the wall, the radial
+      divergence by PIC and APIC, the NaN blend, the two integration tests);
+    - the plan's sloshing tank (a block moving right in the left of a 16 × 16 tank) by PIC, FLIP 0.95, FLIP 1.0 and
+      APIC, and its falling block by FLIP and APIC, each at frames 1, 2, 10, 60 and 300;
+    - a pool at rest (one sweep converges) and under gravity (all 40 run).
+  - The specials:
+    - as dt, as the blend, and as each gravity component;
+    - in each of a particle's seven slots among four others;
+    - particles past every wall, and in 3D;
+    - a corner particle whose vy alone overflows (the mutation tests' gap, below).
+  - 40 seeded scenes (grid shapes 4–19 a side, cell sizes, blends past [0, 1], APIC, gravities, time steps, clouds in
+    2D and 3D, some outside the walls).
+- **`FlipSolver::scenario`** (13, class S): segments that change the blend, APIC and the particle count. They cover
+  the matrices truncated, grown, kept across a FLIP segment, every particle dropped and new ones added, and a NaN
+  blend in a later segment; eight are seeded.
+
+`validate.py` transcribes the solver on a dict, each trajectory cached across its frames. With the scenarios'
+segments it covers 55,011 rows with 0 failures, in about 85 s.
+
+**Result:**
+- **On the first replay** all 244 rows of the first set were bit-exact, the 300-step trajectories included. With the
+  gap's row: 13 modules, 0 failing | rows: 54,297 ok, 0 failed, 0 measured, 3 pending, 711 accepted (ADR 4: 114,
+  ADR 2: 597).
+- **The mutation tests found one gap.** On the first run 25 of 27 port mutations failed rows. Of the two survivors:
+  - a divergence check that reads only vx was a gap. In every row a non-finite vy also reached vx through the
+    pressure. The corner row closes it: a particle on node (0, 0) moving at f64::MAX in y, under gravity f64::MAX at
+    dt 1, makes only that node's vy ∞. No interior divergence reads that node, so vx stays finite. The mutant then
+    fails it;
+  - a G2P that skips its own APIC resize fails only `tests/coupling.tcyr`, which calls it directly (Rust's
+    `test_apic_c_exact_for_rigid_rotation`). Through `step` the resize has already happened, so no row can see it.
+- **The optimisations' code:** after the restructure below, three mutations rerun on it fail rows (the fraction's
+  upper clamp dropped, the finite check on vx only, the sampler's fractions swapped).
+- **Mutations of the transcription:** 7 of 7 caught (no clamp, a stale C without APIC, no re-clamp, the sweeps' stop
+  at 1e-5, z frozen, the default blend 0.9, a scenario that doesn't truncate).
+
+**Tests** (`tests/coupling.tcyr`, 106 checks):
+- the 11 FLIP tests in Rust's order, which makes all 33 of `coupling.rs`. The three that read or set private state
+  read the columns and call `_pv_flip_p2g` and `_pv_flip_g2p`;
+- four Cyrius-only groups:
+  - the layout (240 bytes), the refusals in Rust's order and the out-of-memory size;
+  - APIC's resize to six, four and six particles, and a FLIP step leaving the matrices alone;
+  - a NaN velocity's divergence leaving the particles as they were, and four refused time steps;
+  - 30 steps of a block taking no heap.
+
+`tests/integration.tcyr` adds the two FLIP integration tests: all 33, 79 checks. Surface parity: 386 items ok,
+0 pending, 0 missing.
+
+**Speed** (benchmarks-rust-v-cyrius, M6 part b):
+
+| Bench | Cyrius / Rust |
+|---|---|
+| criterion `flip_step/25_particles` | 4.1–4.2× |
+| criterion `flip_step/100_particles` | 3.7–3.8× |
+| criterion `flip_step/225_particles` | 3.5× |
+
+The restructure, each step bit-neutral (an A/B, pinned):
+- **One cell lookup per particle:** G2P's four samples share it, where Rust's `sample_field` recomputes it per field.
+- **Written out:** the lookup's max and min, the sweeps' running maximum and the finite check. Cyrius declines
+  `#inline` for each.
+- **`_pv_bits` inlined:** `src/mathx.cyr`, the one helper of these that `#inline` accepts.
+
+Together they make the step 1.46× (25 particles) to 1.6× (225) faster than the first version.
